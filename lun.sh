@@ -24,7 +24,9 @@ case "$_exe" in */lun/sing-box*|*/lun/xray*) _lun_proc_running=yes; break ;; esa
 done
 [ "$_lun_proc_running" = "no" ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_proc_running=yes
 [ "$_lun_proc_running" = "no" ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_proc_running=yes
-if [ "$_lun_proc_running" = "yes" ]; then
+_lun_installed=no
+{ [ -f "$HOME/lun/uuid" ] || [ -f "$HOME/lun/xr.json" ] || [ -f "$HOME/lun/sb.json" ]; } && _lun_installed=yes
+if [ "$_lun_proc_running" = "yes" ] || [ "$_lun_installed" = "yes" ]; then
 if [ "$1" = "rep" ]; then
 [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
 fi
@@ -67,18 +69,14 @@ export acme_email=${acme_email:-''}
 export acme_dns=${acme_dns:-''}
 v46url="https://icanhazip.com"
 lunurl=${lunurl:-"https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh"}
-showmode(){
+showmode_short(){
 echo "主脚本：bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh) 或 bash <(wget -qO- https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)"
 echo "风火轮多协议交互面板命令：lun"
-echo "显示节点信息命令：lun list 【或者】 主脚本 list"
-echo "重置变量组命令：自定义各种协议变量组 lun rep 【或者】 自定义各种协议变量组 主脚本 rep"
-echo "更新脚本命令：lun 菜单 → 服务与更新"
-echo "更新Xray或Singbox内核命令：lun upx或ups 【或者】 主脚本 upx或ups"
-echo "重启脚本命令：lun res 【或者】 主脚本 res"
-echo "卸载脚本命令：lun del 【或者】 主脚本 del"
-echo "双栈VPS显示IPv4/IPv6节点配置命令：ippz=4或6 lun list 【或者】 ippz=4或6 主脚本 list"
 echo "---------------------------------------------------------"
 echo
+}
+showmode(){
+showmode_short
 }
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
@@ -2143,6 +2141,16 @@ else
 server_ip="[$v6]"
 echo "$server_ip" > "$HOME/lun/server_ip.log"
 fi
+elif [ "$ippz" = "46" ]; then
+if [ -n "$v4" ]; then
+server_ip="$v4"
+echo "$server_ip" > "$HOME/lun/server_ip.log"
+fi
+if [ -n "$v6" ]; then
+server_ip6="[$v6]"
+echo "$server_ip6" > "$HOME/lun/server_ip6.log"
+fi
+[ -n "$v4" ] || [ -n "$v6" ] || ipbest
 else
 ipbest
 fi
@@ -3197,9 +3205,6 @@ rules:
   - MATCH,🌍选择代理节点
 EOF
 restart_subscription_service
-echo "---------------------------------------------------------"
-echo "$argoshow"
-echo
 if [ -s $HOME/lun/subport.log ]; then
 showsubport=$(cat $HOME/lun/subport.log)
 if ps -ef 2>/dev/null | grep "$showsubport" | grep -v grep >/dev/null; then
@@ -3208,10 +3213,12 @@ fi
 fi
 echo
 echo "---------------------------------------------------------"
+echo "$argoshow"
+echo
+echo "---------------------------------------------------------"
 echo "聚合节点信息，请进入 $HOME/lun/jhsub.txt 文件目录查看或者运行 cat $HOME/lun/jhsub.txt 查看"
 echo "========================================================="
-echo "相关快捷方式如下：(首次安装成功后需重连SSH，lun快捷方式才可生效；如未生效，请使用主脚本)"
-showmode
+showmode_short
 }
 cleandel(){
 keep_entry=$1
@@ -4315,16 +4322,18 @@ subscription_menu(){
 while :; do
 ui_title "Lun 节点订阅分享"
 show_subscription_summary
-echo " 1. 设置订阅 token / 端口"
-echo " 2. 设置订阅 IPv4/IPv6 输出"
-echo " 3. 刷新节点分享（不重装内核）"
+echo " 1. 刷新并查看节点信息"
+echo " 2. 设置订阅 token / 端口"
+echo " 3. 设置订阅 IPv4/IPv6 输出"
+echo " 4. 刷新节点分享（不重装内核）"
 echo " 0. 返回"
-printf "请选择 [0-3]："
+printf "请选择 [0-4]："
 IFS= read -r c
 case "$c" in
-1) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
-2) prompt_subscription_ip_mode; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
-3) refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
+1) LUN_MENU_ACTION=list; return ;;
+2) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
+3) prompt_subscription_ip_mode; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
+4) refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -5221,7 +5230,7 @@ case "$c" in
 2) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
 3) certificate_menu; return ;;
 4) prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
-5) printf "输入 4 或 6（%s回车自动%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
+5) printf "输入 4、6 或 46（%s回车自动%s，46=同时输出v4+v6，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
 6) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 7) subscription_menu; return ;;
 8) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
@@ -5307,14 +5316,12 @@ while :; do
 ui_title "Lun 安装 / 协议管理"
 echo " 1. 引导式安装 / 新建协议"
 echo " 2. 增删改协议并重建"
-echo " 3. 刷新并查看节点"
 echo " 0. 返回"
-printf "请选择 [0-3]："
+printf "请选择 [0-2]："
 IFS= read -r c
 case "$c" in
 1) guided_install; rc=$?; [ "$rc" = 0 ] && { [ -f "$HOME/lun/uuid" ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
 2) pick_protocols; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
-3) LUN_MENU_ACTION=list; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -5360,24 +5367,22 @@ done
 service_update_menu(){
 while :; do
 ui_title "Lun 服务与更新"
-echo " 1. 刷新并查看节点"
-echo " 2. 重启服务"
-echo " 3. 停止服务"
-echo " 4. 查看运行日志"
-echo " 5. 更新 Lun 脚本"
-echo " 6. 更新 Xray 内核"
-echo " 7. 更新 Sing-box 内核"
+echo " 1. 重启服务"
+echo " 2. 停止服务"
+echo " 3. 查看运行日志"
+echo " 4. 更新 Lun 脚本"
+echo " 5. 更新 Xray 内核"
+echo " 6. 更新 Sing-box 内核"
 echo " 0. 返回"
-printf "请选择 [0-7]："
+printf "请选择 [0-6]："
 IFS= read -r c
 case "$c" in
-1) LUN_MENU_ACTION=list; return ;;
-2) LUN_MENU_ACTION=res; return ;;
-3) stop_lun_services; echo "已停止 Lun 服务。"; exit ;;
-4) log_menu ;;
-5) update_lun_script; exit ;;
-6) LUN_MENU_ACTION=upx; return ;;
-7) LUN_MENU_ACTION=ups; return ;;
+1) LUN_MENU_ACTION=res; return ;;
+2) stop_lun_services; echo "已停止 Lun 服务。"; exit ;;
+3) log_menu ;;
+4) update_lun_script; exit ;;
+5) LUN_MENU_ACTION=upx; return ;;
+6) LUN_MENU_ACTION=ups; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -5403,7 +5408,7 @@ case "$c" in
 2) certificate_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; return ;;
 3) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 4) configure_addym_menu; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
-5) printf "输入 4 或 6（%s回车自动%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
+5) printf "输入 4、6 或 46（%s回车自动%s，46=同时输出v4+v6，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
 6) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
 7) LUN_MENU_ACTION=del; return ;;
 8) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=install; return; } ;;
@@ -5457,7 +5462,7 @@ rm -rf sbx_update "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx"
 echo "卸载完成"
 echo "Lun 已卸载完成，欢迎下次使用。" && sleep 2
 echo
-showmode
+showmode_short
 exit
 elif [ "$1" = "rep" ]; then
 cleandel keep-entry
@@ -5634,6 +5639,6 @@ echo
 lunstatus
 echo
 echo "相关快捷方式如下："
-showmode
+showmode_short
 exit
 fi
