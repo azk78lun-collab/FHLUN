@@ -3502,6 +3502,37 @@ done
 return 1
 }
 
+random_nat_port(){
+is_nat_mode || { random_port; return $?; }
+nat_inner_ports=
+for pair in $ptmap; do
+nat_inner_ports="$nat_inner_ports ${pair#*-}"
+done
+if [ -n "$nat_inner_ports" ]; then
+candidates=$(echo "$nat_inner_ports" | tr ' ' '\n' | shuf 2>/dev/null)
+for p in $candidates; do
+[ -n "$p" ] || continue
+port_valid "$p" || continue
+port_reserved "$p" && continue
+port_in_use "$p" || { printf '%s\n' "$p"; return 0; }
+done
+fi
+if [ -n "$inpool" ] || [ -n "$portpool" ]; then
+candidates=$(port_pool_inner_candidates | shuf 2>/dev/null)
+for p in $candidates; do
+port_valid "$p" || continue
+port_reserved "$p" && continue
+port_in_use "$p" || { printf '%s\n' "$p"; return 0; }
+done
+fi
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+p=$(shuf -i 10000-65535 -n 1)
+port_reserved "$p" && continue
+port_in_use "$p" || { printf '%s\n' "$p"; return; }
+done
+shuf -i 10000-65535 -n 1
+}
+
 random_port(){
 if [ -n "$inpool" ] || [ -n "$portpool" ]; then
 candidates=$(port_pool_inner_candidates | shuf 2>/dev/null)
@@ -3537,8 +3568,13 @@ fi
 IFS= read -r val
 [ "$val" = "0" ] && return 2
 if [ -z "$val" ]; then
+if is_nat_mode && [ -n "$ptmap" ]; then
+val=$(random_nat_port) || { echo "无法从NAT映射表取得可用端口。"; continue; }
+echo "从NAT映射表随机内网端口：$val"
+else
 val=$(random_port) || { echo "无法从端口池取得可用端口。"; continue; }
 echo "随机端口：$val"
+fi
 fi
 mapped_inner=$(inner_port_from_public "$val")
 if [ -n "$mapped_inner" ]; then
@@ -4156,11 +4192,16 @@ fi
 IFS= read -r subpt
 [ "$subpt" = "0" ] && return 2
 if [ -z "$subpt" ]; then
+if is_nat_mode && [ -n "$ptmap" ]; then
+subpt=$(random_nat_port) || { echo "无法从NAT映射表取得可用订阅端口。"; continue; }
+echo "节点订阅分享从NAT映射表随机内网端口：$subpt"
+else
 subpt=$(random_port) || { echo "无法从端口池取得可用订阅端口。"; continue; }
 if is_nat_mode; then
 echo "节点订阅分享随机内网端口：$subpt"
 else
 echo "节点订阅分享随机端口：$subpt"
+fi
 fi
 fi
 mapped_inner=$(inner_port_from_public "$subpt")
@@ -4545,6 +4586,10 @@ rc=$?
 [ "$rc" = 0 ] || return 1
 done
 refresh_protocol_flags
+if [ "$(protocol_count)" -gt 0 ]; then
+echo "协议端口已选择完毕，进入下一步。"
+return 0
+fi
 done
 }
 
@@ -4771,8 +4816,14 @@ done
 }
 
 prompt_cert_mode_guided(){
-if [ -n "$domain" ]; then
+cert_subj=
+cert_end=
+cert_issuer=
+cert_status=
+cert_match=
+cert_found=no
 if [ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ]; then
+cert_found=yes
 cert_subj=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -subject 2>/dev/null | sed 's/subject=[ ]*//;s/[\/]CN=//;s/,.*//')
 cert_end=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -enddate 2>/dev/null | cut -d= -f2-)
 cert_issuer=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -issuer 2>/dev/null | sed 's/issuer=[ ]*//;s/[\/]CN=//;s/,.*//')
@@ -4789,8 +4840,6 @@ cert_match="域名匹配"
 else
 cert_match="域名不匹配（证书:$cert_subj / 输入:$domain）"
 fi
-else
-cert_match=""
 fi
 echo "$LUN_GREEN"
 echo "=============================="
@@ -4802,20 +4851,31 @@ echo "  状态：${cert_status}"
 [ -n "$cert_match" ] && echo "  域名：$cert_match"
 echo "=============================="
 echo "$LUN_RESET"
-echo "证书模式："
-echo " 1. 保留已有证书（默认，检测到上述证书可用）"
-echo " 2. 域名证书（HTTP-01，要求域名解析到本机且 80 可访问，证书价值更高）"
-echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
-echo " 4. IP 证书（short-lived，HTTP-01）"
-echo " 0. 返回上一步"
 else
+echo "$LUN_YELLOW"
+echo "=============================="
+echo "  未检测到本机已有证书"
+echo "  将使用自签证书（立即可用但浏览器不信任）"
+if [ -n "$domain" ]; then
+echo "  建议选择域名证书（价值更高，浏览器信任）"
+fi
+echo "=============================="
+echo "$LUN_RESET"
+fi
 echo "证书模式："
+if [ "$cert_found" = "yes" ]; then
+echo " 1. 保留已有证书（默认，检测到上述证书可用）"
+else
 echo " 1. 自签证书（默认，立即可用）"
+fi
+if [ -n "$domain" ]; then
 echo " 2. 域名证书（HTTP-01，要求域名解析到本机且 80 可访问，证书价值更高）"
+else
+echo " 2. 域名证书（需先设置服务域名）"
+fi
 echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
 echo " 4. IP 证书（short-lived，HTTP-01）"
 echo " 0. 返回上一步"
-fi
 printf "请选择 [0-4]，%s回车默认 1%s：" "$LUN_YELLOW" "$LUN_RESET"
 IFS= read -r c
 case "$c" in
@@ -4854,20 +4914,24 @@ fi
 esac
 printf "%s\n" "$certmode" > "$HOME/lun/cert_mode"
 return 0
-else
-prompt_cert_mode
-return $?
-fi
 }
 
 guided_auto_defaults(){
 if [ -z "$sub" ]; then
 sub=y
 subid=
+if is_nat_mode && [ -n "$ptmap" ]; then
+subpt=$(random_nat_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+else
 subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+fi
 for _try in 1 2 3 4 5; do
 port_in_use "$subpt" 2>/dev/null || break
+if is_nat_mode && [ -n "$ptmap" ]; then
+subpt=$(random_nat_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+else
 subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+fi
 done
 echo "已自动启用节点订阅分享，随机端口：$subpt"
 fi
@@ -4965,8 +5029,9 @@ echo " 3. 申请 DNS API 证书"
 echo " 4. 申请 IP 证书（short-lived）"
 echo " 5. 手动续期当前 ACME 证书"
 echo " 6. 清除 DNS API 凭据"
+echo " 7. 查找证书（目录检索）"
 echo " 0. 返回"
-printf "请输入数字 [0-6]："
+printf "请输入数字 [0-7]："
 IFS= read -r c
 case "$c" in
 1) self_signed_cert && echo "已恢复自签证书。" || echo "自签证书生成失败。"; LUN_MENU_ACTION=list; ui_pause; return ;;
@@ -5009,10 +5074,72 @@ LUN_MENU_ACTION=list; ui_pause; return
 ;;
 5) subject=$(cat "$HOME/lun/cert_subject" 2>/dev/null); if [ -n "$subject" ] && [ -x "$HOME/.acme.sh/acme.sh" ]; then "$HOME/.acme.sh/acme.sh" --renew -d "$subject" --ecc --force && install_acme_cert "$subject" "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" && echo "续期完成。"; else echo "当前没有可续期的 ACME 证书。"; fi; LUN_MENU_ACTION=list; ui_pause; return ;;
 6) rm -f "$HOME/lun/cert.env" "$HOME/lun/acme_dns"; echo "DNS API 凭据已清除。"; ui_pause ;;
+7) find_certificates; ui_pause ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
 done
+}
+
+find_certificates(){
+printf "请输入要检索的目录路径（%s回车默认 ~/lun%s）：" "$LUN_YELLOW" "$LUN_RESET"
+IFS= read -r search_dir
+[ -z "$search_dir" ] && search_dir="$HOME/lun"
+[ -d "$search_dir" ] || { echo "目录不存在：$search_dir"; return 1; }
+echo "正在检索 $search_dir 下的证书文件..."
+found_count=0
+while IFS= read -r cert_file; do
+[ -f "$cert_file" ] || continue
+echo "$LUN_GREEN"
+echo "------------------------------"
+echo "文件：$cert_file"
+cert_subj=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/subject=[ ]*//;s/[\/]CN=//;s/,.*//')
+if [ -z "$cert_subj" ]; then
+echo "  （无法解析为证书）"
+echo "$LUN_RESET"
+continue
+fi
+cert_end=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2-)
+cert_issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/issuer=[ ]*//;s/[\/]CN=//;s/,.*//')
+cert_now=$(date -u +%Y%m%d%H%M%S 2>/dev/null)
+cert_end_raw=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2- | xargs -I{} date -u -d "{}" +%Y%m%d%H%M%S 2>/dev/null)
+if [ -n "$cert_end_raw" ] && [ "$cert_now" ] && [ "$cert_end_raw" -lt "$cert_now" ] 2>/dev/null; then
+cert_status="已过期"
+else
+cert_status="有效"
+fi
+echo "  主体：$cert_subj"
+echo "  签发者：${cert_issuer:-未知}"
+echo "  到期：${cert_end:-未知}"
+echo "  状态：$cert_status"
+if echo "$cert_issuer" | grep -qi "let's\|encrypt\|zerossl\|google\|buypass"; then
+echo "  类型：高价值 ACME 证书"
+elif [ "$cert_issuer" = "$cert_subj" ]; then
+echo "  类型：自签证书"
+else
+echo "  类型：CA 签发证书"
+fi
+echo "$LUN_RESET"
+printf "导入此证书到 ~/lun/cert.crt？%s回车跳过，y 导入%s：" "$LUN_YELLOW" "$LUN_RESET"
+IFS= read -r import_choice
+if [ "$import_choice" = "y" ] || [ "$import_choice" = "Y" ]; then
+key_file="${cert_file%.*}.key"
+[ -f "$key_file" ] || key_file="${cert_file%.*}.pem"
+[ -f "$key_file" ] || key_file=$(dirname "$cert_file")/private.key
+if [ -f "$key_file" ]; then
+cp "$cert_file" "$HOME/lun/cert.crt"
+cp "$key_file" "$HOME/lun/private.key"
+echo "已导入证书和私钥到 ~/lun/"
+else
+echo "未找到对应私钥，跳过导入。"
+fi
+fi
+found_count=$((found_count + 1))
+done <<EOF
+$(find "$search_dir" -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.cer" \) 2>/dev/null | head -50)
+EOF
+echo "------------------------------"
+echo "检索完成，找到 $found_count 个证书文件。"
 }
 
 config_menu(){
