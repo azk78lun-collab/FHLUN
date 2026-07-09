@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lun SSH 命令生成器</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101418;
+      --panel: #171d23;
+      --line: #2c3640;
+      --text: #edf2f7;
+      --muted: #9aa8b5;
+      --accent: #55b6ff;
+      --ok: #5fd18b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1160px, calc(100% - 32px));
+      margin: 28px auto;
+    }
+    h1 { margin: 0 0 6px; font-size: clamp(28px, 4vw, 42px); letter-spacing: 0; }
+    p { color: var(--muted); margin: 0 0 18px; }
+    code { color: var(--ok); }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr);
+      gap: 16px;
+    }
+    section {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    input, select, textarea, button {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f141a;
+      color: var(--text);
+      padding: 10px 11px;
+      font: inherit;
+    }
+    input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+    .check { display: flex; align-items: center; gap: 8px; min-height: 40px; color: var(--text); }
+    button { cursor: pointer; background: var(--accent); color: #061018; border: 0; font-weight: 700; }
+    textarea {
+      min-height: 230px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+    .actions { display: flex; gap: 10px; margin-top: 12px; }
+    .actions button { width: auto; min-width: 120px; }
+    .hint { margin-top: 10px; color: var(--ok); min-height: 22px; }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      main { width: min(100% - 20px, 1160px); margin: 16px auto; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Lun SSH 命令生成器</h1>
+    <p>生成的命令使用 <code>azk78lun-collab/FHLUN/main/lun.sh</code>。留空运行脚本会进入 <code>lun</code> 引导式终端菜单。</p>
+
+    <div class="layout">
+      <section>
+        <h2>协议</h2>
+        <div class="grid" id="protocols"></div>
+      </section>
+
+      <section>
+        <h2>输出命令</h2>
+        <textarea id="output" readonly></textarea>
+        <div class="actions">
+          <button id="copy">复制</button>
+          <button id="reset" type="button">重置</button>
+        </div>
+        <div class="hint" id="hint"></div>
+      </section>
+
+      <section>
+        <h2>服务域名与证书</h2>
+        <div class="grid">
+          <label>服务域名 domain
+            <input id="domain" placeholder="proxy.example.com">
+          </label>
+          <label>证书模式 certmode
+            <select id="certmode">
+              <option value="">默认自签 self</option>
+              <option value="self">self 自签</option>
+              <option value="domain">domain HTTP-01</option>
+              <option value="dns">dns DNS API</option>
+              <option value="ip">ip short-lived</option>
+            </select>
+          </label>
+          <label>ACME 邮箱
+            <input id="acme_email" placeholder="mail@example.com">
+          </label>
+          <label>DNS provider
+            <input id="acme_dns" placeholder="dns_cf">
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>常用变量</h2>
+        <div class="grid">
+          <label>Reality SNI
+            <input id="reym" placeholder="apple.com">
+          </label>
+          <label>WS/XHTTP Host
+            <input id="cdnym" placeholder="host.example.com">
+          </label>
+          <label>节点名称前缀
+            <input id="name" placeholder="home">
+          </label>
+          <label>IPv4/IPv6 输出
+            <select id="ippz">
+              <option value="">自动</option>
+              <option value="4">IPv4</option>
+              <option value="6">IPv6</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>addym</h2>
+        <div class="grid">
+          <label>普通节点客户端地址
+            <input id="addym" placeholder="proxy.example.com">
+          </label>
+          <label>输出模式
+            <select id="addout">
+              <option value="">自动</option>
+              <option value="off">off</option>
+              <option value="replace">replace</option>
+              <option value="both">both</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>CDN 优选 IP 加速</h2>
+        <p><b>cdnym</b>（回源域名）：你的域名，已解析到 VPS IP。Cloudflare 通过它找到你的服务器。<br>
+        <b>cfip</b>（优选地址）：客户端实际连接的 Cloudflare 入口，填 IP 或域名。<br>
+        简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。仅对 VMess WS / VLESS WS / VLESS XHTTP 生效，端口必须在 CF 橙云端口内。</p>
+        <div class="grid">
+          <label>回源域名 cdnym（你的域名，解析到VPS）
+            <input id="cdnym" placeholder="如 proxy.example.com，须已解析到VPS">
+          </label>
+          <label>优选地址 cfip（客户端连CF的入口）
+            <input id="cfip" placeholder="推荐 cloudflare-ech.com www.visa.com.sg">
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>Argo / 订阅</h2>
+        <div class="grid">
+          <label>Argo
+            <select id="argo">
+              <option value="">关闭</option>
+              <option value="vmpt">VMess WS</option>
+              <option value="vwpt">VLESS WS</option>
+            </select>
+          </label>
+          <label>Argo 固定域名
+            <input id="agn" placeholder="argo.example.com">
+          </label>
+          <label>Argo token
+            <input id="agk" placeholder="ey...">
+          </label>
+          <label>Argo 优选地址
+            <input id="argoip" placeholder="推荐 cloudflare-ech.com">
+          </label>
+          <label class="check">
+            <input type="checkbox" id="sub"> 启用本地 IP 订阅
+          </label>
+          <label>订阅 token
+            <input id="subid" placeholder="默认 UUID">
+          </label>
+          <label>订阅端口
+            <input id="subpt" placeholder="随机">
+          </label>
+          <label>WARP 出站
+            <input id="warp" placeholder="sx、x、s4、x6">
+          </label>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const SCRIPT = 'bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)';
+    const protocols = [
+      ['vlpt', 'VLESS TCP Reality'],
+      ['xhpt', 'VLESS XHTTP Reality'],
+      ['vxpt', 'VLESS XHTTP（支持CDN）'],
+      ['vwpt', 'VLESS WS（支持CDN）'],
+      ['sspt', 'Shadowsocks-2022'],
+      ['anpt', 'AnyTLS'],
+      ['arpt', 'Any-Reality'],
+      ['vmpt', 'VMess WS（支持CDN）'],
+      ['sopt', 'Socks5'],
+      ['hypt', 'Hysteria2'],
+      ['tupt', 'TUIC']
+    ];
+
+    const protocolBox = document.querySelector('#protocols');
+    protocols.forEach(([id, label]) => {
+      const wrap = document.createElement('label');
+      wrap.innerHTML = `<span class="check"><input type="checkbox" data-proto="${id}"> ${label}</span><input data-port="${id}" placeholder="端口留空随机，CDN需填CF端口">`;
+      protocolBox.appendChild(wrap);
+    });
+
+    const ids = [
+      'domain', 'certmode', 'acme_email', 'acme_dns',
+      'reym', 'cdnym', 'name', 'ippz', 'addym', 'addout',
+      'argo', 'agn', 'agk', 'argoip', 'cfip', 'subid', 'subpt', 'warp'
+    ];
+    const output = document.querySelector('#output');
+    const hint = document.querySelector('#hint');
+
+    function q(id) { return document.querySelector(`#${id}`); }
+    function quote(value) { return `"${String(value).replaceAll('"', '\\"')}"`; }
+
+    function build() {
+      const vars = [];
+      protocols.forEach(([id]) => {
+        const enabled = document.querySelector(`[data-proto="${id}"]`).checked;
+        if (enabled) vars.push(`${id}=${quote(document.querySelector(`[data-port="${id}"]`).value)}`);
+      });
+      ids.forEach(id => {
+        const value = q(id).value.trim();
+        if (value) vars.push(`${id}=${quote(value)}`);
+      });
+      if (q('sub').checked) vars.push('sub="y"');
+      output.value = `${vars.join(' ')} ${SCRIPT}`.trim();
+    }
+
+    document.addEventListener('input', build);
+    document.querySelector('#copy').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(output.value);
+      hint.textContent = '已复制';
+      setTimeout(() => hint.textContent = '', 1600);
+    });
+    document.querySelector('#reset').addEventListener('click', () => {
+      document.querySelectorAll('input').forEach(input => {
+        if (input.type === 'checkbox') input.checked = false;
+        else input.value = '';
+      });
+      document.querySelectorAll('select').forEach(select => select.value = '');
+      build();
+    });
+
+    build();
+  </script>
+</body>
+</html>

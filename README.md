@@ -1,1 +1,225 @@
-# FHLUN
+# Lun
+
+Lun 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
+
+## 快速开始
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+如果系统没有 `curl`：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+安装完成后，root 环境会创建 `/usr/bin/lun`，非 root 环境会创建 `$HOME/bin/lun`。重新登录 SSH 后可直接运行：
+
+```bash
+lun
+```
+
+旧入口 `argosbx.sh` 仅保留为兼容包装器，会自动转到 `lun.sh`。
+
+## 终端菜单
+
+无参数运行 `lun` 会进入 Lun 风火轮多协议交互面板，顶部显示系统、IP、内核、协议、证书、节点订阅分享和 Argo 状态，下方提供：
+
+```text
+1. 安装 / 协议管理
+2. 节点订阅分享
+3. 入口网络管理
+4. 服务与更新
+5. 高级设置
+0. 退出
+```
+
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。CDN / 优选 IP 和 CF 隧道 / Argo 都在“入口网络管理”里单独配置。每一步都会显示当前已选内容；输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。二次进入引导时可保留、新增、改端口或删除已有协议。
+
+Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`。
+
+## 常用命令
+
+```bash
+lun              # 打开终端菜单
+lun list         # 刷新并查看节点、订阅配置
+lun rep          # 使用当前传入的变量重置协议组合
+lun res          # 重启 Lun 相关进程
+lun upx          # 更新 Xray 内核
+lun ups          # 更新 Sing-box 内核
+lun del          # 卸载 Lun
+```
+
+双栈 VPS 临时切换输出：
+
+```bash
+ippz=4 lun list
+ippz=6 lun list
+```
+
+## 协议与域名变量
+
+变量值为空表示随机端口，填写数字表示指定端口。
+
+| 协议 | 变量 |
+| --- | --- |
+| VLESS TCP Reality Vision | `vlpt` |
+| VLESS XHTTP Reality ENC | `xhpt` |
+| VLESS XHTTP ENC | `vxpt` |
+| VLESS WS ENC | `vwpt` |
+| Shadowsocks-2022 | `sspt` |
+| AnyTLS | `anpt` |
+| Any-Reality | `arpt` |
+| VMess WS | `vmpt` |
+| Socks5 | `sopt` |
+| Hysteria2 | `hypt` |
+| TUIC | `tupt` |
+
+示例：
+
+```bash
+vlpt="" vmpt="" hypt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+服务域名与证书：
+
+| 变量 | 用途 |
+| --- | --- |
+| `domain` | 服务域名，用于 ACME 域名证书、TLS 节点 SNI，并默认作为普通节点客户端地址 |
+| `certmode` | `self`、`domain`、`dns`、`ip`，默认 `self` |
+| `acme_email` | Let’s Encrypt 账户邮箱 |
+| `acme_dns` | acme.sh DNS provider，例如 `dns_cf`、`dns_ali` |
+
+`certmode=self` 会生成本地 ECDSA 自签证书。`domain` 使用 HTTP-01，要求域名 A/AAAA 已解析到本机且 80 端口可访问。`dns` 使用 acme.sh 原生 DNS API。`ip` 使用 Let’s Encrypt short-lived IP 证书，仅走 HTTP-01。
+
+DNS API 凭据按 acme.sh 原生环境变量保存到 `/root/lun/cert.env`，权限为 `600`。
+
+Reality、Argo 和 CDN 仍然独立：
+
+| 变量 | 用途 |
+| --- | --- |
+| `reym` | Reality / Any-Reality 的 SNI 伪装域名 |
+| `cdnym` | CDN 回源 Host 域名（已解析到 VPS 的域名，CF 通过它回源到你的服务器） |
+| `argo` | 填写 `vmpt` 或 `vwpt` 启用 Argo |
+| `agn` | Argo 固定隧道域名 |
+| `agk` | Argo 固定隧道 token |
+| `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），最多两个值，推荐 `cloudflare-ech.com` |
+| `argoip` | Argo 优选 IP 或域名（与 cfip 独立），最多两个值 |
+
+`agk` 可直接粘贴完整的 `cloudflared.exe service install ey...` 命令，脚本会自动提取 `ey...` token。
+
+### CDN 优选 IP 加速说明
+
+CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点里的 `add/cfip`），Cloudflare 通过回源域名（`host/cdnym`）回源到你的 VPS。服务器访问外网默认仍直连 VPS；只有启用 WARP 出站时，目标网站才可能显示 WARP/Cloudflare IP。
+
+**使用条件：**
+1. 设置 `cdnym`：一个已解析到 VPS IP 的域名（用于 CF 回源）
+2. 设置 `cfip`（可选）：CDN 优选地址，留空则使用默认 `cloudflare-ech.com`
+3. 协议端口必须在 CF 橙云支持端口列表内
+
+**支持 CDN 的协议：** VMess WS、VLESS WS、VLESS XHTTP（非 Reality）
+**不支持 CDN 的协议：** Reality、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
+
+Cloudflare 橙云支持端口：
+
+```text
+HTTP（明文）：80、8080、8880、2052、2082、2086、2095
+HTTPS（加密）：443、8443、2053、2083、2087、2096
+```
+
+**推荐 CDN 优选域名：** `cloudflare-ech.com`、`www.visa.com.sg`、`www.wto.org`、`www.web.com`（也可使用 CF 优选 IP）
+
+NAT VPS 要看客户端访问的公网端口是否在上述列表内；只有内网端口匹配并不能让橙云回源生效。没有可用公网端口时，可使用直连 NAT 映射端口或 CF 隧道 / Argo。
+
+**示例：**
+
+```bash
+vmpt="" cdnym="proxy.example.com" cfip="cloudflare-ech.com www.visa.com.sg" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+## 自定义普通节点地址 addym
+
+`addym` 用于把普通节点客户端里的 `address/server/add` 从 VPS IP 替换为你自己的域名或 IP。它不会改变 Reality SNI、WS/XHTTP Host、Argo 域名或 Argo 优选地址。
+
+```bash
+vlpt="" addym="proxy.example.com" addout="replace" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+`addout` 支持：
+
+| 值 | 行为 |
+| --- | --- |
+| `off` | 只输出 VPS IP |
+| `replace` | 普通节点地址替换为 `addym` |
+| `both` | 同时输出 `-IP` 和 `-DOMAIN` 两份普通节点 |
+
+默认规则：未设置 `addym` 时等同 `off`；设置 `domain` 且未手动设置 `addym/addout` 时，默认 `addym=domain`、`addout=replace`。
+
+## NAT VPS 端口映射
+
+`ptmap` 用于 NAT VPS 的外网端口到内网监听端口映射，只影响节点链接、订阅链接、`jhsub.txt`、`sbox.json`、`clmi.yaml` 里的客户端端口，不写本机 iptables。
+
+格式为 `外网端口-内网监听端口`，多个映射用空格分隔：
+
+```bash
+ptmap="54834-2096 54835-8443" vlpt="2096" anpt="8443" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+安装后也可通过 `lun` → `入口网络管理` → `NAT 手动映射` 修改或清除。
+
+## 端口池
+
+普通 VPS 只需要设置一个端口池，协议端口和节点订阅分享端口随机时会直接从池内取值。NAT VPS 推荐使用 `inpool/outpool` 分别设置内网端口池和外网端口池；设置外网端口池后，会按位置自动映射到内网端口池，只改变客户端看到的端口，不写 iptables。
+
+```bash
+inpool="1000+1010 8080" outpool="49096+49106 51046" vwpt="" sub="y" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+规则：
+
+| 格式 | 行为 |
+| --- | --- |
+| `2096` | 普通端口 |
+| `1000+1010` | 连续端口范围，表示 1000 到 1010 |
+| `1000..1010` | 兼容的连续端口范围 |
+
+旧变量 `portpool` 仍兼容，NAT 模式下支持 `54834-2096` 这种 `公网端口-内网监听端口` 映射项，并会自动补充到 `$HOME/lun/port_map`。安装后可通过 `lun` → `入口网络管理` → `端口池` 修改。
+
+## 本地订阅
+
+安装时启用：
+
+```bash
+sub="y" subid="mytoken" subpt="30080" vlpt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+订阅地址默认只输出 IPv4。可在 `lun` → `节点订阅分享` 中修改订阅 token/端口，或切换为 `ipv4`、`ipv6`、`both`；无 IPv6 时会自动跳过 IPv6 订阅地址。NAT VPS 下订阅 URL 会显示公网端口，服务仍监听内网端口。修改订阅 token、端口或 IP 输出模式时只刷新分享文件、软链和本地 httpd，不会重装内核或重建协议。
+
+生成内容包括：
+
+```text
+$HOME/lun/jhsub.txt
+$HOME/lun/clmi.yaml
+$HOME/lun/sbox.json
+```
+
+## 二进制资产
+
+Lun 使用本仓库 release tag `lun` 下的资产：
+
+```text
+xray-amd64
+xray-arm64
+sing-box-amd64
+sing-box-arm64
+```
+
+如需自行发布 Docker/SAP 镜像，默认建议使用：
+
+```text
+ghcr.io/azk78lun-collab/lun:latest
+```
+
+## 许可
+
+本项目保留原许可证，详见 `LICENSE`。
