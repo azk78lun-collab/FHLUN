@@ -3189,21 +3189,22 @@ rc-service ip6tables save >/dev/null 2>&1
 fi
 }
 factory_reset(){
-printf "%s警告：此操作将清空所有配置（保留内核二进制），恢复到刚下载的初始状态！%s\n" "$LUN_RED" "$LUN_RESET"
-printf "确认恢复出厂设置？输入 yes 确认，其他取消："
+printf "%s警告：此操作将清空所有配置（端口、域名、协议、UUID等），保留内核和脚本！%s\n" "$LUN_RED" "$LUN_RESET"
+printf "确认清空配置？输入 yes 确认，其他取消："
 IFS= read -r confirm
 [ "$confirm" = "yes" ] || { echo "已取消。"; return 1; }
-cleandel keep-entry
-keep_xray="$HOME/lun/xray"
-keep_sb="$HOME/lun/sing-box"
-cp "$keep_xray" /tmp/lun_xray_bak 2>/dev/null
-cp "$keep_sb" /tmp/lun_sb_bak 2>/dev/null
-rm -rf "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx" sbx_update
-mkdir -p "$HOME/lun"
-[ -f /tmp/lun_xray_bak ] && cp /tmp/lun_xray_bak "$HOME/lun/xray" 2>/dev/null && rm -f /tmp/lun_xray_bak
-[ -f /tmp/lun_sb_bak ] && cp /tmp/lun_sb_bak "$HOME/lun/sing-box" 2>/dev/null && rm -f /tmp/lun_sb_bak
-chmod +x "$HOME/lun/xray" "$HOME/lun/sing-box" 2>/dev/null
-echo "已恢复出厂设置，内核已保留。请重新运行 lun 引导式安装。"
+stop_lun_owned_processes
+rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu
+rm -f "$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_mode "$HOME/lun"/cert_subject "$HOME/lun"/cert.crt "$HOME/lun"/private.key "$HOME/lun"/SHA256.txt
+rm -f "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool
+rm -f "$HOME/lun"/acme_email "$HOME/lun"/acme_dns "$HOME/lun"/cert.env
+rm -f "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/argo* "$HOME/lun"/warp* "$HOME/lun"/name "$HOME/lun"/ipp*
+rm -f "$HOME/lun"/xr.json "$HOME/lun"/sb.json "$HOME/lun"/addym "$HOME/lun"/addout
+rm -f "$HOME/lun"/cfip* "$HOME/lun"/xvvmcdnym "$HOME/lun"/ym_vl_re "$HOME/lun"/argoport.log "$HOME/lun"/argo.log "$HOME/lun"/sbargoym.log "$HOME/lun"/sbargotoken.log
+rm -f "$HOME/lun"/subport.log "$HOME/lun"/subtoken.log "$HOME/lun"/subip_mode
+rm -rf "$HOME/lun"/xrk "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx" sbx_update
+echo "配置已全部清空，内核和脚本已保留。"
+echo "请重新运行 lun 引导式安装来配置协议。"
 sleep 2
 return 0
 }
@@ -4772,15 +4773,49 @@ done
 prompt_cert_mode_guided(){
 if [ -n "$domain" ]; then
 if [ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ]; then
-subj=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -subject 2>/dev/null | sed 's/subject=[ ]*//;s/[\/]CN=//;s/,.*//')
-echo "检测到本机已有证书（主体：${subj:-已存在}）。"
+cert_subj=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -subject 2>/dev/null | sed 's/subject=[ ]*//;s/[\/]CN=//;s/,.*//')
+cert_end=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -enddate 2>/dev/null | cut -d= -f2-)
+cert_issuer=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -issuer 2>/dev/null | sed 's/issuer=[ ]*//;s/[\/]CN=//;s/,.*//')
+cert_now=$(date -u +%Y%m%d%H%M%S 2>/dev/null)
+cert_end_raw=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -enddate 2>/dev/null | cut -d= -f2- | xargs -I{} date -u -d "{}" +%Y%m%d%H%M%S 2>/dev/null)
+if [ -n "$cert_end_raw" ] && [ "$cert_now" ] && [ "$cert_end_raw" -lt "$cert_now" ] 2>/dev/null; then
+cert_status="已过期"
+else
+cert_status="有效"
 fi
+if [ -n "$domain" ] && [ -n "$cert_subj" ]; then
+if [ "$cert_subj" = "$domain" ]; then
+cert_match="域名匹配"
+else
+cert_match="域名不匹配（证书:$cert_subj / 输入:$domain）"
+fi
+else
+cert_match=""
+fi
+echo "$LUN_GREEN"
+echo "=============================="
+echo "  检测到本机已有证书"
+echo "  主体：${cert_subj:-未知}"
+echo "  签发者：${cert_issuer:-未知}"
+echo "  到期：${cert_end:-未知}"
+echo "  状态：${cert_status}"
+[ -n "$cert_match" ] && echo "  域名：$cert_match"
+echo "=============================="
+echo "$LUN_RESET"
 echo "证书模式："
-echo " 1. 保留已有证书 / 自签证书（默认，立即可用）"
+echo " 1. 保留已有证书（默认，检测到上述证书可用）"
 echo " 2. 域名证书（HTTP-01，要求域名解析到本机且 80 可访问，证书价值更高）"
 echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
 echo " 4. IP 证书（short-lived，HTTP-01）"
 echo " 0. 返回上一步"
+else
+echo "证书模式："
+echo " 1. 自签证书（默认，立即可用）"
+echo " 2. 域名证书（HTTP-01，要求域名解析到本机且 80 可访问，证书价值更高）"
+echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
+echo " 4. IP 证书（short-lived，HTTP-01）"
+echo " 0. 返回上一步"
+fi
 printf "请选择 [0-4]，%s回车默认 1%s：" "$LUN_YELLOW" "$LUN_RESET"
 IFS= read -r c
 case "$c" in
@@ -4809,9 +4844,10 @@ certmode=ip
 ""|1)
 if [ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ]; then
 certmode=self
-echo "已保留本机已有证书。"
+echo "已保留本机已有证书（主体：${cert_subj:-已存在}，到期：${cert_end:-未知}）。"
 else
 certmode=self
+echo "将使用自签证书。"
 fi
 ;;
 *) echo "输入错误，请重新选择。"; continue ;;
@@ -4829,6 +4865,10 @@ if [ -z "$sub" ]; then
 sub=y
 subid=
 subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+for _try in 1 2 3 4 5; do
+port_in_use "$subpt" 2>/dev/null || break
+subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+done
 echo "已自动启用节点订阅分享，随机端口：$subpt"
 fi
 if [ -z "$uuid" ] || [ ! -s "$HOME/lun/uuid" ]; then
@@ -4843,7 +4883,7 @@ fi
 export sub subid subpt uuid subipmode
 }
 
-guided_install(){
+confirm_guided_install(){
 while :; do
 guided_summary
 printf "确认开始安装/重建？回车确认，n 取消，0 返回上一步："
@@ -5180,7 +5220,7 @@ case "$c" in
 5) printf "输入 4 或 6（%s回车自动%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
 6) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
 7) LUN_MENU_ACTION=del; return ;;
-8) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=del; return; } ;;
+8) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=install; return; } ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
