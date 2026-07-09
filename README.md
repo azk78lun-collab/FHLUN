@@ -1,6 +1,6 @@
-# Lun
+# 风火轮
 
-Lun 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
+风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，源自甬哥小钢炮（argosbx），由风火轮团队维护升级。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
 ## 快速开始
 
@@ -23,7 +23,7 @@ lun
 
 ## 终端菜单
 
-无参数运行 `lun` 会进入 Lun 风火轮多协议交互面板，顶部显示系统、IP、内核、协议、证书、节点订阅分享和 Argo 状态，下方提供：
+无参数运行 `lun` 会进入风火轮多协议交互面板，顶部显示系统、IP、内核、协议、证书、节点订阅分享和 Argo 状态，下方提供：
 
 ```text
 1. 安装 / 协议管理
@@ -38,24 +38,9 @@ lun
 
 Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`。
 
-## 常用命令
+## 快捷操作
 
-```bash
-lun              # 打开终端菜单
-lun list         # 刷新并查看节点、订阅配置
-lun rep          # 使用当前传入的变量重置协议组合
-lun res          # 重启 Lun 相关进程
-lun upx          # 更新 Xray 内核
-lun ups          # 更新 Sing-box 内核
-lun del          # 卸载 Lun
-```
-
-双栈 VPS 临时切换输出：
-
-```bash
-ippz=4 lun list
-ippz=6 lun list
-```
+安装后运行 `lun` 即可进入交互面板。面板内提供安装/协议管理、节点订阅分享、入口网络管理、服务与更新、高级设置等功能。
 
 ## 协议与域名变量
 
@@ -205,7 +190,7 @@ $HOME/lun/sbox.json
 
 ## 二进制资产
 
-Lun 使用本仓库 release tag `lun` 下的资产：
+风火轮 使用本仓库 release tag `lun` 下的资产：
 
 ```text
 xray-amd64
