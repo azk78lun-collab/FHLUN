@@ -760,13 +760,13 @@ case "$warp" in *x6*) xryx='ForceIPv6' ;; *x*) xryx='ForceIPv4v6' ;; *) xryx='Fo
 fi
 }
 upxray(){
-url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/xray-$cpu"; out="$HOME/lun/xray"; (command -v curl >/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && timeout 3 wget -O "$out" --tries=2 "$url")
+url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/xray-$cpu"; out="$HOME/lun/xray"; (command -v curl >/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && wget -O "$out" --tries=2 --timeout=60 "$url")
 chmod +x "$HOME/lun/xray"
 sbcore=$("$HOME/lun/xray" version 2>/dev/null | awk '/^Xray/{print $2}')
 echo "已安装Xray正式版内核：$sbcore"
 }
 upsingbox(){
-url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-$cpu"; out="$HOME/lun/sing-box"; (command -v curl>/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && timeout 3 wget -O "$out" --tries=2 "$url")
+url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-$cpu"; out="$HOME/lun/sing-box"; (command -v curl >/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && wget -O "$out" --tries=2 --timeout=60 "$url")
 chmod +x "$HOME/lun/sing-box"
 sbcore=$("$HOME/lun/sing-box" version 2>/dev/null | awk '/version/{print $NF}')
 echo "已安装Sing-box正式版内核：$sbcore"
@@ -1634,7 +1634,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/root/lun/xray run -c /root/lun/xr.json
+ExecStart=$HOME/lun/xray run -c $HOME/lun/xr.json
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -1649,8 +1649,8 @@ elif command -v rc-service >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; 
 cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 description="xr service"
-command="/root/lun/xray"
-command_args="run -c /root/lun/xr.json"
+command="$HOME/lun/xray"
+command_args="run -c $HOME/lun/xr.json"
 command_background=yes
 pidfile="/run/xray.pid"
 command_background="yes"
@@ -1725,7 +1725,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/root/lun/sing-box run -c /root/lun/sb.json
+ExecStart=$HOME/lun/sing-box run -c $HOME/lun/sb.json
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -1740,8 +1740,8 @@ elif command -v rc-service >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; 
 cat > /etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
 description="sb service"
-command="/root/lun/sing-box"
-command_args="run -c /root/lun/sb.json"
+command="$HOME/lun/sing-box"
+command_args="run -c $HOME/lun/sb.json"
 command_background=yes
 pidfile="/run/sing-box.pid"
 command_background="yes"
@@ -1786,7 +1786,7 @@ echo "=========启用Cloudflared-argo内核========="
 if [ ! -e "$HOME/lun/cloudflared" ]; then
 argocore=$({ command -v curl >/dev/null 2>&1 && curl -Ls https://data.jsdelivr.com/v1/package/gh/cloudflare/cloudflared || wget -qO- https://data.jsdelivr.com/v1/package/gh/cloudflare/cloudflared; } | grep -Eo '"[0-9.]+"' | sed -n 1p | tr -d '",')
 echo "下载Cloudflared-argo最新正式版内核：$argocore"
-url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu"; out="$HOME/lun/cloudflared"; (command -v curl>/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && timeout 3 wget -O "$out" --tries=2 "$url")
+url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu"; out="$HOME/lun/cloudflared"; (command -v curl>/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && wget -O "$out" --tries=2 --timeout=60 "$url")
 chmod +x "$HOME/lun/cloudflared"
 fi
 if [ "$argo" = "vmpt" ]; then argoport=$(cat "$HOME/lun/port_vm_ws" 2>/dev/null); echo "Vmess" > "$HOME/lun/vlvm"; elif [ "$argo" = "vwpt" ]; then argoport=$(cat "$HOME/lun/port_vw" 2>/dev/null); echo "Vless" > "$HOME/lun/vlvm"; fi; echo "$argoport" > "$HOME/lun/argoport.log"
@@ -1801,7 +1801,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/root/lun/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token "${ARGO_AUTH}"
+ExecStart=$HOME/lun/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token "${ARGO_AUTH}"
 Restart=on-failure
 RestartSec=5s
 [Install]
@@ -1814,7 +1814,7 @@ elif command -v rc-service >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; 
 cat > /etc/init.d/argo <<EOF
 #!/sbin/openrc-run
 description="argo service"
-command="/root/lun/cloudflared tunnel"
+command="$HOME/lun/cloudflared tunnel"
 command_args="--no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
 pidfile="/run/argo.pid"
 command_background="yes"
@@ -1849,7 +1849,7 @@ fi
 fi
 sleep 5
 echo
-if find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(s|x)' ; then
+if { find /proc/[0-9]*/exe -type l 2>/dev/null | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(s|x)'; } 2>/dev/null || pgrep -f 'lun/(s|x)' >/dev/null 2>&1 || systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; then
 [ -f ~/.bashrc ] || touch ~/.bashrc
 sed -i '/lun/d' ~/.bashrc
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
@@ -3157,6 +3157,7 @@ showmode
 cleandel(){
 keep_entry=$1
 stop_lun_owned_processes
+[ -f ~/.bashrc ] || touch ~/.bashrc
 sed -i '/lun/d' ~/.bashrc
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
 . ~/.bashrc 2>/dev/null
@@ -3186,6 +3187,25 @@ netfilter-persistent save >/dev/null 2>&1
 rc-service iptables save >/dev/null 2>&1
 rc-service ip6tables save >/dev/null 2>&1
 fi
+}
+factory_reset(){
+printf "%s警告：此操作将清空所有配置（保留内核二进制），恢复到刚下载的初始状态！%s\n" "$LUN_RED" "$LUN_RESET"
+printf "确认恢复出厂设置？输入 yes 确认，其他取消："
+IFS= read -r confirm
+[ "$confirm" = "yes" ] || { echo "已取消。"; return 1; }
+cleandel keep-entry
+keep_xray="$HOME/lun/xray"
+keep_sb="$HOME/lun/sing-box"
+cp "$keep_xray" /tmp/lun_xray_bak 2>/dev/null
+cp "$keep_sb" /tmp/lun_sb_bak 2>/dev/null
+rm -rf "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx" sbx_update
+mkdir -p "$HOME/lun"
+[ -f /tmp/lun_xray_bak ] && cp /tmp/lun_xray_bak "$HOME/lun/xray" 2>/dev/null && rm -f /tmp/lun_xray_bak
+[ -f /tmp/lun_sb_bak ] && cp /tmp/lun_sb_bak "$HOME/lun/sing-box" 2>/dev/null && rm -f /tmp/lun_sb_bak
+chmod +x "$HOME/lun/xray" "$HOME/lun/sing-box" 2>/dev/null
+echo "已恢复出厂设置，内核已保留。请重新运行 lun 引导式安装。"
+sleep 2
+return 0
 }
 xrestart(){
 for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/xray"|*"/lun/x") kill "$(basename "$P")" 2>/dev/null ;; esac; done
@@ -3923,7 +3943,7 @@ chmod 600 "$HOME/lun/cert.env" "$HOME/lun/acme_dns" 2>/dev/null
 
 prompt_acme_email(){
 cur=$(cat "$HOME/lun/acme_email" 2>/dev/null)
-printf "Let’s Encrypt 账户邮箱，回车随机生成谷歌邮箱%s，0 返回：" "${cur:+[当前:$cur]}"
+printf "ACME 账户邮箱，%s回车随机生成谷歌邮箱%s%s，0 返回：" "$LUN_YELLOW" "$LUN_RESET" "${cur:+[当前:$cur]}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
 if [ -n "$val" ]; then
@@ -3939,11 +3959,11 @@ prompt_cert_mode(){
 while :; do
 echo "证书模式："
 echo " 1. 自签证书（默认，立即可用）"
-echo " 2. Let’s Encrypt 域名证书（HTTP-01，要求域名解析到本机且 80 可访问）"
-echo " 3. Let’s Encrypt DNS API 证书（acme.sh 原生 DNS provider）"
-echo " 4. Let’s Encrypt IP 证书（short-lived，HTTP-01）"
+echo " 2. 域名证书（HTTP-01，要求域名解析到本机且 80 可访问，证书价值更高）"
+echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
+echo " 4. IP 证书（short-lived，HTTP-01）"
 echo " 0. 返回上一步"
-printf "请选择 [0-4]，回车默认 1："
+printf "请选择 [0-4]，%s回车默认 1%s：" "$LUN_YELLOW" "$LUN_RESET"
 IFS= read -r c
 case "$c" in
 0) return 2 ;;
@@ -4577,12 +4597,12 @@ else
 echo "节点订阅分享：未启用"
 fi
 if is_nat_mode; then
-[ -n "$ptmap" ] && echo "NAT端口映射：$ptmap" || echo "NAT端口映射：无"
-[ -n "$inpool" ] && echo "内网端口池：$inpool" || { [ -n "$portpool" ] && echo "内网端口池：$portpool" || echo "内网端口池：未设置"; }
-[ -n "$outpool" ] && echo "外网端口池：$outpool" || echo "外网端口池：未设置"
+[ -n "$ptmap" ] && echo "NAT端口映射：$ptmap" || yellow_line "NAT端口映射：未设置（可在入口网络管理中配置）"
+[ -n "$inpool" ] && echo "内网端口池：$inpool" || { [ -n "$portpool" ] && echo "内网端口池：$portpool" || echo "内网端口池：未设置（可在入口网络管理中配置）"; }
+[ -n "$outpool" ] && echo "外网端口池：$outpool" || echo "外网端口池：未设置（可在入口网络管理中配置）"
 [ -n "$inpool" ] && [ -n "$outpool" ] && echo "NAT自动映射：外网端口池按顺序对应内网端口池"
 else
-[ -n "$inpool" ] && echo "端口池：$inpool" || { [ -n "$portpool" ] && echo "端口池：$portpool" || echo "端口池：未设置"; }
+[ -n "$inpool" ] && echo "端口池：$inpool" || { [ -n "$portpool" ] && echo "端口池：$portpool" || echo "端口池：未设置（可在入口网络管理中配置）"; }
 fi
 if [ -n "$addym" ]; then
 echo "普通节点地址：$addym  输出=${addout:-replace}"
@@ -4624,8 +4644,8 @@ done
 prompt_port_map(){
 while :; do
 echo "NAT VPS 端口映射只改客户端节点/订阅端口，不写 iptables。"
-echo "格式：外网端口-内网监听端口，多个用空格分隔，例如：54834-2096 54835-8443"
-printf "请输入映射；del 清除；回车保留/跳过；0 返回%s：" "${ptmap:+，当前 $ptmap}"
+yellow_line "格式：外网端口-内网监听端口，多个用空格分隔，例如：54834-2096 54835-8443"
+printf "请输入映射；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "$LUN_RESET" "${ptmap:+，当前 $ptmap}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
 case "$val" in
@@ -4749,7 +4769,81 @@ esac
 done
 }
 
-confirm_guided_install(){
+prompt_cert_mode_guided(){
+if [ -n "$domain" ]; then
+if [ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ]; then
+subj=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -subject 2>/dev/null | sed 's/subject=[ ]*//;s/[\/]CN=//;s/,.*//')
+echo "检测到本机已有证书（主体：${subj:-已存在}）。"
+fi
+echo "证书模式："
+echo " 1. 保留已有证书 / 自签证书（默认，立即可用）"
+echo " 2. 域名证书（HTTP-01，要求域名解析到本机且 80 可访问，证书价值更高）"
+echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
+echo " 4. IP 证书（short-lived，HTTP-01）"
+echo " 0. 返回上一步"
+printf "请选择 [0-4]，%s回车默认 1%s：" "$LUN_YELLOW" "$LUN_RESET"
+IFS= read -r c
+case "$c" in
+0) return 2 ;;
+2)
+prompt_acme_email
+rc=$?
+[ "$rc" = 2 ] && return 2
+certmode=domain
+;;
+3)
+prompt_acme_email
+rc=$?
+[ "$rc" = 2 ] && return 2
+save_dns_env_interactive
+rc=$?
+[ "$rc" = 2 ] && return 2
+[ "$rc" = 0 ] && certmode=dns || continue
+;;
+4)
+prompt_acme_email
+rc=$?
+[ "$rc" = 2 ] && return 2
+certmode=ip
+;;
+""|1)
+if [ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ]; then
+certmode=self
+echo "已保留本机已有证书。"
+else
+certmode=self
+fi
+;;
+*) echo "输入错误，请重新选择。"; continue ;;
+esac
+printf "%s\n" "$certmode" > "$HOME/lun/cert_mode"
+return 0
+else
+prompt_cert_mode
+return $?
+fi
+}
+
+guided_auto_defaults(){
+if [ -z "$sub" ]; then
+sub=y
+subid=
+subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+echo "已自动启用节点订阅分享，随机端口：$subpt"
+fi
+if [ -z "$uuid" ] || [ ! -s "$HOME/lun/uuid" ]; then
+uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid 2>/dev/null) || uuid="lun-$(date +%s 2>/dev/null)"
+printf "%s\n" "$uuid" > "$HOME/lun/uuid"
+echo "已自动生成 UUID：$uuid"
+fi
+if [ -z "$subipmode" ]; then
+subipmode=ipv4
+printf "%s\n" "$subipmode" > "$HOME/lun/subip_mode"
+fi
+export sub subid subpt uuid subipmode
+}
+
+guided_install(){
 while :; do
 guided_summary
 printf "确认开始安装/重建？回车确认，n 取消，0 返回上一步："
@@ -4772,49 +4866,48 @@ case "$step" in
 guided_summary
 prompt_vps_mode
 rc=$?
-[ "$rc" = 0 ] && step=2 && continue
+if [ "$rc" = 0 ]; then
+if is_nat_mode; then
+if [ -z "$ptmap" ] && [ -z "$inpool" ]; then
+prompt_port_map
+rc=$?
+[ "$rc" = 2 ] && { step=1; continue; }
+fi
+fi
+step=2 && continue
+fi
 [ "$rc" = 2 ] && return 1
 ;;
 2)
 guided_summary
-prompt_port_pool
+pick_protocols
 rc=$?
 [ "$rc" = 0 ] && step=3 && continue
 [ "$rc" = 2 ] && step=1 && continue
 ;;
 3)
 guided_summary
-pick_protocols
+prompt_service_domain
 rc=$?
-[ "$rc" = 0 ] && step=4 && continue
+[ "$rc" = 0 ] && { [ -n "$domain" ] && [ -z "$addym" ] && { addym="$domain"; addout=replace; load_addym_config; }; step=4; continue; }
 [ "$rc" = 2 ] && step=2 && continue
 ;;
 4)
 guided_summary
-prompt_service_domain
+prompt_cert_mode_guided
 rc=$?
-[ "$rc" = 0 ] && { [ -n "$domain" ] && [ -z "$addym" ] && { addym="$domain"; addout=replace; load_addym_config; }; step=5; continue; }
+[ "$rc" = 0 ] && step=5 && continue
 [ "$rc" = 2 ] && step=3 && continue
 ;;
 5)
-guided_summary
-prompt_cert_mode
-rc=$?
-[ "$rc" = 0 ] && step=6 && continue
-[ "$rc" = 2 ] && step=4 && continue
+guided_auto_defaults
+step=6 && continue
 ;;
 6)
-guided_summary
-prompt_subscription
-rc=$?
-[ "$rc" = 0 ] && step=7 && continue
-[ "$rc" = 2 ] && step=5 && continue
-;;
-7)
 confirm_guided_install
 rc=$?
 [ "$rc" = 0 ] && break
-[ "$rc" = 2 ] && step=6 && continue
+[ "$rc" = 2 ] && step=4 && continue
 return 1
 ;;
 esac
@@ -4827,9 +4920,9 @@ while :; do
 ui_title "Lun 证书管理"
 show_cert_summary
 echo " 1. 恢复/重建自签证书"
-echo " 2. 申请 Let’s Encrypt 域名证书（HTTP-01）"
-echo " 3. 申请 Let’s Encrypt DNS API 证书"
-echo " 4. 申请 Let’s Encrypt IP 证书（short-lived）"
+echo " 2. 申请域名证书（HTTP-01）"
+echo " 3. 申请 DNS API 证书"
+echo " 4. 申请 IP 证书（short-lived）"
 echo " 5. 手动续期当前 ACME 证书"
 echo " 6. 清除 DNS API 凭据"
 echo " 0. 返回"
@@ -5075,8 +5168,9 @@ echo " 4. addym/addout"
 echo " 5. IP 输出优先级"
 echo " 6. 修改 UUID"
 echo " 7. 卸载 Lun"
+echo " 8. 清空配置恢复出厂设置"
 echo " 0. 返回"
-printf "请选择 [0-7]："
+printf "请选择 [0-8]："
 IFS= read -r c
 case "$c" in
 1) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
@@ -5086,6 +5180,7 @@ case "$c" in
 5) printf "输入 4 或 6（%s回车自动%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
 6) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
 7) LUN_MENU_ACTION=del; return ;;
+8) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=del; return; } ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
