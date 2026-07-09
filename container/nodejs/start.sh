@@ -32,7 +32,7 @@ echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
-echo "Lun一键无交互小钢炮脚本💣"
+echo "Lun一键无交互小钢炮脚本"
 echo "当前版本：V25.11.20"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
@@ -982,7 +982,7 @@ short_id_s=$(cat "$HOME/lun/sbk/short_id" 2>/dev/null)
 sskey=$(cat "$HOME/lun/sskey" 2>/dev/null)
 fi
 if grep xhttp-reality "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-xhttp-reality-enc 】支持ENC加密，节点信息如下："
+echo "【 Vless-xhttp-reality-enc 】支持ENC加密，节点信息如下："
 xhpt=$(cat "$HOME/lun/xhpt")
 vl_xh_link="vless://$uuid@$server_ip:$xhpt?encryption=$enkey&flow=xtls-rprx-vision&security=reality&sni=$reym&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=xhttp&path=$uuid-xh&mode=auto#${sxname}vl-xhttp-reality-$hostname"
 echo "$vl_xh_link" >> "$HOME/lun/jh.txt"
@@ -990,14 +990,14 @@ echo "$vl_xh_link"
 echo
 fi
 if grep vless-xhttp "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-xhttp-enc 】支持ENC加密，节点信息如下："
+echo "【 Vless-xhttp-enc 】支持ENC加密，节点信息如下："
 vxpt=$(cat "$HOME/lun/vxpt")
 vl_vx_link="vless://$uuid@$server_ip:$vxpt?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto#${sxname}vl-xhttp-$hostname"
 echo "$vl_vx_link" >> "$HOME/lun/jh.txt"
 echo "$vl_vx_link"
 echo
 if [ -f "$HOME/lun/cdnym" ]; then
-echo "💣【 Vless-xhttp-ecn-cdn 】支持ENC加密，节点信息如下："
+echo "【 Vless-xhttp-ecn-cdn 】支持ENC加密，节点信息如下："
 echo "注：默认使用 Cloudflare 中性优选地址；建议通过 cfip 自定义优选 IP/域名，如是回源端口需手动修改443或者80系端口"
 vl_vx_cdn_link="vless://$uuid@$cdnip1:$vxpt?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&host=$xvvmcdnym&path=$uuid-vx&mode=auto#${sxname}vl-xhttp-$hostname"
 echo "$vl_vx_cdn_link" >> "$HOME/lun/jh.txt"
@@ -1006,14 +1006,14 @@ echo
 fi
 fi
 if grep vless-ws "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-ws-enc 】支持ENC加密，节点信息如下："
+echo "【 Vless-ws-enc 】支持ENC加密，节点信息如下："
 vwpt=$(cat "$HOME/lun/vwpt")
 vl_vw_link="vless://$uuid@$server_ip:$vwpt?encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw#${sxname}vl-ws-enc-$hostname"
 echo "$vl_vw_link" >> "$HOME/lun/jh.txt"
 echo "$vl_vw_link"
 echo
 if [ -f "$HOME/lun/cdnym" ]; then
-echo "💣【 Vless-ws-enc-cdn 】支持ENC加密，节点信息如下："
+echo "【 Vless-ws-enc-cdn 】支持ENC加密，节点信息如下："
 echo "注：默认使用 Cloudflare 中性优选地址；建议通过 cfip 自定义优选 IP/域名，如是回源端口需手动修改443或者80系端口"
 vl_vw_cdn_link="vless://$uuid@$cdnip1:$vwpt?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$xvvmcdnym&path=$uuid-vw#${sxname}vl-ws-enc-cdn-$hostname"
 echo "$vl_vw_cdn_link" >> "$HOME/lun/jh.txt"
@@ -1022,7 +1022,7 @@ echo
 fi
 fi
 if grep reality-vision "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-tcp-reality-vision 】节点信息如下："
+echo "【 Vless-tcp-reality-vision 】节点信息如下："
 vlpt=$(cat "$HOME/lun/vlpt")
 vl_link="vless://$uuid@$server_ip:$vlpt?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reym&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=tcp&headerType=none#${sxname}vl-reality-vision-$hostname"
 echo "$vl_link" >> "$HOME/lun/jh.txt"
@@ -1030,7 +1030,7 @@ echo "$vl_link"
 echo
 fi
 if grep ss-2022 "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Shadowsocks-2022 】节点信息如下："
+echo "【 Shadowsocks-2022 】节点信息如下："
 sspt=$(cat "$HOME/lun/sspt")
 ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$sskey@$server_ip:$sspt" | base64 -w0)#${sxname}Shadowsocks-2022-$hostname"
 echo "$ss_link" >> "$HOME/lun/jh.txt"
@@ -1038,14 +1038,14 @@ echo "$ss_link"
 echo
 fi
 if grep vmess-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep vmess-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Vmess-ws 】节点信息如下："
+echo "【 Vmess-ws 】节点信息如下："
 vmpt=$(cat "$HOME/lun/vmpt")
 vm_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-$hostname\", \"add\": \"$server_ip\", \"port\": \"$vmpt\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"www.bing.com\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
 echo "$vm_link" >> "$HOME/lun/jh.txt"
 echo "$vm_link"
 echo
 if [ -f "$HOME/lun/cdnym" ]; then
-echo "💣【 Vmess-ws-cdn 】节点信息如下："
+echo "【 Vmess-ws-cdn 】节点信息如下："
 echo "注：默认使用 Cloudflare 中性优选地址；建议通过 cfip 自定义优选 IP/域名，如是回源端口需手动修改443或者80系端口"
 vm_cdn_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-cdn-$hostname\", \"add\": \"$cdnip1\", \"port\": \"$vmpt\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
 echo "$vm_cdn_link" >> "$HOME/lun/jh.txt"
@@ -1054,7 +1054,7 @@ echo
 fi
 fi
 if grep anytls-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 AnyTLS 】节点信息如下："
+echo "【 AnyTLS 】节点信息如下："
 anpt=$(cat "$HOME/lun/anpt")
 an_link="anytls://$uuid@$server_ip:$anpt?insecure=1&allowInsecure=1#${sxname}anytls-$hostname"
 echo "$an_link" >> "$HOME/lun/jh.txt"
@@ -1062,7 +1062,7 @@ echo "$an_link"
 echo
 fi
 if grep anyreality-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Any-Reality 】节点信息如下："
+echo "【 Any-Reality 】节点信息如下："
 arpt=$(cat "$HOME/lun/arpt")
 ar_link="anytls://$uuid@$server_ip:$arpt?security=reality&sni=$reym&fp=chrome&pbk=$public_key_s&sid=$short_id_s&type=tcp&headerType=none#${sxname}any-reality-$hostname"
 echo "$ar_link" >> "$HOME/lun/jh.txt"
@@ -1070,7 +1070,7 @@ echo "$ar_link"
 echo
 fi
 if grep hy2-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Hysteria2 】节点信息如下："
+echo "【 Hysteria2 】节点信息如下："
 hypt=$(cat "$HOME/lun/hypt")
 hy2_link="hysteria2://$uuid@$server_ip:$hypt?security=tls&alpn=h3&insecure=1&sni=www.bing.com#${sxname}hy2-$hostname"
 echo "$hy2_link" >> "$HOME/lun/jh.txt"
@@ -1078,7 +1078,7 @@ echo "$hy2_link"
 echo
 fi
 if grep tuic5-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Tuic 】节点信息如下："
+echo "【 Tuic 】节点信息如下："
 tupt=$(cat "$HOME/lun/tupt")
 tuic5_link="tuic://$uuid:$uuid@$server_ip:$tupt?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&allow_insecure=1&allowInsecure=1#${sxname}tuic-$hostname"
 echo "$tuic5_link" >> "$HOME/lun/jh.txt"
@@ -1086,7 +1086,7 @@ echo "$tuic5_link"
 echo
 fi
 if grep socks5-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep socks5-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Socks5 】客户端信息如下："
+echo "【 Socks5 】客户端信息如下："
 sopt=$(cat "$HOME/lun/sopt")
 echo "请配合其他应用内置代理使用，勿做节点直接使用"
 echo "客户端地址：$server_ip"
@@ -1141,10 +1141,10 @@ echo "Argo隧道端口正在使用$vlvm-ws主协议端口：$(cat $HOME/lun/argo
 Argo域名：$argodomain
 $nametn
 
-1、💣443端口的$vlvm-ws-tls-argo节点(优选IP与443系端口随便换)
+1、443端口的$vlvm-ws-tls-argo节点(优选IP与443系端口随便换)
 ${vmatls_link1}${vwatls_link1}
 
-2、💣80端口的$vlvm-ws-argo节点(优选IP与80系端口随便换)
+2、80端口的$vlvm-ws-argo节点(优选IP与80系端口随便换)
 ${vma_link7}${vwa_link2}
 "
 )

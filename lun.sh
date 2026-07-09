@@ -18,7 +18,7 @@ LUN_MENU_REQUEST=
 [ -z "$1" ] && [ "$vwp" != yes ] && [ "$sop" != yes ] && [ "$vxp" != yes ] && [ "$ssp" != yes ] && [ "$vlp" != yes ] && [ "$vmp" != yes ] && [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$xhp" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && LUN_MENU_REQUEST=yes
 if find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(s|x)'; then
 if [ "$1" = "rep" ]; then
-[ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！💣"; exit; }
+[ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
 fi
 else
 [ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
@@ -76,7 +76,7 @@ echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
-echo "Lun一键无交互小钢炮脚本💣"
+echo "Lun一键无交互小钢炮脚本"
 echo "当前版本：V26.5.10"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
@@ -2191,7 +2191,7 @@ short_id_s=$(cat "$HOME/lun/sbk/short_id" 2>/dev/null)
 sskey=$(cat "$HOME/lun/sskey" 2>/dev/null)
 fi
 if grep xhttp-reality "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-xhttp-reality-enc 】支持ENC加密，节点信息如下："
+echo "【 Vless-xhttp-reality-enc 】支持ENC加密，节点信息如下："
 port_xh=$(cat "$HOME/lun/port_xh")
 client_port_xh=$(client_port "$port_xh")
 vl_xh_link="vless://$uuid@$client_addr:$client_port_xh?encryption=$enkey&flow=xtls-rprx-vision&security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=xhttp&path=$uuid-xh&mode=auto#${sxname}vl-xhttp-reality-enc-$hostname$node_name_suffix"
@@ -2200,7 +2200,7 @@ append_share_link "$vl_xh_link"
 echo
 fi
 if grep vless-xhttp "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-xhttp-enc 】支持ENC加密，节点信息如下："
+echo "【 Vless-xhttp-enc 】支持ENC加密，节点信息如下："
 port_vx=$(cat "$HOME/lun/port_vx")
 client_port_vx=$(client_port "$port_vx")
 vl_vx_link="vless://$uuid@$client_addr:$client_port_vx?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto#${sxname}vl-xhttp-enc-$hostname$node_name_suffix"
@@ -2211,7 +2211,7 @@ append_vless_cdn_links "Vless-xhttp-enc-cdn" "vl-xhttp-enc" "$port_vx" "encrypti
 fi
 fi
 if grep vless-ws "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-ws-enc 】支持ENC加密，节点信息如下："
+echo "【 Vless-ws-enc 】支持ENC加密，节点信息如下："
 port_vw=$(cat "$HOME/lun/port_vw")
 client_port_vw=$(client_port "$port_vw")
 vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw#${sxname}vl-ws-enc-$hostname$node_name_suffix"
@@ -2222,7 +2222,7 @@ append_vless_cdn_links "Vless-ws-enc-cdn" "vl-ws-enc" "$port_vw" "encryption=$en
 fi
 fi
 if grep reality-vision "$HOME/lun/xr.json" >/dev/null 2>&1; then
-echo "💣【 Vless-tcp-reality-vision 】节点信息如下："
+echo "【 Vless-tcp-reality-vision 】节点信息如下："
 port_vl_re=$(cat "$HOME/lun/port_vl_re")
 client_port_vl_re=$(client_port "$port_vl_re")
 vl_link="vless://$uuid@$client_addr:$client_port_vl_re?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=tcp&headerType=none#${sxname}vl-reality-vision-$hostname$node_name_suffix"
@@ -2280,7 +2280,7 @@ echo "- ${sxname}vless-reality-vision-$hostname$node_name_suffix"
 }
 fi
 if grep ss-2022 "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Shadowsocks-2022 】节点信息如下："
+echo "【 Shadowsocks-2022 】节点信息如下："
 port_ss=$(cat "$HOME/lun/port_ss")
 client_port_ss=$(client_port "$port_ss")
 ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$sskey@$client_addr:$client_port_ss" | base64 -w0)#${sxname}Shadowsocks-2022-$hostname$node_name_suffix"
@@ -2324,7 +2324,7 @@ echo "- ${sxname}Shadowsocks-2022-$hostname$node_name_suffix"
 }
 fi
 if grep vmess-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep vmess-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Vmess-ws 】节点信息如下："
+echo "【 Vmess-ws 】节点信息如下："
 port_vm_ws=$(cat "$HOME/lun/port_vm_ws")
 client_port_vm_ws=$(client_port "$port_vm_ws")
 vm_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-$hostname$node_name_suffix\", \"add\": \"$client_addr\", \"port\": \"$client_port_vm_ws\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"www.bing.com\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
@@ -2391,7 +2391,7 @@ append_vmess_cdn_links "$port_vm_ws"
 fi
 fi
 if grep anytls-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 AnyTLS 】节点信息如下："
+echo "【 AnyTLS 】节点信息如下："
 port_an=$(cat "$HOME/lun/port_an")
 client_port_an=$(client_port "$port_an")
 an_link="anytls://$uuid@$client_addr:$client_port_an?sni=$cert_sni&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure#${sxname}anytls-$hostname$node_name_suffix"
@@ -2440,7 +2440,7 @@ echo "- ${sxname}anytls-$hostname$node_name_suffix"
 }
 fi
 if grep anyreality-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Any-Reality 】节点信息如下："
+echo "【 Any-Reality 】节点信息如下："
 port_ar=$(cat "$HOME/lun/port_ar")
 client_port_ar=$(client_port "$port_ar")
 ar_link="anytls://$uuid@$client_addr:$client_port_ar?security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_s&sid=$short_id_s&type=tcp&headerType=none#${sxname}any-reality-$hostname$node_name_suffix"
@@ -2479,7 +2479,7 @@ echo "\"${sxname}any-reality-$hostname$node_name_suffix\","
 }
 fi
 if grep hy2-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Hysteria2 】节点信息如下："
+echo "【 Hysteria2 】节点信息如下："
 SHA256=$(cat "$HOME/lun/SHA256.txt" 2>/dev/null)
 port_hy2=$(cat "$HOME/lun/port_hy2")
 client_port_hy2=$(client_port "$port_hy2")
@@ -2544,7 +2544,7 @@ echo "- ${sxname}hysteria2-$hostname$node_name_suffix"
 }
 fi
 if grep tuic5-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Tuic 】节点信息如下："
+echo "【 Tuic 】节点信息如下："
 port_tu=$(cat "$HOME/lun/port_tu")
 client_port_tu=$(client_port "$port_tu")
 tuic5_link="tuic://$uuid:$uuid@$client_addr:$client_port_tu?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$cert_sni&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure&allow_insecure=$generic_link_insecure#${sxname}tuic-$hostname$node_name_suffix"
@@ -2601,7 +2601,7 @@ echo "- ${sxname}tuic5-$hostname$node_name_suffix"
 }
 fi
 if grep socks5-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep socks5-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
-echo "💣【 Socks5 】客户端信息如下："
+echo "【 Socks5 】客户端信息如下："
 port_so=$(cat "$HOME/lun/port_so")
 client_port_so=$(client_port "$port_so")
 echo "请配合其他应用内置代理使用，勿做节点直接使用"
@@ -2852,10 +2852,10 @@ echo "Argo隧道端口正在使用$vlvm-ws主协议端口：$(cat $HOME/lun/argo
 Argo域名：$argodomain
 $nametn
 
-1、💣443端口的$vlvm-ws-tls-argo节点(优选IP与443系端口随便换)
+1、443端口的$vlvm-ws-tls-argo节点(优选IP与443系端口随便换)
 ${vmatls_link1}${vwatls_link1}
 
-2、💣80端口的$vlvm-ws-argo节点(优选IP与80系端口随便换)
+2、80端口的$vlvm-ws-argo节点(优选IP与80系端口随便换)
 ${vma_link7}${vwa_link2}
 "
 )
@@ -3316,19 +3316,20 @@ echo "Lun 脚本更新完成：$target"
 
 lun_menu(){
 while :; do
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "Lun 风火轮多协议交互面板"
-echo " 1. 安装 Lun / 新建协议"
-echo " 2. 增删改协议变量组 (rep)"
-echo " 3. 查看节点与订阅 (list)"
-echo " 4. 设置自定义节点地址 addym/addout"
-echo " 5. 重启 Lun 进程"
-echo " 6. 更新 Xray 内核"
-echo " 7. 更新 Sing-box 内核"
-echo " 8. 更新 Lun 脚本"
-echo " 9. 卸载 Lun"
-echo " 0. 退出"
-printf "请输入数字【0-9】："
+green_line "================================================================================"
+yellow_line "  Lun 风火轮多协议交互面板"
+green_line "================================================================================"
+cyan_line " 1. 安装 Lun / 新建协议"
+cyan_line " 2. 增删改协议变量组 (rep)"
+cyan_line " 3. 查看节点与订阅 (list)"
+cyan_line " 4. 设置自定义节点地址 addym/addout"
+cyan_line " 5. 重启 Lun 进程"
+cyan_line " 6. 更新 Xray 内核"
+cyan_line " 7. 更新 Sing-box 内核"
+cyan_line " 8. 更新 Lun 脚本"
+cyan_line " 9. 卸载 Lun"
+cyan_line " 0. 退出"
+printf "请输入数字【0-9】（%s回车退出%s）：" "$LUN_YELLOW" "$LUN_RESET"
 IFS= read -r menu_choice
 case "$menu_choice" in
 1) pick_protocols; LUN_MENU_ACTION=install; break ;;
@@ -3349,18 +3350,31 @@ done
 ui_line(){ printf '%s\n' "================================================================================"; }
 ui_dash(){ printf '%s\n' "--------------------------------------------------------------------------------"; }
 ui_title(){ ui_line; printf '%s\n' "$1"; ui_line; }
-ui_pause(){ printf "按回车返回菜单："; IFS= read -r _pause; }
+ui_pause(){ printf "%s按回车返回菜单%s：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r _pause; }
 if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+LUN_RED=$(tput setaf 1 2>/dev/null)
 LUN_GREEN=$(tput setaf 2 2>/dev/null)
 LUN_YELLOW=$(tput setaf 3 2>/dev/null)
+LUN_BLUE=$(tput setaf 4 2>/dev/null)
+LUN_CYAN=$(tput setaf 6 2>/dev/null)
+LUN_WHITE=$(tput setaf 7 2>/dev/null)
+LUN_BOLD=$(tput bold 2>/dev/null)
 LUN_RESET=$(tput sgr0 2>/dev/null)
 else
+LUN_RED=
 LUN_GREEN=
 LUN_YELLOW=
+LUN_BLUE=
+LUN_CYAN=
+LUN_WHITE=
+LUN_BOLD=
 LUN_RESET=
 fi
 green_line(){ printf '%s%s%s\n' "$LUN_GREEN" "$1" "$LUN_RESET"; }
 yellow_line(){ printf '%s%s%s\n' "$LUN_YELLOW" "$1" "$LUN_RESET"; }
+red_line(){ printf '%s%s%s\n' "$LUN_RED" "$1" "$LUN_RESET"; }
+cyan_line(){ printf '%s%s%s\n' "$LUN_CYAN" "$1" "$LUN_RESET"; }
+yellow_hint(){ printf '%s%s%s' "$LUN_YELLOW" "$1" "$LUN_RESET"; }
 
 port_valid(){
 printf '%s' "$1" | grep -Eq '^[0-9]+$' || return 1
@@ -3494,10 +3508,10 @@ if is_nat_mode; then
 [ -n "$ptmap" ] && echo "当前手动 NAT 映射：$ptmap；这里请填写内网监听端口或对应公网端口。"
 [ -n "$inpool" ] && echo "当前内网端口池：$inpool"
 [ -n "$outpool" ] && echo "当前外网端口池：$outpool（按位置映射内网池）"
-printf "请输入 %s 内网端口，回车随机，0 返回：" "$label"
+printf "请输入 %s 内网端口（%s回车随机%s，0 返回）：" "$label" "$LUN_YELLOW" "$LUN_RESET"
 else
 [ -n "$inpool" ] && echo "当前端口池：$inpool"
-printf "请输入 %s 端口，回车随机，0 返回：" "$label"
+printf "请输入 %s 端口（%s回车随机%s，0 返回）：" "$label" "$LUN_YELLOW" "$LUN_RESET"
 fi
 IFS= read -r val
 [ "$val" = "0" ] && return 2
@@ -3738,7 +3752,7 @@ return 0
 # 读取 CDN 优选地址，为空则写入默认值
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
-echo "💣【 $label 】CDN 优选节点信息如下："
+echo "【 $label 】CDN 优选节点信息如下："
 echo "注：add=CF优选地址（客户端入口），host=回源域名（CF回源到VPS），服务器出站仍直连 VPS。"
 for cdn_ip in $ips; do
 case "$cdn_ip" in ""|-1) continue ;; esac
@@ -3770,7 +3784,7 @@ return 0
 }
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
-echo "💣【 Vmess-ws-cdn 】CDN 优选节点信息如下："
+echo "【 Vmess-ws-cdn 】CDN 优选节点信息如下："
 echo "注：add=CF优选地址（客户端入口），host=回源域名（CF回源到VPS），服务器出站仍直连 VPS。"
 for cdn_ip in $ips; do
 case "$cdn_ip" in ""|-1) continue ;; esac
@@ -3803,14 +3817,16 @@ fi
 lun_dashboard(){
 clear 2>/dev/null || true
 ui_line
-printf " _      _   _ _   _\n"
-printf "| |    | | | | \\ | |\n"
-printf "| |    | | | |  \\| |\n"
-printf "| |___ | |_| | |\\  |\n"
-printf "|_____| \\___/|_| \\_|\n"
-printf "     (O)===(O)   (O)===(O)   (O)===(O)\n"
+printf '%s%s%s\n' "$LUN_YELLOW" "  _      _   _ _   _            ___        ___        ___        ___ " "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" " | |    | | | | \\ | |          /\\__\\      /\\  \\      /\\  \\      /\\  \\" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" " | |    | | | |  \\| |         /:/  /     /::\\  \\    /::\\  \\    /::\\  \\" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" " | |___ | |_| | |\\  |        /:/  /     /:/\\:\\  \\  /:/\\:\\  \\  /:/\\:\\  \\" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" " |_____| \\___/|_| \\_|       /:/  /  ___ \\:\\~\\ \\  \\/::\\~\\  \\/::\\~\\  \\" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" "                            \\/__/  /\\__\\ \\:\\ \\ \\__/\\:\\ \\ \\__/\\:\\ \\ \\__" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" "  风火轮多协议交互面板          \\/__/  \\:\\ \\ \\__\\/__\\:\\ \\/  \\:\\ \\/__/" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" "                                   \\:\\_\\       \\:\\_\\     \\:\\_\\    \\:\\_\\" "$LUN_RESET"
+printf '%s%s%s\n' "$LUN_YELLOW" "                                    \\/__/       \\/__/      \\/__/     \\/__/" "$LUN_RESET"
 ui_line
-echo "Lun 风火轮多协议交互面板"
 ui_dash
 printf "系统：%s  内核：%s  架构：%s  虚拟化：%s\n" "$op" "$(uname -r)" "$cpu" "${vi:-unknown}"
 printf "BBR算法：%s\n" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
@@ -3853,7 +3869,7 @@ ui_dash
 prompt_service_domain(){
 while :; do
 cur=$(cat "$HOME/lun/domain" 2>/dev/null)
-printf "请输入已解析服务域名，回车跳过/保留当前值%s，del 清除，0 返回：" "${cur:+[$cur]}"
+printf "请输入已解析服务域名（%s回车跳过/保留当前值%s，del 清除，0 返回）%s：" "$LUN_YELLOW" "$LUN_RESET" "${cur:+[$cur]}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
 [ -z "$val" ] && return 0
@@ -3989,7 +4005,7 @@ case "$val" in
 esac
 while :; do
 if is_nat_mode; then
-printf "%s 内网端口，回车默认 8080，0 返回：" "$target_label"
+printf "%s 内网端口（%s回车默认 8080%s，0 返回）：" "$target_label" "$LUN_YELLOW" "$LUN_RESET" "$target_label"
 else
 printf "%s 端口，回车默认 8080，0 返回：" "$target_label"
 fi
@@ -4112,9 +4128,9 @@ IFS= read -r subid
 [ "$subid" = "0" ] && return 2
 while :; do
 if is_nat_mode; then
-printf "节点订阅分享内网监听端口，回车从内网端口池/随机取，0 返回："
+printf "节点订阅分享内网监听端口（%s回车从内网端口池/随机取%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"
 else
-printf "节点订阅分享端口，回车从端口池/随机取，0 返回："
+printf "节点订阅分享端口（%s回车从端口池/随机取%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"
 fi
 IFS= read -r subpt
 [ "$subpt" = "0" ] && return 2
@@ -4635,13 +4651,15 @@ prompt_port_pool(){
 while :; do
 echo "端口池用于协议端口和节点订阅分享端口随机取值。"
 if is_nat_mode; then
+yellow_line "格式说明：单个端口 8080；连续端口 1000+2000；NAT映射 外网端口-内网端口 例如 54834-2096"
 echo "内网端口池：服务实际监听端口，例如 8080 1000+2000。"
 echo "外网端口池：NAT 公网入口端口，例如 53273 49096+49100。按位置自动映射到内网池。"
 echo "旧格式仍兼容：portpool=\"54834-2096 49096-1003\" 会自动补充手动 NAT 映射。"
-printf "请输入内网端口池；del 清除；回车保留/跳过；0 返回%s：" "${inpool:+，当前 $inpool}"
+printf "请输入内网端口池；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "${inpool:+，当前 $inpool}" "$LUN_RESET"
 else
+yellow_line "格式说明：单个端口 8080；连续端口 1000+2000；NAT映射 外网端口-内网端口 例如 54834-2096"
 echo "普通 VPS 只需要一个端口池，随机端口会直接作为客户端端口。"
-printf "请输入端口池；del 清除；回车保留/跳过；0 返回%s：" "${inpool:+，当前 $inpool}"
+printf "请输入端口池；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "${inpool:+，当前 $inpool}" "$LUN_RESET"
 fi
 IFS= read -r val
 [ "$val" = "0" ] && return 2
@@ -4880,11 +4898,11 @@ echo " 0. 返回"
 printf "请选择 [0-9]："
 IFS= read -r c
 case "$c" in
-1) printf "请输入新 UUID，回车随机生成："; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
+1) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
 2) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
 3) certificate_menu; return ;;
 4) prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
-5) printf "输入 4 或 6，回车自动，0 返回："; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
+5) printf "输入 4 或 6（%s回车自动%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
 6) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 7) subscription_menu; return ;;
 8) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
@@ -5065,8 +5083,8 @@ case "$c" in
 2) certificate_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; return ;;
 3) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 4) configure_addym_menu; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
-5) printf "输入 4 或 6，回车自动，0 返回："; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
-6) printf "请输入新 UUID，回车随机生成："; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
+5) printf "输入 4 或 6（%s回车自动%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
+6) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
 7) LUN_MENU_ACTION=del; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;

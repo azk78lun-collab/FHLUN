@@ -223,3 +223,13 @@ ghcr.io/azk78lun-collab/lun:latest
 ## 许可
 
 本项目保留原许可证，详见 `LICENSE`。
+
+## 来源说明
+
+本项目基于以下优秀开源项目构建：
+
+- **Xray-core** ([XTLS/Xray-core](https://github.com/XTLS/Xray-core)) — 提供 VLESS / VMess / Reality / XHTTP 等协议内核
+- **sing-box** ([SagerNet/sing-box](https://github.com/SagerNet/sing-box)) — 提供 Hysteria2 / Tuic / AnyTLS / Shadowsocks 等协议内核
+- **甬哥的 argosbx** ([yonggekkk/argosbx](https://github.com/yonggekkk/argosbx)) — 本项目原始脚本来源，感谢甬哥（@yonggekkk）开源的 argosbx 脚本框架
+
+感谢以上项目的开发者与维护者，正是他们的开源精神让本项目成为可能。
