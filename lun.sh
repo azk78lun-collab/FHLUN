@@ -777,6 +777,29 @@ SHA256=$(openssl x509 -in "$HOME/lun/cert.crt" -outform DER 2>/dev/null | sha256
 fi
 }
 
+gen_random_gmail(){
+local prefix
+prefix=$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 10)
+[ -z "$prefix" ] && prefix="lun$(date +%s 2>/dev/null | tail -c 6)"
+[ -z "$prefix" ] && prefix="lun$(od -An -N4 -tu4 </dev/urandom 2>/dev/null | tr -d ' ')"
+printf '%s@gmail.com\n' "$prefix"
+}
+
+reuse_local_cert_interactive(){
+[ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ] || return 1
+[ -t 0 ] || return 1
+local subj
+subj=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+[ -z "$subj" ] && subj=$(openssl x509 -in "$HOME/lun/cert.crt" -noout -subject 2>/dev/null | sed 's/subject=[ ]*//;s/[\/]CN=//;s/,.*//')
+[ -z "$subj" ] && subj="已存在"
+printf "检测到本机已有证书（主体：%s），是否复用已有证书，跳过重新生成？[Y/n]：" "$subj"
+IFS= read -r ans
+case "$ans" in
+n|N) return 1 ;;
+*) echo "已复用本机已有证书，跳过证书生成。"; return 0 ;;
+esac
+}
+
 cert_subject_default(){
 if [ -n "$domain" ]; then
 printf '%s\n' "$domain"
@@ -829,6 +852,11 @@ return 0
 fi
 email=$acme_email
 [ -z "$email" ] && [ -s "$HOME/lun/acme_email" ] && email=$(cat "$HOME/lun/acme_email" 2>/dev/null)
+if [ -z "$email" ]; then
+email=$(gen_random_gmail)
+printf '%s\n' "$email" > "$HOME/lun/acme_email"
+echo "未设置 ACME 邮箱，已随机生成谷歌邮箱：$email"
+fi
 if command -v curl >/dev/null 2>&1; then
 if [ -n "$email" ]; then
 curl -fsSL https://get.acme.sh | sh -s email="$email" >/dev/null 2>&1 || return 1
@@ -891,6 +919,7 @@ install_acme_cert "$subject" "$mode"
 
 prepare_runtime_cert(){
 load_domain_cert_config
+if reuse_local_cert_interactive; then return 0; fi
 subject=$(cert_subject_default)
 case "$certmode" in
 domain|dns)
@@ -3876,10 +3905,16 @@ chmod 600 "$HOME/lun/cert.env" "$HOME/lun/acme_dns" 2>/dev/null
 
 prompt_acme_email(){
 cur=$(cat "$HOME/lun/acme_email" 2>/dev/null)
-printf "Let’s Encrypt 账户邮箱，回车保留当前值%s，0 返回：" "${cur:+[$cur]}"
+printf "Let’s Encrypt 账户邮箱，回车随机生成谷歌邮箱%s，0 返回：" "${cur:+[当前:$cur]}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
-[ -n "$val" ] && { acme_email="$val"; printf "%s\n" "$acme_email" > "$HOME/lun/acme_email"; }
+if [ -n "$val" ]; then
+acme_email="$val"
+else
+acme_email=$(gen_random_gmail)
+echo "已随机生成谷歌邮箱：$acme_email"
+fi
+printf "%s\n" "$acme_email" > "$HOME/lun/acme_email"
 }
 
 prompt_cert_mode(){
@@ -4786,6 +4821,7 @@ case "$c" in
 prompt_service_domain; rc=$?
 [ "$rc" = 2 ] && continue
 [ -n "$domain" ] || { echo "当前没有服务域名，不能申请域名证书。"; continue; }
+if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
 prompt_acme_email; rc=$?
 [ "$rc" = 2 ] && continue
 certmode=domain
@@ -4797,6 +4833,7 @@ LUN_MENU_ACTION=list; ui_pause; return
 prompt_service_domain; rc=$?
 [ "$rc" = 2 ] && continue
 [ -n "$domain" ] || { echo "当前没有服务域名，不能申请 DNS API 证书。"; continue; }
+if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
 prompt_acme_email; rc=$?
 [ "$rc" = 2 ] && continue
 save_dns_env_interactive; rc=$?
@@ -4808,6 +4845,7 @@ issue_acme_cert dns "$domain" && echo "DNS API 证书申请完成。" || { echo 
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
 4)
+if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
 prompt_acme_email; rc=$?
 [ "$rc" = 2 ] && continue
 certmode=ip
