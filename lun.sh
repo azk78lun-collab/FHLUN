@@ -16,7 +16,15 @@ export LANGUAGE=C.UTF-8
 [ -n "${warp:-}" ] && wap=yes
 LUN_MENU_REQUEST=
 [ -z "$1" ] && [ "$vwp" != yes ] && [ "$sop" != yes ] && [ "$vxp" != yes ] && [ "$ssp" != yes ] && [ "$vlp" != yes ] && [ "$vmp" != yes ] && [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$xhp" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && LUN_MENU_REQUEST=yes
-if find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(s|x)'; then
+_lun_proc_running=no
+for _P in /proc/[0-9]*; do
+[ -L "$_P/exe" ] || continue
+_exe=$(readlink -f "$_P/exe" 2>/dev/null) || continue
+case "$_exe" in */lun/sing-box*|*/lun/xray*) _lun_proc_running=yes; break ;; esac
+done
+[ "$_lun_proc_running" = "no" ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_proc_running=yes
+[ "$_lun_proc_running" = "no" ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_proc_running=yes
+if [ "$_lun_proc_running" = "yes" ]; then
 if [ "$1" = "rep" ]; then
 [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
 fi
@@ -1860,7 +1868,7 @@ mkdir -p "$HOME/bin"
 fi
 install_lun_entry "$SCRIPT_PATH" || { echo "Lun脚本安装失败，请检查网络后重试。"; exit 1; }
 if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
-echo "if ! find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(s|x)' && ! pgrep -f 'lun/(s|x)' >/dev/null 2>&1; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
+echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
 fi
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
 if [ "$SCRIPT_PATH" = "$HOME/bin/lun" ]; then
@@ -1872,10 +1880,18 @@ crontab -l > /tmp/crontab.tmp 2>/dev/null
 if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
 sed -i '/lun\/sing-box/d' /tmp/crontab.tmp
 sed -i '/lun\/xray/d' /tmp/crontab.tmp
-if find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -q 'lun/s' ; then
+_sb_running=no; _xr_running=no
+for P in /proc/[0-9]*; do
+[ -L "$P/exe" ] || continue
+exe=$(readlink -f "$P/exe" 2>/dev/null) || continue
+case "$exe" in */lun/sing-box*) _sb_running=yes ;; */lun/xray*) _xr_running=yes ;; esac
+done
+[ "$_sb_running" = "no" ] && pgrep -f 'lun/sing-box' >/dev/null 2>&1 && _sb_running=yes
+[ "$_xr_running" = "no" ] && pgrep -f 'lun/xray' >/dev/null 2>&1 && _xr_running=yes
+if [ "$_sb_running" = "yes" ]; then
 echo '@reboot sleep 10 && /bin/sh -c "nohup $HOME/lun/sing-box run -c $HOME/lun/sb.json >/dev/null 2>&1 &"' >> /tmp/crontab.tmp
 fi
-if find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -q 'lun/x' ; then
+if [ "$_xr_running" = "yes" ]; then
 echo '@reboot sleep 10 && /bin/sh -c "nohup $HOME/lun/xray run -c $HOME/lun/xr.json >/dev/null 2>&1 &"' >> /tmp/crontab.tmp
 fi
 fi
@@ -1934,13 +1950,40 @@ fi
 }
 lunstatus(){
 echo "=========当前内核运行状态========="
-procs=$(find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null)
-if echo "$procs" | grep -Eq 'lun/s'; then
+sb_running=no
+xr_running=no
+for P in /proc/[0-9]*; do
+[ -L "$P/exe" ] || continue
+exe=$(readlink -f "$P/exe" 2>/dev/null) || continue
+case "$exe" in
+*/lun/sing-box*) sb_running=yes ;;
+*/lun/xray*) xr_running=yes ;;
+esac
+done
+if [ "$sb_running" = "no" ]; then
+pgrep -f 'lun/sing-box' >/dev/null 2>&1 && sb_running=yes
+fi
+if [ "$sb_running" = "no" ]; then
+systemctl is-active --quiet sb 2>/dev/null && sb_running=yes
+fi
+if [ "$sb_running" = "no" ] && rc-service sing-box status >/dev/null 2>&1; then
+sb_running=yes
+fi
+if [ "$xr_running" = "no" ]; then
+pgrep -f 'lun/xray' >/dev/null 2>&1 && xr_running=yes
+fi
+if [ "$xr_running" = "no" ]; then
+systemctl is-active --quiet xr 2>/dev/null && xr_running=yes
+fi
+if [ "$xr_running" = "no" ] && rc-service xray status >/dev/null 2>&1; then
+xr_running=yes
+fi
+if [ "$sb_running" = "yes" ]; then
 echo "Sing-box (版本V$("$HOME/lun/sing-box" version 2>/dev/null | awk '/version/{print $NF}'))：运行中"
 else
 echo "Sing-box：未启用"
 fi
-if echo "$procs" | grep -Eq 'lun/x'; then
+if [ "$xr_running" = "yes" ]; then
 echo "Xray (版本V$("$HOME/lun/xray" version 2>/dev/null | awk '/^Xray/{print $2}'))：运行中"
 else
 echo "Xray：未启用"
@@ -1948,8 +1991,24 @@ fi
 }
 
 argo_status_line(){
-procs=$(find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null)
-if echo "$procs" | grep -Eq 'lun/c'; then
+cf_running=no
+for P in /proc/[0-9]*; do
+[ -L "$P/exe" ] || continue
+exe=$(readlink -f "$P/exe" 2>/dev/null) || continue
+case "$exe" in
+*/lun/cloudflared*) cf_running=yes ;;
+esac
+done
+if [ "$cf_running" = "no" ]; then
+pgrep -f 'lun/cloudflared' >/dev/null 2>&1 && cf_running=yes
+fi
+if [ "$cf_running" = "no" ]; then
+systemctl is-active --quiet argo 2>/dev/null && cf_running=yes
+fi
+if [ "$cf_running" = "no" ] && rc-service argo status >/dev/null 2>&1; then
+cf_running=yes
+fi
+if [ "$cf_running" = "yes" ]; then
 echo "Argo (版本V$("$HOME/lun/cloudflared" version 2>/dev/null | awk '{print $3}'))：运行中"
 else
 echo "Argo：未启用"
@@ -5450,7 +5509,15 @@ done
 sleep 5 && echo "重启完成" && sleep 3 && cip
 exit
 fi
-if ! find /proc/*/exe -type l 2>/dev/null | grep -E '/proc/[0-9]+/exe' | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(s|x)'; then
+_lun_proc_running2=no
+for _P in /proc/[0-9]*; do
+[ -L "$_P/exe" ] || continue
+_exe=$(readlink -f "$_P/exe" 2>/dev/null) || continue
+case "$_exe" in */lun/sing-box*|*/lun/xray*) _lun_proc_running2=yes; break ;; esac
+done
+[ "$_lun_proc_running2" = "no" ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_proc_running2=yes
+[ "$_lun_proc_running2" = "no" ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_proc_running2=yes
+if [ "$_lun_proc_running2" = "no" ]; then
 stop_lun_owned_processes
 if [ -z "$( (command -v curl >/dev/null 2>&1 && curl -s4m5 -k "$v46url" 2>/dev/null) || (command -v wget >/dev/null 2>&1 && timeout 3 wget -4 -qO- --tries=2 "$v46url" 2>/dev/null) )" ]; then
 printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888\n" > /etc/resolv.conf
