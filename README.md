@@ -88,14 +88,16 @@ Reality、Argo 和 CDN 仍然独立：
 | `argo` | 填写 `vmpt` 或 `vwpt` 启用 Argo |
 | `agn` | Argo 固定隧道域名 |
 | `agk` | Argo 固定隧道 token |
-| `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），最多两个值，推荐 `cloudflare-ech.com` |
-| `argoip` | Argo 优选 IP 或域名（与 cfip 独立），最多两个值 |
+| `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），可填多个值，推荐 `cloudflare-ech.com` |
+| `argoip` | Argo 优选 IP 或域名（与 cfip 独立），可填多个值 |
 
 `agk` 可直接粘贴完整的 `cloudflared.exe service install ey...` 命令，脚本会自动提取 `ey...` token。
 
 ### CDN 优选 IP 加速说明
 
 CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点里的 `add/cfip`），Cloudflare 通过回源域名（`host/cdnym`）回源到你的 VPS。服务器访问外网默认仍直连 VPS；只有启用 WARP 出站时，目标网站才可能显示 WARP/Cloudflare IP。
+
+启用 CDN Host 不会强制把普通节点地址改回服务器 IP；如果你设置了 `domain/addym`，订阅里的直连节点仍可继续使用域名。CDN 节点会额外使用 `cfip` 作为 Cloudflare 入口地址。
 
 **使用条件：**
 1. 设置 `cdnym`：一个已解析到 VPS IP 的域名（用于 CF 回源）
@@ -119,7 +121,7 @@ NAT VPS 要看客户端访问的公网端口是否在上述列表内；只有内
 **示例：**
 
 ```bash
-vmpt="" cdnym="proxy.example.com" cfip="cloudflare-ech.com www.visa.com.sg" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+vmpt="" cdnym="proxy.example.com" cfip="cloudflare-ech.com www.visa.com.sg www.wto.org" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
 ## 自定义普通节点地址 addym

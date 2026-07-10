@@ -233,6 +233,24 @@ argoip=$(cat "$HOME/lun/argoip" 2>/dev/null)
 fi
 }
 
+clear_cdn_ip_list(){
+rm -f "$HOME/lun/cdnip" "$HOME/lun"/cdnip[0-9]* 2>/dev/null
+}
+
+save_cdn_ip_list(){
+clear_cdn_ip_list
+idx=1
+list=
+for one in $1; do
+case "$one" in ""|-1) continue ;; esac
+valid_addym "$one" || continue
+list="${list:+$list }$one"
+printf "%s\n" "$one" > "$HOME/lun/cdnip$idx"
+idx=$((idx + 1))
+done
+[ -n "$list" ] && printf "%s\n" "$list" > "$HOME/lun/cdnip"
+}
+
 is_nat_mode(){
 case "${vpsmode:-}" in
 nat) return 0 ;;
@@ -1922,27 +1940,22 @@ else
 echo "Lun脚本进程未启动，安装失败" && exit
 fi
 # ============ CDN 优选 IP/域名写入 ============
-# cfip 变量：用户传入的 CDN 优选地址（1-2个，空格分隔）
-# 如果用户传了 cfip，拆分为 cdnip1/cdnip2 写入配置文件
+# cfip 变量：用户传入的 CDN 优选地址（多个值用空格分隔）
+# 如果用户传了 cfip，保存为 cdnip 列表，并兼容写入 cdnip1/cdnip2/...
 # 如果没传，检查已有配置；都没有则使用默认优选域名
 # 注意：默认用域名而非纯IP，稳定性和兼容性更好（参考 sing-box-yg）
 if [ -n "$cfip" ]; then
-set -- $cfip
-cdnip1="$1"
-cdnip2="$2"
-[ -n "$cdnip1" ] && echo "$cdnip1" > "$HOME/lun/cdnip1" || rm -f "$HOME/lun/cdnip1"
-[ -n "$cdnip2" ] && echo "$cdnip2" > "$HOME/lun/cdnip2" || rm -f "$HOME/lun/cdnip2"
+save_cdn_ip_list "$cfip"
 else
-if [ -s "$HOME/lun/cdnip1" ]; then
-cdnip1=$(cat "$HOME/lun/cdnip1")
+if [ -s "$HOME/lun/cdnip" ] || ls "$HOME/lun"/cdnip[0-9]* >/dev/null 2>&1; then
+cdnip1=$(cat "$HOME/lun/cdnip1" 2>/dev/null)
 cdnip2=$(cat "$HOME/lun/cdnip2" 2>/dev/null)
 else
 # 默认 CDN 优选域名：cloudflare-ech.com 是 Cloudflare 官方 CDN 域名，稳定可靠
 # 备选：www.visa.com.sg、www.wto.org、www.web.com 等大厂域名
 cdnip1="cloudflare-ech.com"
 cdnip2="www.visa.com.sg"
-echo "$cdnip1" > "$HOME/lun/cdnip1"
-echo "$cdnip2" > "$HOME/lun/cdnip2"
+save_cdn_ip_list "$cdnip1 $cdnip2"
 fi
 fi
 }
@@ -2179,11 +2192,6 @@ if [ -n "$addym" ] && [ "$addout" = "replace" ]; then
 client_addr="$addym"
 elif [ -n "$addym" ] && [ "$addout" = "both" ]; then
 node_name_suffix="-IP"
-fi
-if [ -s "$HOME/lun/cdnym" ]; then
-client_addr="$server_ip"
-node_name_suffix="-SERVERIP"
-addout=off
 fi
 cert_client_vars
 
@@ -3791,26 +3799,33 @@ esac
 }
 
 # ============ 读取 CDN 优选 IP/域名列表 ============
-# 从 cdnip1、cdnip2 两个文件读取用户配置的 CDN 优选地址
+# 优先读取新列表文件 cdnip；旧的 cdnip1/cdnip2/... 继续兼容
 # 跳过空值和 "-1"（兼容旧版残留），并用 valid_addym 校验格式
 # 返回值：逐行输出有效的优选地址
 cdn_ip_list(){
-for f in "$HOME/lun/cdnip1" "$HOME/lun/cdnip2"; do
+if [ -s "$HOME/lun/cdnip" ]; then
+files="$HOME/lun/cdnip"
+else
+files=$(ls "$HOME/lun"/cdnip[0-9]* 2>/dev/null)
+fi
+seen=
+for f in $files; do
 [ -s "$f" ] || continue
-while IFS= read -r one; do
+for one in $(cat "$f" 2>/dev/null); do
 case "$one" in ""|-1) continue ;; esac
 valid_addym "$one" || continue
+case " $seen " in *" $one "*) continue ;; esac
+seen="${seen:+$seen }$one"
 printf '%s\n' "$one"
-done < "$f"
+done
 done
 }
 
 # ============ 写入默认 CDN 优选地址 ============
-# 当 cdnip1/cdnip2 文件不存在或为空时，写入默认优选域名
+# 当 CDN 优选列表不存在或为空时，写入默认优选域名
 # 使用域名而非纯IP：纯 Cloudflare IP 可能被识别为直连，域名走 CDN 代理更稳定
 cdn_default_ips(){
-[ -s "$HOME/lun/cdnip1" ] || printf "%s\n" "cloudflare-ech.com" > "$HOME/lun/cdnip1"
-[ -s "$HOME/lun/cdnip2" ] || printf "%s\n" "www.visa.com.sg" > "$HOME/lun/cdnip2"
+[ -n "$(cdn_ip_list)" ] || save_cdn_ip_list "cloudflare-ech.com www.visa.com.sg"
 }
 
 # ============ CDN 跳过提示 ============
@@ -3853,7 +3868,7 @@ done
 # 流程：
 #   1. 检查 cdnym（回源Host域名）是否存在，没有则跳过
 #   2. 获取公网端口并判断 CF 端口模式（http/https）
-#   3. 读取 CDN 优选地址列表（cdnip1/cdnip2）
+#   3. 读取 CDN 优选地址列表（cdnip 或旧 cdnip1/cdnip2/...）
 #   4. 为每个优选地址生成一条 CDN 节点链接
 # CDN 节点原理：add=优选地址（客户端连CF入口），host=回源域名（CF回源到VPS）
 append_vless_cdn_links(){
@@ -4159,7 +4174,7 @@ done
 prompt_argo_ip(){
 while :; do
 cur=$(cat "$HOME/lun/argoip" 2>/dev/null)
-printf "Argo 优选 IP / 入口地址，可填一到两个 IP/域名；回车保留/使用中性默认；del 清除；0 返回%s：" "${cur:+，当前 $cur}"
+printf "Argo 优选 IP / 入口地址，可填多个 IP/域名；回车保留/使用中性默认；del 清除；0 返回%s：" "${cur:+，当前 $cur}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
 case "$val" in
@@ -4406,7 +4421,8 @@ IFS= read -r enable_cdn
 case "$enable_cdn" in
 0) return 2 ;;
 del|none|n|N)
-rm -f "$HOME/lun/cdnym" "$HOME/lun/cdnip1" "$HOME/lun/cdnip2"
+rm -f "$HOME/lun/cdnym"
+clear_cdn_ip_list
 cdnym=
 cfip=
 echo "CDN 节点配置已清除。"
@@ -4440,14 +4456,14 @@ done
 # 推荐使用稳定域名：cloudflare-ech.com、www.visa.com.sg、www.wto.org
 # 也可填 CF 优选 IP，如 162.159.192.1
 while :; do
-printf "Cloudflare 优选 cfip，可填一到两个 IP/域名（空格分隔）\n"
+printf "Cloudflare 优选 cfip，可填多个 IP/域名（空格分隔）\n"
 printf "推荐：cloudflare-ech.com www.visa.com.sg\n"
 printf "回车使用默认优选域名，del 清除，0 返回："
 IFS= read -r val
 [ "$val" = "0" ] && return 2
 if [ "$val" = "del" ] || [ "$val" = "none" ]; then
 cfip=
-rm -f "$HOME/lun/cdnip1" "$HOME/lun/cdnip2"
+clear_cdn_ip_list
 break
 fi
 [ -z "$val" ] && break
@@ -4461,15 +4477,10 @@ done
 # ---- 第三步：写入优选地址到配置文件 ----
 [ -n "$val" ] && cfip="$val"
 if [ -n "$cfip" ]; then
-set -- $cfip
-cdnip1="$1"
-cdnip2="$2"
-[ -n "$cdnip1" ] && printf "%s\n" "$cdnip1" > "$HOME/lun/cdnip1" || rm -f "$HOME/lun/cdnip1"
-[ -n "$cdnip2" ] && printf "%s\n" "$cdnip2" > "$HOME/lun/cdnip2" || rm -f "$HOME/lun/cdnip2"
-elif [ -n "$cdnym" ] && [ ! -s "$HOME/lun/cdnip1" ]; then
+save_cdn_ip_list "$cfip"
+elif [ -n "$cdnym" ] && [ -z "$(cdn_ip_list)" ]; then
 # 未设置优选地址但有回源 Host：写入默认优选域名
-printf "%s\n" "cloudflare-ech.com" > "$HOME/lun/cdnip1"
-printf "%s\n" "www.visa.com.sg" > "$HOME/lun/cdnip2"
+save_cdn_ip_list "cloudflare-ech.com www.visa.com.sg"
 fi
 export cdnym cfip
 }
