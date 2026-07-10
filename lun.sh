@@ -82,7 +82,7 @@ echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
-echo "风火轮一键无交互小钢炮脚本"
+echo "风火轮一键无交互脚本"
 echo "当前版本：V26.5.10"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
@@ -160,8 +160,16 @@ esac
 
 normalize_ptmap(){
 out=
+seen_ext=
+seen_inner=
 for pair in $1; do
 valid_ptmap_pair "$pair" || return 1
+ext=${pair%%-*}
+inner=${pair#*-}
+case " $seen_ext " in *" $ext "*) return 1 ;; esac
+case " $seen_inner " in *" $inner "*) return 1 ;; esac
+seen_ext="${seen_ext:+$seen_ext }$ext"
+seen_inner="${seen_inner:+$seen_inner }$inner"
 out="$out $pair"
 done
 printf '%s\n' "${out# }"
@@ -175,7 +183,7 @@ rm -f "$HOME/lun/port_map"
 ptmap=
 ;;
 *)
-normalized=$(normalize_ptmap "$ptmap") || { echo "ptmap 格式错误，请使用 外网端口-内网端口，例如：54834-2096 54835-8443"; exit 1; }
+normalized=$(normalize_ptmap "$ptmap") || { echo "ptmap 格式错误或存在重复公网/内网端口，请使用 外网端口-内网端口，例如：54834-2096 54835-8443"; exit 1; }
 ptmap="$normalized"
 printf "%s\n" "$ptmap" > "$HOME/lun/port_map"
 ;;
@@ -358,8 +366,14 @@ printf '%s\n' "${out# }"
 append_ptmap_pair(){
 pair=$1
 valid_ptmap_pair "$pair" || return 1
+ext=${pair%%-*}
+inner=${pair#*-}
 for exist in $ptmap; do
 [ "$exist" = "$pair" ] && return 0
+exist_ext=${exist%%-*}
+exist_inner=${exist#*-}
+[ "$exist_ext" = "$ext" ] && return 1
+[ "$exist_inner" = "$inner" ] && return 1
 done
 ptmap="${ptmap:+$ptmap }$pair"
 printf "%s\n" "$ptmap" > "$HOME/lun/port_map"
@@ -1059,7 +1073,7 @@ fi
 if [ -n "$xhp" ]; then
 xhp=xhpt
 if [ -z "$port_xh" ] && [ ! -e "$HOME/lun/port_xh" ]; then
-port_xh=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_xh=$(random_port 2>/dev/null) || { echo "VLESS XHTTP Reality 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_xh" > "$HOME/lun/port_xh"
 elif [ -n "$port_xh" ]; then
 echo "$port_xh" > "$HOME/lun/port_xh"
@@ -1112,7 +1126,7 @@ fi
 if [ -n "$vxp" ]; then
 vxp=vxpt
 if [ -z "$port_vx" ] && [ ! -e "$HOME/lun/port_vx" ]; then
-port_vx=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_vx=$(random_port 2>/dev/null) || { echo "VLESS XHTTP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_vx" > "$HOME/lun/port_vx"
 elif [ -n "$port_vx" ]; then
 echo "$port_vx" > "$HOME/lun/port_vx"
@@ -1159,7 +1173,7 @@ fi
 if [ -n "$vwp" ]; then
 vwp=vwpt
 if [ -z "$port_vw" ] && [ ! -e "$HOME/lun/port_vw" ]; then
-port_vw=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_vw=$(random_port 2>/dev/null) || { echo "VLESS WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_vw" > "$HOME/lun/port_vw"
 elif [ -n "$port_vw" ]; then
 echo "$port_vw" > "$HOME/lun/port_vw"
@@ -1204,7 +1218,7 @@ fi
 if [ -n "$vlp" ]; then
 vlp=vlpt
 if [ -z "$port_vl_re" ] && [ ! -e "$HOME/lun/port_vl_re" ]; then
-port_vl_re=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_vl_re=$(random_port 2>/dev/null) || { echo "VLESS TCP Reality 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_vl_re" > "$HOME/lun/port_vl_re"
 elif [ -n "$port_vl_re" ]; then
 echo "$port_vl_re" > "$HOME/lun/port_vl_re"
@@ -1271,7 +1285,7 @@ prepare_runtime_cert
 if [ -n "$hyp" ]; then
 hyp=hypt
 if [ -z "$port_hy2" ] && [ ! -e "$HOME/lun/port_hy2" ]; then
-port_hy2=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_hy2=$(random_port 2>/dev/null) || { echo "Hysteria2 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_hy2" > "$HOME/lun/port_hy2"
 elif [ -n "$port_hy2" ]; then
 echo "$port_hy2" > "$HOME/lun/port_hy2"
@@ -1306,7 +1320,7 @@ fi
 if [ -n "$tup" ]; then
 tup=tupt
 if [ -z "$port_tu" ] && [ ! -e "$HOME/lun/port_tu" ]; then
-port_tu=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_tu=$(random_port 2>/dev/null) || { echo "TUIC 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_tu" > "$HOME/lun/port_tu"
 elif [ -n "$port_tu" ]; then
 echo "$port_tu" > "$HOME/lun/port_tu"
@@ -1342,7 +1356,7 @@ fi
 if [ -n "$anp" ]; then
 anp=anpt
 if [ -z "$port_an" ] && [ ! -e "$HOME/lun/port_an" ]; then
-port_an=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_an=$(random_port 2>/dev/null) || { echo "AnyTLS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_an" > "$HOME/lun/port_an"
 elif [ -n "$port_an" ]; then
 echo "$port_an" > "$HOME/lun/port_an"
@@ -1392,7 +1406,7 @@ private_key_s=$(cat "$HOME/lun/sbk/private_key")
 public_key_s=$(cat "$HOME/lun/sbk/public_key")
 short_id_s=$(cat "$HOME/lun/sbk/short_id")
 if [ -z "$port_ar" ] && [ ! -e "$HOME/lun/port_ar" ]; then
-port_ar=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_ar=$(random_port 2>/dev/null) || { echo "Any-Reality 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_ar" > "$HOME/lun/port_ar"
 elif [ -n "$port_ar" ]; then
 echo "$port_ar" > "$HOME/lun/port_ar"
@@ -1436,7 +1450,7 @@ sskey=$("$HOME/lun/sing-box" generate rand 16 --base64)
 echo "$sskey" > "$HOME/lun/sskey"
 fi
 if [ -z "$port_ss" ] && [ ! -e "$HOME/lun/port_ss" ]; then
-port_ss=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_ss=$(random_port 2>/dev/null) || { echo "Shadowsocks-2022 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_ss" > "$HOME/lun/port_ss"
 elif [ -n "$port_ss" ]; then
 echo "$port_ss" > "$HOME/lun/port_ss"
@@ -1463,7 +1477,7 @@ xrsbvm(){
 if [ -n "$vmp" ]; then
 vmp=vmpt
 if [ -z "$port_vm_ws" ] && [ ! -e "$HOME/lun/port_vm_ws" ]; then
-port_vm_ws=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_vm_ws=$(random_port 2>/dev/null) || { echo "VMess WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_vm_ws" > "$HOME/lun/port_vm_ws"
 elif [ -n "$port_vm_ws" ]; then
 echo "$port_vm_ws" > "$HOME/lun/port_vm_ws"
@@ -1533,7 +1547,7 @@ xrsbso(){
 if [ -n "$sop" ]; then
 sop=sopt
 if [ -z "$port_so" ] && [ ! -e "$HOME/lun/port_so" ]; then
-port_so=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+port_so=$(random_port 2>/dev/null) || { echo "Socks5 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
 echo "$port_so" > "$HOME/lun/port_so"
 elif [ -n "$port_so" ]; then
 echo "$port_so" > "$HOME/lun/port_so"
@@ -3567,11 +3581,24 @@ return 1
 
 port_reserved(){
 p=$1
+p_public=$(client_port "$p")
 for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu" "$subpt"; do
+[ -n "$used" ] || continue
+used_public=$(client_port "$used")
 [ "$used" = "$p" ] && return 0
+[ "$used_public" = "$p" ] && return 0
+[ "$used" = "$p_public" ] && return 0
+[ "$used_public" = "$p_public" ] && return 0
 done
 for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu" "$HOME/lun/subport.log"; do
-[ -s "$file" ] && [ "$(cat "$file" 2>/dev/null)" = "$p" ] && return 0
+[ -s "$file" ] || continue
+used=$(cat "$file" 2>/dev/null)
+[ -n "$used" ] || continue
+used_public=$(client_port "$used")
+[ "$used" = "$p" ] && return 0
+[ "$used_public" = "$p" ] && return 0
+[ "$used" = "$p_public" ] && return 0
+[ "$used_public" = "$p_public" ] && return 0
 done
 return 1
 }
@@ -3599,12 +3626,13 @@ port_reserved "$p" && continue
 port_in_use "$p" || { printf '%s\n' "$p"; return 0; }
 done
 fi
-for _try in 1 2 3 4 5 6 7 8 9 10; do
+for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 p=$(shuf -i 10000-65535 -n 1)
 port_reserved "$p" && continue
 port_in_use "$p" || { printf '%s\n' "$p"; return; }
 done
-shuf -i 10000-65535 -n 1
+echo "没有找到可用端口，请扩容端口池或手动输入端口。" >&2
+return 1
 }
 
 random_port(){
@@ -3618,12 +3646,13 @@ done
 echo "端口池内没有可用端口，请扩容端口池或手动输入端口。" >&2
 return 1
 fi
-for _try in 1 2 3 4 5 6 7 8 9 10; do
+for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 p=$(shuf -i 10000-65535 -n 1)
 port_reserved "$p" && continue
 port_in_use "$p" || { printf '%s\n' "$p"; return; }
 done
-shuf -i 10000-65535 -n 1
+echo "没有找到可用端口，请扩容端口池或手动输入端口。" >&2
+return 1
 }
 
 prompt_port(){
@@ -3657,6 +3686,15 @@ val="$mapped_inner"
 fi
 if ! port_valid "$val"; then
 echo "端口必须是 1-65535 的数字。"
+continue
+fi
+if port_reserved "$val"; then
+public_val=$(client_port "$val")
+if [ "$public_val" != "$val" ]; then
+echo "端口 $val 或对应公网端口 $public_val 已被当前 Lun 协议/订阅占用，请换一个。"
+else
+echo "端口 $val 已被当前 Lun 协议/订阅占用，请换一个。"
+fi
 continue
 fi
 ensure_port_available "$val" || continue
@@ -3789,7 +3827,7 @@ echo "**********************************************************"
 # CF 橙云只支持特定端口回源：
 #   HTTP 系（明文）：80、8080、8880、2052、2082、2086、2095
 #   HTTPS 系（加密）：443、8443、2053、2083、2087、2096
-# 返回 http 或 https，端口不在列表内则返回失败（return 1）
+# 返回 http 或 https；端口不在列表内时仅表示不属于 Cloudflare 橙云官方端口。
 cf_port_mode(){
 case "$1" in
 80|8080|8880|2052|2082|2086|2095) printf 'http\n' ;;
@@ -3836,11 +3874,12 @@ yellow_line "CDN提示：$1"
 
 # ============ 显示 CDN 端口建议 ============
 # 遍历所有支持 CDN 的协议（VLESS XHTTP、VLESS WS、VMess WS）
-# 检查它们的公网端口是否在 Cloudflare 橙云支持端口列表内
-# 如果端口匹配，显示可生成 CDN 变体；否则提示需要更换端口
+# 检查它们的公网端口是否在 Cloudflare 橙云支持端口列表内。
+# 不在列表内也会输出普通 CDN/优选入口节点，只是不适合直接套 CF 橙云。
 show_cdn_port_advice(){
 echo "Cloudflare 橙云普通代理端口：80/8080/8880/2052/2082/2086/2095 或 443/8443/2053/2083/2087/2096。"
-echo "NAT VPS 请确保公网端口在上述列表内；只有内网端口匹配不算。"
+echo "仅当域名开启 Cloudflare 橙云代理时才必须使用这些公网端口；普通 CDN/优选 IP/自建反代不因此阻止输出节点。"
+echo "NAT VPS 若套橙云，请看公网端口是否在列表内；只有内网端口匹配不算。"
 found=
 for item in \
 "VLESS XHTTP:$HOME/lun/port_vx" \
@@ -3856,18 +3895,18 @@ mode=$(cf_port_mode "$public" 2>/dev/null || true)
 if [ -n "$mode" ]; then
 green_line "$label 可生成 CDN 变体：内网端口 $inner，公网端口 $public，CF 模式 $mode。"
 else
-yellow_line "$label 当前公网端口 $public 不在 CF 支持端口内，将只保留直连节点。"
-yellow_line "  提示：可通过 lun 菜单 → 安装/协议管理 修改端口为 CF 支持端口，以启用 CDN 加速。"
+yellow_line "$label 当前公网端口 $public 不在 CF 橙云官方端口内；若未套橙云，仍会继续输出 CDN/优选节点。"
+yellow_line "  如需 Cloudflare 橙云代理，请通过 lun 菜单 → 安装/协议管理 改为 CF 支持端口。"
 fi
 done
-[ -n "$found" ] || yellow_line "当前没有 VMess WS / VLESS WS / VLESS XHTTP 非 Reality，普通橙云 CDN 不会生成节点；可使用 CF 隧道/Argo。"
+[ -n "$found" ] || yellow_line "当前没有 VMess WS / VLESS WS / VLESS XHTTP 非 Reality，普通 CDN/优选入口不会生成节点；可使用 CF 隧道/Argo。"
 }
 
 # ============ 生成 VLESS CDN 优选节点链接 ============
 # 参数：$1=节点标签  $2=基础名称  $3=协议端口  $4=URL查询参数
 # 流程：
 #   1. 检查 cdnym（回源Host域名）是否存在，没有则跳过
-#   2. 获取公网端口并判断 CF 端口模式（http/https）
+#   2. 获取公网端口，并按协议原有逻辑生成链接；CF 端口模式仅用于提示与 tls 推断
 #   3. 读取 CDN 优选地址列表（cdnip 或旧 cdnip1/cdnip2/...）
 #   4. 为每个优选地址生成一条 CDN 节点链接
 # CDN 节点原理：add=优选地址（客户端连CF入口），host=回源域名（CF回源到VPS）
@@ -3880,13 +3919,9 @@ query=$4
 [ -n "$xvvmcdnym" ] || { cdn_skip "$label 缺少 CDN 回源 Host，已跳过 CDN 变体。请在 lun → 入口网络管理 → CDN 中设置回源 Host 域名。"; return 0; }
 # 获取公网端口（NAT 模式下可能不同于内网端口）
 public_port=$(client_port "$port")
-# 判断端口是否在 CF 橙云支持列表内
-mode=$(cf_port_mode "$public_port" 2>/dev/null) || {
-cdn_skip "$label 的公网端口 $public_port 不在 Cloudflare 橙云支持端口内，已跳过 CDN 变体。"
-cdn_skip "支持端口：80/8080/8880/2052/2082/2086/2095（HTTP）或 443/8443/2053/2083/2087/2096（HTTPS）。"
-cdn_skip "请通过 lun → 安装/协议管理 修改该协议端口。"
-return 0
-}
+# 判断端口是否在 CF 橙云支持列表内；不在列表内时仍继续输出普通 CDN/优选节点
+mode=$(cf_port_mode "$public_port" 2>/dev/null || true)
+[ -z "$mode" ] && cdn_skip "$label 的公网端口 $public_port 不在 Cloudflare 橙云官方端口内；若未套橙云，仍继续输出 CDN/优选节点。"
 # 读取 CDN 优选地址，为空则写入默认值
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
@@ -3914,12 +3949,8 @@ append_vmess_cdn_links(){
 port=$1
 [ -n "$xvvmcdnym" ] || { cdn_skip "VMess WS 缺少 CDN 回源 Host，已跳过 CDN 变体。请在 lun → 入口网络管理 → CDN 中设置回源 Host 域名。"; return 0; }
 public_port=$(client_port "$port")
-mode=$(cf_port_mode "$public_port" 2>/dev/null) || {
-cdn_skip "VMess WS 的公网端口 $public_port 不在 Cloudflare 橙云支持端口内，已跳过 CDN 变体。"
-cdn_skip "支持端口：80/8080/8880/2052/2082/2086/2095（HTTP）或 443/8443/2053/2083/2087/2096（HTTPS）。"
-cdn_skip "请通过 lun → 安装/协议管理 修改该协议端口。"
-return 0
-}
+mode=$(cf_port_mode "$public_port" 2>/dev/null || true)
+[ -z "$mode" ] && cdn_skip "VMess WS 的公网端口 $public_port 不在 Cloudflare 橙云官方端口内；若未套橙云，仍继续输出 CDN/优选节点。"
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
 echo "【 Vmess-ws-cdn 】CDN 优选节点信息如下："
@@ -4270,27 +4301,37 @@ printf "节点订阅分享内网监听端口（%s回车从内网端口池/随机
 else
 printf "节点订阅分享端口（%s回车从端口池/随机取%s，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"
 fi
-IFS= read -r subpt
-[ "$subpt" = "0" ] && return 2
-if [ -z "$subpt" ]; then
+IFS= read -r candidate_subpt
+[ "$candidate_subpt" = "0" ] && return 2
+if [ -z "$candidate_subpt" ]; then
 if is_nat_mode && [ -n "$ptmap" ]; then
-subpt=$(random_nat_port) || { echo "无法从NAT映射表取得可用订阅端口。"; continue; }
-echo "节点订阅分享从NAT映射表随机内网端口：$subpt"
+candidate_subpt=$(random_nat_port) || { echo "无法从NAT映射表取得可用订阅端口。"; continue; }
+echo "节点订阅分享从NAT映射表随机内网端口：$candidate_subpt"
 else
-subpt=$(random_port) || { echo "无法从端口池取得可用订阅端口。"; continue; }
+candidate_subpt=$(random_port) || { echo "无法从端口池取得可用订阅端口。"; continue; }
 if is_nat_mode; then
-echo "节点订阅分享随机内网端口：$subpt"
+echo "节点订阅分享随机内网端口：$candidate_subpt"
 else
-echo "节点订阅分享随机端口：$subpt"
+echo "节点订阅分享随机端口：$candidate_subpt"
 fi
 fi
 fi
-mapped_inner=$(inner_port_from_public "$subpt")
+mapped_inner=$(inner_port_from_public "$candidate_subpt")
 if [ -n "$mapped_inner" ]; then
-echo "检测到你输入的是公网端口 $subpt，已转换为订阅内网端口 $mapped_inner。"
-subpt="$mapped_inner"
+echo "检测到你输入的是公网端口 $candidate_subpt，已转换为订阅内网端口 $mapped_inner。"
+candidate_subpt="$mapped_inner"
 fi
-if port_valid "$subpt" && ensure_port_available "$subpt"; then
+if port_valid "$candidate_subpt" && port_reserved "$candidate_subpt"; then
+public_subpt=$(client_port "$candidate_subpt")
+if [ "$public_subpt" != "$candidate_subpt" ]; then
+echo "订阅端口 $candidate_subpt 或对应公网端口 $public_subpt 已被当前 Lun 协议/订阅占用，请换一个。"
+else
+echo "订阅端口 $candidate_subpt 已被当前 Lun 协议/订阅占用，请换一个。"
+fi
+continue
+fi
+if port_valid "$candidate_subpt" && ensure_port_available "$candidate_subpt"; then
+subpt="$candidate_subpt"
 show_port_mapping_hint "$subpt"
 break
 fi
@@ -4409,10 +4450,10 @@ esac
 prompt_cdn(){
 echo "========== CDN 优选 IP 加速配置 =========="
 echo "cdnym（回源域名）：你自己的域名，须已解析到 VPS IP，CF 通过它找到你的服务器"
-echo "cfip（优选地址）：客户端实际连接的 CF 入口，填 IP 或域名，如 cloudflare-ech.com"
-echo "数据流向：客户端 → cfip(CF入口) → cdnym(你的域名) → VPS服务"
-echo "效果：隐藏 VPS 真实 IP，通过 Cloudflare CDN 中转，提升连接稳定性"
-echo "要求：协议端口必须在 CF 橙云支持端口列表内（见下方提示）"
+echo "cfip（优选地址）：客户端实际连接的 CDN/优选入口，填 IP 或域名，如 cloudflare-ech.com"
+echo "数据流向：客户端 → cfip(CDN入口) → cdnym(你的域名) → VPS服务"
+echo "说明：只有套 Cloudflare 橙云时才受 CF 官方端口限制；普通优选 IP/域名仍会输出节点"
+echo "提醒：只有套 Cloudflare 橙云时才要求公网端口在 CF 支持列表内（见下方提示）"
 echo "=========================================="
 show_cdn_port_advice
 cur_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
@@ -4782,7 +4823,7 @@ echo "NAT 端口映射已清除。"
 return 0
 ;;
 esac
-normalized=$(normalize_ptmap "$val") || { echo "映射格式错误，请使用 外网端口-内网端口，例如：54834-2096"; continue; }
+normalized=$(normalize_ptmap "$val") || { echo "映射格式错误或存在重复公网/内网端口，请使用 外网端口-内网端口，例如：54834-2096"; continue; }
 ptmap="$normalized"
 vpsmode=nat
 printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"
@@ -4999,20 +5040,25 @@ guided_auto_defaults(){
 if [ -z "$sub" ]; then
 sub=y
 subid=
+candidate_subpt=
+for _try in 1 2 3 4 5 6 7 8 9 10; do
 if is_nat_mode && [ -n "$ptmap" ]; then
-subpt=$(random_nat_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+candidate_subpt=$(random_nat_port 2>/dev/null) || candidate_subpt=
 else
-subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
+candidate_subpt=$(random_port 2>/dev/null) || candidate_subpt=
 fi
-for _try in 1 2 3 4 5; do
-port_in_use "$subpt" 2>/dev/null || break
-if is_nat_mode && [ -n "$ptmap" ]; then
-subpt=$(random_nat_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
-else
-subpt=$(random_port 2>/dev/null) || subpt=$(shuf -i 10000-65535 -n 1 2>/dev/null) || subpt=8443
-fi
+[ -n "$candidate_subpt" ] || continue
+port_reserved "$candidate_subpt" && { candidate_subpt=; continue; }
+port_in_use "$candidate_subpt" 2>/dev/null && { candidate_subpt=; continue; }
+break
 done
+if [ -n "$candidate_subpt" ]; then
+subpt="$candidate_subpt"
 echo "已自动启用节点订阅分享，随机端口：$subpt"
+else
+sub=
+echo "节点订阅分享没有取得可用端口，已跳过；可稍后在菜单里手动设置订阅端口。"
+fi
 fi
 if [ -z "$uuid" ] || [ ! -s "$HOME/lun/uuid" ]; then
 uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid 2>/dev/null) || uuid="lun-$(date +%s 2>/dev/null)"
@@ -5574,7 +5620,10 @@ if [ -z "$subpt" ]; then
 if [ -n "$(cat "$HOME/lun/subport.log" 2>/dev/null)" ]; then
 subport=$(cat $HOME/lun/subport.log)
 else
-subport=$(random_port 2>/dev/null || shuf -i 10000-65535 -n 1)
+subport=$(random_port 2>/dev/null) || {
+echo "订阅服务无法取得可用端口，已跳过订阅服务启动。"
+return 1
+}
 fi
 else
 subport="$subpt"
@@ -5583,6 +5632,11 @@ mapped_inner=$(inner_port_from_public "$subport")
 [ -n "$mapped_inner" ] && subport="$mapped_inner"
 if ! port_valid "$subport"; then
 echo "订阅端口 $subport 无效，已跳过订阅服务启动。"
+return 1
+fi
+saved_subport=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+if [ "$saved_subport" != "$subport" ] && port_reserved "$subport"; then
+echo "订阅端口 $subport 已被当前 Lun 协议/订阅占用，已跳过订阅服务启动。"
 return 1
 fi
 echo $subport > $HOME/lun/subport.log

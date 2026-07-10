@@ -1,6 +1,6 @@
 # 风火轮
 
-风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于甬哥小钢炮（argosbx） 的开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
+风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
 ## 快速开始
 
@@ -102,7 +102,7 @@ CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点
 **使用条件：**
 1. 设置 `cdnym`：一个已解析到 VPS IP 的域名（用于 CF 回源）
 2. 设置 `cfip`（可选）：CDN 优选地址，留空则使用默认 `cloudflare-ech.com`
-3. 协议端口必须在 CF 橙云支持端口列表内
+3. 若域名开启 Cloudflare 橙云代理，客户端访问的公网端口必须在 CF 橙云支持端口列表内；普通 CDN/优选 IP/自建反代不受这个端口表限制，脚本仍会输出 CDN 节点
 
 **支持 CDN 的协议：** VMess WS、VLESS WS、VLESS XHTTP（非 Reality）
 **不支持 CDN 的协议：** Reality、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
@@ -116,7 +116,7 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 **推荐 CDN 优选域名：** `cloudflare-ech.com`、`www.visa.com.sg`、`www.wto.org`、`www.web.com`（也可使用 CF 优选 IP）
 
-NAT VPS 要看客户端访问的公网端口是否在上述列表内；只有内网端口匹配并不能让橙云回源生效。没有可用公网端口时，可使用直连 NAT 映射端口或 CF 隧道 / Argo。
+NAT VPS 只有在套 Cloudflare 橙云时才需要看客户端访问的公网端口是否在上述列表内；只有内网端口匹配并不能让橙云回源生效。未套橙云时，普通 CDN 优选 IP/域名或自建反代按实际入口配置使用，脚本不会因为端口不在表内而删除 CDN 节点。
 
 **示例：**
 
@@ -156,7 +156,7 @@ ptmap="54834-2096 54835-8443" vlpt="2096" anpt="8443" bash <(curl -Ls https://ra
 
 ## 端口池
 
-普通 VPS 只需要设置一个端口池，协议端口和节点订阅分享端口随机时会直接从池内取值。NAT VPS 推荐使用 `inpool/outpool` 分别设置内网端口池和外网端口池；设置外网端口池后，会按位置自动映射到内网端口池，只改变客户端看到的端口，不写 iptables。
+普通 VPS 只需要设置一个端口池，协议端口和节点订阅分享端口随机时会直接从池内取值。NAT VPS 推荐使用 `inpool/outpool` 分别设置内网端口池和外网端口池；设置外网端口池后，会按位置自动映射到内网端口池，只改变客户端看到的端口，不写 iptables。随机取端口时会跳过已被当前协议、订阅服务或 NAT 映射占用的端口；手动输入重复端口或重复映射会被拒绝并要求重填。
 
 ```bash
 inpool="1000+1010 8080" outpool="49096+49106 51046" vwpt="" sub="y" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
