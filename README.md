@@ -34,7 +34,7 @@ lun
 0. 退出
 ```
 
-引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。“入口网络管理”精简为 VPS/端口、CDN/CF 优选、NAT Origin Rules、CF 隧道/Argo、CDN 诊断；普通 VPS 不显示回源端口改写流程。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。“入口网络管理”精简为 VPS/端口、CDN/CF 优选、NAT Origin Rules（端口回源）、CF 隧道/Argo、CDN 诊断；普通 VPS 不显示回源端口改写流程。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
 Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`。
 
@@ -71,11 +71,13 @@ vlpt="" vmpt="" hypt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78l
 | 变量 | 用途 |
 | --- | --- |
 | `domain` | 服务域名，用于 ACME 域名证书、TLS 节点 SNI，并默认作为普通节点客户端地址 |
-| `certmode` | `self`、`domain`、`dns`、`ip`，默认 `self` |
+| `certmode` | `self`、`origin`、`ca`、`domain`、`dns`、`ip`，默认 `self` |
 | `acme_email` | Let’s Encrypt 账户邮箱 |
 | `acme_dns` | acme.sh DNS provider，例如 `dns_cf`、`dns_ali` |
 
-`certmode=self` 会生成本地 ECDSA 自签证书。`domain` 使用 HTTP-01，要求域名 A/AAAA 已解析到本机且 80 端口可访问。`dns` 使用 acme.sh 原生 DNS API。`ip` 使用 Let’s Encrypt short-lived IP 证书，仅走 HTTP-01。
+`certmode=self` 会生成本地 ECDSA 自签证书。`origin` 表示 Cloudflare Origin CA 等仅供服务商回源验证的证书，`ca` 表示公开 CA 签发证书。`domain` 使用 HTTP-01，`dns` 使用 acme.sh 原生 DNS API，`ip` 使用 Let’s Encrypt short-lived IP 证书。
+
+引导式安装的证书步骤和“证书管理”菜单都支持搜索并导入本机证书。建议将证书与私钥放入 `~/lun/import/`；脚本也会自动搜索 `~/lun`、`/root/key`、`/root/cert`、acme.sh 与 Let’s Encrypt 常用目录，通过公钥匹配证书和私钥。发现多个证书时会优先推荐“域名匹配、未过期、私钥匹配、服务商/CA 签发”的证书；输入编号可自行选择，输入 `0` 返回，直接回车导入推荐项。
 
 DNS API 凭据按 acme.sh 原生环境变量保存到 `/root/lun/cert.env`，权限为 `600`。
 
@@ -124,9 +126,9 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 普通 VPS 使用同端口 CDN 优选：客户端边缘端口与协议端口相同，不需要 Origin Rules，继续沿用旧版可用流程。
 
-NAT Origin Rules 已从普通 CDN 配置中独立出来，仅 NAT VPS 可开启。客户端连接 Cloudflare 的 `8080` 或 `2096`，Cloudflare 再按 Host 与协议 Path 把目标端口改写为 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。
+NAT Origin Rules（端口回源）已从普通 CDN 配置中独立出来，仅 NAT VPS 可开启。客户端连接 Cloudflare 的 `8080` 或 `2096`，Cloudflare 再按 Host 与协议 Path 把目标端口改写为 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。
 
-`2096` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；证书有效且主体与回源 Host 一致时可使用 Full (Strict)。切换 `8080/2096` 只重建配置并重启服务，不重新下载内核。
+`2096` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换 `8080/2096` 只重建配置并重启服务，不重新下载内核。
 
 **示例：**
 
