@@ -34,7 +34,7 @@ lun
 0. 退出
 ```
 
-引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。CDN / 优选 IP 和 CF 隧道 / Argo 都在“入口网络管理”里单独配置。每一步都会显示当前已选内容；输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。二次进入引导时可保留、新增、改端口或删除已有协议。
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。“入口网络管理”精简为 VPS/端口、CDN/CF 优选、NAT Origin Rules、CF 隧道/Argo、CDN 诊断；普通 VPS 不显示回源端口改写流程。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
 Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`。
 
@@ -92,6 +92,7 @@ Reality、Argo 和 CDN 仍然独立：
 | `argoip` | Argo 优选 IP 或域名（与 cfip 独立），可填多个值 |
 | `cdnmode` | `standard` 同端口模式；`rewrite` 为 NAT 回源端口改写模式 |
 | `cdnpt` | NAT 改写模式的 Cloudflare 边缘端口：`8080` 或 `2096` |
+| `cdnproto` | CDN 节点协议：默认 `xhttp`；`all` 兼容输出 XHTTP、VLESS WS、VMess WS |
 | `addrmode` | 普通节点地址输出：`domain`、`ipv4`、`ipv6`、`dual`、`all` |
 
 `agk` 可直接粘贴完整的 `cloudflared.exe service install ey...` 命令，脚本会自动提取 `ey...` token。
@@ -103,12 +104,13 @@ CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点
 启用 CDN Host 不会强制把普通节点地址改回服务器 IP；如果你设置了 `domain/addym`，订阅里的直连节点仍可继续使用域名。CDN 节点会额外使用 `cfip` 作为 Cloudflare 入口地址。
 
 **使用条件：**
-1. 设置 `cdnym`：一个已解析到 VPS IP 的域名（用于 CF 回源）
-2. 在 Cloudflare 为该域名开启橙云；灰云只做 DNS 解析，不能把手动填写的 Cloudflare 优选 IP 回源到 VPS
-3. 设置 `cfip`（可选）：可混合填写多个 IPv4、IPv6 或域名，脚本会去重并为每个入口生成唯一节点名
-4. 选择同端口或 NAT 端口改写模式
+1. 设置 `cdnym`：Cloudflare 接收请求时使用的 Host 域名。
+2. 设置 `cfip`：可混合填写多个 IPv4、IPv6 或域名，脚本会去重并生成唯一节点名。
+3. 客户端直接连接 `cfip` 时，不依赖客户端把 `cdnym` 解析到哪个地址；脚本以实际 CF 边缘诊断为准。直接使用 `cdnym` 作为入口时应开启橙云。
+4. 默认仅生成 VLESS XHTTP CDN，WS 协议保留直连；需要旧式多协议输出时设置 `cdnproto=all`。
 
-**支持 CDN 的协议：** VMess WS、VLESS WS、VLESS XHTTP（非 Reality）
+**默认 CDN 协议：** VLESS XHTTP（非 Reality）
+**高级兼容协议：** 设置 `cdnproto=all` 后额外生成 VMess WS、VLESS WS
 **不支持 CDN 的协议：** Reality、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
 
 Cloudflare 橙云支持端口：
@@ -120,17 +122,27 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 **推荐 CDN 优选域名：** `cloudflare-ech.com`、`www.visa.com.sg`、`www.wto.org`、`www.web.com`（也可使用 CF 优选 IP）
 
-同端口模式下，客户端连接端口与 NAT 公网回源端口相同，该公网端口必须在上述 Cloudflare 列表内。
+普通 VPS 使用同端口 CDN 优选：客户端边缘端口与协议端口相同，不需要 Origin Rules，继续沿用旧版可用流程。
 
-NAT 端口改写模式用于运营商没有分配 CF 官方公网端口的情况：客户端连接 Cloudflare 的 `8080` 或 `2096`，再通过 Cloudflare Origin Rule 按 Host 和协议 Path 把目标端口改写为 NAT 公网映射端口。例如协议映射为 `56567 → 8080` 时，客户端节点使用边缘端口 `8080`，Origin Rule 的目标端口填写 `56567`。脚本会在 CDN 菜单中显示每个协议对应的准确规则。
+NAT Origin Rules 已从普通 CDN 配置中独立出来，仅 NAT VPS 可开启。客户端连接 Cloudflare 的 `8080` 或 `2096`，Cloudflare 再按 Host 与协议 Path 把目标端口改写为 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。
 
 `2096` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；证书有效且主体与回源 Host 一致时可使用 Full (Strict)。切换 `8080/2096` 只重建配置并重启服务，不重新下载内核。
 
 **示例：**
 
+普通 VPS：
+
 ```bash
-vmpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234 cloudflare-ech.com" cdnmode="rewrite" cdnpt="8080" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+vxpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234" cdnproto="xhttp" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
+
+NAT VPS Origin Rules：
+
+```bash
+vpsmode="nat" vxpt="8080" ptmap="56567-8080" cdnym="proxy.example.com" cfip="108.162.198.31" cdnmode="rewrite" cdnpt="8080" cdnproto="xhttp" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+HTTP `8080` 节点会显式写入 `security=none`，HTTPS `2096` 节点才写入 TLS。节点名称同时包含 `HTTP-8080` 或 `HTTPS-2096`，避免 v2rayN 在切换模式后沿用旧的 TLS/Reality/PublicKey 字段。
 
 ## 普通节点地址输出
 
@@ -239,6 +251,5 @@ ghcr.io/azk78lun-collab/lun:latest
 
 - **Xray-core** ([XTLS/Xray-core](https://github.com/XTLS/Xray-core)) — 提供 VLESS / VMess / Reality / XHTTP 等协议内核
 - **sing-box** ([SagerNet/sing-box](https://github.com/SagerNet/sing-box)) — 提供 Hysteria2 / Tuic / AnyTLS / Shadowsocks 等协议内核
-- **甬哥的 argosbx** ([yonggekkk/argosbx](https://github.com/yonggekkk/argosbx)) — 本项目原始脚本来源，感谢甬哥（@yonggekkk）开源的 argosbx 脚本框架
 
-感谢以上项目的开发者与维护者，正是他们的开源精神让本项目成为可能。
+感谢以上核心项目的开发者与维护者。

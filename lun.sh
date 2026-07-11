@@ -66,6 +66,7 @@ export argoip=${argoip:-''}
 export subipmode=${subipmode:-''}
 export cdnmode=${cdnmode:-''}
 export cdnpt=${cdnpt:-''}
+export cdnproto=${cdnproto:-''}
 export addrmode=${addrmode:-''}
 export domain=${domain:-''}
 export certmode=${certmode:-''}
@@ -87,7 +88,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.11"
+echo "当前版本：V26.7.11.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -344,6 +345,29 @@ elif [ -s "$HOME/lun/cdn_edge_port" ]; then
 cdnpt=$(cat "$HOME/lun/cdn_edge_port" 2>/dev/null)
 fi
 [ "$cdnmode" = rewrite ] && [ -z "$cdnpt" ] && cdnpt=8080
+
+if [ -n "$cdnproto" ]; then
+case "$cdnproto" in
+xhttp|all) printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol" ;;
+del|none|off) rm -f "$HOME/lun/cdn_protocol"; cdnproto=xhttp ;;
+*) echo "cdnproto 只支持 xhttp 或 all。"; exit 1 ;;
+esac
+elif [ -s "$HOME/lun/cdn_protocol" ]; then
+cdnproto=$(cat "$HOME/lun/cdn_protocol" 2>/dev/null)
+elif [ "$_lun_installed" = yes ]; then
+# 旧安装没有此文件时保留原来的多协议 CDN 输出；进入快速配置后迁移为 XHTTP。
+cdnproto=all
+else
+cdnproto=xhttp
+fi
+case "$cdnproto" in xhttp|all) ;; *) cdnproto=xhttp ;; esac
+
+if ! is_nat_mode && [ "$cdnmode" = rewrite ]; then
+cdnmode=standard
+cdnpt=
+printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
+rm -f "$HOME/lun/cdn_edge_port"
+fi
 }
 
 load_address_mode_config(){
@@ -374,6 +398,17 @@ esac
 return 1
 }
 
+cdn_rewrite_active(){
+is_nat_mode && [ "$cdnmode" = rewrite ]
+}
+
+cdn_protocol_enabled(){
+case "$cdnproto:$1" in
+xhttp:xhttp|all:xhttp|all:ws|all:vmess) return 0 ;;
+*) return 1 ;;
+esac
+}
+
 client_port(){
 inner=$1
 if is_nat_mode; then
@@ -397,7 +432,7 @@ case "$1" in 443|8443|2053|2083|2087|2096) return 0 ;; *) return 1 ;; esac
 
 cdn_client_port(){
 origin_inner=$1
-if [ "$cdnmode" = rewrite ]; then
+if cdn_rewrite_active; then
 printf '%s\n' "${cdnpt:-8080}"
 else
 client_port "$origin_inner"
@@ -406,7 +441,7 @@ fi
 
 cdn_origin_tls_for_port(){
 [ -n "$cdnym" ] || [ -s "$HOME/lun/cdnym" ] || return 1
-[ "$cdnmode" = rewrite ] && [ "${cdnpt:-8080}" = 2096 ]
+cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ]
 }
 
 effective_address_mode(){
@@ -2165,7 +2200,7 @@ mkdir -p "$HOME/bin"
 fi
 install_lun_entry "$SCRIPT_PATH" || { echo "Lun脚本安装失败，请检查网络后重试。"; exit 1; }
 if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
-echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" cdnmode=\"${cdnmode}\" cdnpt=\"${cdnpt}\" addrmode=\"${addrmode}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
+echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" cdnmode=\"${cdnmode}\" cdnpt=\"${cdnpt}\" cdnproto=\"${cdnproto}\" addrmode=\"${addrmode}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
 fi
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
 if [ "$SCRIPT_PATH" = "$HOME/bin/lun" ]; then
@@ -2567,14 +2602,14 @@ if grep vless-xhttp "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-xhttp-enc 】支持ENC加密，节点信息如下："
 port_vx=$(cat "$HOME/lun/port_vx")
 client_port_vx=$(client_port "$port_vx")
-vx_direct_extra=
+vx_direct_extra="&security=none"
 if cdn_origin_tls_for_port "$port_vx"; then
 vx_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
 fi
 vl_vx_link="vless://$uuid@$client_addr:$client_port_vx?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto$vx_direct_extra#${sxname}vl-xhttp-enc-$hostname$node_name_suffix"
 append_share_link "$vl_vx_link"
 echo
-if [ -f "$HOME/lun/cdnym" ]; then
+if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled xhttp; then
 append_vless_cdn_links "Vless-xhttp-enc-cdn" "vl-xhttp-enc" "$port_vx" "encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto"
 fi
 fi
@@ -2582,14 +2617,14 @@ if grep vless-ws "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-ws-enc 】支持ENC加密，节点信息如下："
 port_vw=$(cat "$HOME/lun/port_vw")
 client_port_vw=$(client_port "$port_vw")
-vw_direct_extra=
+vw_direct_extra="&security=none"
 if cdn_origin_tls_for_port "$port_vw"; then
 vw_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
 fi
 vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw$vw_direct_extra#${sxname}vl-ws-enc-$hostname$node_name_suffix"
 append_share_link "$vl_vw_link"
 echo
-if [ -f "$HOME/lun/cdnym" ]; then
+if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled ws; then
 append_vless_cdn_links "Vless-ws-enc-cdn" "vl-ws-enc" "$port_vw" "encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw"
 fi
 fi
@@ -2767,7 +2802,7 @@ EOF
 clvmpt1(){
 echo "- ${sxname}vmess-ws-$hostname$node_name_suffix"
 }
-if [ -f "$HOME/lun/cdnym" ]; then
+if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled vmess; then
 append_vmess_cdn_links "$port_vm_ws"
 fi
 fi
@@ -4170,11 +4205,11 @@ yellow_line "CDN提示：$1"
 # 不在列表内也会输出普通 CDN/优选入口节点，只是不适合直接套 CF 橙云。
 show_cdn_port_advice(){
 echo "Cloudflare 橙云普通代理端口：80/8080/8880/2052/2082/2086/2095 或 443/8443/2053/2083/2087/2096。"
-if [ "$cdnmode" = rewrite ]; then
+if cdn_rewrite_active; then
 echo "当前模式：NAT 端口改写。客户端连接 Cloudflare 边缘端口 ${cdnpt:-8080}，Cloudflare 再回源到每个协议的 NAT 公网端口。"
 [ "${cdnpt:-8080}" = 2096 ] && echo "2096 为 HTTPS：Lun 会启用源站 TLS；Cloudflare 自签证书使用 Full，匹配域名的有效证书可使用 Full (Strict)。"
 else
-echo "当前模式：同端口。客户端边缘端口与协议公网端口相同；Cloudflare 橙云要求它位于官方端口列表。"
+echo "当前模式：普通 CDN 优选。客户端直接连接优选入口，端口与协议公网端口相同；不使用 Origin Rules。"
 fi
 found=
 for item in \
@@ -4183,13 +4218,18 @@ for item in \
 "VMess WS:$HOME/lun/port_vm_ws"; do
 label=${item%%:*}
 file=${item#*:}
+case "$label" in
+"VLESS XHTTP") cdn_protocol_enabled xhttp || continue ;;
+"VLESS WS") cdn_protocol_enabled ws || continue ;;
+"VMess WS") cdn_protocol_enabled vmess || continue ;;
+esac
 [ -s "$file" ] || continue
 found=yes
 inner=$(cat "$file" 2>/dev/null)
 public=$(client_port "$inner")
 edge=$(cdn_client_port "$inner")
 mode=$(cf_port_mode "$edge" 2>/dev/null || true)
-if [ "$cdnmode" = rewrite ]; then
+if cdn_rewrite_active; then
 green_line "$label：Cloudflare 边缘端口 $edge → NAT 回源公网端口 $public → 内网监听端口 $inner。"
 elif [ -n "$mode" ]; then
 green_line "$label 可生成 CDN 变体：协议端口 $inner，客户端公网/边缘端口 $public，CF 模式 $mode。"
@@ -4223,7 +4263,7 @@ mode=$(cf_port_mode "$edge_port" 2>/dev/null || true)
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
 echo "【 $label 】CDN 优选节点信息如下："
-if [ "$cdnmode" = rewrite ]; then
+if cdn_rewrite_active; then
 echo "注：客户端边缘端口 $edge_port，Cloudflare Origin Rule 目标端口 $origin_public_port，服务器出站仍直连 VPS。"
 else
 echo "注：客户端边缘端口与回源公网端口均为 $edge_port，服务器出站仍直连 VPS。"
@@ -4236,12 +4276,15 @@ cdn_no=$(printf '%02d' "$cdn_index")
 cdn_kind=$(endpoint_kind "$cdn_ip")
 cdn_raw=$(json_host "$cdn_ip")
 cdn_uri=$(uri_host "$cdn_ip")
-cdn_name="${sxname}${base_name}-CDN-${cdn_kind}-${cdn_no}-$hostname"
 if [ "$mode" = "https" ]; then
+cdn_edge_label="HTTPS-$edge_port"
+cdn_name="${sxname}${base_name}-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
 cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome#$cdn_name"
 cdn_tls=true
 else
-cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym#$cdn_name"
+cdn_edge_label="HTTP-$edge_port"
+cdn_name="${sxname}${base_name}-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym&security=none#$cdn_name"
 cdn_tls=false
 fi
 echo "$cdn_link" >> "$HOME/lun/jhsub.txt"
@@ -4323,7 +4366,7 @@ mode=$(cf_port_mode "$edge_port" 2>/dev/null || true)
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
 echo "【 Vmess-ws-cdn 】CDN 优选节点信息如下："
-if [ "$cdnmode" = rewrite ]; then
+if cdn_rewrite_active; then
 echo "注：客户端边缘端口 $edge_port，Cloudflare Origin Rule 目标端口 $origin_public_port，服务器出站仍直连 VPS。"
 else
 echo "注：客户端边缘端口与回源公网端口均为 $edge_port，服务器出站仍直连 VPS。"
@@ -4335,11 +4378,14 @@ cdn_index=$((cdn_index + 1))
 cdn_no=$(printf '%02d' "$cdn_index")
 cdn_kind=$(endpoint_kind "$cdn_ip")
 cdn_raw=$(json_host "$cdn_ip")
-cdn_name="${sxname}vm-ws-CDN-${cdn_kind}-${cdn_no}-$hostname"
 if [ "$mode" = "https" ]; then
+cdn_edge_label="HTTPS-$edge_port"
+cdn_name="${sxname}vm-ws-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
 vm_cdn_json="{ \"v\": \"2\", \"ps\": \"$cdn_name\", \"add\": \"$cdn_raw\", \"port\": \"$edge_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$xvvmcdnym\", \"fp\": \"chrome\"}"
 cdn_tls=true
 else
+cdn_edge_label="HTTP-$edge_port"
+cdn_name="${sxname}vm-ws-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
 vm_cdn_json="{ \"v\": \"2\", \"ps\": \"$cdn_name\", \"add\": \"$cdn_raw\", \"port\": \"$edge_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}"
 cdn_tls=false
 fi
@@ -4395,10 +4441,10 @@ show_cdn_summary(){
 cdn_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 if [ -n "$cdn_host" ]; then
 cdn_ips=$(cdn_ip_list | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-if [ "$cdnmode" = rewrite ]; then
-echo "CDN：已启用  模式=NAT端口改写  边缘端口=${cdnpt:-8080}  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
+if cdn_rewrite_active; then
+echo "CDN：已启用  协议=${cdnproto:-xhttp}  模式=NAT Origin Rules  边缘端口=${cdnpt:-8080}  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
 else
-echo "CDN：已启用  模式=同端口  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
+echo "CDN：已启用  协议=${cdnproto:-xhttp}  模式=普通优选  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
 fi
 else
 echo "CDN：未启用"
@@ -4873,26 +4919,35 @@ esac
 show_cdn_origin_rules(){
 host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 [ -n "$host" ] || { echo "尚未设置 CDN Host。"; return 1; }
-if [ "$cdnmode" != rewrite ]; then
-echo "当前为同端口模式，不需要 Origin Rule 端口改写。"
+if ! is_nat_mode; then
+echo "普通 VPS 的 CDN 优选不需要 Origin Rules；客户端直接使用协议端口连接 Cloudflare 优选入口。"
+return 0
+fi
+if ! cdn_rewrite_active; then
+echo "当前 NAT VPS 使用普通同端口 CDN，没有启用 Origin Rules 端口改写。"
 return 0
 fi
 rule_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
 edge=${cdnpt:-8080}
 echo "Cloudflare 边缘端口：$edge"
-echo "请在 Cloudflare → Rules → Origin Rules 按以下 Host + Path 分别设置目标端口："
+echo "只按 HTTP/HTTPS 分流会把不同协议送到错误入站，请使用下面的 Host + Path 精确规则："
 for item in \
-"VLESS XHTTP:$HOME/lun/port_vx:$rule_uuid-vx" \
-"VLESS WS:$HOME/lun/port_vw:$rule_uuid-vw" \
-"VMess WS:$HOME/lun/port_vm_ws:$rule_uuid-vm"; do
-label=${item%%:*}
+"xhttp:VLESS XHTTP:$HOME/lun/port_vx:$rule_uuid-vx" \
+"ws:VLESS WS:$HOME/lun/port_vw:$rule_uuid-vw" \
+"vmess:VMess WS:$HOME/lun/port_vm_ws:$rule_uuid-vm"; do
+proto=${item%%:*}
+cdn_protocol_enabled "$proto" || continue
 rest=${item#*:}
+label=${rest%%:*}
+rest=${rest#*:}
 file=${rest%%:*}
 path=${rest#*:}
 [ -s "$file" ] || continue
 inner=$(cat "$file" 2>/dev/null)
 origin_public=$(client_port "$inner")
-printf '%s：Host 等于 %s，Path 以 /%s 开头，目标端口改写为 %s\n' "$label" "$host" "$path" "$origin_public"
+printf '\n%s\n' "$label"
+printf '匹配表达式：(http.host eq "%s" and starts_with(http.request.uri.path, "/%s"))\n' "$host" "$path"
+printf '目标端口：%s（NAT 公网端口，内网监听 %s）\n' "$origin_public" "$inner"
 done
 if [ "$edge" = 2096 ]; then
 cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
@@ -4915,17 +4970,17 @@ for one in $resolved; do
 printf '%s\n' "$locals" | grep -Fx "$one" >/dev/null 2>&1 && direct=yes
 done
 if [ "$direct" = yes ]; then
-yellow_line "$host 当前仍解析到本机公网地址，看起来是灰云/DNS only。使用 Cloudflare 优选入口前请开启橙云。"
+yellow_line "$host 当前直接解析到本机，属于灰云/DNS only。订阅若使用 CF 优选 IP 作为入口，仍会强制连接 Cloudflare 边缘，以实际诊断为准；直接使用该域名作为入口时应开启橙云。"
 else
-green_line "$host 未直接返回本机公网地址；请仍在 Cloudflare 控制台确认该记录已开启橙云。"
+green_line "$host 未直接返回本机公网地址；使用域名入口时请在 Cloudflare 控制台确认已开启橙云。"
 fi
 }
 
 cdn_probe_path(){
 probe_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
-if [ -s "$HOME/lun/port_vx" ]; then printf '%s\n' "$probe_uuid-vx"; return; fi
-if [ -s "$HOME/lun/port_vw" ]; then printf '%s\n' "$probe_uuid-vw"; return; fi
-if [ -s "$HOME/lun/port_vm_ws" ]; then printf '%s\n' "$probe_uuid-vm"; return; fi
+if cdn_protocol_enabled xhttp && [ -s "$HOME/lun/port_vx" ]; then printf '%s\n' "$probe_uuid-vx"; return; fi
+if cdn_protocol_enabled ws && [ -s "$HOME/lun/port_vw" ]; then printf '%s\n' "$probe_uuid-vw"; return; fi
+if cdn_protocol_enabled vmess && [ -s "$HOME/lun/port_vm_ws" ]; then printf '%s\n' "$probe_uuid-vm"; return; fi
 }
 
 diagnose_cdn_endpoints(){
@@ -4934,21 +4989,27 @@ host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 path=$(cdn_probe_path)
 [ -n "$host" ] && [ -n "$path" ] || { echo "需要先设置 CDN Host 并安装一个兼容协议。"; return 1; }
 edge=${cdnpt:-}
-[ "$cdnmode" = rewrite ] || {
-for f in "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vm_ws"; do [ -s "$f" ] && { edge=$(client_port "$(cat "$f")"); break; }; done
+cdn_rewrite_active || {
+if cdn_protocol_enabled xhttp && [ -s "$HOME/lun/port_vx" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vx")")
+elif cdn_protocol_enabled ws && [ -s "$HOME/lun/port_vw" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vw")")
+elif cdn_protocol_enabled vmess && [ -s "$HOME/lun/port_vm_ws" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vm_ws")")
+fi
 }
 [ -n "$edge" ] || { echo "无法确定 CDN 边缘端口。"; return 1; }
 if is_cf_https_port "$edge"; then scheme=https; else scheme=http; fi
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { echo "尚未设置 CDN 优选入口。"; return 1; }
 echo "诊断 Host=$host，边缘端口=$edge，Path=/$path"
+echo "说明：本项检查 Cloudflare HTTP 路由；400/404 只表示到达入站，不等于代理测速成功。"
 for endpoint in $ips; do
 connect_endpoint=$(uri_host "$endpoint")
 errfile="/tmp/lun-cdn-diag.$$"
-code=$(curl -k -v -sS -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 10 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>"$errfile")
+headerfile="/tmp/lun-cdn-header.$$"
+code=$(curl -k -v -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 10 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>"$errfile")
 rc=$?
 err=$(cat "$errfile" 2>/dev/null)
-rm -f "$errfile"
+if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$headerfile" 2>/dev/null; then through_cf=yes; else through_cf=no; fi
+rm -f "$errfile" "$headerfile"
 if [ "$rc" -ne 0 ]; then
 case "$err" in
 *SSL*|*TLS*|*certificate*) red_line "$endpoint：TLS 握手失败（检查橙云边缘证书、2096 源站 TLS 和 Cloudflare SSL 模式）。" ;;
@@ -4956,138 +5017,164 @@ case "$err" in
 if [ "$scheme" = https ]; then
 red_line "$endpoint：TCP 边缘端口可达，但 TLS/Host 握手未完成（检查橙云、边缘证书和 SNI）。"
 else
-red_line "$endpoint：TCP 边缘端口可达，但回源请求未完成（检查橙云和 Origin Rule）。"
+if cdn_rewrite_active; then
+red_line "$endpoint：TCP 边缘端口可达，但回源请求未完成（检查 NAT Origin Rule 的 Host、Path 和目标端口）。"
+else
+red_line "$endpoint：TCP 边缘端口可达，但请求未完成（检查 Host 与普通 CDN 端口）。"
+fi
 fi
 ;;
 *timed*out*|*Timeout*) red_line "$endpoint：边缘端口连接超时（入口 IP/域名或端口不可达）。" ;;
 *) red_line "$endpoint：连接失败（curl 返回码 $rc）。" ;;
 esac
 elif [ "$code" -ge 520 ] 2>/dev/null && [ "$code" -le 527 ] 2>/dev/null; then
-red_line "$endpoint：Cloudflare 返回 $code，边缘已到达但回源失败（检查 Origin Rule、NAT 公网端口和源站 TLS）。"
+if cdn_rewrite_active; then
+red_line "$endpoint：Cloudflare 返回 $code，边缘已到达但 NAT 回源失败（检查精确 Path 规则、公网目标端口和源站 TLS）。"
 else
-green_line "$endpoint：Cloudflare 边缘可达，HTTP 状态 $code。"
+red_line "$endpoint：Cloudflare 返回 $code，边缘已到达但普通回源失败（检查 Host、协议端口和源站 TLS）。"
 fi
+elif [ "$through_cf" != yes ]; then
+red_line "$endpoint：收到 HTTP $code，但响应中没有 Cloudflare 标识，优选入口可能没有进入 CF 边缘。"
+elif [ "$code" = 400 ] || [ "$code" = 404 ]; then
+yellow_line "$endpoint：已进入 Cloudflare 并到达 HTTP 入站，状态 $code；这是 Xray 探测的常见响应，但仍需客户端实际连接验证。"
+else
+green_line "$endpoint：Cloudflare HTTP 路由可达，状态 $code；最终代理能力仍以外部客户端测试为准。"
+fi
+done
+is_nat_mode && yellow_line "NAT VPS 在服务器自身发起 CF 回环测试时可能误判；客户端外部测试结果优先。"
+}
+
+prompt_cdn_host(){
+cur_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+while :; do
+default_host="${cdnym:-${domain:-$cur_host}}"
+printf "CDN Host%s（回车保留，0 返回）：" "${default_host:+，当前 $default_host}"
+IFS= read -r val
+[ "$val" = 0 ] && return 2
+[ -z "$val" ] && val="$default_host"
+[ -z "$val" ] && { echo "启用 CDN 需要 Host 域名。"; continue; }
+if valid_domain "$val"; then
+cdnym="$val"
+printf '%s\n' "$cdnym" > "$HOME/lun/cdnym"
+return 0
+fi
+echo "域名格式错误，请只填写 example.com，不要带协议、端口或路径。"
 done
 }
 
-prompt_cdn(){
-old_cdnmode=$cdnmode
-old_cdnpt=$cdnpt
-CDN_REBUILD_REQUIRED=no
-echo "========== CDN 优选 IP 加速配置 =========="
-echo "cdnym（回源域名）：你自己的域名，须已解析到 VPS IP，CF 通过它找到你的服务器"
-echo "cfip（优选地址）：客户端实际连接的 CDN/优选入口，填 IP 或域名，如 cloudflare-ech.com"
-echo "数据流向：客户端 → cfip(CDN入口) → cdnym(你的域名) → VPS服务"
-echo "说明：只有套 Cloudflare 橙云时才受 CF 官方端口限制；普通优选 IP/域名仍会输出节点"
-echo "提醒：只有套 Cloudflare 橙云时才要求公网端口在 CF 支持列表内（见下方提示）"
-echo "=========================================="
-show_cdn_port_advice
-cur_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
-printf "是否生成/保留 CDN 节点？[y/N]，del 清除，0 返回%s：" "${cur_host:+，当前 Host=$cur_host}"
-IFS= read -r enable_cdn
-case "$enable_cdn" in
-0) return 2 ;;
-del|none|n|N)
-rm -f "$HOME/lun/cdnym"
-clear_cdn_ip_list
-rm -f "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port"
-cdnym=
-cfip=
-cdnmode=standard
-cdnpt=
-[ "$old_cdnpt" = 2096 ] && CDN_REBUILD_REQUIRED=yes
-echo "CDN 节点配置已清除。"
-return 0
-;;
-"" )
-[ -n "$cur_host" ] || return 0
-cdnym="$cur_host"
-;;
-y|Y) ;;
-*) echo "输入错误，请输入 y、n、del 或 0。"; prompt_cdn; return $? ;;
-esac
-# ---- 第一步：设置回源 Host 域名 ----
-# 这个域名必须已解析到 VPS IP，Cloudflare 通过它回源到你的服务器
+prompt_cdn_ips(){
+current_ips=$(cdn_ip_list | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 while :; do
-default_host="${cdnym:-${domain:-$cur_host}}"
-printf "请输入 CDN 回源 Host 域名%s，0 返回：" "${default_host:+，回车使用 $default_host}"
+printf "优选 IP/域名%s（多个空格分隔，回车保留，0 返回）：" "${current_ips:+，当前 $current_ips}"
 IFS= read -r val
-[ "$val" = "0" ] && return 2
-[ -z "$val" ] && val="$default_host"
-[ -z "$val" ] && { echo "启用 CDN 需要一个回源 Host 域名（已解析到 VPS 的域名）。"; continue; }
-if valid_domain "$val"; then
-cdnym="$val"
-printf "%s\n" "$cdnym" > "$HOME/lun/cdnym"
-break
-fi
-echo "Host 域名格式不正确，请填写 example.com，不要带协议、端口或路径。"
-done
-# ---- 第二步：设置 CDN 优选地址 ----
-# 优选地址是客户端实际连接的 Cloudflare 入口
-# 推荐使用稳定域名：cloudflare-ech.com、www.visa.com.sg、www.wto.org
-# 也可填 CF 优选 IP，如 162.159.192.1
-while :; do
-printf "Cloudflare 优选 cfip，可填多个 IP/域名（空格分隔）\n"
-printf "推荐：cloudflare-ech.com www.visa.com.sg\n"
-printf "回车使用默认优选域名，del 清除，0 返回："
-IFS= read -r val
-[ "$val" = "0" ] && return 2
-if [ "$val" = "del" ] || [ "$val" = "none" ]; then
-cfip=
-clear_cdn_ip_list
-break
-fi
-[ -z "$val" ] && break
+[ "$val" = 0 ] && return 2
+[ -z "$val" ] && { [ -n "$current_ips" ] && return 0; val="cloudflare-ech.com www.visa.com.sg"; }
 bad=
 for one in $val; do
 case "$one" in -1) bad=yes ;; *) valid_addym "$one" || bad=yes ;; esac
 done
-[ -z "$bad" ] && break
-echo "cfip 只接受 IP 或域名，多个值用空格分隔。"
-done
-# ---- 第三步：写入优选地址到配置文件 ----
-[ -n "$val" ] && cfip="$val"
-if [ -n "$cfip" ]; then
+[ -z "$bad" ] || { echo "只接受 IPv4、IPv6 或域名。"; continue; }
+cfip="$val"
 save_cdn_ip_list "$cfip"
-elif [ -n "$cdnym" ] && [ -z "$(cdn_ip_list)" ]; then
-# 未设置优选地址但有回源 Host：写入默认优选域名
-save_cdn_ip_list "cloudflare-ech.com www.visa.com.sg"
-fi
-echo "CDN 端口模式："
-echo " 1. 同端口：客户端边缘端口等于协议公网端口"
-echo " 2. NAT 端口改写：客户端使用 CF 边缘端口，Origin Rule 回源到 NAT 公网端口"
-printf "请选择 [1-2]，当前 ${cdnmode:-standard}，回车保留，0 返回："
-IFS= read -r mode_choice
-[ "$mode_choice" = 0 ] && return 2
-case "$mode_choice" in
-1) cdnmode=standard; cdnpt=; rm -f "$HOME/lun/cdn_edge_port" ;;
-2) cdnmode=rewrite ;;
-"") [ -n "$cdnmode" ] || cdnmode=standard ;;
-*) echo "输入错误，已保留当前模式。" ;;
-esac
+return 0
+done
+}
+
+prompt_cdn(){
+CDN_REBUILD_REQUIRED=no
+while :; do
+ui_title "Lun CDN / CF 优选"
+echo "普通 CDN：客户端 → 优选入口 → CDN Host → VPS，不使用 Origin Rules。"
+echo "默认只生成 XHTTP CDN；VLESS WS、VMess WS 仍保留直连节点。"
+show_cdn_summary
+echo " 1. 一键启用 / 修复 XHTTP CDN"
+echo " 2. 仅修改优选 IP / 域名"
+echo " 3. 关闭 CDN 节点"
+echo " 0. 返回"
+printf "请选择 [0-3]："
+IFS= read -r choice
+case "$choice" in
+1)
+[ -s "$HOME/lun/port_vx" ] || { yellow_line "尚未安装 VLESS XHTTP，请先到“安装 / 协议管理”添加。"; return 1; }
+prompt_cdn_host || return $?
+prompt_cdn_ips || return $?
+cdnproto=xhttp
+printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
+[ -n "$cdnmode" ] || cdnmode=standard
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
-if [ "$cdnmode" = rewrite ]; then
-echo "边缘端口：1. 8080（HTTP）  2. 2096（HTTPS + 源站 TLS）"
-printf "请选择 [1-2]，当前 ${cdnpt:-8080}，回车保留，0 返回："
-IFS= read -r edge_choice
-[ "$edge_choice" = 0 ] && return 2
-case "$edge_choice" in
-1) cdnpt=8080 ;;
-2) cdnpt=2096 ;;
-"") [ -n "$cdnpt" ] || cdnpt=8080 ;;
-*) echo "输入错误，使用 8080。"; cdnpt=8080 ;;
-esac
-printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port"
-fi
-if [ "$old_cdnmode" != "$cdnmode" ] || [ "$old_cdnpt" != "$cdnpt" ]; then
-CDN_REBUILD_REQUIRED=yes
-fi
-export cdnym cfip cdnmode cdnpt
+export cdnym cfip cdnmode cdnpt cdnproto
 show_cdn_dns_hint
+green_line "XHTTP CDN 配置已保存；分享节点将使用新名称，避免继承客户端旧 TLS/Reality 字段。"
+return 0
+;;
+2)
+[ -s "$HOME/lun/cdnym" ] || { yellow_line "尚未设置 CDN Host，请先使用选项 1。"; continue; }
+prompt_cdn_ips || return $?
+export cfip
+return 0
+;;
+3)
+old_tls=no
+cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ] && old_tls=yes
+rm -f "$HOME/lun/cdnym" "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port" "$HOME/lun/cdn_protocol"
+clear_cdn_ip_list
+cdnym=; cfip=; cdnmode=standard; cdnpt=; cdnproto=xhttp
+[ "$old_tls" = yes ] && CDN_REBUILD_REQUIRED=yes
+echo "CDN 节点已关闭，普通直连节点不受影响。"
+return 0
+;;
+0|"") return 2 ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+prompt_nat_origin_rules(){
+CDN_REBUILD_REQUIRED=no
+is_nat_mode || { yellow_line "Origin Rules 端口改写仅用于 NAT VPS；普通 VPS 请使用 CDN / CF 优选。"; return 1; }
+[ -s "$HOME/lun/port_vx" ] || { yellow_line "NAT Origin Rules 默认绑定 VLESS XHTTP，请先安装该协议。"; return 1; }
+[ -s "$HOME/lun/cdnym" ] || { yellow_line "请先在 CDN / CF 优选中设置 Host。"; return 1; }
+while :; do
+ui_title "Lun NAT Origin Rules"
+echo "该功能只分离 Cloudflare 边缘端口与 NAT 回源公网端口。"
+echo " 1. HTTP 8080（推荐，无证书）"
+echo " 2. HTTPS 2096（源站 TLS）"
+echo " 3. 显示精确 Host + Path 规则"
+echo " 4. 关闭端口改写，恢复普通同端口 CDN"
+echo " 0. 返回"
+printf "请选择 [0-4]："
+IFS= read -r choice
+case "$choice" in
+1|2)
+old_tls=no; new_tls=no
+cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ] && old_tls=yes
+[ "$choice" = 1 ] && cdnpt=8080 || { cdnpt=2096; new_tls=yes; }
+cdnmode=rewrite
+cdnproto=xhttp
+printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
+printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port"
+printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
+[ "$old_tls" != "$new_tls" ] && CDN_REBUILD_REQUIRED=yes
+export cdnmode cdnpt cdnproto
 show_cdn_origin_rules
-printf "是否立即执行 CDN 连通诊断？[y/N]："
-IFS= read -r run_diag
-case "$run_diag" in y|Y) diagnose_cdn_endpoints ;; esac
+return 0
+;;
+3) show_cdn_origin_rules; ui_pause ;;
+4)
+old_tls=no
+cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ] && old_tls=yes
+cdnmode=standard; cdnpt=
+printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
+rm -f "$HOME/lun/cdn_edge_port"
+[ "$old_tls" = yes ] && CDN_REBUILD_REQUIRED=yes
+export cdnmode cdnpt
+echo "已恢复普通同端口 CDN；Origin Rules 不再参与节点生成。"
+return 0
+;;
+0|"") return 2 ;;
+*) echo "输入错误。" ;;
+esac
+done
 }
 
 configure_addym_menu(){
@@ -6006,40 +6093,101 @@ esac
 done
 }
 
+vps_port_menu(){
+while :; do
+ui_title "Lun VPS / 端口"
+is_nat_mode && echo "当前：NAT VPS" || echo "当前：普通 VPS"
+echo " 1. VPS 类型"
+echo " 2. 端口池"
+is_nat_mode && echo " 3. NAT 公网端口映射"
+echo " 0. 返回"
+printf "请选择："
+IFS= read -r c
+case "$c" in
+1) prompt_vps_mode; rc=$?; [ "$rc" = 2 ] && continue; return 0 ;;
+2) prompt_port_pool; rc=$?; [ "$rc" = 2 ] && continue; return 0 ;;
+3)
+is_nat_mode || { echo "普通 VPS 不需要 NAT 端口映射。"; continue; }
+prompt_port_map; rc=$?; [ "$rc" = 2 ] && continue; return 0
+;;
+0|"") return 2 ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+argo_network_menu(){
+while :; do
+ui_title "Lun CF 隧道 / Argo"
+echo " 1. 配置 / 修改隧道"
+echo " 2. Argo 优选 IP / 入口地址"
+echo " 0. 返回"
+printf "请选择 [0-2]："
+IFS= read -r c
+case "$c" in
+1)
+prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue
+load_installed_protocol_flags; LUN_MENU_ACTION=rep; return 0
+;;
+2)
+prompt_argo_ip; rc=$?; [ "$rc" = 2 ] && continue
+LUN_MENU_ACTION=list; return 0
+;;
+0|"") return 2 ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
 network_menu(){
 while :; do
 ui_title "Lun 入口网络管理"
-if is_nat_mode; then
-echo "当前 VPS 类型：NAT VPS"
-[ -n "$inpool" ] && echo "内网端口池：$inpool"
-[ -n "$outpool" ] && echo "外网端口池：$outpool"
-[ -n "$ptmap" ] && echo "手动映射：$ptmap"
-else
-echo "当前 VPS 类型：普通 VPS"
-[ -n "$inpool" ] && echo "端口池：$inpool"
-fi
+is_nat_mode && echo "当前 VPS：NAT" || echo "当前 VPS：普通"
 show_cdn_summary
 [ -s "$HOME/lun/argoip" ] && echo "Argo优选：$(cat "$HOME/lun/argoip")" || echo "Argo优选：中性默认"
-echo " 1. VPS 类型"
-echo " 2. 端口池"
-echo " 3. NAT 手动映射"
-echo " 4. CDN / 优选 IP"
-echo " 5. CF 隧道 / Argo"
-echo " 6. Argo 优选 IP / 入口地址"
-echo " 7. 显示 Cloudflare Origin Rule 配置"
-echo " 8. CDN 连通诊断"
+echo " 1. VPS / 端口"
+echo " 2. CDN / CF 优选"
+if is_nat_mode; then
+echo " 3. NAT Origin Rules"
+echo " 4. CF 隧道 / Argo"
+echo " 5. CDN 连通诊断"
+menu_max=5
+else
+echo " 3. CF 隧道 / Argo"
+echo " 4. CDN 连通诊断"
+menu_max=4
+fi
 echo " 0. 返回"
-printf "请选择 [0-8]："
+printf "请选择 [0-%s]：" "$menu_max"
 IFS= read -r c
 case "$c" in
-1) prompt_vps_mode; rc=$?; [ "$rc" = 2 ] && continue ;;
-2) prompt_port_pool; rc=$?; [ "$rc" = 2 ] && continue ;;
-3) vpsmode=nat; printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"; prompt_port_map; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
-4) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_MENU_ACTION=rep; else LUN_MENU_ACTION=list; fi; return ;;
-5) prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
-6) prompt_argo_ip; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
-7) show_cdn_origin_rules; ui_pause ;;
-8) diagnose_cdn_endpoints; ui_pause ;;
+1)
+vps_port_menu; rc=$?; [ "$rc" = 2 ] && continue
+LUN_MENU_ACTION=list; return
+;;
+2)
+prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue
+if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_MENU_ACTION=rep; else LUN_MENU_ACTION=list; fi
+return
+;;
+3)
+if ! is_nat_mode; then
+argo_network_menu; rc=$?; [ "$rc" = 2 ] && continue
+return
+fi
+prompt_nat_origin_rules; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || { ui_pause; continue; }
+if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_MENU_ACTION=rep; else LUN_MENU_ACTION=list; fi
+return
+;;
+4)
+if ! is_nat_mode; then
+diagnose_cdn_endpoints; ui_pause
+continue
+fi
+argo_network_menu; rc=$?; [ "$rc" = 2 ] && continue
+return
+;;
+5) is_nat_mode && { diagnose_cdn_endpoints; ui_pause; } || echo "输入错误。" ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
