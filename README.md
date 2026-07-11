@@ -36,6 +36,8 @@ lun
 
 引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。“入口网络管理”精简为 VPS/端口、CDN/CF 优选、NAT Origin Rules（端口回源）、CF 隧道/Argo、CDN 诊断；普通 VPS 不显示回源端口改写流程。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
+“安装 / 协议管理”中的增删改操作会停止旧协议进程并重写 Xray/Sing-box 配置，这是让新增、删除和端口修改生效的必要步骤；已有内核、证书、UUID 与订阅设置会保留，只有所选协议需要的内核文件确实缺失时才下载。重建前会创建事务快照，SSH 断线、命令中断或新配置校验失败时自动恢复旧配置和服务，成功后保留 `~/lun/.last_good_rebuild`。状态区会区分“运行中”“已安装但未运行”“内核已安装但当前协议未使用”和“未安装”。
+
 Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`。
 
 ## 快捷操作
@@ -76,6 +78,8 @@ vlpt="" vmpt="" hypt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78l
 | `acme_dns` | acme.sh DNS provider，例如 `dns_cf`、`dns_ali` |
 
 `certmode=self` 会生成本地 ECDSA 自签证书。`origin` 表示 Cloudflare Origin CA 等仅供服务商回源验证的证书，`ca` 表示公开 CA 签发证书。`domain` 使用 HTTP-01，`dns` 使用 acme.sh 原生 DNS API，`ip` 使用 Let’s Encrypt short-lived IP 证书。
+
+IPv6-only VPS 可以使用 HTTP-01。脚本检测到域名只有 AAAA 时会让 acme.sh 使用 IPv6 监听；AAAA 必须指向本机公网 IPv6，并且公网 TCP 80 必须可达且未被其他进程占用。域名同时存在 A 和 AAAA 时，Let’s Encrypt 会优先验证 IPv6，因此错误的 AAAA 也会导致申请失败。失败时菜单会显示 A/AAAA、本机地址、80 端口占用，并把 acme.sh 完整输出保存到 `~/lun/acme_issue.log`。无法开放 80 或域名使用橙云时建议使用 DNS API 模式。
 
 引导式安装的证书步骤和“证书管理”菜单都支持搜索并导入本机证书。建议将证书与私钥放入 `~/lun/import/`；脚本也会自动搜索 `~/lun`、`/root/key`、`/root/cert`、acme.sh 与 Let’s Encrypt 常用目录，通过公钥匹配证书和私钥。发现多个证书时会优先推荐“域名匹配、未过期、私钥匹配、服务商/CA 签发”的证书；输入编号可自行选择，输入 `0` 返回，直接回车导入推荐项。
 
