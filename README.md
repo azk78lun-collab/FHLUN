@@ -90,6 +90,9 @@ Reality、Argo 和 CDN 仍然独立：
 | `agk` | Argo 固定隧道 token |
 | `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），可填多个值，推荐 `cloudflare-ech.com` |
 | `argoip` | Argo 优选 IP 或域名（与 cfip 独立），可填多个值 |
+| `cdnmode` | `standard` 同端口模式；`rewrite` 为 NAT 回源端口改写模式 |
+| `cdnpt` | NAT 改写模式的 Cloudflare 边缘端口：`8080` 或 `2096` |
+| `addrmode` | 普通节点地址输出：`domain`、`ipv4`、`ipv6`、`dual`、`all` |
 
 `agk` 可直接粘贴完整的 `cloudflared.exe service install ey...` 命令，脚本会自动提取 `ey...` token。
 
@@ -101,8 +104,9 @@ CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点
 
 **使用条件：**
 1. 设置 `cdnym`：一个已解析到 VPS IP 的域名（用于 CF 回源）
-2. 设置 `cfip`（可选）：CDN 优选地址，留空则使用默认 `cloudflare-ech.com`
-3. 若域名开启 Cloudflare 橙云代理，客户端访问的公网端口必须在 CF 橙云支持端口列表内；普通 CDN/优选 IP/自建反代不受这个端口表限制，脚本仍会输出 CDN 节点
+2. 在 Cloudflare 为该域名开启橙云；灰云只做 DNS 解析，不能把手动填写的 Cloudflare 优选 IP 回源到 VPS
+3. 设置 `cfip`（可选）：可混合填写多个 IPv4、IPv6 或域名，脚本会去重并为每个入口生成唯一节点名
+4. 选择同端口或 NAT 端口改写模式
 
 **支持 CDN 的协议：** VMess WS、VLESS WS、VLESS XHTTP（非 Reality）
 **不支持 CDN 的协议：** Reality、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
@@ -116,15 +120,33 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 **推荐 CDN 优选域名：** `cloudflare-ech.com`、`www.visa.com.sg`、`www.wto.org`、`www.web.com`（也可使用 CF 优选 IP）
 
-NAT VPS 只有在套 Cloudflare 橙云时才需要看客户端访问的公网端口是否在上述列表内；只有内网端口匹配并不能让橙云回源生效。未套橙云时，普通 CDN 优选 IP/域名或自建反代按实际入口配置使用，脚本不会因为端口不在表内而删除 CDN 节点。
+同端口模式下，客户端连接端口与 NAT 公网回源端口相同，该公网端口必须在上述 Cloudflare 列表内。
+
+NAT 端口改写模式用于运营商没有分配 CF 官方公网端口的情况：客户端连接 Cloudflare 的 `8080` 或 `2096`，再通过 Cloudflare Origin Rule 按 Host 和协议 Path 把目标端口改写为 NAT 公网映射端口。例如协议映射为 `56567 → 8080` 时，客户端节点使用边缘端口 `8080`，Origin Rule 的目标端口填写 `56567`。脚本会在 CDN 菜单中显示每个协议对应的准确规则。
+
+`2096` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；证书有效且主体与回源 Host 一致时可使用 Full (Strict)。切换 `8080/2096` 只重建配置并重启服务，不重新下载内核。
 
 **示例：**
 
 ```bash
-vmpt="" cdnym="proxy.example.com" cfip="cloudflare-ech.com www.visa.com.sg www.wto.org" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+vmpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234 cloudflare-ech.com" cdnmode="rewrite" cdnpt="8080" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-## 自定义普通节点地址 addym
+## 普通节点地址输出
+
+菜单路径：`lun` → `高级设置` → `节点地址输出`。可选择仅域名、仅 IPv4、仅 IPv6、IPv4+IPv6、域名+IPv4+IPv6。选择结果保存到 `$HOME/lun/address_mode`，刷新订阅后仍然有效。
+
+| `addrmode` | 输出内容 |
+| --- | --- |
+| `domain` | 仅域名 |
+| `ipv4` | 仅 IPv4 |
+| `ipv6` | 仅 IPv6 |
+| `dual` | IPv4 和 IPv6 |
+| `all` | 域名、IPv4 和 IPv6 |
+
+生成的节点名称会带 `DOMAIN`、`IPv4`、`IPv6` 后缀。CDN 节点继续只使用 `cfip`，Argo 节点继续只使用 `argoip`。
+
+### 兼容 addym/addout
 
 `addym` 用于把普通节点客户端里的 `address/server/add` 从 VPS IP 替换为你自己的域名或 IP。它不会改变 Reality SNI、WS/XHTTP Host、Argo 域名或 Argo 优选地址。
 
@@ -138,9 +160,9 @@ vlpt="" addym="proxy.example.com" addout="replace" bash <(curl -Ls https://raw.g
 | --- | --- |
 | `off` | 只输出 VPS IP |
 | `replace` | 普通节点地址替换为 `addym` |
-| `both` | 同时输出 `-IP` 和 `-DOMAIN` 两份普通节点 |
+| `both` | 同时输出 IP 和 DOMAIN 普通节点 |
 
-默认规则：未设置 `addym` 时等同 `off`；设置 `domain` 且未手动设置 `addym/addout` 时，默认 `addym=domain`、`addout=replace`。
+旧变量继续兼容；设置 `addrmode` 后以新的统一地址模式为准。未设置 `addrmode` 时仍按原有 `addym/addout/ippz` 行为读取。
 
 ## NAT VPS 端口映射
 

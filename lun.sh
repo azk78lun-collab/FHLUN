@@ -47,6 +47,7 @@ export port_ss=${sspt:-''}
 export port_so=${sopt:-''}
 export ym_vl_re=${reym:-''}
 export cdnym=${cdnym:-''}
+export cfip=${cfip:-''}
 export argo=${argo:-''}
 export ARGO_DOMAIN=${agn:-''}
 export ARGO_AUTH=${agk:-''}
@@ -63,6 +64,9 @@ export outpool=${outpool:-''}
 export vpsmode=${vpsmode:-''}
 export argoip=${argoip:-''}
 export subipmode=${subipmode:-''}
+export cdnmode=${cdnmode:-''}
+export cdnpt=${cdnpt:-''}
+export addrmode=${addrmode:-''}
 export domain=${domain:-''}
 export certmode=${certmode:-''}
 export acme_email=${acme_email:-''}
@@ -83,7 +87,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.5.10"
+echo "当前版本：V26.7.11"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -109,10 +113,49 @@ addr=$1
 case "$addr" in
 ""|del|none) return 0 ;;
 *"://"*|*/*|*\?*|*#*|*" "*|*"	"*) return 1 ;;
-\[*\]) return 0 ;;
-*:*) return 1 ;;
+esac
+addr=$(normalize_host "$addr")
+case "$addr" in
+*:*) printf '%s' "$addr" | grep -Eq '^[0-9A-Fa-f:.]+$' ;;
 *) return 0 ;;
 esac
+}
+
+normalize_host(){
+host=$1
+case "$host" in
+\[*\]) host=${host#\[}; host=${host%\]} ;;
+esac
+printf '%s\n' "$host"
+}
+
+host_is_ipv6(){
+host=$(normalize_host "$1")
+case "$host" in *:*) return 0 ;; *) return 1 ;; esac
+}
+
+uri_host(){
+host=$(normalize_host "$1")
+if host_is_ipv6 "$host"; then
+printf '[%s]\n' "$host"
+else
+printf '%s\n' "$host"
+fi
+}
+
+json_host(){
+normalize_host "$1"
+}
+
+endpoint_kind(){
+host=$(normalize_host "$1")
+if host_is_ipv6 "$host"; then
+printf 'V6\n'
+elif printf '%s' "$host" | grep -Eq '^[0-9]+(\.[0-9]+){3}$'; then
+printf 'V4\n'
+else
+printf 'DOMAIN\n'
+fi
 }
 
 valid_domain(){
@@ -229,10 +272,17 @@ argoip=
 ;;
 *)
 bad=
+normalized=
+seen=
 for one in $argoip; do
-case "$one" in -1) bad=yes ;; *) valid_addym "$one" || bad=yes ;; esac
+case "$one" in -1) bad=yes; continue ;; *) valid_addym "$one" || { bad=yes; continue; } ;; esac
+one=$(normalize_host "$one")
+case " $seen " in *" $one "*) continue ;; esac
+seen="${seen:+$seen }$one"
+normalized="${normalized:+$normalized }$one"
 done
 [ -z "$bad" ] || { echo "argoip 只接受 IP 或域名，多个值用空格分隔"; exit 1; }
+argoip="$normalized"
 printf "%s\n" "$argoip" > "$HOME/lun/argoip"
 ;;
 esac
@@ -249,14 +299,69 @@ save_cdn_ip_list(){
 clear_cdn_ip_list
 idx=1
 list=
+seen=
 for one in $1; do
 case "$one" in ""|-1) continue ;; esac
 valid_addym "$one" || continue
+one=$(normalize_host "$one")
+case " $seen " in *" $one "*) continue ;; esac
+seen="${seen:+$seen }$one"
 list="${list:+$list }$one"
 printf "%s\n" "$one" > "$HOME/lun/cdnip$idx"
 idx=$((idx + 1))
 done
 [ -n "$list" ] && printf "%s\n" "$list" > "$HOME/lun/cdnip"
+}
+
+load_cdn_mode_config(){
+[ -z "$cdnym" ] && [ -s "$HOME/lun/cdnym" ] && cdnym=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+if [ -n "$cfip" ]; then
+case "$cfip" in
+del|none|off) clear_cdn_ip_list; cfip= ;;
+*) save_cdn_ip_list "$cfip" ;;
+esac
+fi
+if [ -n "$cdnmode" ]; then
+case "$cdnmode" in
+standard|rewrite) printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode" ;;
+del|none|off) rm -f "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port"; cdnmode=standard; cdnpt= ;;
+*) echo "cdnmode 只支持 standard 或 rewrite。"; exit 1 ;;
+esac
+elif [ -s "$HOME/lun/cdn_mode" ]; then
+cdnmode=$(cat "$HOME/lun/cdn_mode" 2>/dev/null)
+else
+cdnmode=standard
+fi
+case "$cdnmode" in standard|rewrite) ;; *) cdnmode=standard ;; esac
+
+if [ -n "$cdnpt" ]; then
+case "$cdnpt" in
+8080|2096) printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port" ;;
+del|none|off) rm -f "$HOME/lun/cdn_edge_port"; cdnpt= ;;
+*) echo "cdnpt 当前只支持 8080 或 2096。"; exit 1 ;;
+esac
+elif [ -s "$HOME/lun/cdn_edge_port" ]; then
+cdnpt=$(cat "$HOME/lun/cdn_edge_port" 2>/dev/null)
+fi
+[ "$cdnmode" = rewrite ] && [ -z "$cdnpt" ] && cdnpt=8080
+}
+
+load_address_mode_config(){
+if [ -n "$addrmode" ]; then
+case "$addrmode" in
+domain|ipv4|ipv6|dual|all)
+printf '%s\n' "$addrmode" > "$HOME/lun/address_mode"
+;;
+del|none|off|auto)
+rm -f "$HOME/lun/address_mode"
+addrmode=
+;;
+*) echo "addrmode 只支持 domain、ipv4、ipv6、dual、all。"; exit 1 ;;
+esac
+elif [ -s "$HOME/lun/address_mode" ]; then
+addrmode=$(cat "$HOME/lun/address_mode" 2>/dev/null)
+fi
+case "$addrmode" in ""|domain|ipv4|ipv6|dual|all) ;; *) addrmode= ;; esac
 }
 
 is_nat_mode(){
@@ -280,6 +385,111 @@ done
 pool_public_for_inner "$inner" && return
 fi
 printf '%s\n' "$inner"
+}
+
+is_cf_http_port(){
+case "$1" in 80|8080|8880|2052|2082|2086|2095) return 0 ;; *) return 1 ;; esac
+}
+
+is_cf_https_port(){
+case "$1" in 443|8443|2053|2083|2087|2096) return 0 ;; *) return 1 ;; esac
+}
+
+cdn_client_port(){
+origin_inner=$1
+if [ "$cdnmode" = rewrite ]; then
+printf '%s\n' "${cdnpt:-8080}"
+else
+client_port "$origin_inner"
+fi
+}
+
+cdn_origin_tls_for_port(){
+[ -n "$cdnym" ] || [ -s "$HOME/lun/cdnym" ] || return 1
+[ "$cdnmode" = rewrite ] && [ "${cdnpt:-8080}" = 2096 ]
+}
+
+effective_address_mode(){
+if [ -n "$addrmode" ]; then
+printf '%s\n' "$addrmode"
+return
+fi
+if [ -n "$addym" ]; then
+case "$addout" in
+replace) printf 'domain\n' ;;
+both)
+case "$ippz" in
+4) printf 'legacy-domain4\n' ;;
+6) printf 'legacy-domain6\n' ;;
+46) printf 'all\n' ;;
+*) printf 'legacy-domain-auto\n' ;;
+esac
+;;
+*) case "$ippz" in 4) printf 'ipv4\n' ;; 6) printf 'ipv6\n' ;; 46) printf 'dual\n' ;; *) printf 'auto\n' ;; esac ;;
+esac
+else
+case "$ippz" in 4) printf 'ipv4\n' ;; 6) printf 'ipv6\n' ;; 46) printf 'dual\n' ;; *) printf 'auto\n' ;; esac
+fi
+}
+
+direct_address_entries(){
+mode=$(effective_address_mode)
+domain_addr=$(normalize_host "${addym:-$domain}")
+case "$mode" in
+domain)
+[ -n "$domain_addr" ] && printf '%s|DOMAIN\n' "$domain_addr"
+;;
+ipv4)
+[ -n "$v4" ] && printf '%s|IPv4\n' "$v4"
+;;
+ipv6)
+[ -n "$v6" ] && printf '%s|IPv6\n' "$v6"
+;;
+dual)
+[ -n "$v4" ] && printf '%s|IPv4\n' "$v4"
+[ -n "$v6" ] && printf '%s|IPv6\n' "$v6"
+;;
+all)
+[ -n "$domain_addr" ] && printf '%s|DOMAIN\n' "$domain_addr"
+[ -n "$v4" ] && [ "$v4" != "$domain_addr" ] && printf '%s|IPv4\n' "$v4"
+[ -n "$v6" ] && [ "$v6" != "$domain_addr" ] && printf '%s|IPv6\n' "$v6"
+;;
+legacy-domain4)
+[ -n "$v4" ] && printf '%s|IPv4\n' "$v4"
+[ -n "$domain_addr" ] && [ "$domain_addr" != "$v4" ] && printf '%s|DOMAIN\n' "$domain_addr"
+;;
+legacy-domain6)
+[ -n "$v6" ] && printf '%s|IPv6\n' "$v6"
+[ -n "$domain_addr" ] && [ "$domain_addr" != "$v6" ] && printf '%s|DOMAIN\n' "$domain_addr"
+;;
+legacy-domain-auto)
+if [ -n "$v4" ]; then printf '%s|IPv4\n' "$v4"; elif [ -n "$v6" ]; then printf '%s|IPv6\n' "$v6"; fi
+[ -n "$domain_addr" ] && [ "$domain_addr" != "$v4" ] && [ "$domain_addr" != "$v6" ] && printf '%s|DOMAIN\n' "$domain_addr"
+;;
+*)
+if [ -n "$v4" ]; then
+printf '%s|IPv4\n' "$v4"
+elif [ -n "$v6" ]; then
+printf '%s|IPv6\n' "$v6"
+elif [ -n "$domain_addr" ]; then
+printf '%s|DOMAIN\n' "$domain_addr"
+fi
+;;
+esac
+}
+
+address_mode_label(){
+case "$(effective_address_mode)" in
+domain) printf '仅域名\n' ;;
+ipv4) printf '仅 IPv4\n' ;;
+ipv6) printf '仅 IPv6\n' ;;
+dual) printf 'IPv4 + IPv6\n' ;;
+all) printf '域名 + IPv4 + IPv6\n' ;;
+legacy-domain4) printf '域名 + IPv4（兼容模式）\n' ;;
+legacy-domain6) printf '域名 + IPv6（兼容模式）\n' ;;
+legacy-domain-auto) printf '域名 + 自动 IP（兼容模式）\n' ;;
+*) printf '自动\n' ;;
+esac
 }
 
 inner_port_from_public(){
@@ -615,6 +825,7 @@ if ! valid_addym "$addym"; then
 echo "addym 只需要填写域名或 IP，例如 proxy.example.com，不要带 http://、https://、端口或路径。"
 exit 1
 fi
+addym=$(normalize_host "$addym")
 printf "%s\n" "$addym" > "$HOME/lun/addym"
 ;;
 esac
@@ -706,9 +917,11 @@ mkdir -p "$HOME/lun"
 [ -n "$ARGO_AUTH" ] && ARGO_AUTH=$(sanitize_argo_token "$ARGO_AUTH")
 load_domain_cert_config
 load_addym_config
+load_address_mode_config
 load_port_map_config
 load_port_pool_config
 load_vps_mode_config
+load_cdn_mode_config
 load_argoip_config
 load_subip_mode_config
 ensure_lun_command || true
@@ -987,6 +1200,14 @@ fi
 esac
 }
 
+ensure_cdn_origin_cert(){
+origin_port=$1
+cdn_origin_tls_for_port "$origin_port" || return 0
+if [ ! -s "$HOME/lun/cert.crt" ] || [ ! -s "$HOME/lun/private.key" ]; then
+prepare_runtime_cert
+fi
+}
+
 cert_client_vars(){
 cert_mode_current=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
 [ -z "$cert_mode_current" ] && cert_mode_current=self
@@ -1008,6 +1229,47 @@ sbox_tls_insecure=false
 clash_skip_verify=false
 clash_disable_sni=false
 fi
+}
+
+cdn_host_current(){
+if [ -n "$cdnym" ]; then
+printf '%s\n' "$cdnym"
+else
+cat "$HOME/lun/cdnym" 2>/dev/null
+fi
+}
+
+xray_stream_security_block(){
+origin_port=$1
+if cdn_origin_tls_for_port "$origin_port"; then
+cat <<EOF
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["h2", "http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "$HOME/lun/cert.crt",
+              "keyFile": "$HOME/lun/private.key"
+            }
+          ]
+        },
+EOF
+else
+printf '        "security": "none",\n'
+fi
+}
+
+singbox_inbound_tls_block(){
+origin_port=$1
+cdn_origin_tls_for_port "$origin_port" || return 0
+cat <<EOF
+,
+        "tls": {
+            "enabled": true,
+            "certificate_path": "$HOME/lun/cert.crt",
+            "key_path": "$HOME/lun/private.key"
+        }
+EOF
 }
 
 insuuid(){
@@ -1132,6 +1394,7 @@ elif [ -n "$port_vx" ]; then
 echo "$port_vx" > "$HOME/lun/port_vx"
 fi
 port_vx=$(cat "$HOME/lun/port_vx")
+ensure_cdn_origin_cert "$port_vx"
 echo "Vless-xhttp-enc端口：$port_vx"
 if [ -n "$cdnym" ]; then
 echo "$cdnym" > "$HOME/lun/cdnym"
@@ -1154,6 +1417,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
       },
       "streamSettings": {
         "network": "xhttp",
+$(xray_stream_security_block "$port_vx")
         "xhttpSettings": {
           "host": "",
           "path": "${uuid}-vx",
@@ -1179,6 +1443,7 @@ elif [ -n "$port_vw" ]; then
 echo "$port_vw" > "$HOME/lun/port_vw"
 fi
 port_vw=$(cat "$HOME/lun/port_vw")
+ensure_cdn_origin_cert "$port_vw"
 echo "Vless-ws-enc端口：$port_vw"
 if [ -n "$cdnym" ]; then
 echo "$cdnym" > "$HOME/lun/cdnym"
@@ -1201,6 +1466,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
       },
       "streamSettings": {
         "network": "ws",
+$(xray_stream_security_block "$port_vw")
         "wsSettings": {
           "path": "${uuid}-vw"
         }
@@ -1483,6 +1749,7 @@ elif [ -n "$port_vm_ws" ]; then
 echo "$port_vm_ws" > "$HOME/lun/port_vm_ws"
 fi
 port_vm_ws=$(cat "$HOME/lun/port_vm_ws")
+ensure_cdn_origin_cert "$port_vm_ws"
 echo "Vmess-ws端口：$port_vm_ws"
 if [ -n "$cdnym" ]; then
 echo "$cdnym" > "$HOME/lun/cdnym"
@@ -1504,7 +1771,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
             },
             "streamSettings": {
                 "network": "ws",
-                "security": "none",
+$(xray_stream_security_block "$port_vm_ws")
                 "wsSettings": {
                   "path": "${uuid}-vm"
             }
@@ -1534,7 +1801,7 @@ cat >> "$HOME/lun/sb.json" <<EOF
             "path": "${uuid}-vm",
             "max_early_data":2048,
             "early_data_header_name": "Sec-WebSocket-Protocol"
-        }
+        }$(singbox_inbound_tls_block "$port_vm_ws")
     },
 EOF
 fi
@@ -1898,7 +2165,7 @@ mkdir -p "$HOME/bin"
 fi
 install_lun_entry "$SCRIPT_PATH" || { echo "Lun脚本安装失败，请检查网络后重试。"; exit 1; }
 if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
-echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
+echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" cdnmode=\"${cdnmode}\" cdnpt=\"${cdnpt}\" addrmode=\"${addrmode}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
 fi
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
 if [ "$SCRIPT_PATH" = "$HOME/bin/lun" ]; then
@@ -2154,36 +2421,25 @@ echo "本地IPV6地址：$vps_ipv6 $w6"
 echo "服务器地区：$location"
 echo
 sleep 2
-if [ "$ippz" = "4" ]; then
-if [ -z "$v4" ]; then
-ipbest
-else
-server_ip="$v4"
-echo "$server_ip" > "$HOME/lun/server_ip.log"
-fi
-elif [ "$ippz" = "6" ]; then
-if [ -z "$v6" ]; then
-ipbest
-else
-server_ip="[$v6]"
-echo "$server_ip" > "$HOME/lun/server_ip.log"
-fi
-elif [ "$ippz" = "46" ]; then
 if [ -n "$v4" ]; then
 server_ip="$v4"
-echo "$server_ip" > "$HOME/lun/server_ip.log"
-fi
-if [ -n "$v6" ]; then
-server_ip6="[$v6]"
-echo "$server_ip6" > "$HOME/lun/server_ip6.log"
-fi
-[ -n "$v4" ] || [ -n "$v6" ] || ipbest
+printf '%s\n' "$server_ip" > "$HOME/lun/server_ip.log"
+elif [ -n "$v6" ]; then
+server_ip=$(uri_host "$v6")
+printf '%s\n' "$server_ip" > "$HOME/lun/server_ip.log"
 else
 ipbest
+fi
+if [ -n "$v6" ]; then
+server_ip6=$(uri_host "$v6")
+printf '%s\n' "$server_ip6" > "$HOME/lun/server_ip6.log"
+else
+rm -f "$HOME/lun/server_ip6.log"
 fi
 }
 ipchange
 rm -rf "$HOME/lun/jhsub.txt"
+rm -f "$HOME/lun/.cdn_sbox_entries" "$HOME/lun/.cdn_sbox_tags" "$HOME/lun/.cdn_clash_entries" "$HOME/lun/.cdn_clash_names"
 uuid=$(cat "$HOME/lun/uuid")
 server_ip=$(cat "$HOME/lun/server_ip.log")
 sxname=$(cat "$HOME/lun/name" 2>/dev/null)
@@ -2200,13 +2456,19 @@ argoip_cfg=$(cat "$HOME/lun/argoip" 2>/dev/null)
 set -- $argoip_cfg
 argoip1=${1:-162.159.192.1}
 argoip2=${2:-$argoip1}
-client_addr="$server_ip"
-node_name_suffix=
-if [ -n "$addym" ] && [ "$addout" = "replace" ]; then
-client_addr="$addym"
-elif [ -n "$addym" ] && [ "$addout" = "both" ]; then
-node_name_suffix="-IP"
+argoip1_uri=$(uri_host "$argoip1")
+argoip2_uri=$(uri_host "$argoip2")
+direct_entries=$(direct_address_entries)
+if [ -z "$direct_entries" ]; then
+echo "当前地址输出模式 $(address_mode_label) 没有可用地址，请在高级设置中重新选择。"
+return 1
 fi
+primary_entry=$(printf '%s\n' "$direct_entries" | sed -n '1p')
+client_addr_raw=${primary_entry%%|*}
+primary_name_suffix=${primary_entry#*|}
+client_addr=$(uri_host "$client_addr_raw")
+client_addr_json=$(json_host "$client_addr_raw")
+node_name_suffix="-$primary_name_suffix"
 cert_client_vars
 
 sed_escape(){
@@ -2220,14 +2482,23 @@ printf '%s' "$1" | sed 's/[&\\]/\\&/g'
 replace_link_addr(){
 link=$1
 new_addr=$2
-old_esc=$(sed_escape "$server_ip")
-new_esc=$(sed_replacement_escape "$new_addr")
+new_suffix=$3
+old_uri=$(uri_host "$client_addr_raw")
+new_uri=$(uri_host "$new_addr")
+old_json=$(json_host "$client_addr_raw")
+new_json=$(json_host "$new_addr")
+old_uri_esc=$(sed_escape "$old_uri")
+new_uri_esc=$(sed_replacement_escape "$new_uri")
+old_json_esc=$(sed_escape "$old_json")
+new_json_esc=$(sed_replacement_escape "$new_json")
+old_suffix_esc=$(sed_escape "-$primary_name_suffix")
+new_suffix_esc=$(sed_replacement_escape "-$new_suffix")
 case "$link" in
 vmess://*)
 payload=${link#vmess://}
 json=$(printf '%s' "$payload" | base64 -d 2>/dev/null)
 [ -z "$json" ] && printf '%s\n' "$link" && return
-json=$(printf '%s' "$json" | sed "s/\"add\": \"$old_esc\"/\"add\": \"$new_esc\"/g; s/-IP\"/-DOMAIN\"/g")
+json=$(printf '%s' "$json" | sed "s/\"add\": \"$old_json_esc\"/\"add\": \"$new_json_esc\"/g; s/$old_suffix_esc\"/$new_suffix_esc\"/g")
 printf 'vmess://%s\n' "$(printf '%s' "$json" | base64 -w0)"
 ;;
 ss://*)
@@ -2236,25 +2507,29 @@ encoded=${body%%#*}
 label=${body#*#}
 raw=$(printf '%s' "$encoded" | base64 -d 2>/dev/null)
 [ -z "$raw" ] && printf '%s\n' "$link" && return
-raw=$(printf '%s' "$raw" | sed "s/@$old_esc:/@$new_esc:/g")
-label=$(printf '%s' "$label" | sed 's/-IP$/-DOMAIN/')
+raw=$(printf '%s' "$raw" | sed "s/@$old_uri_esc:/@$new_uri_esc:/g")
+label=$(printf '%s' "$label" | sed "s/$old_suffix_esc\$/$new_suffix_esc/")
 printf 'ss://%s#%s\n' "$(printf '%s' "$raw" | base64 -w0)" "$label"
 ;;
 *)
-printf '%s\n' "$link" | sed "s/@$old_esc:/@$new_esc:/g; s/-IP$/-DOMAIN/"
+printf '%s\n' "$link" | sed "s/@$old_uri_esc:/@$new_uri_esc:/g; s/$old_suffix_esc\$/$new_suffix_esc/"
 ;;
 esac
 }
 
 append_share_link(){
 link=$1
-printf '%s\n' "$link" >> "$HOME/lun/jhsub.txt"
-printf '%s\n' "$link"
-if [ -n "$addym" ] && [ "$addout" = "both" ]; then
-domain_link=$(replace_link_addr "$link" "$addym")
-printf '%s\n' "$domain_link" >> "$HOME/lun/jhsub.txt"
-printf '%s\n' "$domain_link"
+for entry in $direct_entries; do
+entry_addr=${entry%%|*}
+entry_suffix=${entry#*|}
+if [ "$entry_addr" = "$client_addr_raw" ] && [ "$entry_suffix" = "$primary_name_suffix" ]; then
+output_link=$link
+else
+output_link=$(replace_link_addr "$link" "$entry_addr" "$entry_suffix")
 fi
+printf '%s\n' "$output_link" >> "$HOME/lun/jhsub.txt"
+printf '%s\n' "$output_link"
+done
 }
 
 echo "*********************************************************"
@@ -2292,7 +2567,11 @@ if grep vless-xhttp "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-xhttp-enc 】支持ENC加密，节点信息如下："
 port_vx=$(cat "$HOME/lun/port_vx")
 client_port_vx=$(client_port "$port_vx")
-vl_vx_link="vless://$uuid@$client_addr:$client_port_vx?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto#${sxname}vl-xhttp-enc-$hostname$node_name_suffix"
+vx_direct_extra=
+if cdn_origin_tls_for_port "$port_vx"; then
+vx_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
+fi
+vl_vx_link="vless://$uuid@$client_addr:$client_port_vx?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto$vx_direct_extra#${sxname}vl-xhttp-enc-$hostname$node_name_suffix"
 append_share_link "$vl_vx_link"
 echo
 if [ -f "$HOME/lun/cdnym" ]; then
@@ -2303,7 +2582,11 @@ if grep vless-ws "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-ws-enc 】支持ENC加密，节点信息如下："
 port_vw=$(cat "$HOME/lun/port_vw")
 client_port_vw=$(client_port "$port_vw")
-vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw#${sxname}vl-ws-enc-$hostname$node_name_suffix"
+vw_direct_extra=
+if cdn_origin_tls_for_port "$port_vw"; then
+vw_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
+fi
+vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw$vw_direct_extra#${sxname}vl-ws-enc-$hostname$node_name_suffix"
 append_share_link "$vl_vw_link"
 echo
 if [ -f "$HOME/lun/cdnym" ]; then
@@ -2416,7 +2699,15 @@ if grep vmess-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep vmess-sb "$HOME/lun
 echo "【 Vmess-ws 】节点信息如下："
 port_vm_ws=$(cat "$HOME/lun/port_vm_ws")
 client_port_vm_ws=$(client_port "$port_vm_ws")
-vm_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-$hostname$node_name_suffix\", \"add\": \"$client_addr\", \"port\": \"$client_port_vm_ws\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"www.bing.com\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
+vm_direct_host=www.bing.com
+vm_direct_tls=
+vm_direct_tls_enabled=false
+if cdn_origin_tls_for_port "$port_vm_ws"; then
+vm_direct_host=$xvvmcdnym
+vm_direct_tls=tls
+vm_direct_tls_enabled=true
+fi
+vm_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-$hostname$node_name_suffix\", \"add\": \"$client_addr_json\", \"port\": \"$client_port_vm_ws\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$vm_direct_host\", \"path\": \"/$uuid-vm\", \"tls\": \"$vm_direct_tls\", \"sni\": \"$vm_direct_host\", \"allowInsecure\": \"$generic_link_insecure\"}" | base64 -w0)"
 append_share_link "$vm_link"
 echo
 sbvmpt(){
@@ -2426,9 +2717,9 @@ cat <<EOF
             "server_port": $client_port_vm_ws,
             "tag": "${sxname}vmess-$hostname$node_name_suffix",
             "tls": {
-                "enabled": false,
-                "server_name": "www.bing.com",
-                "insecure": false,
+                "enabled": $vm_direct_tls_enabled,
+                "server_name": "$vm_direct_host",
+                "insecure": $sbox_tls_insecure,
                 "utls": {
                     "enabled": true,
                     "fingerprint": "chrome"
@@ -2438,7 +2729,7 @@ cat <<EOF
             "transport": {
                 "headers": {
                     "Host": [
-                        "www.bing.com"
+                        "$vm_direct_host"
                     ]
                 },
                 "path": "$uuid-vm",
@@ -2463,13 +2754,14 @@ cat <<EOF
   alterId: 0
   cipher: auto
   udp: true
-  tls: false
+  tls: $vm_direct_tls_enabled
   network: ws
-  servername: www.bing.com
+  servername: $vm_direct_host
+  skip-cert-verify: $clash_skip_verify
   ws-opts:
     path: "$uuid-vm"
     headers:
-      Host: www.bing.com
+      Host: $vm_direct_host
 EOF
 }
 clvmpt1(){
@@ -2834,9 +3126,9 @@ echo "- ${sxname}vmess-ws-tls-argo-$hostname-443"
 echo "- ${sxname}vmess-ws-argo-$hostname-80"
 }
 elif [ "$vlvm" = "Vless" ]; then
-vwatls_link1="vless://$uuid@$argoip1:443?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$argodomain&path=$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#${sxname}vless-ws-tls-argo-enc-vision-$hostname"
+vwatls_link1="vless://$uuid@$argoip1_uri:443?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$argodomain&path=$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#${sxname}vless-ws-tls-argo-enc-vision-$hostname"
 echo "$vwatls_link1" >> "$HOME/lun/jhsub.txt"
-vwa_link2="vless://$uuid@$argoip2:80?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$argodomain&path=$uuid-vw&security=none#${sxname}vless-ws-argo-enc-vision-$hostname"
+vwa_link2="vless://$uuid@$argoip2_uri:80?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$argodomain&path=$uuid-vw&security=none#${sxname}vless-ws-argo-enc-vision-$hostname"
 echo "$vwa_link2" >> "$HOME/lun/jhsub.txt"
 sbvmargopt(){
 cat <<EOF
@@ -2957,27 +3249,24 @@ out=
 case "$f" in
 *argopt*) out=$($f); [ -n "$out" ] && printf "%s\n" "$out"; return ;;
 esac
-if [ -n "$addym" ] && [ "$addout" = "both" ]; then
-client_addr="$server_ip"
-node_name_suffix="-IP"
+for entry in $direct_entries; do
+entry_addr=${entry%%|*}
+entry_suffix=${entry#*|}
+client_addr=$(json_host "$entry_addr")
+client_addr_json=$client_addr
+node_name_suffix="-$entry_suffix"
 out=$($f)
 [ -n "$out" ] && printf "%s\n" "$out"
-client_addr="$addym"
-node_name_suffix="-DOMAIN"
-out=$($f)
-[ -n "$out" ] && printf "%s\n" "$out"
-client_addr="$server_ip"
-node_name_suffix="-IP"
-else
-out=$($f)
-[ -n "$out" ] && printf "%s\n" "$out"
-fi
+done
+client_addr=$(uri_host "$client_addr_raw")
+client_addr_json=$(json_host "$client_addr_raw")
+node_name_suffix="-$primary_name_suffix"
 fi
 }
-sbxy="$(get_func sbvlpt; get_func sbsspt; get_func sbanpt; get_func sbarpt; get_func sbvmpt; get_func sbhypt; get_func sbtupt; get_func sbvmargopt)"
-clxy="$(get_func clvlpt; get_func clsspt; get_func clanpt; get_func clvmpt; get_func clhypt; get_func cltupt; get_func clvmargopt)"
-sbgz="$(get_func sbvlpt1; get_func sbsspt1; get_func sbanpt1; get_func sbarpt1; get_func sbvmpt1; get_func sbhypt1; get_func sbtupt1; get_func sbvmargopt1)"
-clgz="$({ get_func clvlpt1; get_func clsspt1; get_func clanpt1; get_func clvmpt1; get_func clhypt1; get_func cltupt1; get_func clvmargopt1; } | sed '2,$s/^/    /')"
+sbxy="$(get_func sbvlpt; get_func sbsspt; get_func sbanpt; get_func sbarpt; get_func sbvmpt; get_func sbhypt; get_func sbtupt; get_func sbvmargopt; cat "$HOME/lun/.cdn_sbox_entries" 2>/dev/null)"
+clxy="$(get_func clvlpt; get_func clsspt; get_func clanpt; get_func clvmpt; get_func clhypt; get_func cltupt; get_func clvmargopt; cat "$HOME/lun/.cdn_clash_entries" 2>/dev/null)"
+sbgz="$(get_func sbvlpt1; get_func sbsspt1; get_func sbanpt1; get_func sbarpt1; get_func sbvmpt1; get_func sbhypt1; get_func sbtupt1; get_func sbvmargopt1; cat "$HOME/lun/.cdn_sbox_tags" 2>/dev/null)"
+clgz="$({ get_func clvlpt1; get_func clsspt1; get_func clanpt1; get_func clvmpt1; get_func clhypt1; get_func cltupt1; get_func clvmargopt1; cat "$HOME/lun/.cdn_clash_names" 2>/dev/null; } | sed '2,$s/^/    /')"
 sbgz=$(printf "%s\n" "$sbgz" | sed '$ s/,$//')
 cat > $HOME/lun/sbox.json <<EOF
 {
@@ -3226,6 +3515,7 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,🌍选择代理节点
 EOF
+rm -f "$HOME/lun/.cdn_sbox_entries" "$HOME/lun/.cdn_sbox_tags" "$HOME/lun/.cdn_clash_entries" "$HOME/lun/.cdn_clash_names"
 restart_subscription_service
 if [ -s $HOME/lun/subport.log ]; then
 showsubport=$(cat $HOME/lun/subport.log)
@@ -3287,6 +3577,7 @@ rm -f "$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_mode "$HOME/lun"/cert
 rm -f "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool
 rm -f "$HOME/lun"/acme_email "$HOME/lun"/acme_dns "$HOME/lun"/cert.env
 rm -f "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/argo* "$HOME/lun"/warp* "$HOME/lun"/name "$HOME/lun"/ipp*
+rm -f "$HOME/lun/address_mode"
 rm -f "$HOME/lun"/xr.json "$HOME/lun"/sb.json "$HOME/lun"/addym "$HOME/lun"/addout
 rm -f "$HOME/lun"/cfip* "$HOME/lun"/xvvmcdnym "$HOME/lun"/ym_vl_re "$HOME/lun"/argoport.log "$HOME/lun"/argo.log "$HOME/lun"/sbargoym.log "$HOME/lun"/sbargotoken.log
 rm -f "$HOME/lun"/subport.log "$HOME/lun"/subtoken.log "$HOME/lun"/subip_mode
@@ -3852,6 +4143,7 @@ for f in $files; do
 for one in $(cat "$f" 2>/dev/null); do
 case "$one" in ""|-1) continue ;; esac
 valid_addym "$one" || continue
+one=$(normalize_host "$one")
 case " $seen " in *" $one "*) continue ;; esac
 seen="${seen:+$seen }$one"
 printf '%s\n' "$one"
@@ -3878,8 +4170,12 @@ yellow_line "CDN提示：$1"
 # 不在列表内也会输出普通 CDN/优选入口节点，只是不适合直接套 CF 橙云。
 show_cdn_port_advice(){
 echo "Cloudflare 橙云普通代理端口：80/8080/8880/2052/2082/2086/2095 或 443/8443/2053/2083/2087/2096。"
-echo "仅当域名开启 Cloudflare 橙云代理时才必须使用这些公网端口；普通 CDN/优选 IP/自建反代不因此阻止输出节点。"
-echo "NAT VPS 若套橙云，请看公网端口是否在列表内；只有内网端口匹配不算。"
+if [ "$cdnmode" = rewrite ]; then
+echo "当前模式：NAT 端口改写。客户端连接 Cloudflare 边缘端口 ${cdnpt:-8080}，Cloudflare 再回源到每个协议的 NAT 公网端口。"
+[ "${cdnpt:-8080}" = 2096 ] && echo "2096 为 HTTPS：Lun 会启用源站 TLS；Cloudflare 自签证书使用 Full，匹配域名的有效证书可使用 Full (Strict)。"
+else
+echo "当前模式：同端口。客户端边缘端口与协议公网端口相同；Cloudflare 橙云要求它位于官方端口列表。"
+fi
 found=
 for item in \
 "VLESS XHTTP:$HOME/lun/port_vx" \
@@ -3891,12 +4187,14 @@ file=${item#*:}
 found=yes
 inner=$(cat "$file" 2>/dev/null)
 public=$(client_port "$inner")
-mode=$(cf_port_mode "$public" 2>/dev/null || true)
-if [ -n "$mode" ]; then
-green_line "$label 可生成 CDN 变体：内网端口 $inner，公网端口 $public，CF 模式 $mode。"
+edge=$(cdn_client_port "$inner")
+mode=$(cf_port_mode "$edge" 2>/dev/null || true)
+if [ "$cdnmode" = rewrite ]; then
+green_line "$label：Cloudflare 边缘端口 $edge → NAT 回源公网端口 $public → 内网监听端口 $inner。"
+elif [ -n "$mode" ]; then
+green_line "$label 可生成 CDN 变体：协议端口 $inner，客户端公网/边缘端口 $public，CF 模式 $mode。"
 else
-yellow_line "$label 当前公网端口 $public 不在 CF 橙云官方端口内；若未套橙云，仍会继续输出 CDN/优选节点。"
-yellow_line "  如需 Cloudflare 橙云代理，请通过 lun 菜单 → 安装/协议管理 改为 CF 支持端口。"
+yellow_line "$label 当前公网端口 $public 不在 CF 橙云官方端口内；可切换 NAT 端口改写模式，或仅用于支持该端口的其它反代。"
 fi
 done
 [ -n "$found" ] || yellow_line "当前没有 VMess WS / VLESS WS / VLESS XHTTP 非 Reality，普通 CDN/优选入口不会生成节点；可使用 CF 隧道/Argo。"
@@ -3917,27 +4215,97 @@ port=$3
 query=$4
 # 检查回源 Host 域名：CDN 需要一个解析到 VPS 的域名作为回源地址
 [ -n "$xvvmcdnym" ] || { cdn_skip "$label 缺少 CDN 回源 Host，已跳过 CDN 变体。请在 lun → 入口网络管理 → CDN 中设置回源 Host 域名。"; return 0; }
-# 获取公网端口（NAT 模式下可能不同于内网端口）
-public_port=$(client_port "$port")
-# 判断端口是否在 CF 橙云支持列表内；不在列表内时仍继续输出普通 CDN/优选节点
-mode=$(cf_port_mode "$public_port" 2>/dev/null || true)
-[ -z "$mode" ] && cdn_skip "$label 的公网端口 $public_port 不在 Cloudflare 橙云官方端口内；若未套橙云，仍继续输出 CDN/优选节点。"
+origin_public_port=$(client_port "$port")
+edge_port=$(cdn_client_port "$port")
+mode=$(cf_port_mode "$edge_port" 2>/dev/null || true)
+[ -z "$mode" ] && cdn_skip "$label 的客户端边缘端口 $edge_port 不在 Cloudflare 官方端口内；只适用于明确支持该端口的其它反代。"
 # 读取 CDN 优选地址，为空则写入默认值
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
 echo "【 $label 】CDN 优选节点信息如下："
-echo "注：add=CF优选地址（客户端入口），host=回源域名（CF回源到VPS），服务器出站仍直连 VPS。"
+if [ "$cdnmode" = rewrite ]; then
+echo "注：客户端边缘端口 $edge_port，Cloudflare Origin Rule 目标端口 $origin_public_port，服务器出站仍直连 VPS。"
+else
+echo "注：客户端边缘端口与回源公网端口均为 $edge_port，服务器出站仍直连 VPS。"
+fi
+cdn_index=0
 for cdn_ip in $ips; do
 case "$cdn_ip" in ""|-1) continue ;; esac
+cdn_index=$((cdn_index + 1))
+cdn_no=$(printf '%02d' "$cdn_index")
+cdn_kind=$(endpoint_kind "$cdn_ip")
+cdn_raw=$(json_host "$cdn_ip")
+cdn_uri=$(uri_host "$cdn_ip")
+cdn_name="${sxname}${base_name}-CDN-${cdn_kind}-${cdn_no}-$hostname"
 if [ "$mode" = "https" ]; then
-# HTTPS 模式：启用 TLS，sni=回源域名
-cdn_link="vless://$uuid@$cdn_ip:$public_port?${query}&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome#${sxname}${base_name}-cdn-$hostname-$public_port"
+cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome#$cdn_name"
+cdn_tls=true
 else
-# HTTP 模式：不启用 TLS
-cdn_link="vless://$uuid@$cdn_ip:$public_port?${query}&host=$xvvmcdnym#${sxname}${base_name}-cdn-$hostname-$public_port"
+cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym#$cdn_name"
+cdn_tls=false
 fi
 echo "$cdn_link" >> "$HOME/lun/jhsub.txt"
 echo "$cdn_link"
+if [ "$base_name" = "vl-xhttp-enc" ]; then
+cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
+- name: "$cdn_name"
+  type: vless
+  server: "$cdn_raw"
+  port: $edge_port
+  uuid: $uuid
+  flow: xtls-rprx-vision
+  encryption: "$enkey"
+  udp: true
+  tls: $cdn_tls
+  servername: $xvvmcdnym
+  client-fingerprint: chrome
+  network: xhttp
+  xhttp-opts:
+    path: "/$uuid-vx"
+    host: $xvvmcdnym
+    mode: auto
+EOF
+elif [ "$base_name" = "vl-ws-enc" ]; then
+cat >> "$HOME/lun/.cdn_sbox_entries" <<EOF
+    {
+      "type": "vless",
+      "tag": "$cdn_name",
+      "server": "$cdn_raw",
+      "server_port": $edge_port,
+      "uuid": "$uuid",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": $cdn_tls,
+        "server_name": "$xvvmcdnym"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/$uuid-vw",
+        "headers": { "Host": "$xvvmcdnym" }
+      }
+    },
+EOF
+printf '"%s",\n' "$cdn_name" >> "$HOME/lun/.cdn_sbox_tags"
+cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
+- name: "$cdn_name"
+  type: vless
+  server: "$cdn_raw"
+  port: $edge_port
+  uuid: $uuid
+  flow: xtls-rprx-vision
+  encryption: "$enkey"
+  udp: true
+  tls: $cdn_tls
+  servername: $xvvmcdnym
+  client-fingerprint: chrome
+  network: ws
+  ws-opts:
+    path: "/$uuid-vw"
+    headers:
+      Host: $xvvmcdnym
+EOF
+fi
+printf -- '- "%s"\n' "$cdn_name" >> "$HOME/lun/.cdn_clash_names"
 done
 echo
 }
@@ -3948,25 +4316,75 @@ echo
 append_vmess_cdn_links(){
 port=$1
 [ -n "$xvvmcdnym" ] || { cdn_skip "VMess WS 缺少 CDN 回源 Host，已跳过 CDN 变体。请在 lun → 入口网络管理 → CDN 中设置回源 Host 域名。"; return 0; }
-public_port=$(client_port "$port")
-mode=$(cf_port_mode "$public_port" 2>/dev/null || true)
-[ -z "$mode" ] && cdn_skip "VMess WS 的公网端口 $public_port 不在 Cloudflare 橙云官方端口内；若未套橙云，仍继续输出 CDN/优选节点。"
+origin_public_port=$(client_port "$port")
+edge_port=$(cdn_client_port "$port")
+mode=$(cf_port_mode "$edge_port" 2>/dev/null || true)
+[ -z "$mode" ] && cdn_skip "VMess WS 的客户端边缘端口 $edge_port 不在 Cloudflare 官方端口内；只适用于明确支持该端口的其它反代。"
 ips=$(cdn_ip_list)
 [ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
 echo "【 Vmess-ws-cdn 】CDN 优选节点信息如下："
-echo "注：add=CF优选地址（客户端入口），host=回源域名（CF回源到VPS），服务器出站仍直连 VPS。"
+if [ "$cdnmode" = rewrite ]; then
+echo "注：客户端边缘端口 $edge_port，Cloudflare Origin Rule 目标端口 $origin_public_port，服务器出站仍直连 VPS。"
+else
+echo "注：客户端边缘端口与回源公网端口均为 $edge_port，服务器出站仍直连 VPS。"
+fi
+cdn_index=0
 for cdn_ip in $ips; do
 case "$cdn_ip" in ""|-1) continue ;; esac
+cdn_index=$((cdn_index + 1))
+cdn_no=$(printf '%02d' "$cdn_index")
+cdn_kind=$(endpoint_kind "$cdn_ip")
+cdn_raw=$(json_host "$cdn_ip")
+cdn_name="${sxname}vm-ws-CDN-${cdn_kind}-${cdn_no}-$hostname"
 if [ "$mode" = "https" ]; then
-# HTTPS 模式：启用 TLS，sni=回源域名
-vm_cdn_json="{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-cdn-$hostname-$public_port\", \"add\": \"$cdn_ip\", \"port\": \"$public_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$xvvmcdnym\", \"fp\": \"chrome\"}"
+vm_cdn_json="{ \"v\": \"2\", \"ps\": \"$cdn_name\", \"add\": \"$cdn_raw\", \"port\": \"$edge_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$xvvmcdnym\", \"fp\": \"chrome\"}"
+cdn_tls=true
 else
-# HTTP 模式：不启用 TLS
-vm_cdn_json="{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-cdn-$hostname-$public_port\", \"add\": \"$cdn_ip\", \"port\": \"$public_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}"
+vm_cdn_json="{ \"v\": \"2\", \"ps\": \"$cdn_name\", \"add\": \"$cdn_raw\", \"port\": \"$edge_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}"
+cdn_tls=false
 fi
 vm_cdn_link="vmess://$(printf '%s' "$vm_cdn_json" | base64 -w0)"
 echo "$vm_cdn_link" >> "$HOME/lun/jhsub.txt"
 echo "$vm_cdn_link"
+cat >> "$HOME/lun/.cdn_sbox_entries" <<EOF
+    {
+      "type": "vmess",
+      "tag": "$cdn_name",
+      "server": "$cdn_raw",
+      "server_port": $edge_port,
+      "uuid": "$uuid",
+      "security": "auto",
+      "packet_encoding": "packetaddr",
+      "tls": {
+        "enabled": $cdn_tls,
+        "server_name": "$xvvmcdnym"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/$uuid-vm",
+        "headers": { "Host": "$xvvmcdnym" }
+      }
+    },
+EOF
+printf '"%s",\n' "$cdn_name" >> "$HOME/lun/.cdn_sbox_tags"
+cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
+- name: "$cdn_name"
+  type: vmess
+  server: "$cdn_raw"
+  port: $edge_port
+  uuid: $uuid
+  alterId: 0
+  cipher: auto
+  udp: true
+  tls: $cdn_tls
+  servername: $xvvmcdnym
+  network: ws
+  ws-opts:
+    path: "/$uuid-vm"
+    headers:
+      Host: $xvvmcdnym
+EOF
+printf -- '- "%s"\n' "$cdn_name" >> "$HOME/lun/.cdn_clash_names"
 done
 echo
 }
@@ -3977,7 +4395,11 @@ show_cdn_summary(){
 cdn_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 if [ -n "$cdn_host" ]; then
 cdn_ips=$(cdn_ip_list | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-echo "CDN：已启用  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
+if [ "$cdnmode" = rewrite ]; then
+echo "CDN：已启用  模式=NAT端口改写  边缘端口=${cdnpt:-8080}  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
+else
+echo "CDN：已启用  模式=同端口  Host=$cdn_host  优选=${cdn_ips:-默认域名}"
+fi
 else
 echo "CDN：未启用"
 fi
@@ -4006,7 +4428,8 @@ lunstatus
 ui_dash
 show_cert_summary
 [ -s "$HOME/lun/domain" ] && printf "服务域名：%s\n" "$(cat "$HOME/lun/domain")" || echo "服务域名：未设置"
-[ -s "$HOME/lun/addym" ] && printf "普通节点地址：%s  输出：%s\n" "$(cat "$HOME/lun/addym")" "$(cat "$HOME/lun/addout" 2>/dev/null)" || echo "普通节点地址：使用服务器 IP"
+dashboard_addresses=$(direct_address_entries | awk -F'|' '{printf "%s%s", sep, $1; sep=" "}')
+printf "节点地址输出：%s  地址：%s\n" "$(address_mode_label)" "${dashboard_addresses:-暂不可用}"
 if is_nat_mode; then
 echo "VPS类型：NAT VPS"
 [ -s "$HOME/lun/port_map" ] && printf "NAT端口映射：%s\n" "$(cat "$HOME/lun/port_map")" || echo "NAT端口映射：无"
@@ -4446,8 +4869,111 @@ esac
 #
 # 数据流向：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS服务
 # 效果：隐藏 VPS 真实 IP，通过 CDN 中转提升连接稳定性和速度
-# 限制：只有 VMess WS、VLESS WS、VLESS XHTTP（非Reality）支持，端口须在 CF 橙云端口列表内
+# 限制：只有 VMess WS、VLESS WS、VLESS XHTTP（非Reality）支持
+show_cdn_origin_rules(){
+host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+[ -n "$host" ] || { echo "尚未设置 CDN Host。"; return 1; }
+if [ "$cdnmode" != rewrite ]; then
+echo "当前为同端口模式，不需要 Origin Rule 端口改写。"
+return 0
+fi
+rule_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
+edge=${cdnpt:-8080}
+echo "Cloudflare 边缘端口：$edge"
+echo "请在 Cloudflare → Rules → Origin Rules 按以下 Host + Path 分别设置目标端口："
+for item in \
+"VLESS XHTTP:$HOME/lun/port_vx:$rule_uuid-vx" \
+"VLESS WS:$HOME/lun/port_vw:$rule_uuid-vw" \
+"VMess WS:$HOME/lun/port_vm_ws:$rule_uuid-vm"; do
+label=${item%%:*}
+rest=${item#*:}
+file=${rest%%:*}
+path=${rest#*:}
+[ -s "$file" ] || continue
+inner=$(cat "$file" 2>/dev/null)
+origin_public=$(client_port "$inner")
+printf '%s：Host 等于 %s，Path 以 /%s 开头，目标端口改写为 %s\n' "$label" "$host" "$path" "$origin_public"
+done
+if [ "$edge" = 2096 ]; then
+cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+cert_subject_now=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+if [ "$cert_subject_now" = "$host" ] && [ "$cert_mode_now" != self ]; then
+green_line "2096 源站 TLS：证书与 Host 匹配，可在 Cloudflare 使用 Full (Strict)。"
+else
+yellow_line "2096 源站 TLS：当前证书为自签或与 Host 不同，请在 Cloudflare 使用 Full，不要使用 Full (Strict)。"
+fi
+fi
+}
+
+show_cdn_dns_hint(){
+host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+[ -n "$host" ] || return 0
+resolved=$(resolve_domain_ips "$host")
+locals=$(local_public_ips)
+direct=no
+for one in $resolved; do
+printf '%s\n' "$locals" | grep -Fx "$one" >/dev/null 2>&1 && direct=yes
+done
+if [ "$direct" = yes ]; then
+yellow_line "$host 当前仍解析到本机公网地址，看起来是灰云/DNS only。使用 Cloudflare 优选入口前请开启橙云。"
+else
+green_line "$host 未直接返回本机公网地址；请仍在 Cloudflare 控制台确认该记录已开启橙云。"
+fi
+}
+
+cdn_probe_path(){
+probe_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
+if [ -s "$HOME/lun/port_vx" ]; then printf '%s\n' "$probe_uuid-vx"; return; fi
+if [ -s "$HOME/lun/port_vw" ]; then printf '%s\n' "$probe_uuid-vw"; return; fi
+if [ -s "$HOME/lun/port_vm_ws" ]; then printf '%s\n' "$probe_uuid-vm"; return; fi
+}
+
+diagnose_cdn_endpoints(){
+command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法执行 CDN 连通诊断。"; return 1; }
+host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+path=$(cdn_probe_path)
+[ -n "$host" ] && [ -n "$path" ] || { echo "需要先设置 CDN Host 并安装一个兼容协议。"; return 1; }
+edge=${cdnpt:-}
+[ "$cdnmode" = rewrite ] || {
+for f in "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vm_ws"; do [ -s "$f" ] && { edge=$(client_port "$(cat "$f")"); break; }; done
+}
+[ -n "$edge" ] || { echo "无法确定 CDN 边缘端口。"; return 1; }
+if is_cf_https_port "$edge"; then scheme=https; else scheme=http; fi
+ips=$(cdn_ip_list)
+[ -n "$ips" ] || { echo "尚未设置 CDN 优选入口。"; return 1; }
+echo "诊断 Host=$host，边缘端口=$edge，Path=/$path"
+for endpoint in $ips; do
+connect_endpoint=$(uri_host "$endpoint")
+errfile="/tmp/lun-cdn-diag.$$"
+code=$(curl -k -v -sS -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 10 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>"$errfile")
+rc=$?
+err=$(cat "$errfile" 2>/dev/null)
+rm -f "$errfile"
+if [ "$rc" -ne 0 ]; then
+case "$err" in
+*SSL*|*TLS*|*certificate*) red_line "$endpoint：TLS 握手失败（检查橙云边缘证书、2096 源站 TLS 和 Cloudflare SSL 模式）。" ;;
+*Connected\ to*)
+if [ "$scheme" = https ]; then
+red_line "$endpoint：TCP 边缘端口可达，但 TLS/Host 握手未完成（检查橙云、边缘证书和 SNI）。"
+else
+red_line "$endpoint：TCP 边缘端口可达，但回源请求未完成（检查橙云和 Origin Rule）。"
+fi
+;;
+*timed*out*|*Timeout*) red_line "$endpoint：边缘端口连接超时（入口 IP/域名或端口不可达）。" ;;
+*) red_line "$endpoint：连接失败（curl 返回码 $rc）。" ;;
+esac
+elif [ "$code" -ge 520 ] 2>/dev/null && [ "$code" -le 527 ] 2>/dev/null; then
+red_line "$endpoint：Cloudflare 返回 $code，边缘已到达但回源失败（检查 Origin Rule、NAT 公网端口和源站 TLS）。"
+else
+green_line "$endpoint：Cloudflare 边缘可达，HTTP 状态 $code。"
+fi
+done
+}
+
 prompt_cdn(){
+old_cdnmode=$cdnmode
+old_cdnpt=$cdnpt
+CDN_REBUILD_REQUIRED=no
 echo "========== CDN 优选 IP 加速配置 =========="
 echo "cdnym（回源域名）：你自己的域名，须已解析到 VPS IP，CF 通过它找到你的服务器"
 echo "cfip（优选地址）：客户端实际连接的 CDN/优选入口，填 IP 或域名，如 cloudflare-ech.com"
@@ -4464,8 +4990,12 @@ case "$enable_cdn" in
 del|none|n|N)
 rm -f "$HOME/lun/cdnym"
 clear_cdn_ip_list
+rm -f "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port"
 cdnym=
 cfip=
+cdnmode=standard
+cdnpt=
+[ "$old_cdnpt" = 2096 ] && CDN_REBUILD_REQUIRED=yes
 echo "CDN 节点配置已清除。"
 return 0
 ;;
@@ -4523,7 +5053,41 @@ elif [ -n "$cdnym" ] && [ -z "$(cdn_ip_list)" ]; then
 # 未设置优选地址但有回源 Host：写入默认优选域名
 save_cdn_ip_list "cloudflare-ech.com www.visa.com.sg"
 fi
-export cdnym cfip
+echo "CDN 端口模式："
+echo " 1. 同端口：客户端边缘端口等于协议公网端口"
+echo " 2. NAT 端口改写：客户端使用 CF 边缘端口，Origin Rule 回源到 NAT 公网端口"
+printf "请选择 [1-2]，当前 ${cdnmode:-standard}，回车保留，0 返回："
+IFS= read -r mode_choice
+[ "$mode_choice" = 0 ] && return 2
+case "$mode_choice" in
+1) cdnmode=standard; cdnpt=; rm -f "$HOME/lun/cdn_edge_port" ;;
+2) cdnmode=rewrite ;;
+"") [ -n "$cdnmode" ] || cdnmode=standard ;;
+*) echo "输入错误，已保留当前模式。" ;;
+esac
+printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
+if [ "$cdnmode" = rewrite ]; then
+echo "边缘端口：1. 8080（HTTP）  2. 2096（HTTPS + 源站 TLS）"
+printf "请选择 [1-2]，当前 ${cdnpt:-8080}，回车保留，0 返回："
+IFS= read -r edge_choice
+[ "$edge_choice" = 0 ] && return 2
+case "$edge_choice" in
+1) cdnpt=8080 ;;
+2) cdnpt=2096 ;;
+"") [ -n "$cdnpt" ] || cdnpt=8080 ;;
+*) echo "输入错误，使用 8080。"; cdnpt=8080 ;;
+esac
+printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port"
+fi
+if [ "$old_cdnmode" != "$cdnmode" ] || [ "$old_cdnpt" != "$cdnpt" ]; then
+CDN_REBUILD_REQUIRED=yes
+fi
+export cdnym cfip cdnmode cdnpt
+show_cdn_dns_hint
+show_cdn_origin_rules
+printf "是否立即执行 CDN 连通诊断？[y/N]："
+IFS= read -r run_diag
+case "$run_diag" in y|Y) diagnose_cdn_endpoints ;; esac
 }
 
 configure_addym_menu(){
@@ -4559,6 +5123,69 @@ load_addym_config
 echo "addym/addout 设置已保存。"
 return 0
 done
+}
+
+prompt_address_mode(){
+v4v6
+current_mode=$(address_mode_label)
+current_domain=$(normalize_host "${addym:-$domain}")
+if [ -z "$current_domain" ] || [ "$(endpoint_kind "$current_domain")" != DOMAIN ]; then current_domain=$(normalize_host "$domain"); fi
+[ -z "$current_domain" ] || [ "$(endpoint_kind "$current_domain")" = DOMAIN ] || current_domain=
+echo "节点地址输出（当前：$current_mode）"
+echo " 1. 仅域名"
+echo " 2. 仅 IPv4"
+echo " 3. 仅 IPv6"
+echo " 4. IPv4 + IPv6"
+echo " 5. 域名 + IPv4 + IPv6"
+echo " 0. 返回"
+printf "请选择 [0-5]："
+IFS= read -r mode_choice
+case "$mode_choice" in
+0) return 2 ;;
+1) new_addrmode=domain ;;
+2) new_addrmode=ipv4 ;;
+3) new_addrmode=ipv6 ;;
+4) new_addrmode=dual ;;
+5) new_addrmode=all ;;
+*) echo "输入错误。"; return 1 ;;
+esac
+case "$new_addrmode" in
+domain|all)
+while [ -z "$current_domain" ]; do
+printf "请输入节点域名（不带协议、端口或路径，0 返回）："
+IFS= read -r current_domain
+[ "$current_domain" = 0 ] && return 2
+if ! valid_domain "$current_domain" || [ "$(endpoint_kind "$current_domain")" != DOMAIN ] || [ "$current_domain" = del ] || [ "$current_domain" = none ]; then
+echo "域名格式不正确。"
+current_domain=
+fi
+done
+current_domain=$(normalize_host "$current_domain")
+addym="$current_domain"
+if [ "$new_addrmode" = domain ]; then addout=replace; else addout=both; fi
+printf '%s\n' "$addym" > "$HOME/lun/addym"
+printf '%s\n' "$addout" > "$HOME/lun/addout"
+;;
+ipv4)
+[ -n "$v4" ] || { echo "当前未检测到可用公网 IPv4，设置未更改。"; return 1; }
+ippz=4
+;;
+ipv6)
+[ -n "$v6" ] || { echo "当前未检测到可用公网 IPv6，设置未更改。"; return 1; }
+ippz=6
+;;
+dual)
+[ -n "$v4" ] || [ -n "$v6" ] || { echo "当前未检测到公网 IPv4/IPv6，设置未更改。"; return 1; }
+[ -z "$v4" ] && yellow_line "当前没有 IPv4，将只输出 IPv6。"
+[ -z "$v6" ] && yellow_line "当前没有 IPv6，将只输出 IPv4。"
+ippz=46
+;;
+esac
+addrmode=$new_addrmode
+printf '%s\n' "$addrmode" > "$HOME/lun/address_mode"
+export addrmode ippz addym addout
+echo "节点地址输出已设置为：$(address_mode_label)"
+return 0
 }
 
 protocol_label(){
@@ -4646,15 +5273,15 @@ note=$(protocol_note "$id")
 port=$(protocol_current_port "$id")
 if [ -n "$port" ]; then
 if is_nat_mode; then
-printf "%2s. %-38s 已选，内网端口：%s" "$id" "$label$note" "$port"
+printf "%2s. [已选] %s，内网端口：%s" "$id" "$label$note" "$port"
 public=$(client_port "$port")
 [ "$public" != "$port" ] && printf "，公网端口：%s" "$public"
 else
-printf "%2s. %-38s 已选，端口：%s" "$id" "$label$note" "$port"
+printf "%2s. [已选] %s，端口：%s" "$id" "$label$note" "$port"
 fi
 printf "\n"
 else
-printf "%2s. %-38s 未选择\n" "$id" "$label$note"
+printf "%2s. [未选] %s\n" "$id" "$label$note"
 fi
 done
 }
@@ -4770,13 +5397,7 @@ if is_nat_mode; then
 else
 [ -n "$inpool" ] && echo "端口池：$inpool" || { [ -n "$portpool" ] && echo "端口池：$portpool" || echo "端口池：未设置（可在入口网络管理中配置）"; }
 fi
-if [ -n "$addym" ]; then
-echo "普通节点地址：$addym  输出=${addout:-replace}"
-elif [ -n "$domain" ]; then
-echo "普通节点地址：将默认使用服务域名 $domain"
-else
-echo "普通节点地址：服务器 IP"
-fi
+echo "节点地址输出：$(address_mode_label)"
 ui_dash
 }
 
@@ -5274,7 +5895,7 @@ echo " 1. 修改 UUID"
 echo " 2. 设置服务域名"
 echo " 3. 管理证书"
 echo " 4. 设置 Argo 隧道"
-echo " 5. 设置 IP 输出优先级"
+echo " 5. 节点地址输出（域名 / IPv4 / IPv6）"
 echo " 6. 设置 WARP 出站"
 echo " 7. 节点订阅分享"
 echo " 8. 设置 CDN Host / cfip"
@@ -5287,10 +5908,10 @@ case "$c" in
 2) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
 3) certificate_menu; return ;;
 4) prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
-5) printf "输入 4、6 或 46（%s回车自动%s，46=同时输出v4+v6，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
+5) prompt_address_mode; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; LUN_MENU_ACTION=list; return ;;
 6) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 7) subscription_menu; return ;;
-8) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
+8) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_MENU_ACTION=rep; else LUN_MENU_ACTION=list; fi; return ;;
 9) configure_addym_menu; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
@@ -5405,16 +6026,20 @@ echo " 3. NAT 手动映射"
 echo " 4. CDN / 优选 IP"
 echo " 5. CF 隧道 / Argo"
 echo " 6. Argo 优选 IP / 入口地址"
+echo " 7. 显示 Cloudflare Origin Rule 配置"
+echo " 8. CDN 连通诊断"
 echo " 0. 返回"
-printf "请选择 [0-6]："
+printf "请选择 [0-8]："
 IFS= read -r c
 case "$c" in
 1) prompt_vps_mode; rc=$?; [ "$rc" = 2 ] && continue ;;
 2) prompt_port_pool; rc=$?; [ "$rc" = 2 ] && continue ;;
 3) vpsmode=nat; printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"; prompt_port_map; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
-4) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
+4) prompt_cdn; rc=$?; [ "$rc" = 2 ] && continue; if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_MENU_ACTION=rep; else LUN_MENU_ACTION=list; fi; return ;;
 5) prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 6) prompt_argo_ip; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
+7) show_cdn_origin_rules; ui_pause ;;
+8) diagnose_cdn_endpoints; ui_pause ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -5452,23 +6077,21 @@ ui_title "Lun 高级设置"
 echo " 1. 设置服务域名"
 echo " 2. 管理证书"
 echo " 3. WARP 出站"
-echo " 4. addym/addout"
-echo " 5. IP 输出优先级"
-echo " 6. 修改 UUID"
-echo " 7. 卸载 Lun"
-echo " 8. 清空配置恢复出厂设置"
+echo " 4. 节点地址输出（域名 / IPv4 / IPv6）"
+echo " 5. 修改 UUID"
+echo " 6. 卸载 Lun"
+echo " 7. 清空配置恢复出厂设置"
 echo " 0. 返回"
-printf "请选择 [0-8]："
+printf "请选择 [0-7]："
 IFS= read -r c
 case "$c" in
 1) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
 2) certificate_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; return ;;
 3) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
-4) configure_addym_menu; rc=$?; [ "$rc" = 2 ] && continue; LUN_MENU_ACTION=list; return ;;
-5) printf "输入 4、6 或 46（%s回车自动%s，46=同时输出v4+v6，0 返回）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r ippz; [ "$ippz" = 0 ] && continue; export ippz; LUN_MENU_ACTION=list; return ;;
-6) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
-7) LUN_MENU_ACTION=del; return ;;
-8) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=install; return; } ;;
+4) prompt_address_mode; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; LUN_MENU_ACTION=list; return ;;
+5) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
+6) LUN_MENU_ACTION=del; return ;;
+7) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=install; return; } ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
