@@ -25,7 +25,7 @@ done
 [ "$_lun_proc_running" = "no" ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_proc_running=yes
 [ "$_lun_proc_running" = "no" ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_proc_running=yes
 _lun_installed=no
-{ [ -f "$HOME/lun/uuid" ] || [ -f "$HOME/lun/xr.json" ] || [ -f "$HOME/lun/sb.json" ]; } && _lun_installed=yes
+{ [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/xr.json" ] || [ -s "$HOME/lun/sb.json" ]; } && _lun_installed=yes
 if [ "$_lun_proc_running" = "yes" ] || [ "$_lun_installed" = "yes" ]; then
 if [ "$1" = "rep" ]; then
 [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
@@ -72,6 +72,7 @@ export domain=${domain:-''}
 export certmode=${certmode:-''}
 export acme_email=${acme_email:-''}
 export acme_dns=${acme_dns:-''}
+export coremirror=${coremirror:-${LUN_CORE_MIRROR:-"https://oracle1.1223344.xyz/fhlun"}}
 v46url="https://icanhazip.com"
 lunurl=${lunurl:-"https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh"}
 showmode_short(){
@@ -88,7 +89,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.12.1"
+echo "当前版本：V26.7.12.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1049,17 +1050,95 @@ case "$warp" in *s6*|x) sbyx='ipv6_only' ;; *) sbyx='prefer_ipv4' ;; esac
 case "$warp" in *x6*) xryx='ForceIPv6' ;; *x*) xryx='ForceIPv4v6' ;; *) xryx='ForceIPv6v4' ;; esac
 fi
 }
+core_network_detect(){
+[ -n "$core_net_v4" ] && [ -n "$core_net_v6" ] && return
+core_net_v4=no; core_net_v6=no
+if command -v curl >/dev/null 2>&1; then
+curl -4 -fsS --connect-timeout 5 --max-time 8 "$v46url" >/dev/null 2>&1 && core_net_v4=yes
+curl -6 -fsS --connect-timeout 5 --max-time 8 "$v46url" >/dev/null 2>&1 && core_net_v6=yes
+elif command -v wget >/dev/null 2>&1; then
+timeout 8 wget -4 -qO- --tries=1 "$v46url" >/dev/null 2>&1 && core_net_v4=yes
+timeout 8 wget -6 -qO- --tries=1 "$v46url" >/dev/null 2>&1 && core_net_v6=yes
+fi
+}
+
+download_core_url(){
+download_url=$1
+download_out=$2
+download_family=$3
+rm -f "$download_out"
+if command -v curl >/dev/null 2>&1; then
+case "$download_family" in
+4) curl -4 -fL --connect-timeout 10 --max-time 300 --retry 2 -o "$download_out" "$download_url" ;;
+6) curl -6 -fL --connect-timeout 10 --max-time 300 --retry 2 -o "$download_out" "$download_url" ;;
+*) curl -fL --connect-timeout 10 --max-time 300 --retry 2 -o "$download_out" "$download_url" ;;
+esac
+elif command -v wget >/dev/null 2>&1; then
+case "$download_family" in
+4) wget -4 -O "$download_out" --tries=2 --timeout=60 "$download_url" ;;
+6) wget -6 -O "$download_out" --tries=2 --timeout=60 "$download_url" ;;
+*) wget -O "$download_out" --tries=2 --timeout=60 "$download_url" ;;
+esac
+else
+return 1
+fi
+[ -s "$download_out" ]
+}
+
+download_core_asset(){
+asset_name=$1
+asset_tmp=$2
+asset_upstream=$3
+core_network_detect
+mirror_base=${coremirror%/}
+[ "$mirror_base" = off ] && mirror_base=
+if [ "$core_net_v4" = yes ]; then
+echo "下载 $asset_name：GitHub Release（IPv4）"
+download_core_url "$asset_upstream" "$asset_tmp" 4 && return 0
+fi
+if [ "$core_net_v6" = yes ] && [ -n "$mirror_base" ]; then
+echo "下载 $asset_name：IPv6 镜像 ${mirror_base}"
+download_core_url "$mirror_base/$asset_name" "$asset_tmp" 6 && return 0
+fi
+rm -f "$asset_tmp"
+echo "下载 $asset_name 失败：IPv4=$core_net_v4，IPv6=$core_net_v6。"
+if [ "$core_net_v6" = yes ] && [ "$core_net_v4" != yes ]; then
+echo "此服务器仅能 IPv6 出网，GitHub Release 的 github.com 入口没有可用 IPv6 路由。请部署 oracle1.1223344.xyz/fhlun Worker 镜像，或使用 coremirror=你的镜像地址。"
+fi
+return 1
+}
+
 upxray(){
-url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/xray-$cpu"; out="$HOME/lun/xray"; (command -v curl >/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && wget -O "$out" --tries=2 --timeout=60 "$url")
-chmod +x "$HOME/lun/xray"
-sbcore=$("$HOME/lun/xray" version 2>/dev/null | awk '/^Xray/{print $2}')
+out="$HOME/lun/xray"; tmp="${out}.tmp.$$"
+url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/xray-$cpu"
+download_core_asset "xray-$cpu" "$tmp" "$url" || return 1
+chmod +x "$tmp" || { rm -f "$tmp"; return 1; }
+sbcore=$("$tmp" version 2>/dev/null | awk '/^Xray/{print $2}')
+[ -n "$sbcore" ] || { echo "下载的 Xray 文件无法执行，已保留原内核。"; rm -f "$tmp"; return 1; }
+mv -f "$tmp" "$out"
 echo "已安装Xray正式版内核：$sbcore"
 }
+
 upsingbox(){
-url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-$cpu"; out="$HOME/lun/sing-box"; (command -v curl >/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && wget -O "$out" --tries=2 --timeout=60 "$url")
-chmod +x "$HOME/lun/sing-box"
-sbcore=$("$HOME/lun/sing-box" version 2>/dev/null | awk '/version/{print $NF}')
+out="$HOME/lun/sing-box"; tmp="${out}.tmp.$$"
+url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-$cpu"
+download_core_asset "sing-box-$cpu" "$tmp" "$url" || return 1
+chmod +x "$tmp" || { rm -f "$tmp"; return 1; }
+sbcore=$("$tmp" version 2>/dev/null | awk '/version/{print $NF}')
+[ -n "$sbcore" ] || { echo "下载的 Sing-box 文件无法执行，已保留原内核。"; rm -f "$tmp"; return 1; }
+mv -f "$tmp" "$out"
 echo "已安装Sing-box正式版内核：$sbcore"
+}
+
+upcloudflared(){
+out="$HOME/lun/cloudflared"; tmp="${out}.tmp.$$"
+url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu"
+download_core_asset "cloudflared-linux-$cpu" "$tmp" "$url" || return 1
+chmod +x "$tmp" || { rm -f "$tmp"; return 1; }
+argocore=$("$tmp" version 2>/dev/null | awk '{print $3}')
+[ -n "$argocore" ] || { echo "下载的 Cloudflared 文件无法执行，已保留原内核。"; rm -f "$tmp"; return 1; }
+mv -f "$tmp" "$out"
+echo "已安装Cloudflared正式版内核：$argocore"
 }
 
 cert_hash_update(){
@@ -1583,7 +1662,7 @@ echo
 echo "=========启用xray内核========="
 mkdir -p "$HOME/lun/xrk"
 if [ ! -e "$HOME/lun/xray" ]; then
-upxray
+upxray || { echo "Xray 内核下载失败，已停止生成协议配置。"; return 1; }
 fi
 cat > "$HOME/lun/xr.json" <<EOF
 {
@@ -1827,7 +1906,7 @@ installsb(){
 echo
 echo "=========启用Sing-box内核========="
 if [ ! -e "$HOME/lun/sing-box" ]; then
-upsingbox
+upsingbox || { echo "Sing-box 内核下载失败，已停止生成协议配置。"; return 1; }
 fi
 cat > "$HOME/lun/sb.json" <<EOF
 {
@@ -2356,22 +2435,22 @@ fi
 }
 ins(){
 if [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$ssp" != yes ]; then
-installxray
+installxray || return 1
 xrsbvm
 xrsbso
 warpsx
 xrsbout
 hyp="hyptargo"; tup="tuptargo"; anp="anptargo"; arp="arptargo"; ssp="ssptargo"
 elif [ "$xhp" != yes ] && [ "$vlp" != yes ] && [ "$vxp" != yes ] && [ "$vwp" != yes ]; then
-installsb
+installsb || return 1
 xrsbvm
 xrsbso
 warpsx
 xrsbout
 xhp="xhptargo"; vlp="vlptargo"; vxp="vxptargo"; vwp="vwptargo"
 else
-installsb
-installxray
+installsb || return 1
+installxray || return 1
 xrsbvm
 xrsbso
 warpsx
@@ -2381,10 +2460,7 @@ if [ -n "$argo" ] && [ -n "$vmag" ]; then
 echo
 echo "=========启用Cloudflared-argo内核========="
 if [ ! -e "$HOME/lun/cloudflared" ]; then
-argocore=$({ command -v curl >/dev/null 2>&1 && curl -Ls https://data.jsdelivr.com/v1/package/gh/cloudflare/cloudflared || wget -qO- https://data.jsdelivr.com/v1/package/gh/cloudflare/cloudflared; } | grep -Eo '"[0-9.]+"' | sed -n 1p | tr -d '",')
-echo "下载Cloudflared-argo最新正式版内核：$argocore"
-url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu"; out="$HOME/lun/cloudflared"; (command -v curl>/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && wget -O "$out" --tries=2 --timeout=60 "$url")
-chmod +x "$HOME/lun/cloudflared"
+upcloudflared || { echo "Cloudflared 内核下载失败，已停止 Argo 配置。"; return 1; }
 fi
 if [ "$argo" = "vmpt" ]; then argoport=$(cat "$HOME/lun/port_vm_ws" 2>/dev/null); echo "Vmess" > "$HOME/lun/vlvm"; elif [ "$argo" = "vwpt" ]; then argoport=$(cat "$HOME/lun/port_vw" 2>/dev/null); echo "Vless" > "$HOME/lun/vlvm"; fi; echo "$argoport" > "$HOME/lun/argoport.log"
 if [ -n "${ARGO_DOMAIN}" ] && [ -n "${ARGO_AUTH}" ]; then
@@ -6462,7 +6538,7 @@ echo " 0. 返回"
 printf "请选择 [0-2]："
 IFS= read -r c
 case "$c" in
-1) guided_install; rc=$?; [ "$rc" = 0 ] && { [ -f "$HOME/lun/uuid" ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
+1) guided_install; rc=$?; [ "$rc" = 0 ] && { { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; } && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
 2) pick_protocols; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
@@ -6671,6 +6747,8 @@ showmode_short
 exit
 elif [ "$1" = "rep" ]; then
 _lun_rebuild_request=yes
+_lun_rebuild_existing=no
+{ [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; } && _lun_rebuild_existing=yes
 create_rebuild_snapshot || { echo "无法创建重建快照，已取消操作，原服务未改动。"; exit 1; }
 trap 'rollback_rebuild' EXIT
 trap 'exit 130' HUP INT TERM
@@ -6678,7 +6756,11 @@ cleandel keep-entry
 ensure_lun_command || true
 rm -rf "$HOME/lun"/{sb.json,xr.json,sbargoym.log,sbargotoken.log,argo.log,argoport.log,name}
 rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu
+if [ "$_lun_rebuild_existing" = yes ]; then
 echo "旧协议进程已停止，正在重建配置；现有内核、证书、UUID 与订阅设置均保留。"
+else
+echo "未检测到可用内核，当前按首次安装继续。"
+fi
 echo
 elif [ "$1" = "list" ]; then
 cip
@@ -6747,7 +6829,7 @@ xendip="162.159.192.1"
 fi
 echo "VPS系统：$op"
 echo "CPU架构：$cpu"
-if [ "$_lun_rebuild_request" = yes ]; then
+if [ "$_lun_rebuild_request" = yes ] && [ "$_lun_rebuild_existing" = yes ]; then
 echo "Lun 已安装：仅重建协议配置，不重复下载现有 Xray/Sing-box 内核。"
 elif [ -s "$HOME/lun/uuid" ] && { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; }; then
 echo "检测到 Lun 已安装但服务未运行，正在使用现有内核修复配置并启动。"
@@ -6764,7 +6846,10 @@ netfilter-persistent save >/dev/null 2>&1
 echo
 echo "iptables执行开放所有端口"
 fi
-ins
+if ! ins; then
+echo "Lun 内核安装失败，未覆盖已有内核或启动不完整服务。"
+exit 1
+fi
 if [ "$_lun_rebuild_request" = yes ]; then
 if ! validate_rebuild; then
 rollback_rebuild
