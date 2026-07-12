@@ -1,7 +1,0 @@
-name = "fhlun-core-mirror"
-main = "_worker.js"
-compatibility_date = "2026-07-12"
-
-routes = [
-  { pattern = "oracle1.1223344.xyz/fhlun/*", zone_name = "1223344.xyz" }
-]

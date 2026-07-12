@@ -76,7 +76,6 @@ vlpt="" vmpt="" hypt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78l
 | `certmode` | `self`、`origin`、`ca`、`domain`、`dns`、`ip`，默认 `self` |
 | `acme_email` | Let’s Encrypt 账户邮箱 |
 | `acme_dns` | acme.sh DNS provider，例如 `dns_cf`、`dns_ali` |
-| `coremirror` | 内核 IPv6 镜像基础地址；默认 `https://oracle1.1223344.xyz/fhlun`，填 `off` 仅使用 GitHub Release |
 
 `certmode=self` 会生成本地 ECDSA 自签证书。`origin` 表示 Cloudflare Origin CA 等仅供服务商回源验证的证书，`ca` 表示公开 CA 签发证书。`domain` 使用 HTTP-01，`dns` 使用 acme.sh 原生 DNS API，`ip` 使用 Let’s Encrypt short-lived IP 证书。
 
@@ -86,22 +85,11 @@ IPv6-only VPS 可以使用 HTTP-01。脚本检测到域名只有 AAAA 时会让 
 
 DNS API 凭据按 acme.sh 原生环境变量保存到 `/root/lun/cert.env`，权限为 `600`。
 
-### IPv6 内核镜像
+### IPv6 内核下载
 
-GitHub 的 `raw.githubusercontent.com` 可通过 IPv6 访问，但 Release 下载入口 `github.com` 可能只返回 IPv4；因此 IPv6-only VPS 需要通过 Cloudflare Worker 镜像下载内核。仓库的 `_worker.js` 只代理 FHLUN 的 Xray/Sing-box 和 Cloudflared 六个固定二进制，默认路由为 `oracle1.1223344.xyz/fhlun/*`。
+GitHub Release 下载入口 `github.com` 可能只返回 IPv4，因此纯 IPv6 VPS 会自动改用 `https://oracle1.1223344.xyz/fhlun` 静态镜像。该镜像由 Oracle 双栈服务器通过 IPv4 同步 FHLUN 的 Xray/Sing-box 与 Cloudflared 文件，再通过 HTTPS 同时提供 IPv4/IPv6 下载；不使用 Cloudflare Worker 或第三方代理。可通过 `coremirror="https://your-mirror.example/fhlun"` 覆盖，填写 `coremirror=off` 则只使用 GitHub Release。
 
-在已登录 Cloudflare 的电脑或服务器中执行：
-
-```bash
-npx wrangler login
-npx wrangler deploy
-```
-
-确保 `oracle1.1223344.xyz` 保持 Cloudflare 橙云。部署后可通过 `lun upx`、`lun ups` 更新内核；首次安装会自动优先使用 GitHub IPv4，IPv4 不可用时改用该 IPv6 镜像。镜像地址也可覆盖：
-
-```bash
-coremirror="https://your-domain.example/fhlun" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
-```
+镜像主机使用 Nginx 提供文件，并由 `fhlun-core-mirror.timer` 每日执行同步；可在镜像主机运行 `systemctl status fhlun-core-mirror.timer` 查看状态，或运行 `systemctl start fhlun-core-mirror.service` 立即同步最新 Release。
 
 Reality、Argo 和 CDN 仍然独立：
 

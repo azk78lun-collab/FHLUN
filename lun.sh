@@ -89,7 +89,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.12.2"
+echo "当前版本：V26.7.12.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1096,14 +1096,20 @@ if [ "$core_net_v4" = yes ]; then
 echo "下载 $asset_name：GitHub Release（IPv4）"
 download_core_url "$asset_upstream" "$asset_tmp" 4 && return 0
 fi
-if [ "$core_net_v6" = yes ] && [ -n "$mirror_base" ]; then
-echo "下载 $asset_name：IPv6 镜像 ${mirror_base}"
+if [ -n "$mirror_base" ]; then
+if [ "$core_net_v6" = yes ]; then
+echo "下载 $asset_name：Oracle 静态镜像（IPv6）"
 download_core_url "$mirror_base/$asset_name" "$asset_tmp" 6 && return 0
+fi
+if [ "$core_net_v4" = yes ]; then
+echo "下载 $asset_name：Oracle 静态镜像（IPv4）"
+download_core_url "$mirror_base/$asset_name" "$asset_tmp" 4 && return 0
+fi
 fi
 rm -f "$asset_tmp"
 echo "下载 $asset_name 失败：IPv4=$core_net_v4，IPv6=$core_net_v6。"
 if [ "$core_net_v6" = yes ] && [ "$core_net_v4" != yes ]; then
-echo "此服务器仅能 IPv6 出网，GitHub Release 的 github.com 入口没有可用 IPv6 路由。请部署 oracle1.1223344.xyz/fhlun Worker 镜像，或使用 coremirror=你的镜像地址。"
+echo "已尝试 Oracle 静态镜像，请检查 oracle1.1223344.xyz/fhlun 服务和 IPv6 连通性。"
 fi
 return 1
 }
