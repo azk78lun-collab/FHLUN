@@ -89,7 +89,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.12.3"
+echo "当前版本：V26.7.12.4"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -544,6 +544,28 @@ inner=$1
 is_nat_mode || return 0
 public=$(client_port "$inner")
 [ "$public" != "$inner" ] && echo "NAT映射：公网端口 $public -> 内网端口 $inner"
+}
+
+show_port_map_list(){
+maps=${1:-$ptmap}
+if [ -z "$maps" ]; then
+echo "NAT端口映射：无"
+return 0
+fi
+count=$(printf '%s\n' $maps | awk 'NF{n++} END{print n+0}')
+echo "NAT端口映射：共 $count 组"
+line=
+column=0
+for pair in $maps; do
+line="$line  $pair"
+column=$((column + 1))
+if [ "$column" -ge 4 ]; then
+echo "$line"
+line=
+column=0
+fi
+done
+[ -z "$line" ] || echo "$line"
 }
 
 valid_port_range(){
@@ -2715,22 +2737,13 @@ echo "订阅服务缺少 token/UUID，已跳过。"
 return 1
 fi
 if [ -n "$subpt" ]; then
-subport="$subpt"
+requested_subport="$subpt"
 elif [ -s "$HOME/lun/subport.log" ]; then
-subport=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+requested_subport=$(cat "$HOME/lun/subport.log" 2>/dev/null)
 else
-subport=$(random_port) || { echo "订阅服务无法取得可用端口，已跳过。"; return 1; }
+requested_subport=
 fi
-mapped_inner=$(inner_port_from_public "$subport")
-[ -n "$mapped_inner" ] && subport="$mapped_inner"
-port_valid "$subport" || { echo "订阅端口 $subport 无效，已跳过。"; return 1; }
-stop_subscription_service
-sleep 1
-if port_in_use "$subport"; then
-echo "订阅端口 $subport 仍被占用，订阅服务未启动："
-port_owner_lines "$subport" | sed 's/^/  /'
-return 1
-fi
+subport=$(select_subscription_port "$requested_subport") || { echo "订阅服务无法取得可用端口，已跳过。"; return 1; }
 rm -rf "$HOME/weblun/$subtoken"
 mkdir -p "$HOME/weblun/$subtoken"
 printf "%s\n" "$subtoken" > "$HOME/lun/subtoken.log"
@@ -2835,11 +2848,6 @@ cdnip2="www.visa.com.sg"
 fi
 argoip_cfg=$(cat "$HOME/lun/argoip" 2>/dev/null)
 [ -z "$argoip_cfg" ] && argoip_cfg="162.159.192.1 162.159.192.2"
-set -- $argoip_cfg
-argoip1=${1:-162.159.192.1}
-argoip2=${2:-$argoip1}
-argoip1_uri=$(uri_host "$argoip1")
-argoip2_uri=$(uri_host "$argoip2")
 direct_entries=$(direct_address_entries)
 if [ -z "$direct_entries" ]; then
 echo "当前地址输出模式 $(address_mode_label) 没有可用地址，请在高级设置中重新选择。"
@@ -3380,230 +3388,145 @@ argodomain=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
 [ -z "$argodomain" ] && argodomain=$(grep -a trycloudflare.com "$HOME/lun/argo.log" 2>/dev/null | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
 if [ -n "$argodomain" ]; then
 vlvm=$(cat $HOME/lun/vlvm 2>/dev/null)
+argo_entries=
+argo_index=0
+argo_seen=
+for argo_addr in $argoip_cfg; do
+argo_addr=$(json_host "$argo_addr")
+[ -n "$argo_addr" ] || continue
+case " $argo_seen " in *" $argo_addr "*) continue ;; esac
+argo_seen="${argo_seen:+$argo_seen }$argo_addr"
+argo_index=$((argo_index + 1))
+argo_suffix="$(endpoint_kind "$argo_addr")-$(printf '%02d' "$argo_index")"
+argo_entries="$argo_entries $argo_addr|$argo_suffix"
+done
+
+argo_links_display=
 if [ "$vlvm" = "Vmess" ]; then
-vmatls_link1="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-tls-argo-$hostname-443\", \"add\": \"$argoip1\", \"port\": \"443\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)"
-echo "$vmatls_link1" >> "$HOME/lun/jhsub.txt"
-vmatls_link2="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-tls-argo-$hostname-8443\", \"add\": \"162.159.192.1\", \"port\": \"8443\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)"
-echo "$vmatls_link2" >> "$HOME/lun/jhsub.txt"
-vmatls_link3="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-tls-argo-$hostname-2053\", \"add\": \"162.159.192.1\", \"port\": \"2053\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)"
-echo "$vmatls_link3" >> "$HOME/lun/jhsub.txt"
-vmatls_link4="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-tls-argo-$hostname-2083\", \"add\": \"162.159.192.1\", \"port\": \"2083\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)"
-echo "$vmatls_link4" >> "$HOME/lun/jhsub.txt"
-vmatls_link5="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-tls-argo-$hostname-2087\", \"add\": \"162.159.192.1\", \"port\": \"2087\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)"
-echo "$vmatls_link5" >> "$HOME/lun/jhsub.txt"
-vmatls_link6="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-tls-argo-$hostname-2096\", \"add\": \"[2606:4700::0]\", \"port\": \"2096\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)"
-echo "$vmatls_link6" >> "$HOME/lun/jhsub.txt"
-vma_link7="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-80\", \"add\": \"$argoip2\", \"port\": \"80\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link7" >> "$HOME/lun/jhsub.txt"
-vma_link8="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-8080\", \"add\": \"162.159.192.2\", \"port\": \"8080\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link8" >> "$HOME/lun/jhsub.txt"
-vma_link9="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-8880\", \"add\": \"162.159.192.2\", \"port\": \"8880\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link9" >> "$HOME/lun/jhsub.txt"
-vma_link10="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-2052\", \"add\": \"162.159.192.2\", \"port\": \"2052\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link10" >> "$HOME/lun/jhsub.txt"
-vma_link11="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-2082\", \"add\": \"162.159.192.2\", \"port\": \"2082\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link11" >> "$HOME/lun/jhsub.txt"
-vma_link12="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-2086\", \"add\": \"162.159.192.2\", \"port\": \"2086\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link12" >> "$HOME/lun/jhsub.txt"
-vma_link13="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vmess-ws-argo-$hostname-2095\", \"add\": \"[2400:cb00:2049::0]\", \"port\": \"2095\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
-echo "$vma_link13" >> "$HOME/lun/jhsub.txt"
+for argo_entry in $argo_entries; do
+argo_addr=${argo_entry%%|*}
+argo_suffix=${argo_entry#*|}
+tls_name="${sxname}vmess-ws-argo-TLS-443-$hostname-$argo_suffix"
+http_name="${sxname}vmess-ws-argo-HTTP-80-$hostname-$argo_suffix"
+tls_link="vmess://$(printf '%s' "{ \"v\": \"2\", \"ps\": \"$tls_name\", \"add\": \"$argo_addr\", \"port\": \"443\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"fp\": \"chrome\"}" | base64 -w0)"
+http_link="vmess://$(printf '%s' "{ \"v\": \"2\", \"ps\": \"$http_name\", \"add\": \"$argo_addr\", \"port\": \"80\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
+printf '%s\n%s\n' "$tls_link" "$http_link" >> "$HOME/lun/jhsub.txt"
+argo_links_display="$argo_links_display
+$tls_link
+$http_link"
+done
 sbvmargopt(){
+for argo_entry in $argo_entries; do
+argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
+for argo_mode in tls http; do
+if [ "$argo_mode" = tls ]; then argo_port=443; argo_tls=true; argo_label=TLS; else argo_port=80; argo_tls=false; argo_label=HTTP; fi
 cat <<EOF
 {
-            "server": "$argoip1",
-            "server_port": 443,
-            "tag": "${sxname}vmess-ws-tls-argo-$hostname-443",
-            "tls": {
-                "enabled": true,
-                "server_name": "$argodomain",
-                "insecure": false,
-                "utls": {
-                    "enabled": true,
-                    "fingerprint": "chrome"
-                }
-            },
-            "packet_encoding": "packetaddr",
-            "transport": {
-                "headers": {
-                    "Host": [
-                        "$argodomain"
-                    ]
-                },
-                "path": "$uuid-vm",
-                "type": "ws"
-            },
-            "type": "vmess",
-            "security": "auto",
-            "uuid": "$uuid"
-        },
-{
-            "server": "$argoip2",
-            "server_port": 80,
-            "tag": "${sxname}vmess-ws-argo-$hostname-80",
-            "tls": {
-                "enabled": false,
-                "server_name": "$argodomain",
-                "insecure": false,
-                "utls": {
-                    "enabled": true,
-                    "fingerprint": "chrome"
-                }
-            },
-            "packet_encoding": "packetaddr",
-            "transport": {
-                "headers": {
-                    "Host": [
-                        "$argodomain"
-                    ]
-                },
-                "path": "$uuid-vm",
-                "type": "ws"
-            },
-            "type": "vmess",
-            "security": "auto",
-            "uuid": "$uuid"
-        },
+  "server": "$argo_addr",
+  "server_port": $argo_port,
+  "tag": "${sxname}vmess-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix",
+  "tls": {"enabled": $argo_tls, "server_name": "$argodomain", "insecure": false, "utls": {"enabled": true, "fingerprint": "chrome"}},
+  "packet_encoding": "packetaddr",
+  "transport": {"headers": {"Host": ["$argodomain"]}, "path": "/$uuid-vm", "type": "ws"},
+  "type": "vmess",
+  "security": "auto",
+  "uuid": "$uuid"
+},
 EOF
+done
+done
 }
 sbvmargopt1(){
-echo "\"${sxname}vmess-ws-tls-argo-$hostname-443\","
-echo "\"${sxname}vmess-ws-argo-$hostname-80\","
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "\"${sxname}vmess-ws-argo-TLS-443-$hostname-$argo_suffix\","; echo "\"${sxname}vmess-ws-argo-HTTP-80-$hostname-$argo_suffix\","; done
 }
 clvmargopt(){
+for argo_entry in $argo_entries; do
+argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
+for argo_mode in tls http; do
+if [ "$argo_mode" = tls ]; then argo_port=443; argo_tls=true; argo_label=TLS; else argo_port=80; argo_tls=false; argo_label=HTTP; fi
 cat <<EOF
-- name: ${sxname}vmess-ws-tls-argo-$hostname-443
+- name: ${sxname}vmess-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix
   type: vmess
-  server: "$argoip1"
-  port: 443
+  server: "$argo_addr"
+  port: $argo_port
   uuid: $uuid
   alterId: 0
   cipher: auto
   udp: true
-  tls: true
+  tls: $argo_tls
   network: ws
   servername: $argodomain
   ws-opts:
-    path: "$uuid-vm"
-    headers:
-      Host: $argodomain
-- name: ${sxname}vmess-ws-argo-$hostname-80
-  type: vmess
-  server: "$argoip2"
-  port: 80
-  uuid: $uuid
-  alterId: 0
-  cipher: auto
-  udp: true
-  tls: false
-  network: ws
-  servername: $argodomain
-  ws-opts:
-    path: "$uuid-vm"
+    path: "/$uuid-vm"
     headers:
       Host: $argodomain
 EOF
+done
+done
 }
 clvmargopt1(){
-echo "- ${sxname}vmess-ws-tls-argo-$hostname-443"
-echo "- ${sxname}vmess-ws-argo-$hostname-80"
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- ${sxname}vmess-ws-argo-TLS-443-$hostname-$argo_suffix"; echo "- ${sxname}vmess-ws-argo-HTTP-80-$hostname-$argo_suffix"; done
 }
 elif [ "$vlvm" = "Vless" ]; then
-vwatls_link1="vless://$uuid@$argoip1_uri:443?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$argodomain&path=$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#${sxname}vless-ws-tls-argo-enc-vision-$hostname"
-echo "$vwatls_link1" >> "$HOME/lun/jhsub.txt"
-vwa_link2="vless://$uuid@$argoip2_uri:80?encryption=$enkey&flow=xtls-rprx-vision&type=ws&host=$argodomain&path=$uuid-vw&security=none#${sxname}vless-ws-argo-enc-vision-$hostname"
-echo "$vwa_link2" >> "$HOME/lun/jhsub.txt"
+for argo_entry in $argo_entries; do
+argo_addr=${argo_entry%%|*}
+argo_suffix=${argo_entry#*|}
+argo_uri=$(uri_host "$argo_addr")
+tls_link="vless://$uuid@$argo_uri:443?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#${sxname}vless-ws-argo-TLS-443-$hostname-$argo_suffix"
+http_link="vless://$uuid@$argo_uri:80?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=none#${sxname}vless-ws-argo-HTTP-80-$hostname-$argo_suffix"
+printf '%s\n%s\n' "$tls_link" "$http_link" >> "$HOME/lun/jhsub.txt"
+argo_links_display="$argo_links_display
+$tls_link
+$http_link"
+done
 sbvmargopt(){
+for argo_entry in $argo_entries; do
+argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
+for argo_mode in tls http; do
+if [ "$argo_mode" = tls ]; then argo_port=443; argo_tls=true; argo_label=TLS; else argo_port=80; argo_tls=false; argo_label=HTTP; fi
 cat <<EOF
 {
-            "server": "$argoip1",
-            "server_port": 443,
-            "tag": "${sxname}vless-ws-tls-argo-$hostname-443",
-            "type": "vless",
-            "uuid": "$uuid",
-            "flow": "xtls-rprx-vision",
-            "tls": {
-                "enabled": true,
-                "server_name": "$argodomain",
-                "insecure": false,
-                "utls": {
-                    "enabled": true,
-                    "fingerprint": "chrome"
-                }
-            },
-            "transport": {
-                "headers": {
-                    "Host": [
-                        "$argodomain"
-                    ]
-                },
-                "path": "$uuid-vw",
-                "type": "ws"
-            }
-        },
-{
-            "server": "$argoip2",
-            "server_port": 80,
-            "tag": "${sxname}vless-ws-argo-$hostname-80",
-            "type": "vless",
-            "uuid": "$uuid",
-            "flow": "xtls-rprx-vision",
-            "tls": {
-                "enabled": false,
-                "server_name": "$argodomain",
-                "insecure": false
-            },
-            "transport": {
-                "headers": {
-                    "Host": [
-                        "$argodomain"
-                    ]
-                },
-                "path": "$uuid-vw",
-                "type": "ws"
-            }
-        },
+  "server": "$argo_addr",
+  "server_port": $argo_port,
+  "tag": "${sxname}vless-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix",
+  "type": "vless",
+  "uuid": "$uuid",
+  "tls": {"enabled": $argo_tls, "server_name": "$argodomain", "insecure": false, "utls": {"enabled": true, "fingerprint": "chrome"}},
+  "transport": {"headers": {"Host": ["$argodomain"]}, "path": "/$uuid-vw", "type": "ws"}
+},
 EOF
+done
+done
 }
 sbvmargopt1(){
-echo "\"${sxname}vless-ws-tls-argo-$hostname-443\","
-echo "\"${sxname}vless-ws-argo-$hostname-80\","
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "\"${sxname}vless-ws-argo-TLS-443-$hostname-$argo_suffix\","; echo "\"${sxname}vless-ws-argo-HTTP-80-$hostname-$argo_suffix\","; done
 }
 clvmargopt(){
+for argo_entry in $argo_entries; do
+argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
+for argo_mode in tls http; do
+if [ "$argo_mode" = tls ]; then argo_port=443; argo_tls=true; argo_label=TLS; else argo_port=80; argo_tls=false; argo_label=HTTP; fi
 cat <<EOF
-- name: ${sxname}vless-ws-tls-argo-$hostname-443
+- name: ${sxname}vless-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix
   type: vless
-  server: "$argoip1"
-  port: 443
+  server: "$argo_addr"
+  port: $argo_port
   uuid: $uuid
   network: ws
   udp: true
-  tls: true
-  flow: xtls-rprx-vision
+  tls: $argo_tls
   servername: $argodomain
   client-fingerprint: chrome
   ws-opts:
-    path: "$uuid-vw"
-    headers:
-      Host: $argodomain
-- name: ${sxname}vless-ws-argo-$hostname-80
-  type: vless
-  server: "$argoip2"
-  port: 80
-  uuid: $uuid
-  network: ws
-  udp: true
-  tls: false
-  flow: xtls-rprx-vision
-  servername: $argodomain
-  ws-opts:
-    path: "$uuid-vw"
+    path: "/$uuid-vw"
     headers:
       Host: $argodomain
 EOF
+done
+done
 }
 clvmargopt1(){
-echo "- ${sxname}vless-ws-tls-argo-$hostname-443"
-echo "- ${sxname}vless-ws-argo-$hostname-80"
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- ${sxname}vless-ws-argo-TLS-443-$hostname-$argo_suffix"; echo "- ${sxname}vless-ws-argo-HTTP-80-$hostname-$argo_suffix"; done
 }
 fi
 sbtk=$(cat "$HOME/lun/sbargotoken.log" 2>/dev/null)
@@ -3615,11 +3538,7 @@ echo "Argo隧道端口正在使用$vlvm-ws主协议端口：$(cat $HOME/lun/argo
 Argo域名：$argodomain
 $nametn
 
-1、443端口的$vlvm-ws-tls-argo节点(优选IP与443系端口随便换)
-${vmatls_link1}${vwatls_link1}
-
-2、80端口的$vlvm-ws-argo节点(优选IP与80系端口随便换)
-${vma_link7}${vwa_link2}
+已按 Argo 优选地址导出 TLS 443 与 HTTP 80 节点：$argo_links_display
 "
 )
 fi
@@ -4321,10 +4240,10 @@ port_owner_lines "$p" | sed 's/^/  /'
 return 1
 }
 
-port_reserved(){
+protocol_port_reserved(){
 p=$1
 p_public=$(client_port "$p")
-for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu" "$subpt"; do
+for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu"; do
 [ -n "$used" ] || continue
 used_public=$(client_port "$used")
 [ "$used" = "$p" ] && return 0
@@ -4332,7 +4251,7 @@ used_public=$(client_port "$used")
 [ "$used" = "$p_public" ] && return 0
 [ "$used_public" = "$p_public" ] && return 0
 done
-for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu" "$HOME/lun/subport.log"; do
+for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu"; do
 [ -s "$file" ] || continue
 used=$(cat "$file" 2>/dev/null)
 [ -n "$used" ] || continue
@@ -4343,6 +4262,103 @@ used_public=$(client_port "$used")
 [ "$used_public" = "$p_public" ] && return 0
 done
 return 1
+}
+
+port_reserved(){
+p=$1
+protocol_port_reserved "$p" && return 0
+p_public=$(client_port "$p")
+for used in "$subpt" "$(cat "$HOME/lun/subport.log" 2>/dev/null)"; do
+[ -n "$used" ] || continue
+used_public=$(client_port "$used")
+[ "$used" = "$p" ] && return 0
+[ "$used_public" = "$p" ] && return 0
+[ "$used" = "$p_public" ] && return 0
+[ "$used_public" = "$p_public" ] && return 0
+done
+return 1
+}
+
+subscription_port_available(){
+p=$1
+port_valid "$p" || return 1
+protocol_port_reserved "$p" && return 1
+port_in_use "$p" && return 1
+return 0
+}
+
+subscription_port_preferred(){
+public=$(client_port "$1")
+[ "$public" -ge 10000 ] 2>/dev/null
+}
+
+random_subscription_port(){
+if is_nat_mode; then
+candidates=
+for pair in $ptmap; do
+candidates="$candidates ${pair#*-}"
+done
+[ -n "$inpool" ] || [ -z "$portpool" ] || inpool=$portpool
+if [ -n "$inpool" ]; then
+candidates="$candidates $(port_pool_inner_candidates 2>/dev/null)"
+fi
+[ -n "$candidates" ] || {
+echo "NAT VPS 没有可用映射，无法自动分配可访问的订阅端口。" >&2
+return 1
+}
+shuffled=$(printf '%s\n' $candidates | awk 'NF && !seen[$0]++' | shuf 2>/dev/null)
+for p in $shuffled; do
+subscription_port_preferred "$p" || continue
+subscription_port_available "$p" && { printf '%s\n' "$p"; return 0; }
+done
+for p in $shuffled; do
+subscription_port_available "$p" && { printf '%s\n' "$p"; return 0; }
+done
+echo "NAT 映射中的端口都已被协议或其他进程占用，请增加映射。" >&2
+return 1
+fi
+
+if [ -n "$inpool" ] || [ -n "$portpool" ]; then
+shuffled=$(port_pool_inner_candidates | awk 'NF && !seen[$0]++' | shuf 2>/dev/null)
+for p in $shuffled; do
+subscription_port_preferred "$p" || continue
+subscription_port_available "$p" && { printf '%s\n' "$p"; return 0; }
+done
+for p in $shuffled; do
+subscription_port_available "$p" && { printf '%s\n' "$p"; return 0; }
+done
+fi
+for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+p=$(shuf -i 20000-65535 -n 1)
+subscription_port_available "$p" && { printf '%s\n' "$p"; return 0; }
+done
+echo "没有找到可用的订阅端口，请手动设置端口或扩容端口池。" >&2
+return 1
+}
+
+select_subscription_port(){
+requested=$1
+[ -n "$requested" ] && {
+mapped_inner=$(inner_port_from_public "$requested")
+[ -n "$mapped_inner" ] && requested=$mapped_inner
+}
+stop_subscription_service
+sleep 1
+if [ -n "$requested" ] && subscription_port_available "$requested"; then
+printf '%s\n' "$requested"
+return 0
+fi
+selected=$(random_subscription_port) || return 1
+if [ -n "$requested" ] && [ "$selected" != "$requested" ]; then
+old_public=$(client_port "$requested")
+new_public=$(client_port "$selected")
+if is_nat_mode; then
+green_line "订阅端口冲突：已从公网 $old_public / 内网 $requested 自动改为公网 $new_public / 内网 $selected。" >&2
+else
+green_line "订阅端口 $requested 冲突，已自动改为 $selected。" >&2
+fi
+fi
+printf '%s\n' "$selected"
 }
 
 random_nat_port(){
@@ -4402,7 +4418,7 @@ label=$1
 var=$2
 while :; do
 if is_nat_mode; then
-[ -n "$ptmap" ] && echo "当前手动 NAT 映射：$ptmap；这里请填写内网监听端口或对应公网端口。"
+[ -n "$ptmap" ] && { show_port_map_list "$ptmap"; echo "这里请填写内网监听端口或对应公网端口。"; }
 [ -n "$inpool" ] && echo "当前内网端口池：$inpool"
 [ -n "$outpool" ] && echo "当前外网端口池：$outpool（按位置映射内网池）"
 printf "请输入 %s 内网端口（%s回车随机%s，0 返回）：" "$label" "$LUN_YELLOW" "$LUN_RESET"
@@ -4903,7 +4919,7 @@ dashboard_addresses=$(direct_address_entries | awk -F'|' '{printf "%s%s", sep, $
 printf "节点地址输出：%s  地址：%s\n" "$(address_mode_label)" "${dashboard_addresses:-暂不可用}"
 if is_nat_mode; then
 echo "VPS类型：NAT VPS"
-[ -s "$HOME/lun/port_map" ] && printf "NAT端口映射：%s\n" "$(cat "$HOME/lun/port_map")" || echo "NAT端口映射：无"
+[ -s "$HOME/lun/port_map" ] && show_port_map_list "$(cat "$HOME/lun/port_map")" || echo "NAT端口映射：无"
 [ -s "$HOME/lun/inner_port_pool" ] && printf "内网端口池：%s\n" "$(cat "$HOME/lun/inner_port_pool")" || { [ -s "$HOME/lun/port_pool" ] && printf "内网端口池：%s\n" "$(cat "$HOME/lun/port_pool")" || echo "内网端口池：未设置"; }
 [ -s "$HOME/lun/outer_port_pool" ] && printf "外网端口池：%s\n" "$(cat "$HOME/lun/outer_port_pool")" || echo "外网端口池：未设置"
 [ -s "$HOME/lun/inner_port_pool" ] && [ -s "$HOME/lun/outer_port_pool" ] && echo "NAT自动映射：外网端口池按顺序对应内网端口池"
@@ -5175,6 +5191,11 @@ ARGO_AUTH="$agk"
 prompt_argo_ip
 rc=$?
 [ "$rc" = 2 ] && return 2
+case "$argo" in
+vmpt) selected_argo_port="$vm_ws_port" ;;
+vwpt) selected_argo_port="$vless_ws_port" ;;
+esac
+[ -z "$agn" ] || green_line "Cloudflare Tunnel 的 Public Hostname Service 请设置为：http://localhost:$selected_argo_port"
 export argo agn agk ARGO_DOMAIN ARGO_AUTH argoip
 fi
 }
@@ -5198,34 +5219,25 @@ fi
 IFS= read -r candidate_subpt
 [ "$candidate_subpt" = "0" ] && return 2
 if [ -z "$candidate_subpt" ]; then
-if is_nat_mode && [ -n "$ptmap" ]; then
-candidate_subpt=$(random_nat_port) || { echo "无法从NAT映射表取得可用订阅端口。"; continue; }
-echo "节点订阅分享从NAT映射表随机内网端口：$candidate_subpt"
-else
-candidate_subpt=$(random_port) || { echo "无法从端口池取得可用订阅端口。"; continue; }
-if is_nat_mode; then
-echo "节点订阅分享随机内网端口：$candidate_subpt"
-else
-echo "节点订阅分享随机端口：$candidate_subpt"
-fi
-fi
+candidate_subpt=$(select_subscription_port "$(cat "$HOME/lun/subport.log" 2>/dev/null)") || {
+echo "无法自动取得可用订阅端口，请增加 NAT 映射/端口池。"
+continue
+}
+subpt="$candidate_subpt"
+green_line "节点订阅分享已选择可用端口：$(client_port "$subpt")"
+show_port_mapping_hint "$subpt"
+break
 fi
 mapped_inner=$(inner_port_from_public "$candidate_subpt")
 if [ -n "$mapped_inner" ]; then
 echo "检测到你输入的是公网端口 $candidate_subpt，已转换为订阅内网端口 $mapped_inner。"
 candidate_subpt="$mapped_inner"
 fi
-if port_valid "$candidate_subpt" && port_reserved "$candidate_subpt"; then
-public_subpt=$(client_port "$candidate_subpt")
-if [ "$public_subpt" != "$candidate_subpt" ]; then
-echo "订阅端口 $candidate_subpt 或对应公网端口 $public_subpt 已被当前 Lun 协议/订阅占用，请换一个。"
-else
-echo "订阅端口 $candidate_subpt 已被当前 Lun 协议/订阅占用，请换一个。"
-fi
+if port_valid "$candidate_subpt"; then
+subpt=$(select_subscription_port "$candidate_subpt") || {
+echo "没有可自动替换的订阅端口，请增加 NAT 映射/端口池或手动换一个。"
 continue
-fi
-if port_valid "$candidate_subpt" && ensure_port_available "$candidate_subpt"; then
-subpt="$candidate_subpt"
+}
 show_port_mapping_hint "$subpt"
 break
 fi
@@ -5902,7 +5914,7 @@ else
 echo "节点订阅分享：未启用"
 fi
 if is_nat_mode; then
-[ -n "$ptmap" ] && echo "NAT端口映射：$ptmap" || yellow_line "NAT端口映射：未设置（可在入口网络管理中配置）"
+[ -n "$ptmap" ] && show_port_map_list "$ptmap" || yellow_line "NAT端口映射：未设置（可在入口网络管理中配置）"
 [ -n "$inpool" ] && echo "内网端口池：$inpool" || { [ -n "$portpool" ] && echo "内网端口池：$portpool" || echo "内网端口池：未设置（可在入口网络管理中配置）"; }
 [ -n "$outpool" ] && echo "外网端口池：$outpool" || echo "外网端口池：未设置（可在入口网络管理中配置）"
 [ -n "$inpool" ] && [ -n "$outpool" ] && echo "NAT自动映射：外网端口池按顺序对应内网端口池"
@@ -6160,21 +6172,10 @@ guided_auto_defaults(){
 if [ -z "$sub" ]; then
 sub=y
 subid=
-candidate_subpt=
-for _try in 1 2 3 4 5 6 7 8 9 10; do
-if is_nat_mode && [ -n "$ptmap" ]; then
-candidate_subpt=$(random_nat_port 2>/dev/null) || candidate_subpt=
-else
-candidate_subpt=$(random_port 2>/dev/null) || candidate_subpt=
-fi
-[ -n "$candidate_subpt" ] || continue
-port_reserved "$candidate_subpt" && { candidate_subpt=; continue; }
-port_in_use "$candidate_subpt" 2>/dev/null && { candidate_subpt=; continue; }
-break
-done
+candidate_subpt=$(select_subscription_port "$(cat "$HOME/lun/subport.log" 2>/dev/null)") || candidate_subpt=
 if [ -n "$candidate_subpt" ]; then
 subpt="$candidate_subpt"
-echo "已自动启用节点订阅分享，随机端口：$subpt"
+green_line "已自动启用节点订阅分享，可用端口：$(client_port "$subpt")"
 else
 sub=
 echo "节点订阅分享没有取得可用端口，已跳过；可稍后在菜单里手动设置订阅端口。"
@@ -6575,13 +6576,77 @@ esac
 done
 }
 
+probe_argo_remote_service(){
+[ -x "$HOME/lun/cloudflared" ] || return 1
+[ -s "$HOME/lun/sbargotoken.log" ] || return 1
+probe_log="$HOME/lun/.argo-probe-$$.log"
+rm -f "$probe_log"
+"$HOME/lun/cloudflared" tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --loglevel info --logfile "$probe_log" run --token "$(cat "$HOME/lun/sbargotoken.log")" >/dev/null 2>&1 &
+probe_pid=$!
+for _try in 1 2 3 4 5 6 7 8; do
+grep -q 'Updated to new configuration' "$probe_log" 2>/dev/null && break
+sleep 1
+done
+kill "$probe_pid" 2>/dev/null || true
+wait "$probe_pid" 2>/dev/null || true
+remote_service=$(grep 'Updated to new configuration' "$probe_log" 2>/dev/null | grep -o '\\"service\\":\\"[^\\"]*' | head -1 | sed 's/^\\"service\\":\\"//')
+rm -f "$probe_log"
+[ -n "$remote_service" ] || return 1
+printf '%s\n' "$remote_service"
+}
+
+diagnose_argo_tunnel(){
+ui_title "Lun CF 隧道 / Argo 回源诊断"
+argo_port=$(cat "$HOME/lun/argoport.log" 2>/dev/null)
+argo_type=$(cat "$HOME/lun/vlvm" 2>/dev/null)
+argo_domain=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
+[ -n "$argo_port" ] || { red_line "未找到 Argo 绑定端口，请先配置隧道。"; return 1; }
+[ "$argo_type" = Vmess ] && argo_path="/$(cat "$HOME/lun/uuid")-vm" || argo_path="/$(cat "$HOME/lun/uuid")-vw"
+expected_service="http://localhost:$argo_port"
+echo "Lun 当前协议：$argo_type WS"
+echo "本机应使用的 Tunnel 服务：$expected_service"
+echo "WebSocket 路径：$argo_path"
+if command -v curl >/dev/null 2>&1; then
+local_code=$(curl -sm 8 -o /dev/null -w '%{http_code}' "$expected_service$argo_path" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 2>/dev/null)
+if [ "$local_code" = 101 ]; then
+green_line "本机回源：正常（WebSocket 101）"
+else
+red_line "本机回源：异常（HTTP ${local_code:-连接失败}），请先检查协议服务。"
+fi
+fi
+echo "正在读取 Cloudflare 下发的 Tunnel 配置，约需数秒……"
+remote_service=$(probe_argo_remote_service 2>/dev/null)
+if [ -n "$remote_service" ]; then
+echo "Cloudflare 控制台当前服务：$remote_service"
+if [ "$remote_service" = "$expected_service" ]; then
+green_line "控制台回源与本机端口一致。"
+else
+red_line "端口不一致：请在 Cloudflare Tunnel 的 Public Hostname 中把 Service 改为 $expected_service。"
+fi
+else
+yellow_line "未能读取远端服务配置；请手动确认 Public Hostname 的 Service 为 $expected_service。"
+fi
+if [ -n "$argo_domain" ] && command -v curl >/dev/null 2>&1; then
+edge_code=$(curl -skm 12 -o /dev/null -w '%{http_code}' "https://$argo_domain$argo_path" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 2>/dev/null)
+case "$edge_code" in
+101) green_line "Cloudflare 边缘回源：正常（WebSocket 101）" ;;
+502) red_line "Cloudflare 边缘回源：502，通常就是控制台 Service 的协议或端口不匹配。" ;;
+*) yellow_line "Cloudflare 边缘返回：${edge_code:-连接失败}" ;;
+esac
+fi
+}
+
 argo_network_menu(){
 while :; do
 ui_title "Lun CF 隧道 / Argo"
+if [ -s "$HOME/lun/argoport.log" ]; then
+echo "当前本机回源：http://localhost:$(cat "$HOME/lun/argoport.log")"
+fi
 echo " 1. 配置 / 修改隧道"
 echo " 2. Argo 优选 IP / 入口地址"
+echo " 3. 诊断隧道回源（检查 Cloudflare 控制台端口）"
 echo " 0. 返回"
-printf "请选择 [0-2]："
+printf "请选择 [0-3]："
 IFS= read -r c
 case "$c" in
 1)
@@ -6591,6 +6656,11 @@ load_installed_protocol_flags; LUN_MENU_ACTION=rep; return 0
 2)
 prompt_argo_ip; rc=$?; [ "$rc" = 2 ] && continue
 LUN_MENU_ACTION=list; return 0
+;;
+3)
+diagnose_argo_tunnel
+ui_pause
+continue
 ;;
 0|"") return 2 ;;
 *) echo "输入错误。" ;;
@@ -6605,14 +6675,15 @@ is_nat_mode && echo "当前 VPS：NAT" || echo "当前 VPS：普通"
 show_cdn_summary
 [ -s "$HOME/lun/argoip" ] && echo "Argo优选：$(cat "$HOME/lun/argoip")" || echo "Argo优选：中性默认"
 echo " 1. VPS / 端口"
-echo " 2. CDN / CF 优选"
+echo " 2. CDN / CF 优选（入口地址与 Host）"
 if is_nat_mode; then
 echo " 3. NAT Origin Rules（端口回源）"
-echo " 4. CF 隧道 / Argo"
+echo " 4. CF 隧道 / Argo（独立链路，不使用 2/3 的设置）"
+echo "    说明：2 + 3 属于普通 CDN 入站；4 是无需 NAT 入站端口的隧道。"
 echo " 5. CDN 连通诊断"
 menu_max=5
 else
-echo " 3. CF 隧道 / Argo"
+echo " 3. CF 隧道 / Argo（独立链路）"
 echo " 4. CDN 连通诊断"
 menu_max=4
 fi
@@ -6876,32 +6947,18 @@ echo $subtoken > $HOME/lun/subtoken.log
 subportipsub(){
 if [ -z "$subpt" ]; then
 if [ -n "$(cat "$HOME/lun/subport.log" 2>/dev/null)" ]; then
-subport=$(cat $HOME/lun/subport.log)
+requested_subport=$(cat "$HOME/lun/subport.log")
 else
-subport=$(random_port 2>/dev/null) || {
-echo "订阅服务无法取得可用端口，已跳过订阅服务启动。"
-return 1
-}
+requested_subport=
 fi
 else
-subport="$subpt"
+requested_subport="$subpt"
 fi
-mapped_inner=$(inner_port_from_public "$subport")
-[ -n "$mapped_inner" ] && subport="$mapped_inner"
-if ! port_valid "$subport"; then
-echo "订阅端口 $subport 无效，已跳过订阅服务启动。"
-return 1
-fi
-saved_subport=$(cat "$HOME/lun/subport.log" 2>/dev/null)
-if [ "$saved_subport" != "$subport" ] && port_reserved "$subport"; then
-echo "订阅端口 $subport 已被当前 Lun 协议/订阅占用，已跳过订阅服务启动。"
-return 1
-fi
-echo $subport > $HOME/lun/subport.log
+subport=$(select_subscription_port "$requested_subport") || return 1
+printf '%s\n' "$subport" > "$HOME/lun/subport.log"
 }
-subtokenipsub && subportipsub
+if subportipsub && subtokenipsub; then
 echo "请稍后…………"
-stop_subscription_service
 mkdir -p $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"
 ln -sf $HOME/lun/clmi.yaml $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"/clmi.yaml
 ln -sf $HOME/lun/sbox.json $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"/sbox.json
@@ -6928,6 +6985,9 @@ crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 fi
 echo "本地IP订阅链接已更新完成"
+else
+echo "订阅端口不可用，已保留协议服务并跳过订阅 httpd 启动。"
+fi
 fi
 if [ -n "$hyjpt" ] && [ -n "$hyp" ]; then
 echo

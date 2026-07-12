@@ -38,7 +38,7 @@ lun
 
 “安装 / 协议管理”中的增删改操作会停止旧协议进程并重写 Xray/Sing-box 配置，这是让新增、删除和端口修改生效的必要步骤；已有内核、证书、UUID 与订阅设置会保留，只有所选协议需要的内核文件确实缺失时才下载。重建前会创建事务快照，SSH 断线、命令中断或新配置校验失败时自动恢复旧配置和服务，成功后保留 `~/lun/.last_good_rebuild`。状态区会区分“运行中”“已安装但未运行”“内核已安装但当前协议未使用”和“未安装”。
 
-Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`。
+Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`；每个入口都会导出 TLS 443 和 HTTP 80 节点。该菜单的“诊断隧道回源”会同时检查本机 WebSocket 和 Cloudflare 下发的 Public Hostname Service，若控制台仍指向旧端口，会直接显示应改成的 `http://localhost:端口`。
 
 ## 快捷操作
 
@@ -226,7 +226,7 @@ inpool="1000+1010 8080" outpool="49096+49106 51046" vwpt="" sub="y" bash <(curl 
 sub="y" subid="mytoken" subpt="30080" vlpt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-订阅地址默认只输出 IPv4。可在 `lun` → `节点订阅分享` 中修改订阅 token/端口，或切换为 `ipv4`、`ipv6`、`both`；无 IPv6 时会自动跳过 IPv6 订阅地址。NAT VPS 下订阅 URL 会显示公网端口，服务仍监听内网端口。修改订阅 token、端口或 IP 输出模式时只刷新分享文件、软链和本地 httpd，不会重装内核或重建协议。
+订阅地址默认只输出 IPv4。可在 `lun` → `节点订阅分享` 中修改订阅 token/端口，或切换为 `ipv4`、`ipv6`、`both`；无 IPv6 时会自动跳过 IPv6 订阅地址。NAT VPS 下订阅 URL 会显示公网端口，服务仍监听内网端口。刷新时会识别订阅自身的 httpd，不会把原端口误判为协议占用；若确实撞到协议或外部进程，会从完整映射/端口池中自动选择空闲端口，普通 VPS 的自动随机端口使用 `20000-65535`。修改订阅 token、端口或 IP 输出模式时只刷新分享文件、软链和本地 httpd，不会重装内核或重建协议。
 
 生成内容包括：
 
