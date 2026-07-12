@@ -89,7 +89,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.12.4"
+echo "当前版本：V26.7.12.5"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1857,8 +1857,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
       "settings": {
         "clients": [
           {
-            "id": "${uuid}",
-            "flow": "xtls-rprx-vision"
+            "id": "${uuid}"
           }
         ],
         "decryption": "${dekey}"
@@ -2976,11 +2975,11 @@ vw_direct_extra="&security=none"
 if cdn_origin_tls_for_port "$port_vw"; then
 vw_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
 fi
-vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw$vw_direct_extra#${sxname}vl-ws-enc-$hostname$node_name_suffix"
+vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&type=ws&path=$uuid-vw$vw_direct_extra#${sxname}vl-ws-enc-$hostname$node_name_suffix"
 append_share_link "$vl_vw_link"
 echo
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled ws; then
-append_vless_cdn_links "Vless-ws-enc-cdn" "vl-ws-enc" "$port_vw" "encryption=$enkey&flow=xtls-rprx-vision&type=ws&path=$uuid-vw"
+append_vless_cdn_links "Vless-ws-enc-cdn" "vl-ws-enc" "$port_vw" "encryption=$enkey&type=ws&path=$uuid-vw"
 fi
 fi
 if grep reality-vision "$HOME/lun/xr.json" >/dev/null 2>&1; then
@@ -4757,7 +4756,6 @@ cat >> "$HOME/lun/.cdn_sbox_entries" <<EOF
       "server": "$cdn_raw",
       "server_port": $edge_port,
       "uuid": "$uuid",
-      "flow": "xtls-rprx-vision",
       "tls": {
         "enabled": $cdn_tls,
         "server_name": "$xvvmcdnym"
@@ -4776,7 +4774,6 @@ cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
   server: "$cdn_raw"
   port: $edge_port
   uuid: $uuid
-  flow: xtls-rprx-vision
   encryption: "$enkey"
   udp: true
   tls: $cdn_tls
@@ -6627,7 +6624,7 @@ else
 yellow_line "未能读取远端服务配置；请手动确认 Public Hostname 的 Service 为 $expected_service。"
 fi
 if [ -n "$argo_domain" ] && command -v curl >/dev/null 2>&1; then
-edge_code=$(curl -skm 12 -o /dev/null -w '%{http_code}' "https://$argo_domain$argo_path" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 2>/dev/null)
+edge_code=$(curl --http1.1 -skm 12 -o /dev/null -w '%{http_code}' "https://$argo_domain$argo_path" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 2>/dev/null)
 case "$edge_code" in
 101) green_line "Cloudflare 边缘回源：正常（WebSocket 101）" ;;
 502) red_line "Cloudflare 边缘回源：502，通常就是控制台 Service 的协议或端口不匹配。" ;;
