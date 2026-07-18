@@ -4267,13 +4267,13 @@ for svc in xr sb argo; do
 systemctl stop "$svc" >/dev/null 2>&1
 systemctl disable "$svc" >/dev/null 2>&1
 done
-rm -rf /etc/systemd/system/{xr.service,sb.service,argo.service}
+rm -f /etc/systemd/system/xr.service /etc/systemd/system/sb.service /etc/systemd/system/argo.service
 elif command -v rc-service >/dev/null 2>&1; then
 for svc in sing-box xray argo; do
 rc-service "$svc" stop >/dev/null 2>&1
 rc-update del "$svc" default >/dev/null 2>&1
 done
-rm -rf /etc/init.d/{sing-box,xray,argo} /etc/local.d/alpinelun.start /etc/local.d/alpinesublun.start
+rm -f /etc/init.d/sing-box /etc/init.d/xray /etc/init.d/argo /etc/local.d/alpinelun.start /etc/local.d/alpinesublun.start
 iptables -t nat -F PREROUTING >/dev/null 2>&1
 netfilter-persistent save >/dev/null 2>&1
 rc-service iptables save >/dev/null 2>&1
@@ -7318,7 +7318,7 @@ trap 'rollback_rebuild' EXIT
 trap 'exit 130' HUP INT TERM
 cleandel keep-entry
 ensure_lun_command || true
-rm -rf "$HOME/lun"/{sb.json,xr.json,sbargoym.log,sbargotoken.log,argo.log,argoport.log,name}
+rm -f "$HOME/lun/sb.json" "$HOME/lun/xr.json" "$HOME/lun/sbargoym.log" "$HOME/lun/sbargotoken.log" "$HOME/lun/argo.log" "$HOME/lun/argoport.log" "$HOME/lun/name"
 rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu "$HOME/lun"/port_xu "$HOME/lun"/port_xc "$HOME/lun"/port_nv
 if [ "$_lun_rebuild_existing" = yes ]; then
 echo "旧协议进程已停止，正在重建配置；现有内核、证书、UUID 与订阅设置均保留。"
