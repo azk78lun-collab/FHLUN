@@ -2,6 +2,8 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
+当前脚本版本：`V26.7.18.1`。
+
 ## 快速开始
 
 ```bash
@@ -61,6 +63,9 @@ Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设
 | Socks5 | `sopt` |
 | Hysteria2 | `hypt` |
 | TUIC | `tupt` |
+| VLESS XHTTP TLS UDP | `xupt` |
+| VLESS XHTTP TLS TCP/UDP | `xcpt` |
+| NaiveProxy H2/H3 | `nvpt` |
 
 示例：
 
@@ -79,9 +84,23 @@ vlpt="" vmpt="" hypt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78l
 
 `certmode=self` 会生成本地 ECDSA 自签证书。`origin` 表示 Cloudflare Origin CA 等仅供服务商回源验证的证书，`ca` 表示公开 CA 签发证书。`domain` 使用 HTTP-01，`dns` 使用 acme.sh 原生 DNS API，`ip` 使用 Let’s Encrypt short-lived IP 证书。
 
+### XHTTP TLS 与 NaiveProxy
+
+三个新变量默认都不启用，只有显式设置变量或在菜单中勾选后才会安装：
+
+| 协议 | 监听与放行要求 | 证书与订阅 |
+| --- | --- | --- |
+| `xupt` | Xray XHTTP + TLS + ALPN `h3`；放行对应 UDP 端口 | 路径 `UUID-xu`；支持自签、Origin CA 和公开 CA；输出分享链接与 Clash/Mihomo 节点 |
+| `xcpt` | Xray XHTTP + TLS + ALPN `h2,http/1.1`；源站监听并放行 TCP 端口 | 路径 `UUID-xc`；支持风火轮全部证书模式；实验 CDN-UDP 仅要求客户端到 Cloudflare 边缘的 UDP 443，回源仍为 TCP |
+| `nvpt` | Sing-box Naive，同一端口提供 H2/TCP 与 H3/UDP；必须同时放行 TCP/UDP | 用户名、密码均沿用 UUID；只接受与服务域名匹配、未过期且可由系统公开 CA 信任库验证的完整证书链 |
+
+NaiveProxy 会在配置生成前拒绝自签证书、Cloudflare Origin CA、IP-only 证书、域名不匹配或不可信的证书链，并提示先从证书管理导入。运行状态分别保存在 `~/lun/port_xu`、`~/lun/port_xc`、`~/lun/port_nv`。
+
+Sing-box 1.13 原生 VLESS 出站不支持 XHTTP transport，因此 `xupt/xcpt` 不写入 `sbox.json` 伪兼容项；它们仍会写入通用分享链接和 `clmi.yaml`。NaiveProxy 会写入 H2/H3 两种 Sing-box 节点，但不会写入当前不支持 Naive 的 Clash/Mihomo 订阅。Linux 客户端使用 Sing-box Naive 出站时，还要同时部署官方发行包中的 `libcronet.so`；服务端 Naive 入站不依赖该动态库。
+
 IPv6-only VPS 可以使用 HTTP-01。脚本检测到域名只有 AAAA 时会让 acme.sh 使用 IPv6 监听；AAAA 必须指向本机公网 IPv6，并且公网 TCP 80 必须可达且未被其他进程占用。域名同时存在 A 和 AAAA 时，Let’s Encrypt 会优先验证 IPv6，因此错误的 AAAA 也会导致申请失败。失败时菜单会显示 A/AAAA、本机地址、80 端口占用，并把 acme.sh 完整输出保存到 `~/lun/acme_issue.log`。无法开放 80 或域名使用橙云时建议使用 DNS API 模式。
 
-引导式安装的证书步骤和“证书管理”菜单都支持搜索并导入本机证书。建议将证书与私钥放入 `~/lun/import/`；脚本也会自动搜索 `~/lun`、`/root/key`、`/root/cert`、acme.sh 与 Let’s Encrypt 常用目录，通过公钥匹配证书和私钥。发现多个证书时会优先推荐“域名匹配、未过期、私钥匹配、服务商/CA 签发”的证书；输入编号可自行选择，输入 `0` 返回，直接回车导入推荐项。
+引导式安装的证书步骤和“证书管理”菜单都支持搜索并导入本机证书。建议将证书与私钥放入 `~/lun/import/`；脚本也会自动搜索 `~/lun`、`/root/key`、`/root/cert`、`/root/ygkkkca`、acme.sh 与 Let’s Encrypt 常用目录，通过公钥匹配证书和私钥。发现多个证书时会优先推荐“域名匹配、未过期、私钥匹配、服务商/CA 签发”的证书；输入编号可自行选择，输入 `0` 返回，直接回车导入推荐项。
 
 DNS API 凭据按 acme.sh 原生环境变量保存到 `/root/lun/cert.env`，权限为 `600`。
 
@@ -103,7 +122,7 @@ Reality、Argo 和 CDN 仍然独立：
 | `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），可填多个值，推荐 `cloudflare-ech.com` |
 | `argoip` | Argo 优选 IP 或域名（与 cfip 独立），可填多个值 |
 | `cdnmode` | `standard` 同端口模式；`rewrite` 为 NAT 回源端口改写模式 |
-| `cdnpt` | NAT 改写模式的 Cloudflare 边缘端口：`8080` 或 `2096` |
+| `cdnpt` | NAT 改写模式的 Cloudflare 边缘端口：`8080`、`2096` 或 `443` |
 | `cdnproto` | CDN 节点协议：默认 `xhttp`；`all` 兼容输出 XHTTP、VLESS WS、VMess WS |
 | `addrmode` | 普通节点地址输出：`domain`、`ipv4`、`ipv6`、`dual`、`all` |
 
@@ -119,11 +138,11 @@ CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点
 1. 设置 `cdnym`：Cloudflare 接收请求时使用的 Host 域名。
 2. 设置 `cfip`：可混合填写多个 IPv4、IPv6 或域名，脚本会去重并生成唯一节点名。
 3. 客户端直接连接 `cfip` 时，不依赖客户端把 `cdnym` 解析到哪个地址；脚本以实际 CF 边缘诊断为准。直接使用 `cdnym` 作为入口时应开启橙云。
-4. 默认仅生成 VLESS XHTTP CDN，WS 协议保留直连；需要旧式多协议输出时设置 `cdnproto=all`。
+4. 默认生成 VLESS XHTTP CDN；`xcpt` 只在 Cloudflare HTTPS 边缘端口生成 CDN-TCP，WS 协议保留直连；需要旧式多协议输出时设置 `cdnproto=all`。
 
-**默认 CDN 协议：** VLESS XHTTP（非 Reality）
+**默认 CDN 协议：** VLESS XHTTP（非 Reality）与已启用的 VLESS XHTTP TLS
 **高级兼容协议：** 设置 `cdnproto=all` 后额外生成 VMess WS、VLESS WS
-**不支持 CDN 的协议：** Reality、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
+**不支持 CDN 的协议：** Reality、XHTTP TLS UDP（`xupt`）、NaiveProxy、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
 
 Cloudflare 橙云支持端口：
 
@@ -136,9 +155,11 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 普通 VPS 使用同端口 CDN 优选：客户端边缘端口与协议端口相同，不需要 Origin Rules，继续沿用旧版可用流程。
 
-NAT Origin Rules（端口回源）已从普通 CDN 配置中独立出来，仅 NAT VPS 可开启。客户端连接 Cloudflare 的 `8080` 或 `2096`，Cloudflare 再按 Host 与协议 Path 把目标端口改写为 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。
+NAT Origin Rules（端口回源）已从普通 CDN 配置中独立出来，仅 NAT VPS 可开启。客户端连接 Cloudflare 的 `8080`、`2096` 或 `443`，Cloudflare 再按 Host 与协议 Path 把目标端口改写为 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则。
 
-`2096` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换 `8080/2096` 只重建配置并重启服务，不重新下载内核。
+`2096` 和 `443` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换 `8080/2096/443` 只重建配置并重启服务，不重新下载内核。
+
+`xcpt` 的 CDN-TCP 只会在 Cloudflare 官方 HTTPS 边缘端口生成。实验性 CDN-UDP 只会在边缘端口严格为 `443` 时生成；还必须让 DNS 记录保持橙云代理状态并在 Cloudflare 开启 HTTP/3，因为 HTTP/3 使用 QUIC/UDP 443。若条件不满足，脚本只显示警告，不会把 UDP 节点伪装成可用配置。参考 [Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/) 与 [Cloudflare 代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)。
 
 **示例：**
 
@@ -154,7 +175,13 @@ NAT VPS Origin Rules：
 vpsmode="nat" vxpt="8080" ptmap="56567-8080" cdnym="proxy.example.com" cfip="108.162.198.31" cdnmode="rewrite" cdnpt="8080" cdnproto="xhttp" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-HTTP `8080` 节点会显式写入 `security=none`，HTTPS `2096` 节点才写入 TLS。节点名称同时包含 `HTTP-8080` 或 `HTTPS-2096`，避免 v2rayN 在切换模式后沿用旧的 TLS/Reality/PublicKey 字段。
+XHTTP TLS + NaiveProxy（`24443/UDP`、`25443/TCP`、`26443/TCP+UDP`）：
+
+```bash
+domain="proxy.example.com" certmode="domain" xupt="24443" xcpt="25443" nvpt="26443" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+HTTP `8080` 节点会显式写入 `security=none`，HTTPS `2096/443` 节点写入 TLS。节点名称同时包含边缘模式和端口，避免 v2rayN 在切换模式后沿用旧的 TLS/Reality/PublicKey 字段。
 
 ## 普通节点地址输出
 
@@ -262,6 +289,6 @@ ghcr.io/azk78lun-collab/lun:latest
 本项目基于以下优秀开源项目构建：
 
 - **Xray-core** ([XTLS/Xray-core](https://github.com/XTLS/Xray-core)) — 提供 VLESS / VMess / Reality / XHTTP 等协议内核
-- **sing-box** ([SagerNet/sing-box](https://github.com/SagerNet/sing-box)) — 提供 Hysteria2 / Tuic / AnyTLS / Shadowsocks 等协议内核
+- **sing-box** ([SagerNet/sing-box](https://github.com/SagerNet/sing-box)) — 提供 NaiveProxy / Hysteria2 / Tuic / AnyTLS / Shadowsocks 等协议内核
 
 感谢以上核心项目的开发者与维护者。

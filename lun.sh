@@ -13,9 +13,12 @@ export LANGUAGE=C.UTF-8
 [ -z "${sspt+x}" ] || ssp=yes
 [ -z "${arpt+x}" ] || arp=yes
 [ -z "${sopt+x}" ] || sop=yes
+[ -z "${xupt+x}" ] || xup=yes
+[ -z "${xcpt+x}" ] || xcp=yes
+[ -z "${nvpt+x}" ] || nvp=yes
 [ -n "${warp:-}" ] && wap=yes
 LUN_MENU_REQUEST=
-[ -z "$1" ] && [ "$vwp" != yes ] && [ "$sop" != yes ] && [ "$vxp" != yes ] && [ "$ssp" != yes ] && [ "$vlp" != yes ] && [ "$vmp" != yes ] && [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$xhp" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && LUN_MENU_REQUEST=yes
+[ -z "$1" ] && [ "$vwp" != yes ] && [ "$sop" != yes ] && [ "$vxp" != yes ] && [ "$ssp" != yes ] && [ "$vlp" != yes ] && [ "$vmp" != yes ] && [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$xhp" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$xup" != yes ] && [ "$xcp" != yes ] && [ "$nvp" != yes ] && LUN_MENU_REQUEST=yes
 _lun_proc_running=no
 for _P in /proc/[0-9]*; do
 [ -L "$_P/exe" ] || continue
@@ -28,10 +31,10 @@ _lun_installed=no
 { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/xr.json" ] || [ -s "$HOME/lun/sb.json" ]; } && _lun_installed=yes
 if [ "$_lun_proc_running" = "yes" ] || [ "$_lun_installed" = "yes" ]; then
 if [ "$1" = "rep" ]; then
-[ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
+[ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
 fi
 else
-[ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
+[ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
 fi
 export uuid=${uuid:-''}
 export port_vl_re=${vlpt:-''}
@@ -45,6 +48,9 @@ export port_an=${anpt:-''}
 export port_ar=${arpt:-''}
 export port_ss=${sspt:-''}
 export port_so=${sopt:-''}
+export port_xu=${xupt:-''}
+export port_xc=${xcpt:-''}
+export port_nv=${nvpt:-''}
 export ym_vl_re=${reym:-''}
 export cdnym=${cdnym:-''}
 export cfip=${cfip:-''}
@@ -89,7 +95,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.12.5"
+echo "当前版本：V26.7.18.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -338,9 +344,9 @@ case "$cdnmode" in standard|rewrite) ;; *) cdnmode=standard ;; esac
 
 if [ -n "$cdnpt" ]; then
 case "$cdnpt" in
-8080|2096) printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port" ;;
+443|8080|2096) printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port" ;;
 del|none|off) rm -f "$HOME/lun/cdn_edge_port"; cdnpt= ;;
-*) echo "cdnpt 当前只支持 8080 或 2096。"; exit 1 ;;
+*) echo "cdnpt 当前只支持 443、8080 或 2096。"; exit 1 ;;
 esac
 elif [ -s "$HOME/lun/cdn_edge_port" ]; then
 cdnpt=$(cat "$HOME/lun/cdn_edge_port" 2>/dev/null)
@@ -442,7 +448,7 @@ fi
 
 cdn_origin_tls_for_port(){
 [ -n "$cdnym" ] || [ -s "$HOME/lun/cdnym" ] || return 1
-cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ]
+cdn_rewrite_active && is_cf_https_port "${cdnpt:-8080}"
 }
 
 effective_address_mode(){
@@ -1613,6 +1619,7 @@ SHA256=$(cat "$HOME/lun/SHA256.txt" 2>/dev/null)
 case "$cert_mode_current" in
 self|origin)
 hy2_pin_arg="&pinSHA256=$SHA256"
+generic_tls_pin_arg="&hpkp=$SHA256&pcs=$SHA256"
 hy2_link_insecure=0
 generic_link_insecure=1
 sbox_tls_insecure=true
@@ -1621,6 +1628,7 @@ clash_disable_sni=true
 ;;
 *)
 hy2_pin_arg=
+generic_tls_pin_arg=
 hy2_link_insecure=0
 generic_link_insecure=0
 sbox_tls_insecure=false
@@ -1629,6 +1637,73 @@ clash_disable_sni=false
 ;;
 esac
 }
+
+naive_certificate_ready(){ (
+naive_cert="$HOME/lun/cert.crt"
+naive_key="$HOME/lun/private.key"
+naive_host=$(normalize_host "${domain:-$(cat "$HOME/lun/cert_subject" 2>/dev/null)}")
+
+cert_key_matches "$naive_cert" "$naive_key" || {
+echo "NaiveProxy 启用失败：~/lun 中没有匹配的证书与私钥。"
+echo "请运行 lun → 高级设置 → 管理证书 → 搜索并导入本机证书；脚本会搜索 /root/ygkkkca。"
+return 1
+}
+openssl x509 -in "$naive_cert" -noout -checkend 0 >/dev/null 2>&1 || {
+echo "NaiveProxy 启用失败：当前证书已经过期。"
+return 1
+}
+case "$(cert_detect_mode "$naive_cert")" in
+self|origin)
+echo "NaiveProxy 启用失败：Naive 客户端不接受自签证书或 Cloudflare Origin CA。"
+echo "请先导入与服务域名匹配的公开可信证书；可运行 lun → 高级设置 → 管理证书 → 搜索并导入本机证书。"
+return 1
+;;
+esac
+[ -n "$naive_host" ] && [ "$(endpoint_kind "$naive_host")" = DOMAIN ] && valid_domain "$naive_host" || {
+echo "NaiveProxy 启用失败：需要设置与证书匹配的服务域名，不能只使用 IP。"
+return 1
+}
+cert_covers_domain "$naive_cert" "$naive_host" || {
+echo "NaiveProxy 启用失败：当前证书不覆盖服务域名 $naive_host。"
+return 1
+}
+
+naive_leaf="/tmp/lun-naive-leaf.$$"
+naive_chain="/tmp/lun-naive-chain.$$"
+awk '
+/-----BEGIN CERTIFICATE-----/ { block++ }
+block == 1 { print }
+' "$naive_cert" > "$naive_leaf"
+awk '
+/-----BEGIN CERTIFICATE-----/ { block++ }
+block >= 2 { print }
+' "$naive_cert" > "$naive_chain"
+naive_ca=
+for naive_ca_candidate in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+[ -s "$naive_ca_candidate" ] && { naive_ca=$naive_ca_candidate; break; }
+done
+if [ -n "$naive_ca" ]; then
+if [ -s "$naive_chain" ]; then
+openssl verify -purpose sslserver -CAfile "$naive_ca" -untrusted "$naive_chain" "$naive_leaf" >/dev/null 2>&1
+else
+openssl verify -purpose sslserver -CAfile "$naive_ca" "$naive_leaf" >/dev/null 2>&1
+fi
+else
+if [ -s "$naive_chain" ]; then
+openssl verify -purpose sslserver -untrusted "$naive_chain" "$naive_leaf" >/dev/null 2>&1
+else
+openssl verify -purpose sslserver "$naive_leaf" >/dev/null 2>&1
+fi
+fi
+naive_verify_rc=$?
+rm -f "$naive_leaf" "$naive_chain"
+[ "$naive_verify_rc" = 0 ] || {
+echo "NaiveProxy 启用失败：当前证书链无法通过本机公开 CA 信任库校验。"
+echo "请导入完整证书链（fullchain）与匹配私钥后重试。"
+return 1
+}
+return 0
+) }
 
 cdn_host_current(){
 if [ -n "$cdnym" ]; then
@@ -1729,6 +1804,13 @@ echo "$enkey" > "$HOME/lun/xrk/enkey"
 fi
 dekey=$(cat "$HOME/lun/xrk/dekey")
 enkey=$(cat "$HOME/lun/xrk/enkey")
+fi
+if [ -n "$xup" ] || [ -n "$xcp" ]; then
+if cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key"; then
+sync_cert_metadata || { echo "XHTTP TLS 证书元数据同步失败。"; return 1; }
+else
+prepare_runtime_cert || { echo "XHTTP TLS 证书准备失败。"; return 1; }
+fi
 fi
 
 if [ -n "$xhp" ]; then
@@ -1832,6 +1914,114 @@ $(xray_stream_security_block "$port_vx")
 EOF
 else
 vxp=vxptargo
+fi
+if [ -n "$xup" ]; then
+xup=xupt
+if [ -z "$port_xu" ] && [ ! -e "$HOME/lun/port_xu" ]; then
+port_xu=$(random_port 2>/dev/null) || { echo "VLESS XHTTP TLS UDP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+echo "$port_xu" > "$HOME/lun/port_xu"
+elif [ -n "$port_xu" ]; then
+echo "$port_xu" > "$HOME/lun/port_xu"
+fi
+port_xu=$(cat "$HOME/lun/port_xu")
+echo "Vless-xhttp-tls-UDP端口：$port_xu"
+cat >> "$HOME/lun/xr.json" <<EOF
+    {
+      "tag": "xhttp-h3",
+      "listen": "::",
+      "port": ${port_xu},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "${uuid}-xu"
+        },
+        "tlsSettings": {
+          "alpn": ["h3"],
+          "certificates": [
+            {
+              "certificateFile": "$HOME/lun/cert.crt",
+              "keyFile": "$HOME/lun/private.key"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    },
+EOF
+else
+xup=xuptargo
+fi
+if [ -n "$xcp" ]; then
+xcp=xcpt
+if [ -z "$port_xc" ] && [ ! -e "$HOME/lun/port_xc" ]; then
+port_xc=$(random_port 2>/dev/null) || { echo "VLESS XHTTP TLS TCP/UDP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+echo "$port_xc" > "$HOME/lun/port_xc"
+elif [ -n "$port_xc" ]; then
+echo "$port_xc" > "$HOME/lun/port_xc"
+fi
+port_xc=$(cat "$HOME/lun/port_xc")
+echo "Vless-xhttp-tls-TCP/UDP端口：$port_xc"
+if [ -n "$cdnym" ]; then
+echo "$cdnym" > "$HOME/lun/cdnym"
+echo "XHTTP TLS CDN 回源 Host：$cdnym"
+fi
+cat >> "$HOME/lun/xr.json" <<EOF
+    {
+      "tag": "xhttp-h23",
+      "listen": "::",
+      "port": ${port_xc},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "${uuid}-xc"
+        },
+        "tlsSettings": {
+          "alpn": ["h2", "http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "$HOME/lun/cert.crt",
+              "keyFile": "$HOME/lun/private.key"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    },
+EOF
+else
+xcp=xcptargo
 fi
 if [ -n "$vwp" ]; then
 vwp=vwpt
@@ -1946,6 +2136,39 @@ cat > "$HOME/lun/sb.json" <<EOF
 EOF
 insuuid
 prepare_runtime_cert
+if [ -n "$nvp" ]; then
+naive_certificate_ready || return 1
+nvp=nvpt
+if [ -z "$port_nv" ] && [ ! -e "$HOME/lun/port_nv" ]; then
+port_nv=$(random_port 2>/dev/null) || { echo "NaiveProxy 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+echo "$port_nv" > "$HOME/lun/port_nv"
+elif [ -n "$port_nv" ]; then
+echo "$port_nv" > "$HOME/lun/port_nv"
+fi
+port_nv=$(cat "$HOME/lun/port_nv")
+echo "NaiveProxy H2/H3端口：$port_nv"
+cat >> "$HOME/lun/sb.json" <<EOF
+    {
+        "type": "naive",
+        "tag": "naive-sb",
+        "listen": "::",
+        "listen_port": ${port_nv},
+        "users": [
+            {
+                "username": "${uuid}",
+                "password": "${uuid}"
+            }
+        ],
+        "tls": {
+            "enabled": true,
+            "certificate_path": "$HOME/lun/cert.crt",
+            "key_path": "$HOME/lun/private.key"
+        }
+    },
+EOF
+else
+nvp=nvptargo
+fi
 if [ -n "$hyp" ]; then
 hyp=hypt
 if [ -z "$port_hy2" ] && [ ! -e "$HOME/lun/port_hy2" ]; then
@@ -2461,20 +2684,20 @@ fi
 fi
 }
 ins(){
-if [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$ssp" != yes ]; then
+if [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$ssp" != yes ] && [ "$nvp" != yes ]; then
 installxray || return 1
 xrsbvm
 xrsbso
 warpsx
 xrsbout
-hyp="hyptargo"; tup="tuptargo"; anp="anptargo"; arp="arptargo"; ssp="ssptargo"
-elif [ "$xhp" != yes ] && [ "$vlp" != yes ] && [ "$vxp" != yes ] && [ "$vwp" != yes ]; then
+hyp="hyptargo"; tup="tuptargo"; anp="anptargo"; arp="arptargo"; ssp="ssptargo"; nvp="nvptargo"
+elif [ "$xhp" != yes ] && [ "$vlp" != yes ] && [ "$vxp" != yes ] && [ "$vwp" != yes ] && [ "$xup" != yes ] && [ "$xcp" != yes ]; then
 installsb || return 1
 xrsbvm
 xrsbso
 warpsx
 xrsbout
-xhp="xhptargo"; vlp="vlptargo"; vxp="vxptargo"; vwp="vwptargo"
+xhp="xhptargo"; vlp="vlptargo"; vxp="vxptargo"; vwp="vwptargo"; xup="xuptargo"; xcp="xcptargo"
 else
 installsb || return 1
 installxray || return 1
@@ -2560,7 +2783,7 @@ mkdir -p "$HOME/bin"
 fi
 install_lun_entry "$SCRIPT_PATH" || { echo "Lun脚本安装失败，请检查网络后重试。"; exit 1; }
 if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
-echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" cdnmode=\"${cdnmode}\" cdnpt=\"${cdnpt}\" cdnproto=\"${cdnproto}\" addrmode=\"${addrmode}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
+echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(s|x)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" cdnmode=\"${cdnmode}\" cdnpt=\"${cdnpt}\" cdnproto=\"${cdnproto}\" addrmode=\"${addrmode}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $xup=\"${port_xu}\" $xcp=\"${port_xc}\" $nvp=\"${port_nv}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
 fi
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
 if [ "$SCRIPT_PATH" = "$HOME/bin/lun" ]; then
@@ -2967,6 +3190,73 @@ if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled xhttp; then
 append_vless_cdn_links "Vless-xhttp-enc-cdn" "vl-xhttp-enc" "$port_vx" "encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto"
 fi
 fi
+if grep xhttp-h3 "$HOME/lun/xr.json" >/dev/null 2>&1; then
+echo "【 Vless-xhttp-tls-UDP 】节点信息如下："
+port_xu=$(cat "$HOME/lun/port_xu")
+client_port_xu=$(client_port "$port_xu")
+vl_xu_link="vless://$uuid@$client_addr:$client_port_xu?encryption=none&security=tls&sni=$cert_sni&alpn=h3&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure$generic_tls_pin_arg&type=xhttp&path=$uuid-xu&mode=auto#${sxname}vless-xhttp-tls-udp-$hostname$node_name_suffix"
+append_share_link "$vl_xu_link"
+[ -f "$HOME/lun/cdnym" ] && cdn_skip "VLESS XHTTP TLS UDP 为直连 QUIC/UDP 协议，不生成普通 CDN 变体。"
+echo
+clxupt(){
+cat <<EOF
+- name: ${sxname}vless-xhttp-tls-udp-$hostname$node_name_suffix
+  type: vless
+  server: $client_addr
+  port: $client_port_xu
+  uuid: $uuid
+  udp: true
+  tls: true
+  network: xhttp
+  alpn:
+    - h3
+  servername: $cert_sni
+  client-fingerprint: chrome
+  skip-cert-verify: $clash_skip_verify
+  xhttp-opts:
+    path: "$uuid-xu"
+    mode: auto
+EOF
+}
+clxupt1(){
+echo "- ${sxname}vless-xhttp-tls-udp-$hostname$node_name_suffix"
+}
+fi
+if grep xhttp-h23 "$HOME/lun/xr.json" >/dev/null 2>&1; then
+echo "【 Vless-xhttp-tls-TCP/UDP 】直连节点信息如下："
+port_xc=$(cat "$HOME/lun/port_xc")
+client_port_xc=$(client_port "$port_xc")
+vl_xc_link="vless://$uuid@$client_addr:$client_port_xc?encryption=none&security=tls&sni=$cert_sni&alpn=h2,http/1.1&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure$generic_tls_pin_arg&type=xhttp&path=$uuid-xc&mode=auto#${sxname}vless-xhttp-tls-tcp-$hostname$node_name_suffix"
+append_share_link "$vl_xc_link"
+echo
+clxcpt(){
+cat <<EOF
+- name: ${sxname}vless-xhttp-tls-tcp-$hostname$node_name_suffix
+  type: vless
+  server: $client_addr
+  port: $client_port_xc
+  uuid: $uuid
+  udp: true
+  tls: true
+  network: xhttp
+  alpn:
+    - h2
+    - http/1.1
+  servername: $cert_sni
+  client-fingerprint: chrome
+  skip-cert-verify: $clash_skip_verify
+  xhttp-opts:
+    path: "$uuid-xc"
+    mode: auto
+EOF
+}
+clxcpt1(){
+echo "- ${sxname}vless-xhttp-tls-tcp-$hostname$node_name_suffix"
+}
+if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled xhttp; then
+append_xhttp_tls_cdn_links "$port_xc"
+fi
+fi
 if grep vless-ws "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-ws-enc 】支持ENC加密，节点信息如下："
 port_vw=$(cat "$HOME/lun/port_vw")
@@ -3159,6 +3449,61 @@ echo "- ${sxname}vmess-ws-$hostname$node_name_suffix"
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled vmess; then
 append_vmess_cdn_links "$port_vm_ws"
 fi
+fi
+if grep naive-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
+echo "【 NaiveProxy H2/H3 】节点信息如下："
+port_nv=$(cat "$HOME/lun/port_nv")
+client_port_nv=$(client_port "$port_nv")
+nv_https_link="naive+https://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0#${sxname}naive-h2-$hostname$node_name_suffix"
+nv_quic_link="naive+quic://$uuid:$uuid@$client_addr:$client_port_nv?congestion_control=bbr&security=tls&sni=$cert_sni&insecure=0&allowInsecure=0#${sxname}naive-h3-$hostname$node_name_suffix"
+nv_http2_link="http2://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0&padding=1&tfo=1#${sxname}naive-h2-$hostname$node_name_suffix"
+nv_http3_link="http3://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0&padding=1&tfo=1#${sxname}naive-h3-$hostname$node_name_suffix"
+echo "V2rayN / Karing / NekoBox："
+append_share_link "$nv_https_link"
+append_share_link "$nv_quic_link"
+echo "Shadowrocket："
+append_share_link "$nv_http2_link"
+append_share_link "$nv_http3_link"
+[ -f "$HOME/lun/cdnym" ] && cdn_skip "NaiveProxy 使用公开域名证书直连，不生成普通 CDN 变体。"
+echo "NaiveProxy 已写入 Sing-box 订阅；Clash/Mihomo 暂不支持 Naive，未写入 Clash 订阅。"
+echo
+sbnvpt(){
+cat <<EOF
+    {
+      "type": "naive",
+      "tag": "${sxname}naive-h3-$hostname$node_name_suffix",
+      "server": "$client_addr",
+      "server_port": $client_port_nv,
+      "username": "$uuid",
+      "password": "$uuid",
+      "udp_over_tcp": false,
+      "quic": true,
+      "quic_congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "server_name": "$cert_sni"
+      }
+    },
+    {
+      "type": "naive",
+      "tag": "${sxname}naive-h2-$hostname$node_name_suffix",
+      "server": "$client_addr",
+      "server_port": $client_port_nv,
+      "username": "$uuid",
+      "password": "$uuid",
+      "udp_over_tcp": true,
+      "quic": false,
+      "tls": {
+        "enabled": true,
+        "server_name": "$cert_sni"
+      }
+    },
+EOF
+}
+sbnvpt1(){
+echo "\"${sxname}naive-h3-$hostname$node_name_suffix\","
+echo "\"${sxname}naive-h2-$hostname$node_name_suffix\","
+}
 fi
 if grep anytls-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
 echo "【 AnyTLS 】节点信息如下："
@@ -3563,10 +3908,10 @@ client_addr_json=$(json_host "$client_addr_raw")
 node_name_suffix="-$primary_name_suffix"
 fi
 }
-sbxy="$(get_func sbvlpt; get_func sbsspt; get_func sbanpt; get_func sbarpt; get_func sbvmpt; get_func sbhypt; get_func sbtupt; get_func sbvmargopt; cat "$HOME/lun/.cdn_sbox_entries" 2>/dev/null)"
-clxy="$(get_func clvlpt; get_func clsspt; get_func clanpt; get_func clvmpt; get_func clhypt; get_func cltupt; get_func clvmargopt; cat "$HOME/lun/.cdn_clash_entries" 2>/dev/null)"
-sbgz="$(get_func sbvlpt1; get_func sbsspt1; get_func sbanpt1; get_func sbarpt1; get_func sbvmpt1; get_func sbhypt1; get_func sbtupt1; get_func sbvmargopt1; cat "$HOME/lun/.cdn_sbox_tags" 2>/dev/null)"
-clgz="$({ get_func clvlpt1; get_func clsspt1; get_func clanpt1; get_func clvmpt1; get_func clhypt1; get_func cltupt1; get_func clvmargopt1; cat "$HOME/lun/.cdn_clash_names" 2>/dev/null; } | sed '2,$s/^/    /')"
+sbxy="$(get_func sbvlpt; get_func sbsspt; get_func sbanpt; get_func sbarpt; get_func sbvmpt; get_func sbhypt; get_func sbtupt; get_func sbnvpt; get_func sbvmargopt; cat "$HOME/lun/.cdn_sbox_entries" 2>/dev/null)"
+clxy="$(get_func clxupt; get_func clxcpt; get_func clvlpt; get_func clsspt; get_func clanpt; get_func clvmpt; get_func clhypt; get_func cltupt; get_func clvmargopt; cat "$HOME/lun/.cdn_clash_entries" 2>/dev/null)"
+sbgz="$(get_func sbvlpt1; get_func sbsspt1; get_func sbanpt1; get_func sbarpt1; get_func sbvmpt1; get_func sbhypt1; get_func sbtupt1; get_func sbnvpt1; get_func sbvmargopt1; cat "$HOME/lun/.cdn_sbox_tags" 2>/dev/null)"
+clgz="$({ get_func clxupt1; get_func clxcpt1; get_func clvlpt1; get_func clsspt1; get_func clanpt1; get_func clvmpt1; get_func clhypt1; get_func cltupt1; get_func clvmargopt1; cat "$HOME/lun/.cdn_clash_names" 2>/dev/null; } | sed '2,$s/^/    /')"
 sbgz=$(printf "%s\n" "$sbgz" | sed '$ s/,$//')
 cat > $HOME/lun/sbox.json <<EOF
 {
@@ -3941,7 +4286,7 @@ printf "确认清空配置？输入 yes 确认，其他取消："
 IFS= read -r confirm
 [ "$confirm" = "yes" ] || { echo "已取消。"; return 1; }
 stop_lun_owned_processes
-rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu
+rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu "$HOME/lun"/port_xu "$HOME/lun"/port_xc "$HOME/lun"/port_nv
 rm -f "$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_mode "$HOME/lun"/cert_subject "$HOME/lun"/cert_source "$HOME/lun"/cert.crt "$HOME/lun"/private.key "$HOME/lun"/SHA256.txt
 rm -f "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool
 rm -f "$HOME/lun"/acme_email "$HOME/lun"/acme_dns "$HOME/lun"/cert.env
@@ -3978,8 +4323,8 @@ fi
 }
 
 refresh_protocol_flags(){
-unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop vmag
-unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so
+unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop xup xcp nvp vmag
+unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so port_xu port_xc port_nv
 [ -z "${vlpt+x}" ] || { vlp=yes; port_vl_re=$vlpt; }
 [ -z "${vmpt+x}" ] || { vmp=yes; vmag=yes; port_vm_ws=$vmpt; }
 [ -z "${vwpt+x}" ] || { vwp=yes; vmag=yes; port_vw=$vwpt; }
@@ -3991,6 +4336,9 @@ unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an por
 [ -z "${sspt+x}" ] || { ssp=yes; port_ss=$sspt; }
 [ -z "${arpt+x}" ] || { arp=yes; port_ar=$arpt; }
 [ -z "${sopt+x}" ] || { sop=yes; port_so=$sopt; }
+[ -z "${xupt+x}" ] || { xup=yes; port_xu=$xupt; }
+[ -z "${xcpt+x}" ] || { xcp=yes; port_xc=$xcpt; }
+[ -z "${nvpt+x}" ] || { nvp=yes; port_nv=$nvpt; }
 [ -n "${warp:-}" ] && wap=yes || wap=
 }
 
@@ -4015,6 +4363,9 @@ echo " 8. VMess WS"
 echo " 9. Socks5"
 echo "10. Hysteria2"
 echo "11. TUIC"
+echo "12. VLESS XHTTP TLS UDP"
+echo "13. VLESS XHTTP TLS TCP/UDP"
+echo "14. NaiveProxy H2/H3（需公开可信证书）"
 printf "协议编号："
 IFS= read -r picks
 [ -z "$picks" ] && picks=1
@@ -4031,6 +4382,9 @@ case "$pick" in
 9) prompt_port "Socks5" sopt ;;
 10) prompt_port "Hysteria2" hypt ;;
 11) prompt_port "TUIC" tupt ;;
+12) prompt_port "VLESS XHTTP TLS UDP" xupt ;;
+13) prompt_port "VLESS XHTTP TLS TCP/UDP" xcpt ;;
+14) prompt_port "NaiveProxy H2/H3" nvpt ;;
 *) echo "忽略未知协议编号：$pick" ;;
 esac
 done
@@ -4242,7 +4596,7 @@ return 1
 protocol_port_reserved(){
 p=$1
 p_public=$(client_port "$p")
-for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu"; do
+for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu" "$port_xu" "$port_xc" "$port_nv"; do
 [ -n "$used" ] || continue
 used_public=$(client_port "$used")
 [ "$used" = "$p" ] && return 0
@@ -4250,7 +4604,7 @@ used_public=$(client_port "$used")
 [ "$used" = "$p_public" ] && return 0
 [ "$used_public" = "$p_public" ] && return 0
 done
-for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu"; do
+for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu" "$HOME/lun/port_xu" "$HOME/lun/port_xc" "$HOME/lun/port_nv"; do
 [ -s "$file" ] || continue
 used=$(cat "$file" 2>/dev/null)
 [ -n "$used" ] || continue
@@ -4478,6 +4832,9 @@ load_installed_protocol_flags(){
 [ -s "$HOME/lun/port_so" ] && { sopt=$(cat "$HOME/lun/port_so"); sop=yes; port_so=$sopt; }
 [ -s "$HOME/lun/port_hy2" ] && { hypt=$(cat "$HOME/lun/port_hy2"); hyp=yes; port_hy2=$hypt; }
 [ -s "$HOME/lun/port_tu" ] && { tupt=$(cat "$HOME/lun/port_tu"); tup=yes; port_tu=$tupt; }
+[ -s "$HOME/lun/port_xu" ] && { xupt=$(cat "$HOME/lun/port_xu"); xup=yes; port_xu=$xupt; }
+[ -s "$HOME/lun/port_xc" ] && { xcpt=$(cat "$HOME/lun/port_xc"); xcp=yes; port_xc=$xcpt; }
+[ -s "$HOME/lun/port_nv" ] && { nvpt=$(cat "$HOME/lun/port_nv"); nvp=yes; port_nv=$nvpt; }
 }
 
 show_protocol_summary(){
@@ -4493,7 +4850,10 @@ for item in \
 "VMess WS:$HOME/lun/port_vm_ws" \
 "Socks5:$HOME/lun/port_so" \
 "Hysteria2:$HOME/lun/port_hy2" \
-"TUIC:$HOME/lun/port_tu"; do
+"TUIC:$HOME/lun/port_tu" \
+"VLESS XHTTP TLS UDP:$HOME/lun/port_xu" \
+"VLESS XHTTP TLS TCP/UDP:$HOME/lun/port_xc" \
+"NaiveProxy H2/H3:$HOME/lun/port_nv"; do
 label=${item%%:*}
 file=${item#*:}
 if [ -s "$file" ]; then
@@ -4640,26 +5000,28 @@ yellow_line "CDN提示：$1"
 }
 
 # ============ 显示 CDN 端口建议 ============
-# 遍历所有支持 CDN 的协议（VLESS XHTTP、VLESS WS、VMess WS）
+# 遍历所有支持 CDN 的协议（VLESS XHTTP、VLESS XHTTP TLS、VLESS WS、VMess WS）
 # 检查它们的公网端口是否在 Cloudflare 橙云支持端口列表内。
 # 不在列表内也会输出普通 CDN/优选入口节点，只是不适合直接套 CF 橙云。
 show_cdn_port_advice(){
 echo "Cloudflare 橙云普通代理端口：80/8080/8880/2052/2082/2086/2095 或 443/8443/2053/2083/2087/2096。"
 if cdn_rewrite_active; then
 echo "当前模式：NAT 端口改写。客户端连接 Cloudflare 边缘端口 ${cdnpt:-8080}，Cloudflare 再回源到每个协议的 NAT 公网端口。"
-[ "${cdnpt:-8080}" = 2096 ] && echo "2096 为 HTTPS：Lun 会启用源站 TLS；Cloudflare 自签证书使用 Full，匹配域名的有效证书可使用 Full (Strict)。"
+is_cf_https_port "${cdnpt:-8080}" && echo "${cdnpt:-8080} 为 HTTPS：Lun 会启用源站 TLS；Cloudflare 自签证书使用 Full，匹配域名的有效证书可使用 Full (Strict)。"
 else
 echo "当前模式：普通 CDN 优选。客户端直接连接优选入口，端口与协议公网端口相同；不使用 Origin Rules。"
 fi
 found=
 for item in \
 "VLESS XHTTP:$HOME/lun/port_vx" \
+"VLESS XHTTP TLS:$HOME/lun/port_xc" \
 "VLESS WS:$HOME/lun/port_vw" \
 "VMess WS:$HOME/lun/port_vm_ws"; do
 label=${item%%:*}
 file=${item#*:}
 case "$label" in
 "VLESS XHTTP") cdn_protocol_enabled xhttp || continue ;;
+"VLESS XHTTP TLS") cdn_protocol_enabled xhttp || continue ;;
 "VLESS WS") cdn_protocol_enabled ws || continue ;;
 "VMess WS") cdn_protocol_enabled vmess || continue ;;
 esac
@@ -4669,7 +5031,9 @@ inner=$(cat "$file" 2>/dev/null)
 public=$(client_port "$inner")
 edge=$(cdn_client_port "$inner")
 mode=$(cf_port_mode "$edge" 2>/dev/null || true)
-if cdn_rewrite_active; then
+if [ "$label" = "VLESS XHTTP TLS" ] && [ "$mode" != https ]; then
+yellow_line "$label 仅生成 HTTPS CDN 节点；当前边缘端口 $edge 不是 Cloudflare HTTPS 端口。"
+elif cdn_rewrite_active; then
 green_line "$label：Cloudflare 边缘端口 $edge → NAT 回源公网端口 $public → 内网监听端口 $inner。"
 elif [ -n "$mode" ]; then
 green_line "$label 可生成 CDN 变体：协议端口 $inner，客户端公网/边缘端口 $public，CF 模式 $mode。"
@@ -4677,7 +5041,7 @@ else
 yellow_line "$label 当前公网端口 $public 不在 CF 橙云官方端口内；可切换 NAT 端口改写模式，或仅用于支持该端口的其它反代。"
 fi
 done
-[ -n "$found" ] || yellow_line "当前没有 VMess WS / VLESS WS / VLESS XHTTP 非 Reality，普通 CDN/优选入口不会生成节点；可使用 CF 隧道/Argo。"
+[ -n "$found" ] || yellow_line "当前没有 VMess WS / VLESS WS / VLESS XHTTP 非 Reality / VLESS XHTTP TLS，普通 CDN/优选入口不会生成节点；可使用 CF 隧道/Argo。"
 }
 
 # ============ 生成 VLESS CDN 优选节点链接 ============
@@ -4788,6 +5152,93 @@ EOF
 fi
 printf -- '- "%s"\n' "$cdn_name" >> "$HOME/lun/.cdn_clash_names"
 done
+echo
+}
+
+append_xhttp_tls_cdn_links(){
+port=$1
+[ -n "$xvvmcdnym" ] || { cdn_skip "VLESS XHTTP TLS 缺少 CDN 回源 Host，已跳过 CDN 变体。请在 lun → 入口网络管理 → CDN 中设置回源 Host 域名。"; return 0; }
+origin_public_port=$(client_port "$port")
+edge_port=$(cdn_client_port "$port")
+mode=$(cf_port_mode "$edge_port" 2>/dev/null || true)
+if [ "$mode" != https ]; then
+cdn_skip "VLESS XHTTP TLS CDN 只在 Cloudflare HTTPS 边缘端口生成；当前边缘端口 $edge_port 不是受支持的 HTTPS 端口。"
+return 0
+fi
+ips=$(cdn_ip_list)
+[ -n "$ips" ] || { cdn_default_ips; ips=$(cdn_ip_list); }
+echo "【 Vless-xhttp-tls-CDN-TCP 】CDN 优选节点信息如下："
+if cdn_rewrite_active; then
+echo "注：客户端 HTTPS 边缘端口 $edge_port，Cloudflare Origin Rule 目标端口 $origin_public_port。"
+else
+echo "注：客户端 HTTPS 边缘端口与回源公网端口均为 $edge_port。"
+fi
+cdn_index=0
+for cdn_ip in $ips; do
+case "$cdn_ip" in ""|-1) continue ;; esac
+cdn_index=$((cdn_index + 1))
+cdn_no=$(printf '%02d' "$cdn_index")
+cdn_kind=$(endpoint_kind "$cdn_ip")
+cdn_raw=$(json_host "$cdn_ip")
+cdn_uri=$(uri_host "$cdn_ip")
+cdn_tcp_name="${sxname}vless-xhttp-tls-CDN-TCP-HTTPS-${edge_port}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_tcp_link="vless://$uuid@$cdn_uri:$edge_port?encryption=none&security=tls&sni=$xvvmcdnym&host=$xvvmcdnym&alpn=h2,http/1.1&fp=chrome&insecure=0&allowInsecure=0&type=xhttp&path=$uuid-xc&mode=auto#$cdn_tcp_name"
+printf '%s\n' "$cdn_tcp_link" >> "$HOME/lun/jhsub.txt"
+printf '%s\n' "$cdn_tcp_link"
+cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
+- name: "$cdn_tcp_name"
+  type: vless
+  server: "$cdn_raw"
+  port: $edge_port
+  uuid: $uuid
+  udp: true
+  tls: true
+  network: xhttp
+  alpn:
+    - h2
+    - http/1.1
+  servername: $xvvmcdnym
+  client-fingerprint: chrome
+  skip-cert-verify: false
+  xhttp-opts:
+    path: "/$uuid-xc"
+    host: $xvvmcdnym
+    mode: auto
+EOF
+printf -- '- "%s"\n' "$cdn_tcp_name" >> "$HOME/lun/.cdn_clash_names"
+
+if [ "$edge_port" = 443 ]; then
+cdn_udp_name="${sxname}vless-xhttp-tls-CDN-UDP-EXP-443-${cdn_kind}-${cdn_no}-$hostname"
+cdn_udp_link="vless://$uuid@$cdn_uri:443?encryption=none&security=tls&sni=$xvvmcdnym&host=$xvvmcdnym&alpn=h3&fp=chrome&insecure=0&allowInsecure=0&type=xhttp&path=$uuid-xc&mode=auto#$cdn_udp_name"
+printf '%s\n' "$cdn_udp_link" >> "$HOME/lun/jhsub.txt"
+printf '%s\n' "$cdn_udp_link"
+cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
+- name: "$cdn_udp_name"
+  type: vless
+  server: "$cdn_raw"
+  port: 443
+  uuid: $uuid
+  udp: true
+  tls: true
+  network: xhttp
+  alpn:
+    - h3
+  servername: $xvvmcdnym
+  client-fingerprint: chrome
+  skip-cert-verify: false
+  xhttp-opts:
+    path: "/$uuid-xc"
+    host: $xvvmcdnym
+    mode: auto
+EOF
+printf -- '- "%s"\n' "$cdn_udp_name" >> "$HOME/lun/.cdn_clash_names"
+fi
+done
+if [ "$edge_port" = 443 ]; then
+yellow_line "实验性 CDN-UDP 节点已生成：必须开启 Cloudflare 橙云代理与 HTTP/3（QUIC/UDP 443），最终以客户端实测为准。"
+else
+yellow_line "未生成实验性 CDN-UDP：Cloudflare HTTP/3 只使用 UDP 443，当前边缘端口为 $edge_port。"
+fi
 echo
 }
 
@@ -5047,6 +5498,7 @@ rc=$?
 [ "$rc" = 0 ] && certmode=dns || continue
 ;;
 4)
+[ "$nvp" = yes ] && { echo "NaiveProxy 不能使用仅匹配 IP 的证书，请选择域名证书或导入公开域名证书。"; continue; }
 prompt_acme_email
 rc=$?
 [ "$rc" = 2 ] && return 2
@@ -5349,7 +5801,7 @@ esac
 #
 # 数据流向：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS服务
 # 效果：隐藏 VPS 真实 IP，通过 CDN 中转提升连接稳定性和速度
-# 限制：只有 VMess WS、VLESS WS、VLESS XHTTP（非Reality）支持
+# 限制：只有 VMess WS、VLESS WS、VLESS XHTTP（非Reality）与 VLESS XHTTP TLS 支持
 show_cdn_origin_rules(){
 host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 [ -n "$host" ] || { echo "尚未设置 CDN Host。"; return 1; }
@@ -5367,6 +5819,7 @@ echo "Cloudflare 边缘端口：$edge"
 echo "只按 HTTP/HTTPS 分流会把不同协议送到错误入站，请使用下面的 Host + Path 精确规则："
 for item in \
 "xhttp:VLESS XHTTP:$HOME/lun/port_vx:$rule_uuid-vx" \
+"xhttp:VLESS XHTTP TLS:$HOME/lun/port_xc:$rule_uuid-xc" \
 "ws:VLESS WS:$HOME/lun/port_vw:$rule_uuid-vw" \
 "vmess:VMess WS:$HOME/lun/port_vm_ws:$rule_uuid-vm"; do
 proto=${item%%:*}
@@ -5383,14 +5836,15 @@ printf '\n%s\n' "$label"
 printf '匹配表达式：(http.host eq "%s" and starts_with(http.request.uri.path, "/%s"))\n' "$host" "$path"
 printf '目标端口：%s（NAT 公网端口，内网监听 %s）\n' "$origin_public" "$inner"
 done
-if [ "$edge" = 2096 ]; then
+if is_cf_https_port "$edge"; then
 cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
 cert_subject_now=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
 if [ "$cert_subject_now" = "$host" ] && [ "$cert_mode_now" != self ]; then
-green_line "2096 源站 TLS：证书与 Host 匹配，可在 Cloudflare 使用 Full (Strict)。"
+green_line "$edge 源站 TLS：证书与 Host 匹配，可在 Cloudflare 使用 Full (Strict)。"
 else
-yellow_line "2096 源站 TLS：当前证书为自签或与 Host 不同，请在 Cloudflare 使用 Full，不要使用 Full (Strict)。"
+yellow_line "$edge 源站 TLS：当前证书为自签或与 Host 不同，请在 Cloudflare 使用 Full，不要使用 Full (Strict)。"
 fi
+[ "$edge" = 443 ] && yellow_line "实验性 CDN-UDP 还要求该 DNS 记录开启橙云代理，并在 Cloudflare 开启 HTTP/3（QUIC/UDP 443）。"
 fi
 }
 
@@ -5412,6 +5866,10 @@ fi
 
 cdn_probe_path(){
 probe_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
+if cdn_protocol_enabled xhttp && [ -s "$HOME/lun/port_xc" ]; then
+probe_xc_edge=$(cdn_client_port "$(cat "$HOME/lun/port_xc")")
+is_cf_https_port "$probe_xc_edge" && { printf '%s\n' "$probe_uuid-xc"; return; }
+fi
 if cdn_protocol_enabled xhttp && [ -s "$HOME/lun/port_vx" ]; then printf '%s\n' "$probe_uuid-vx"; return; fi
 if cdn_protocol_enabled ws && [ -s "$HOME/lun/port_vw" ]; then printf '%s\n' "$probe_uuid-vw"; return; fi
 if cdn_protocol_enabled vmess && [ -s "$HOME/lun/port_vm_ws" ]; then printf '%s\n' "$probe_uuid-vm"; return; fi
@@ -5424,7 +5882,10 @@ path=$(cdn_probe_path)
 [ -n "$host" ] && [ -n "$path" ] || { echo "需要先设置 CDN Host 并安装一个兼容协议。"; return 1; }
 edge=${cdnpt:-}
 cdn_rewrite_active || {
-if cdn_protocol_enabled xhttp && [ -s "$HOME/lun/port_vx" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vx")")
+xc_diag_edge=
+[ -s "$HOME/lun/port_xc" ] && xc_diag_edge=$(client_port "$(cat "$HOME/lun/port_xc")")
+if cdn_protocol_enabled xhttp && [ -n "$xc_diag_edge" ] && is_cf_https_port "$xc_diag_edge"; then edge=$xc_diag_edge
+elif cdn_protocol_enabled xhttp && [ -s "$HOME/lun/port_vx" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vx")")
 elif cdn_protocol_enabled ws && [ -s "$HOME/lun/port_vw" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vw")")
 elif cdn_protocol_enabled vmess && [ -s "$HOME/lun/port_vm_ws" ]; then edge=$(client_port "$(cat "$HOME/lun/port_vm_ws")")
 fi
@@ -5446,7 +5907,7 @@ if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$headerfile" 2>/dev/nul
 rm -f "$errfile" "$headerfile"
 if [ "$rc" -ne 0 ]; then
 case "$err" in
-*SSL*|*TLS*|*certificate*) red_line "$endpoint：TLS 握手失败（检查橙云边缘证书、2096 源站 TLS 和 Cloudflare SSL 模式）。" ;;
+*SSL*|*TLS*|*certificate*) red_line "$endpoint：TLS 握手失败（检查橙云边缘证书、HTTPS 源站 TLS 和 Cloudflare SSL 模式）。" ;;
 *Connected\ to*)
 if [ "$scheme" = https ]; then
 red_line "$endpoint：TCP 边缘端口可达，但 TLS/Host 握手未完成（检查橙云、边缘证书和 SNI）。"
@@ -5519,7 +5980,7 @@ CDN_REBUILD_REQUIRED=no
 while :; do
 ui_title "Lun CDN / CF 优选"
 echo "普通 CDN：客户端 → 优选入口 → CDN Host → VPS，不使用 Origin Rules。"
-echo "默认只生成 XHTTP CDN；VLESS WS、VMess WS 仍保留直连节点。"
+echo "默认生成 XHTTP CDN；XHTTP TLS 只在 HTTPS 边缘端口生成，UDP 变体仅限实验性 443。"
 show_cdn_summary
 echo " 1. 一键启用 / 修复 XHTTP CDN"
 echo " 2. 仅修改优选 IP / 域名"
@@ -5529,7 +5990,7 @@ printf "请选择 [0-3]："
 IFS= read -r choice
 case "$choice" in
 1)
-[ -s "$HOME/lun/port_vx" ] || { yellow_line "尚未安装 VLESS XHTTP，请先到“安装 / 协议管理”添加。"; return 1; }
+{ [ -s "$HOME/lun/port_vx" ] || [ -s "$HOME/lun/port_xc" ]; } || { yellow_line "尚未安装 VLESS XHTTP 或 VLESS XHTTP TLS，请先到“安装 / 协议管理”添加。"; return 1; }
 prompt_cdn_host || return $?
 prompt_cdn_ips || return $?
 cdnproto=xhttp
@@ -5549,7 +6010,7 @@ return 0
 ;;
 3)
 old_tls=no
-cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ] && old_tls=yes
+cdn_rewrite_active && is_cf_https_port "${cdnpt:-8080}" && old_tls=yes
 rm -f "$HOME/lun/cdnym" "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port" "$HOME/lun/cdn_protocol"
 clear_cdn_ip_list
 cdnym=; cfip=; cdnmode=standard; cdnpt=; cdnproto=xhttp
@@ -5566,23 +6027,31 @@ done
 prompt_nat_origin_rules(){
 CDN_REBUILD_REQUIRED=no
 is_nat_mode || { yellow_line "Origin Rules 端口改写仅用于 NAT VPS；普通 VPS 请使用 CDN / CF 优选。"; return 1; }
-[ -s "$HOME/lun/port_vx" ] || { yellow_line "NAT Origin Rules 默认绑定 VLESS XHTTP，请先安装该协议。"; return 1; }
+{ [ -s "$HOME/lun/port_vx" ] || [ -s "$HOME/lun/port_xc" ]; } || { yellow_line "NAT Origin Rules 需要 VLESS XHTTP 或 VLESS XHTTP TLS，请先安装协议。"; return 1; }
 [ -s "$HOME/lun/cdnym" ] || { yellow_line "请先在 CDN / CF 优选中设置 Host。"; return 1; }
 while :; do
 ui_title "Lun NAT Origin Rules（端口回源）"
 echo "该功能只分离 Cloudflare 边缘端口与 NAT 回源公网端口。"
 echo " 1. HTTP 8080（推荐，无证书）"
 echo " 2. HTTPS 2096（源站 TLS）"
-echo " 3. 显示精确 Host + Path 规则"
-echo " 4. 关闭端口改写，恢复普通同端口 CDN"
+echo " 3. HTTPS 443（源站 TLS；可实验 CDN-UDP/HTTP3）"
+echo " 4. 显示精确 Host + Path 规则"
+echo " 5. 关闭端口改写，恢复普通同端口 CDN"
 echo " 0. 返回"
-printf "请选择 [0-4]："
+printf "请选择 [0-5]："
 IFS= read -r choice
 case "$choice" in
-1|2)
+1|2|3)
 old_tls=no; new_tls=no
-cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ] && old_tls=yes
-[ "$choice" = 1 ] && cdnpt=8080 || { cdnpt=2096; new_tls=yes; }
+cdn_rewrite_active && is_cf_https_port "${cdnpt:-8080}" && old_tls=yes
+case "$choice" in
+1)
+[ -s "$HOME/lun/port_vx" ] || { yellow_line "当前只有 VLESS XHTTP TLS，不能使用 HTTP 8080；请选择 HTTPS 2096 或 443。"; continue; }
+cdnpt=8080
+;;
+2) cdnpt=2096; new_tls=yes ;;
+3) cdnpt=443; new_tls=yes ;;
+esac
 cdnmode=rewrite
 cdnproto=xhttp
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
@@ -5593,10 +6062,10 @@ export cdnmode cdnpt cdnproto
 show_cdn_origin_rules
 return 0
 ;;
-3) show_cdn_origin_rules; ui_pause ;;
-4)
+4) show_cdn_origin_rules; ui_pause ;;
+5)
 old_tls=no
-cdn_rewrite_active && [ "${cdnpt:-8080}" = 2096 ] && old_tls=yes
+cdn_rewrite_active && is_cf_https_port "${cdnpt:-8080}" && old_tls=yes
 cdnmode=standard; cdnpt=
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
 rm -f "$HOME/lun/cdn_edge_port"
@@ -5722,6 +6191,9 @@ case "$1" in
 9) echo "Socks5" ;;
 10) echo "Hysteria2" ;;
 11) echo "TUIC" ;;
+12) echo "VLESS XHTTP TLS UDP" ;;
+13) echo "VLESS XHTTP TLS TCP/UDP" ;;
+14) echo "NaiveProxy H2/H3" ;;
 esac
 }
 
@@ -5730,6 +6202,9 @@ case "$1" in
 3) echo "（支持后续CF优选CDN）" ;;
 4) echo "（支持后续Argo隧道/CF优选CDN）" ;;
 8) echo "（支持后续Argo隧道/CF优选CDN）" ;;
+12) echo "（UDP/QUIC，需放行 UDP 端口）" ;;
+13) echo "（源站 TCP；支持 HTTPS CDN / 实验 UDP 443）" ;;
+14) echo "（同端口 H2/H3；需公开可信域名证书）" ;;
 *) echo "" ;;
 esac
 }
@@ -5747,6 +6222,9 @@ case "$1" in
 9) echo sopt ;;
 10) echo hypt ;;
 11) echo tupt ;;
+12) echo xupt ;;
+13) echo xcpt ;;
+14) echo nvpt ;;
 esac
 }
 
@@ -5769,18 +6247,21 @@ case "$1" in
 9) unset sopt sop port_so ;;
 10) unset hypt hyp port_hy2 ;;
 11) unset tupt tup port_tu ;;
+12) unset xupt xup port_xu ;;
+13) unset xcpt xcp port_xc ;;
+14) unset nvpt nvp port_nv ;;
 esac
 }
 
 clear_all_protocol_picks(){
-for id in 1 2 3 4 5 6 7 8 9 10 11; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
 clear_protocol_pick "$id"
 done
 }
 
 protocol_count(){
 count=0
-for id in 1 2 3 4 5 6 7 8 9 10 11; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
 [ -n "$(protocol_current_port "$id")" ] && count=$((count + 1))
 done
 printf '%s\n' "$count"
@@ -5788,7 +6269,7 @@ printf '%s\n' "$count"
 
 show_protocol_picker(){
 echo "当前协议选择："
-for id in 1 2 3 4 5 6 7 8 9 10 11; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
 label=$(protocol_label "$id")
 note=$(protocol_note "$id")
 port=$(protocol_current_port "$id")
@@ -5874,7 +6355,10 @@ for item in \
 "VMess WS:$port_vm_ws" \
 "Socks5:$port_so" \
 "Hysteria2:$port_hy2" \
-"TUIC:$port_tu"; do
+"TUIC:$port_tu" \
+"VLESS XHTTP TLS UDP:$port_xu" \
+"VLESS XHTTP TLS TCP/UDP:$port_xc" \
+"NaiveProxy H2/H3:$port_nv"; do
 label=${item%%:*}
 port=${item#*:}
 [ -n "$port" ] || continue
@@ -6110,6 +6594,7 @@ fi
 echo " 3. DNS API 证书（acme.sh 原生 DNS provider）"
 echo " 4. IP 证书（short-lived，HTTP-01）"
 echo " 5. 搜索并导入本机证书（自动匹配私钥）"
+[ "$nvp" = yes ] && yellow_line "已选择 NaiveProxy：必须使用与服务域名匹配的公开可信证书，不能使用自签或 Cloudflare Origin CA。"
 echo " 0. 返回上一步"
 printf "请选择 [0-5]，%s回车默认 1%s：" "$LUN_YELLOW" "$LUN_RESET"
 IFS= read -r c
@@ -6145,6 +6630,7 @@ rc=$?
 if [ "$rc" = 0 ]; then
 certmode=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
 show_cert_summary
+[ "$nvp" = yes ] && { naive_certificate_ready || continue; }
 return 0
 fi
 continue
@@ -6160,6 +6646,10 @@ echo "将使用自签证书。"
 fi
 ;;
 *) echo "输入错误，请重新选择。"; continue ;;
+esac
+[ "$nvp" = yes ] && case "$certmode" in
+domain|dns) ;;
+*) naive_certificate_ready || continue ;;
 esac
 printf "%s\n" "$certmode" > "$HOME/lun/cert_mode"
 return 0
@@ -6352,7 +6842,7 @@ if [ -n "$search_dir" ]; then
 [ -d "$search_dir" ] || { echo "目录不存在：$search_dir"; rm -f "$roots_file" "$raw_file" "$rows_file"; return 1; }
 printf '%s\n' "$search_dir" > "$roots_file"
 else
-for cert_root in "$HOME/lun" "$HOME/key" "$HOME/cert" "$HOME/.acme.sh" /root/key /root/cert /etc/letsencrypt/live; do
+for cert_root in "$HOME/lun" "$HOME/key" "$HOME/cert" "$HOME/.acme.sh" /root/key /root/cert /root/ygkkkca /etc/letsencrypt/live; do
 [ -d "$cert_root" ] && printf '%s\n' "$cert_root" >> "$roots_file"
 done
 fi
@@ -6829,7 +7319,7 @@ trap 'exit 130' HUP INT TERM
 cleandel keep-entry
 ensure_lun_command || true
 rm -rf "$HOME/lun"/{sb.json,xr.json,sbargoym.log,sbargotoken.log,argo.log,argoport.log,name}
-rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu
+rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu "$HOME/lun"/port_xu "$HOME/lun"/port_xc "$HOME/lun"/port_nv
 if [ "$_lun_rebuild_existing" = yes ]; then
 echo "旧协议进程已停止，正在重建配置；现有内核、证书、UUID 与订阅设置均保留。"
 else

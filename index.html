@@ -87,6 +87,7 @@
     <div class="layout">
       <section>
         <h2>协议</h2>
+        <p>端口留空会随机分配。XHTTP TLS UDP 放行 UDP；XHTTP TLS TCP/UDP 的源站端口放行 TCP；NaiveProxy H2/H3 需同时放行同一端口的 TCP 和 UDP。</p>
         <div class="grid" id="protocols"></div>
       </section>
 
@@ -130,9 +131,6 @@
           <label>Reality SNI
             <input id="reym" placeholder="apple.com">
           </label>
-          <label>WS/XHTTP Host
-            <input id="cdnym" placeholder="host.example.com">
-          </label>
           <label>节点名称前缀
             <input id="name" placeholder="home">
           </label>
@@ -167,13 +165,36 @@
         <h2>CDN 优选 IP 加速</h2>
         <p><b>cdnym</b>（回源域名）：你的域名，已解析到 VPS IP。Cloudflare 通过它找到你的服务器。<br>
         <b>cfip</b>（优选地址）：客户端实际连接的 Cloudflare 入口，填 IP 或域名。<br>
-        简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。仅对 VMess WS / VLESS WS / VLESS XHTTP 生效，端口必须在 CF 橙云端口内。</p>
+        简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。适用于 VMess WS / VLESS WS / VLESS XHTTP；VLESS XHTTP TLS 只生成 HTTPS CDN 节点。</p>
+        <p>实验性 CDN-UDP 只在边缘端口 443 时生成，并要求 DNS 记录开启橙云代理、Cloudflare HTTP/3 已开启且 UDP 443 可用；其它端口不会生成伪可用 UDP 节点。</p>
         <div class="grid">
           <label>回源域名 cdnym（你的域名，解析到VPS）
             <input id="cdnym" placeholder="如 proxy.example.com，须已解析到VPS">
           </label>
           <label>优选地址 cfip（客户端连CF的入口）
             <input id="cfip" placeholder="推荐 cloudflare-ech.com www.visa.com.sg">
+          </label>
+          <label>CDN 模式 cdnmode
+            <select id="cdnmode">
+              <option value="">默认 standard</option>
+              <option value="standard">standard 同端口</option>
+              <option value="rewrite">rewrite NAT Origin Rules</option>
+            </select>
+          </label>
+          <label>边缘端口 cdnpt
+            <select id="cdnpt">
+              <option value="">按模式默认</option>
+              <option value="8080">8080 HTTP</option>
+              <option value="2096">2096 HTTPS</option>
+              <option value="443">443 HTTPS / 实验 HTTP3</option>
+            </select>
+          </label>
+          <label>CDN 协议 cdnproto
+            <select id="cdnproto">
+              <option value="">默认 xhttp</option>
+              <option value="xhttp">xhttp</option>
+              <option value="all">all（含 WS）</option>
+            </select>
           </label>
         </div>
       </section>
@@ -227,19 +248,23 @@
       ['vmpt', 'VMess WS（支持CDN）'],
       ['sopt', 'Socks5'],
       ['hypt', 'Hysteria2'],
-      ['tupt', 'TUIC']
+      ['tupt', 'TUIC'],
+      ['xupt', 'VLESS XHTTP TLS UDP', 'UDP 端口，留空随机'],
+      ['xcpt', 'VLESS XHTTP TLS TCP/UDP（HTTPS CDN）', '源站 TCP 端口'],
+      ['nvpt', 'NaiveProxy H2/H3（公开域名证书）', 'TCP/UDP 同端口']
     ];
 
     const protocolBox = document.querySelector('#protocols');
-    protocols.forEach(([id, label]) => {
+    protocols.forEach(([id, label, portHint]) => {
       const wrap = document.createElement('label');
-      wrap.innerHTML = `<span class="check"><input type="checkbox" data-proto="${id}"> ${label}</span><input data-port="${id}" placeholder="端口留空随机，CDN需填CF端口">`;
+      wrap.innerHTML = `<span class="check"><input type="checkbox" data-proto="${id}"> ${label}</span><input data-port="${id}" placeholder="${portHint || '端口留空随机，CDN需填CF端口'}">`;
       protocolBox.appendChild(wrap);
     });
 
     const ids = [
       'domain', 'certmode', 'acme_email', 'acme_dns',
       'reym', 'cdnym', 'name', 'ippz', 'addym', 'addout',
+      'cdnmode', 'cdnpt', 'cdnproto',
       'argo', 'agn', 'agk', 'argoip', 'cfip', 'subid', 'subpt', 'warp'
     ];
     const output = document.querySelector('#output');
@@ -260,6 +285,20 @@
       });
       if (q('sub').checked) vars.push('sub="y"');
       output.value = `${vars.join(' ')} ${SCRIPT}`.trim();
+
+      const enabled = id => document.querySelector(`[data-proto="${id}"]`).checked;
+      const warnings = [];
+      if (enabled('nvpt')) {
+        const certMode = q('certmode').value;
+        if (!q('domain').value.trim()) warnings.push('NaiveProxy 需要填写与公开证书匹配的服务域名。');
+        if (!certMode || ['self', 'ip'].includes(certMode)) warnings.push('NaiveProxy 不能使用自签或 IP-only 证书；请选择 domain/dns，或先在服务器导入公开可信证书。');
+      }
+      if (enabled('xupt')) warnings.push('xupt 需要在安全组与防火墙放行所选 UDP 端口。');
+      if (enabled('xcpt')) warnings.push('xcpt 源站需放行 TCP；实验 CDN-UDP 另需客户端到 Cloudflare 的 UDP 443。');
+      if (enabled('nvpt')) warnings.push('nvpt 需要同时放行所选端口的 TCP 与 UDP。');
+      if (enabled('xcpt') && q('cdnym').value.trim() && q('cdnpt').value === '8080') warnings.push('xcpt 不生成 HTTP 8080 CDN 节点，请改用 HTTPS 2096 或 443。');
+      if (enabled('xcpt') && q('cdnpt').value === '443') warnings.push('CDN-UDP 443 为实验项：还需橙云代理和 Cloudflare HTTP/3。');
+      hint.textContent = warnings.join(' ');
     }
 
     document.addEventListener('input', build);
