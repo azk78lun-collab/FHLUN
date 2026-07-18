@@ -79,6 +79,24 @@ Xray `run -test` 与 Sing-box `check` 均通过，`xr.service`、`sb.service`、
 
 当前非 443 CDN 条件下，订阅中的实验性 CDN-UDP 节点数量为 `0`，符合“不满足 UDP 443、橙云和 HTTP/3 条件时不生成伪可用节点”的要求。
 
+## GitHub 分支卸载与全新安装
+
+推送功能分支后，又使用该分支的 GitHub raw `lun.sh` 完成了一次完整生命周期测试：
+
+| 项目 | 结果 |
+| --- | --- |
+| GitHub raw 脚本与本地源码 SHA-256 一致 | PASS |
+| 更新本机 `lun` 命令后执行完整卸载 | PASS |
+| 状态目录、订阅目录、命令入口和 systemd 单元全部删除 | PASS |
+| 原协议与新增协议监听全部退出，Nginx 保持运行 | PASS |
+| 从空状态重新下载 Xray、Sing-box 并生成配置 | PASS |
+| 导入 `/root/ygkkkca` 公开证书后启用 NaiveProxy | PASS |
+| 安装后事务重建与 `.last_good_rebuild` | PASS |
+| 新安装的 XHTTP TLS UDP/TCP、Naive H2/H3 真实代理 | PASS |
+| 新安装的服务、监听和订阅端点 | PASS |
+
+该测试复现并修复了一个既有卸载缺陷：脚本 shebang 为 `/bin/sh`，但卸载与重建清理曾使用 Bash 花括号路径展开，导致通过 `lun del` 执行时 systemd 单元文件未删除。现已改为 POSIX 兼容的显式路径，并同时修正同类 OpenRC 与重建清理路径。
+
 ## 最终状态
 
 - 测试机保留 `V26.7.18.1` 和三项新增协议。
