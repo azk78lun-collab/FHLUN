@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.7.18.1`。
+当前脚本版本：`V26.7.19.1`。
 
 ## 快速开始
 
@@ -36,7 +36,7 @@ lun
 0. 退出
 ```
 
-引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。“入口网络管理”精简为 VPS/端口、CDN/CF 优选、NAT Origin Rules（端口回源）、CF 隧道/Argo、CDN 诊断；普通 VPS 不显示回源端口改写流程。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、Cloudflare Origin Rules（端口回源）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
 “安装 / 协议管理”中的增删改操作会停止旧协议进程并重写 Xray/Sing-box 配置，这是让新增、删除和端口修改生效的必要步骤；已有内核、证书、UUID 与订阅设置会保留，只有所选协议需要的内核文件确实缺失时才下载。重建前会创建事务快照，SSH 断线、命令中断或新配置校验失败时自动恢复旧配置和服务，成功后保留 `~/lun/.last_good_rebuild`。状态区会区分“运行中”“已安装但未运行”“内核已安装但当前协议未使用”和“未安装”。
 
@@ -119,10 +119,10 @@ Reality、Argo 和 CDN 仍然独立：
 | `argo` | 填写 `vmpt` 或 `vwpt` 启用 Argo |
 | `agn` | Argo 固定隧道域名 |
 | `agk` | Argo 固定隧道 token |
-| `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），可填多个值，推荐 `cloudflare-ech.com` |
+| `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），可填多个；留空时尝试从已橙云的 `cdnym` 自动解析 CF 边缘 IP |
 | `argoip` | Argo 优选 IP 或域名（与 cfip 独立），可填多个值 |
-| `cdnmode` | `standard` 同端口模式；`rewrite` 为 NAT 回源端口改写模式 |
-| `cdnpt` | NAT 改写模式的 Cloudflare 边缘端口：`8080`、`2096` 或 `443` |
+| `cdnmode` | `standard` 同端口模式；`rewrite` 为普通/NAT VPS 通用的 Origin Rules 回源端口改写模式 |
+| `cdnpt` | 改写模式的 Cloudflare 边缘端口；支持下列全部官方 HTTP/HTTPS 代理端口 |
 | `cdnproto` | CDN 节点协议：默认 `xhttp`；`all` 兼容输出 XHTTP、VLESS WS、VMess WS |
 | `addrmode` | 普通节点地址输出：`domain`、`ipv4`、`ipv6`、`dual`、`all` |
 
@@ -136,7 +136,7 @@ CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点
 
 **使用条件：**
 1. 设置 `cdnym`：Cloudflare 接收请求时使用的 Host 域名。
-2. 设置 `cfip`：可混合填写多个 IPv4、IPv6 或域名，脚本会去重并生成唯一节点名。
+2. 设置 `cfip`：可混合填写多个 IPv4、IPv6 或域名，脚本会去重并生成唯一节点名。留空时只采用从已橙云 `cdnym` 解析到且不等于本机公网地址的 IP；无法确认橙云时不会再自动塞入第三方优选域名。
 3. 客户端直接连接 `cfip` 时，不依赖客户端把 `cdnym` 解析到哪个地址；脚本以实际 CF 边缘诊断为准。直接使用 `cdnym` 作为入口时应开启橙云。
 4. 默认生成 VLESS XHTTP CDN；`xcpt` 只在 Cloudflare HTTPS 边缘端口生成 CDN-TCP，WS 协议保留直连；需要旧式多协议输出时设置 `cdnproto=all`。
 
@@ -151,13 +151,9 @@ HTTP（明文）：80、8080、8880、2052、2082、2086、2095
 HTTPS（加密）：443、8443、2053、2083、2087、2096
 ```
 
-**推荐 CDN 优选域名：** `cloudflare-ech.com`、`www.visa.com.sg`、`www.wto.org`、`www.web.com`（也可使用 CF 优选 IP）
+普通 VPS 在协议端口本身属于 Cloudflare 官方端口时可以继续使用同端口 CDN；协议端口不适合 CF 时，脚本自动启用 Origin Rules。仅有 `xcpt` 时自动选择 HTTPS `443`；与原有 XHTTP/WS 混装时，旧协议默认继续使用 HTTP `8080`，`xcpt` 单独使用 HTTPS `443`，不会为套 CDN 而改变旧协议直连的 TLS 行为。也可手动使用上表中的任一官方端口。普通 VPS 的规则目标是本机协议监听端口，NAT VPS 的规则目标是该协议的 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则及边缘端口。
 
-普通 VPS 使用同端口 CDN 优选：客户端边缘端口与协议端口相同，不需要 Origin Rules，继续沿用旧版可用流程。
-
-NAT Origin Rules（端口回源）已从普通 CDN 配置中独立出来，仅 NAT VPS 可开启。客户端连接 Cloudflare 的 `8080`、`2096` 或 `443`，Cloudflare 再按 Host 与协议 Path 把目标端口改写为 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则。
-
-`2096` 和 `443` 会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换 `8080/2096/443` 只重建配置并重启服务，不重新下载内核。
+HTTPS 端口组会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换边缘端口只重建配置并重启服务，不重新下载内核。
 
 `xcpt` 的 CDN-TCP 只会在 Cloudflare 官方 HTTPS 边缘端口生成。实验性 CDN-UDP 只会在边缘端口严格为 `443` 时生成；还必须让 DNS 记录保持橙云代理状态并在 Cloudflare 开启 HTTP/3，因为 HTTP/3 使用 QUIC/UDP 443。若条件不满足，脚本只显示警告，不会把 UDP 节点伪装成可用配置。参考 [Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/) 与 [Cloudflare 代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)。
 
@@ -167,6 +163,12 @@ NAT Origin Rules（端口回源）已从普通 CDN 配置中独立出来，仅 N
 
 ```bash
 vxpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234" cdnproto="xhttp" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
+```
+
+普通 VPS 的 XHTTP TLS 随机源站端口会自动分配 Cloudflare HTTPS 443 边缘端口并启用回源改写：
+
+```bash
+xcpt="" cdnym="proxy.example.com" cfip="108.162.198.31" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
 NAT VPS Origin Rules：
@@ -181,7 +183,7 @@ XHTTP TLS + NaiveProxy（`24443/UDP`、`25443/TCP`、`26443/TCP+UDP`）：
 domain="proxy.example.com" certmode="domain" xupt="24443" xcpt="25443" nvpt="26443" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-HTTP `8080` 节点会显式写入 `security=none`，HTTPS `2096/443` 节点写入 TLS。节点名称同时包含边缘模式和端口，避免 v2rayN 在切换模式后沿用旧的 TLS/Reality/PublicKey 字段。
+HTTP 端口组节点会显式写入 `security=none`，HTTPS 端口组节点写入 TLS。节点名称同时包含边缘模式和端口，避免 v2rayN 在切换模式后沿用旧的 TLS/Reality/PublicKey 字段。CDN 名称中的 `DOMAIN` 只表示 `cfip` 是域名入口，并不是另一种旧协议；新版不再自动生成未经验证的第三方 `DOMAIN` 入口，显式填写的域名仍会保留。
 
 ## 普通节点地址输出
 

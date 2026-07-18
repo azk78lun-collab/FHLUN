@@ -165,26 +165,36 @@
         <h2>CDN 优选 IP 加速</h2>
         <p><b>cdnym</b>（回源域名）：你的域名，已解析到 VPS IP。Cloudflare 通过它找到你的服务器。<br>
         <b>cfip</b>（优选地址）：客户端实际连接的 Cloudflare 入口，填 IP 或域名。<br>
-        简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。适用于 VMess WS / VLESS WS / VLESS XHTTP；VLESS XHTTP TLS 只生成 HTTPS CDN 节点。</p>
+        简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。普通 VPS 和 NAT VPS 都可用 Origin Rules 把 CF 边缘端口改写到协议源站端口。VLESS XHTTP TLS 只生成 HTTPS CDN 节点。</p>
         <p>实验性 CDN-UDP 只在边缘端口 443 时生成，并要求 DNS 记录开启橙云代理、Cloudflare HTTP/3 已开启且 UDP 443 可用；其它端口不会生成伪可用 UDP 节点。</p>
         <div class="grid">
           <label>回源域名 cdnym（你的域名，解析到VPS）
             <input id="cdnym" placeholder="如 proxy.example.com，须已解析到VPS">
           </label>
           <label>优选地址 cfip（客户端连CF的入口）
-            <input id="cfip" placeholder="推荐 cloudflare-ech.com www.visa.com.sg">
+            <input id="cfip" placeholder="可留空自动解析橙云 Host，或填写已验证的优选 IP">
           </label>
           <label>CDN 模式 cdnmode
             <select id="cdnmode">
               <option value="">默认 standard</option>
               <option value="standard">standard 同端口</option>
-              <option value="rewrite">rewrite NAT Origin Rules</option>
+              <option value="rewrite">rewrite Origin Rules（普通/NAT VPS）</option>
             </select>
           </label>
           <label>边缘端口 cdnpt
             <select id="cdnpt">
               <option value="">按模式默认</option>
+              <option value="80">80 HTTP</option>
               <option value="8080">8080 HTTP</option>
+              <option value="8880">8880 HTTP</option>
+              <option value="2052">2052 HTTP</option>
+              <option value="2082">2082 HTTP</option>
+              <option value="2086">2086 HTTP</option>
+              <option value="2095">2095 HTTP</option>
+              <option value="8443">8443 HTTPS</option>
+              <option value="2053">2053 HTTPS</option>
+              <option value="2083">2083 HTTPS</option>
+              <option value="2087">2087 HTTPS</option>
               <option value="2096">2096 HTTPS</option>
               <option value="443">443 HTTPS / 实验 HTTP3</option>
             </select>
@@ -264,7 +274,7 @@
     const ids = [
       'domain', 'certmode', 'acme_email', 'acme_dns',
       'reym', 'cdnym', 'name', 'ippz', 'addym', 'addout',
-      'cdnmode', 'cdnpt', 'cdnproto',
+      'cdnproto',
       'argo', 'agn', 'agk', 'argoip', 'cfip', 'subid', 'subpt', 'warp'
     ];
     const output = document.querySelector('#output');
@@ -275,18 +285,48 @@
 
     function build() {
       const vars = [];
+      const enabled = id => document.querySelector(`[data-proto="${id}"]`).checked;
+      const portOf = id => document.querySelector(`[data-port="${id}"]`).value.trim();
+      const cfHttpPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
+      const cfHttpsPorts = ['443', '8443', '2053', '2083', '2087', '2096'];
+      const cfPorts = [...cfHttpPorts, ...cfHttpsPorts];
+      let effectiveCdnMode = q('cdnmode').value.trim();
+      let effectiveCdnPort = q('cdnpt').value.trim();
+      let cdnAutoAdjusted = false;
+      let xhttpTlsEdgePort = '';
+      if (q('cdnym').value.trim()) {
+        const cdnProtoAll = q('cdnproto').value === 'all';
+        const hasGenericCdn = enabled('vxpt') || (cdnProtoAll && (enabled('vwpt') || enabled('vmpt')));
+        const recommendedEdge = hasGenericCdn ? '8080' : (enabled('xcpt') ? '443' : '8080');
+        const needsRewrite =
+          (enabled('xcpt') && !cfHttpsPorts.includes(portOf('xcpt'))) ||
+          (enabled('vxpt') && !cfPorts.includes(portOf('vxpt'))) ||
+          (cdnProtoAll && enabled('vwpt') && !cfPorts.includes(portOf('vwpt'))) ||
+          (cdnProtoAll && enabled('vmpt') && !cfPorts.includes(portOf('vmpt')));
+        if (effectiveCdnMode === 'rewrite') {
+          if (!cfPorts.includes(effectiveCdnPort) || (enabled('xcpt') && !hasGenericCdn && !cfHttpsPorts.includes(effectiveCdnPort))) {
+            effectiveCdnPort = recommendedEdge;
+            cdnAutoAdjusted = true;
+          }
+        } else if (needsRewrite) {
+          effectiveCdnMode = 'rewrite';
+          effectiveCdnPort = recommendedEdge;
+          cdnAutoAdjusted = true;
+        }
+        if (enabled('xcpt')) xhttpTlsEdgePort = cfHttpsPorts.includes(effectiveCdnPort) ? effectiveCdnPort : '443';
+      }
       protocols.forEach(([id]) => {
-        const enabled = document.querySelector(`[data-proto="${id}"]`).checked;
-        if (enabled) vars.push(`${id}=${quote(document.querySelector(`[data-port="${id}"]`).value)}`);
+        if (enabled(id)) vars.push(`${id}=${quote(portOf(id))}`);
       });
       ids.forEach(id => {
         const value = q(id).value.trim();
         if (value) vars.push(`${id}=${quote(value)}`);
       });
+      if (effectiveCdnMode) vars.push(`cdnmode=${quote(effectiveCdnMode)}`);
+      if (effectiveCdnPort) vars.push(`cdnpt=${quote(effectiveCdnPort)}`);
       if (q('sub').checked) vars.push('sub="y"');
       output.value = `${vars.join(' ')} ${SCRIPT}`.trim();
 
-      const enabled = id => document.querySelector(`[data-proto="${id}"]`).checked;
       const warnings = [];
       if (enabled('nvpt')) {
         const certMode = q('certmode').value;
@@ -296,8 +336,10 @@
       if (enabled('xupt')) warnings.push('xupt 需要在安全组与防火墙放行所选 UDP 端口。');
       if (enabled('xcpt')) warnings.push('xcpt 源站需放行 TCP；实验 CDN-UDP 另需客户端到 Cloudflare 的 UDP 443。');
       if (enabled('nvpt')) warnings.push('nvpt 需要同时放行所选端口的 TCP 与 UDP。');
-      if (enabled('xcpt') && q('cdnym').value.trim() && q('cdnpt').value === '8080') warnings.push('xcpt 不生成 HTTP 8080 CDN 节点，请改用 HTTPS 2096 或 443。');
-      if (enabled('xcpt') && q('cdnpt').value === '443') warnings.push('CDN-UDP 443 为实验项：还需橙云代理和 Cloudflare HTTP/3。');
+      if (cdnAutoAdjusted) warnings.push(`已自动使用 ${effectiveCdnPort} 作为默认 Cloudflare 边缘端口，并生成 Origin Rules 回源配置。`);
+      if (enabled('xcpt') && effectiveCdnMode === 'rewrite' && xhttpTlsEdgePort !== effectiveCdnPort) warnings.push(`XHTTP TLS 不使用 HTTP ${effectiveCdnPort}，将单独使用 HTTPS ${xhttpTlsEdgePort}。`);
+      if (q('cdnym').value.trim() && !q('cfip').value.trim()) warnings.push('cfip 留空时，脚本只会采用从橙云 Host 解析到且不等于本机的边缘 IP；发现灰云会要求手动填写。');
+      if (enabled('xcpt') && xhttpTlsEdgePort === '443') warnings.push('CDN-UDP 443 为实验项：还需橙云代理和 Cloudflare HTTP/3。');
       hint.textContent = warnings.join(' ');
     }
 
