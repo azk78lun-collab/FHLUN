@@ -71,3 +71,11 @@
 - XHTTP TLS 直连 UDP/TCP：各 1 条。
 - Xray `run -test` 与 Sing-box `check` 再次通过，`xr`、`sb`、`nginx` 均为 `active`。
 - Cloudflare Origin Rule 生效后重新刷新订阅，只有通过回源探测的入口才会恢复输出 CDN 节点。
+
+## CF 端口自动匹配补丁复测
+
+- 支持 CDN 的随机协议端口现在按协议匹配未占用的 CF 官方端口：HTTP 协议使用 HTTP 端口组，XHTTP TLS TCP/UDP 使用 HTTPS 端口组；自动随机排除 443。
+- 测试机先将 `xcpt` 迁移到 `8443`，三个 Cloudflare 8443 入口均与本机 Xray `404 + 空响应体` 指纹一致，生成 3 条 `vless-xhttp-tls-CDN-TCP-HTTPS-8443-V4-*`。
+- 用空端口随机重建后，`xcpt` 自动选择 `2096`，生成 3 条 `vless-xhttp-tls-CDN-TCP-HTTPS-2096-V4-*`；未选择 443，Xray、Sing-box、Nginx 仍为 `active`。
+- 将边缘端口临时切到 443 做反向验证时，因 Cloudflare 未配置 443 → XHTTP TLS 源站端口的 Origin Rule，TCP/UDP CDN 节点均为 0，脚本给出明确提示；随后已恢复 `standard` 同端口模式和 2096 TCP CDN 节点。
+- 首次设置、NAT 端口映射、Origin Rules 菜单和 CDN 菜单均增加黄色 CF 端口及 NAT 回源步骤提醒。

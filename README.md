@@ -149,9 +149,14 @@ Cloudflare 橙云支持端口：
 ```text
 HTTP（明文）：80、8080、8880、2052、2082、2086、2095
 HTTPS（加密）：443、8443、2053、2083、2087、2096
+支持但缓存已禁用：2052、2053、2082、2083、2086、2087、2095、2096、8880、8443
 ```
 
-普通 VPS 在协议端口本身属于 Cloudflare 官方端口时可以继续使用同端口 CDN；协议端口不适合 CF 时，脚本自动启用 Origin Rules。仅有 `xcpt` 时自动选择 HTTPS `443`；与原有 XHTTP/WS 混装时，旧协议默认继续使用 HTTP `8080`，`xcpt` 单独使用 HTTPS `443`，不会为套 CDN 而改变旧协议直连的 TLS 行为。也可手动使用上表中的任一官方端口。普通 VPS 的规则目标是本机协议监听端口，NAT VPS 的规则目标是该协议的 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则及边缘端口。
+首次设置或新增支持 CDN 的协议时，端口回车随机会优先从未占用的 CF 官方端口中匹配：VLESS XHTTP、VLESS WS、VMess WS 使用 HTTP 端口组，XHTTP TLS TCP/UDP 使用 HTTPS 端口组；自动随机默认排除热门的 `443`。若端口池中没有可用 CF 端口，脚本会回退普通随机端口并用黄色提示后续必须配置 Origin Rules。`xupt`、Reality 和 NaiveProxy 仍按普通端口处理，不套普通 CDN。
+
+普通 VPS 在协议端口本身属于 Cloudflare 官方端口时可以继续使用同端口 CDN；协议端口不适合 CF 时，脚本自动启用 Origin Rules。XHTTP TLS 的实验 CDN-UDP 固定需要 Cloudflare 边缘 `443`，但源站不必监听 `443`，可用 Origin Rule 将 `443` 回源到随机分配的 `8443/2053/2083/2087/2096` 等 HTTPS 源站端口。普通 VPS 的规则目标是本机协议监听端口，NAT VPS 的规则目标是该协议的 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则及边缘端口。
+
+NAT VPS 需要三层设置：先在服务商/端口转发处建立“公网端口 → 内网监听端口”，再在 `lun → 入口网络管理 → Cloudflare Origin Rules` 使用菜单显示的 Host + Path 规则；Origin Rule 目标填写公网 NAT 端口，不是内网端口，Cloudflare 不能代替服务商映射。最后确认安全组放行公网端口并刷新订阅。若公网映射本身不是 CF 官方端口，也必须使用 Origin Rules 回源，不能把内网端口直接当成 CDN 节点端口。
 
 HTTPS 端口组会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换边缘端口只重建配置并重启服务，不重新下载内核。
 
@@ -167,11 +172,13 @@ HTTPS 端口组会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在
 vxpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234" cdnproto="xhttp" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-普通 VPS 的 XHTTP TLS 随机源站端口会自动分配 Cloudflare HTTPS 443 边缘端口并启用回源改写：
+普通 VPS 的 XHTTP TLS 随机源站端口会优先分配未占用的 Cloudflare HTTPS 端口（默认排除 443）；可直接测试 HTTPS CDN-TCP：
 
 ```bash
 xcpt="" cdnym="proxy.example.com" cfip="108.162.198.31" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
+
+需要实验 CDN-UDP 时，在 Origin Rules 中将边缘 `443` 按 `UUID-xc` Path 回源到该 XHTTP TLS 源站端口，并开启橙云与 HTTP/3。
 
 NAT VPS Origin Rules：
 

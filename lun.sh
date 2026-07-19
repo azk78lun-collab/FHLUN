@@ -431,6 +431,31 @@ is_cf_https_port(){
 case "$1" in 443|8443|2053|2083|2087|2096) return 0 ;; *) return 1 ;; esac
 }
 
+cf_http_port_list(){
+printf '%s\n' 80 8080 8880 2052 2082 2086 2095
+}
+
+# 默认随机端口避开最常被占用的 443；需要 UDP 443 时由 Origin Rules 单独配置边缘端口。
+cf_https_random_port_list(){
+printf '%s\n' 8443 2053 2083 2087 2096
+}
+
+cf_port_kind_label(){
+case "$1" in
+http) printf 'Cloudflare HTTP' ;;
+https) printf 'Cloudflare HTTPS' ;;
+*) printf 'Cloudflare' ;;
+esac
+}
+
+cf_port_matches_kind(){
+case "$1:$2" in
+http:*) is_cf_http_port "$2" ;;
+https:*) is_cf_https_port "$2" ;;
+*) return 1 ;;
+esac
+}
+
 cdn_protocol_state_port(){
 value=$1
 file=$2
@@ -1958,7 +1983,7 @@ fi
 if [ -n "$vxp" ]; then
 vxp=vxpt
 if [ -z "$port_vx" ] && [ ! -e "$HOME/lun/port_vx" ]; then
-port_vx=$(random_port 2>/dev/null) || { echo "VLESS XHTTP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+port_vx=$(random_cdn_port http 2>/dev/null) || { yellow_line "VLESS XHTTP 没有未占用的 Cloudflare HTTP 端口，将回退普通随机端口；后续使用 CDN 时需要 Origin Rules。"; port_vx=$(random_port 2>/dev/null) || { echo "VLESS XHTTP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }; }
 echo "$port_vx" > "$HOME/lun/port_vx"
 elif [ -n "$port_vx" ]; then
 echo "$port_vx" > "$HOME/lun/port_vx"
@@ -2059,7 +2084,7 @@ fi
 if [ -n "$xcp" ]; then
 xcp=xcpt
 if [ -z "$port_xc" ] && [ ! -e "$HOME/lun/port_xc" ]; then
-port_xc=$(random_port 2>/dev/null) || { echo "VLESS XHTTP TLS TCP/UDP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+port_xc=$(random_cdn_port https 2>/dev/null) || { yellow_line "VLESS XHTTP TLS TCP/UDP 没有未占用的 Cloudflare HTTPS 端口，将回退普通随机端口；后续使用 CDN 时需要 Origin Rules。"; port_xc=$(random_port 2>/dev/null) || { echo "VLESS XHTTP TLS TCP/UDP 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }; }
 echo "$port_xc" > "$HOME/lun/port_xc"
 elif [ -n "$port_xc" ]; then
 echo "$port_xc" > "$HOME/lun/port_xc"
@@ -2115,7 +2140,7 @@ fi
 if [ -n "$vwp" ]; then
 vwp=vwpt
 if [ -z "$port_vw" ] && [ ! -e "$HOME/lun/port_vw" ]; then
-port_vw=$(random_port 2>/dev/null) || { echo "VLESS WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+port_vw=$(random_cdn_port http 2>/dev/null) || { yellow_line "VLESS WS 没有未占用的 Cloudflare HTTP 端口，将回退普通随机端口；后续使用 CDN 时需要 Origin Rules。"; port_vw=$(random_port 2>/dev/null) || { echo "VLESS WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }; }
 echo "$port_vw" > "$HOME/lun/port_vw"
 elif [ -n "$port_vw" ]; then
 echo "$port_vw" > "$HOME/lun/port_vw"
@@ -2453,7 +2478,7 @@ xrsbvm(){
 if [ -n "$vmp" ]; then
 vmp=vmpt
 if [ -z "$port_vm_ws" ] && [ ! -e "$HOME/lun/port_vm_ws" ]; then
-port_vm_ws=$(random_port 2>/dev/null) || { echo "VMess WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }
+port_vm_ws=$(random_cdn_port http 2>/dev/null) || { yellow_line "VMess WS 没有未占用的 Cloudflare HTTP 端口，将回退普通随机端口；后续使用 CDN 时需要 Origin Rules。"; port_vm_ws=$(random_port 2>/dev/null) || { echo "VMess WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }; }
 echo "$port_vm_ws" > "$HOME/lun/port_vm_ws"
 elif [ -n "$port_vm_ws" ]; then
 echo "$port_vm_ws" > "$HOME/lun/port_vm_ws"
@@ -4840,10 +4865,52 @@ echo "没有找到可用端口，请扩容端口池或手动输入端口。" >&2
 return 1
 }
 
+random_cdn_port(){
+cdn_kind=$1
+case "$cdn_kind" in
+http) cf_candidates=$(cf_http_port_list) ;;
+https) cf_candidates=$(cf_https_random_port_list) ;;
+*) return 1 ;;
+esac
+
+if is_nat_mode; then
+mapped_candidates=
+for public_candidate in $cf_candidates; do
+inner_candidate=$(inner_port_from_public "$public_candidate") || continue
+[ -n "$inner_candidate" ] || continue
+mapped_candidates="$mapped_candidates $inner_candidate"
+done
+[ -n "$mapped_candidates" ] || return 1
+candidates=$(printf '%s\n' $mapped_candidates | awk 'NF && !seen[$0]++' | shuf 2>/dev/null)
+elif [ -n "$inpool" ] || [ -n "$portpool" ]; then
+pooled_candidates=
+for pool_candidate in $(port_pool_inner_candidates); do
+cf_port_matches_kind "$cdn_kind" "$pool_candidate" || continue
+pooled_candidates="$pooled_candidates $pool_candidate"
+done
+[ -n "$pooled_candidates" ] || return 1
+candidates=$(printf '%s\n' $pooled_candidates | awk 'NF && !seen[$0]++' | shuf 2>/dev/null)
+else
+candidates=$(printf '%s\n' $cf_candidates | shuf 2>/dev/null)
+fi
+
+for p in $candidates; do
+port_valid "$p" || continue
+port_reserved "$p" && continue
+port_in_use "$p" && continue
+public_candidate=$(client_port "$p")
+cf_port_matches_kind "$cdn_kind" "$public_candidate" || continue
+printf '%s\n' "$p"
+return 0
+done
+return 1
+}
+
 prompt_port(){
 label=$1
 var=$2
 LUN_IGNORE_PROTOCOL_PORT=${3:-}
+cdn_kind=${4:-}
 while :; do
 if is_nat_mode; then
 [ -n "$ptmap" ] && { show_port_map_list "$ptmap"; echo "这里请填写内网监听端口或对应公网端口。"; }
@@ -4857,7 +4924,21 @@ fi
 IFS= read -r val
 [ "$val" = "0" ] && { unset LUN_IGNORE_PROTOCOL_PORT; return 2; }
 if [ -z "$val" ]; then
+if [ -n "$cdn_kind" ]; then
+if val=$(random_cdn_port "$cdn_kind" 2>/dev/null); then
+public_candidate=$(client_port "$val")
+echo "已优先选择未占用的 $(cf_port_kind_label "$cdn_kind")端口：$public_candidate"
+else
+yellow_line "$label 没有匹配的未占用 $(cf_port_kind_label "$cdn_kind")端口，将使用普通随机端口；后续使用 CDN 时必须配置 Cloudflare Origin Rules。"
 if is_nat_mode && [ -n "$ptmap" ]; then
+val=$(random_nat_port) || { echo "无法从NAT映射表取得可用端口。"; continue; }
+echo "从NAT映射表随机内网端口：$val"
+else
+val=$(random_port) || { echo "无法从端口池取得可用端口。"; continue; }
+echo "随机端口：$val"
+fi
+fi
+elif is_nat_mode && [ -n "$ptmap" ]; then
 val=$(random_nat_port) || { echo "无法从NAT映射表取得可用端口。"; continue; }
 echo "从NAT映射表随机内网端口：$val"
 else
@@ -4879,6 +4960,12 @@ fi
 if ! port_valid "$val"; then
 echo "端口必须是 1-65535 的数字。"
 continue
+fi
+if [ -n "$cdn_kind" ]; then
+public_val=$(client_port "$val")
+if ! cf_port_matches_kind "$cdn_kind" "$public_val"; then
+yellow_line "$label 当前公网端口 $public_val 不在 $(cf_port_kind_label "$cdn_kind")官方端口组内；后续使用 CDN 时必须按菜单配置 Origin Rules（Host + Path → 当前源站端口）。"
+fi
 fi
 if port_reserved "$val"; then
 public_val=$(client_port "$val")
@@ -5119,11 +5206,13 @@ yellow_line "CDN提示：$1"
 # 检查它们的公网端口是否在 Cloudflare 橙云支持端口列表内。
 # 不在列表内也会输出普通 CDN/优选入口节点，只是不适合直接套 CF 橙云。
 show_cdn_port_advice(){
-echo "Cloudflare 橙云普通代理端口：80/8080/8880/2052/2082/2086/2095 或 443/8443/2053/2083/2087/2096。"
+echo "Cloudflare HTTP 端口：80/8080/8880/2052/2082/2086/2095。"
+echo "Cloudflare HTTPS 端口：443/8443/2053/2083/2087/2096。"
+echo "Cloudflare 支持但缓存已禁用：2052/2053/2082/2083/2086/2087/2095/2096/8880/8443。"
 if cdn_rewrite_active; then
 echo "当前模式：Origin Rules 端口改写。客户端连接 Cloudflare 边缘端口 ${cdnpt:-8080}，Cloudflare 再回源到每个协议的源站端口。"
 is_cf_https_port "${cdnpt:-8080}" && echo "${cdnpt:-8080} 为 HTTPS：Lun 会启用源站 TLS；Cloudflare 自签证书使用 Full，匹配域名的有效证书可使用 Full (Strict)。"
-cdn_has_xhttp_tls && ! is_cf_https_port "${cdnpt:-8080}" && echo "VLESS XHTTP TLS 不使用 HTTP 边缘端口，将单独自动使用 HTTPS 443。"
+cdn_has_xhttp_tls && ! is_cf_https_port "${cdnpt:-8080}" && echo "VLESS XHTTP TLS 不使用 HTTP 边缘端口，将单独使用 HTTPS 443；请按 Host + UUID-xc Path 配置 Origin Rules。"
 else
 echo "当前模式：普通 CDN 优选。客户端直接连接优选入口，端口与协议公网端口相同；不使用 Origin Rules。"
 fi
@@ -5162,6 +5251,7 @@ else
 fi
 done
 [ -n "$found" ] || yellow_line "当前没有 VMess WS / VLESS WS / VLESS XHTTP 非 Reality / VLESS XHTTP TLS，普通 CDN/优选入口不会生成节点；可使用 CF 隧道/Argo。"
+is_nat_mode && yellow_line "NAT VPS：请先完成公网端口映射；若公网端口不是上表 CF 端口，必须再配置 Origin Rules 回源到该公网端口。"
 }
 
 # ============ 生成 VLESS CDN 优选节点链接 ============
@@ -5990,7 +6080,7 @@ return 0
 fi
 rule_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
 base_edge=${cdnpt:-$(cdn_recommended_edge_port)}
-echo "Cloudflare 默认边缘端口：$base_edge（XHTTP TLS 若遇到 HTTP 端口会自动改用 HTTPS 443）"
+echo "Cloudflare 默认边缘端口：$base_edge（XHTTP TLS 若遇到 HTTP 端口会自动改用 HTTPS 443；443 仅是边缘端口，不代表源站必须监听 443）"
 echo "只按 HTTP/HTTPS 分流会把不同协议送到错误入站，请使用下面的 Host + Path 精确规则："
 https_used=no
 h3_edge=no
@@ -6031,6 +6121,7 @@ yellow_line "HTTPS 源站 TLS：当前证书为自签或与 Host 不同，请在
 fi
 [ "$h3_edge" = yes ] && yellow_line "实验性 CDN-UDP 还要求该 DNS 记录开启橙云代理，并在 Cloudflare 开启 HTTP/3（QUIC/UDP 443）。"
 fi
+is_nat_mode && show_nat_cdn_hint
 }
 
 show_cdn_dns_hint(){
@@ -6176,6 +6267,7 @@ ui_title "Lun CDN / CF 优选"
 echo "CDN：客户端 → 优选入口 → CDN Host → VPS；协议端口不适合 CF 时会自动启用 Origin Rules。"
 echo "XHTTP TLS CDN-TCP 只用 HTTPS 端口组；实验 CDN-UDP 只用 UDP 443。xupt/NaiveProxy 不套普通 CDN。"
 show_cdn_summary
+show_cdn_port_advice
 echo " 1. 一键启用 / 修复 XHTTP CDN"
 echo " 2. 仅修改优选 IP / 域名"
 echo " 3. 关闭 CDN 节点"
@@ -6233,7 +6325,8 @@ echo "普通 VPS 与 NAT VPS 均可把 Cloudflare 边缘端口改写到各协议
 echo "HTTP：80/8080/8880/2052/2082/2086/2095"
 echo "HTTPS：443/8443/2053/2083/2087/2096"
 echo " 1. 自动选择（当前推荐 $recommended_edge）"
-cdn_has_xhttp_tls && cdn_has_generic_protocol && yellow_line "混合协议将使用 HTTP $recommended_edge；XHTTP TLS 单独使用 HTTPS 443。"
+cdn_has_xhttp_tls && cdn_has_generic_protocol && yellow_line "混合协议将使用 HTTP $recommended_edge；XHTTP TLS 单独使用 HTTPS 443。随机源站端口默认避开 443，需按下方 Host + Path 规则回源。"
+cdn_has_xhttp_tls && is_nat_mode && yellow_line "NAT VPS：Origin Rule 的目标端口填写公网映射端口，不是内网监听端口；Cloudflare 不能替代服务商的端口映射。"
 echo " 2. 手动填写 Cloudflare 官方边缘端口"
 echo " 3. 显示精确 Host + Path 规则"
 echo " 4. 关闭端口改写，恢复普通同端口 CDN"
@@ -6252,7 +6345,7 @@ IFS= read -r new_edge
 [ "$new_edge" = 0 ] && continue
 { is_cf_http_port "$new_edge" || is_cf_https_port "$new_edge"; } || { yellow_line "该端口不在 Cloudflare HTTP/HTTPS 官方代理端口组内。"; continue; }
 if cdn_has_xhttp_tls && ! cdn_has_generic_protocol && ! is_cf_https_port "$new_edge"; then
-yellow_line "当前只有 xcpt，边缘端口必须来自 HTTPS 端口组；推荐 443。"
+yellow_line "当前只有 xcpt，边缘端口必须来自 HTTPS 端口组；推荐 443 仅用于需要实验 CDN-UDP 的回源规则。"
 continue
 fi
 fi
@@ -6433,6 +6526,13 @@ case "$1" in
 esac
 }
 
+protocol_cf_port_kind(){
+case "$1" in
+3|4|8) printf 'http\n' ;;
+13) printf 'https\n' ;;
+esac
+}
+
 protocol_current_port(){
 var=$(protocol_var "$1")
 [ -n "$var" ] || return
@@ -6498,7 +6598,7 @@ id=$1
 label=$(protocol_label "$id")
 var=$(protocol_var "$id")
 [ -n "$label" ] && [ -n "$var" ] || { echo "忽略未知协议编号：$id"; return 0; }
-prompt_port "$label" "$var"
+prompt_port "$label" "$var" "" "$(protocol_cf_port_kind "$id")"
 }
 
 pick_protocols(){
@@ -6575,7 +6675,7 @@ label=$(protocol_label "$id")
 var=$(protocol_var "$id")
 [ -n "$current" ] && [ -n "$label" ] && [ -n "$var" ] || { echo "请输入上方已安装协议的编号。"; continue; }
 echo "当前 $label 端口：$current"
-prompt_port "$label" "$var" "$current"
+prompt_port "$label" "$var" "$current" "$(protocol_cf_port_kind "$id")"
 rc=$?
 [ "$rc" = 2 ] && continue
 [ "$rc" = 3 ] && return 2
@@ -6672,6 +6772,7 @@ return 0
 vpsmode=nat
 printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"
 echo "已设置为 NAT VPS。"
+show_nat_cdn_hint
 return 0
 ;;
 *) echo "请输入 1、2 或 0。" ;;
@@ -6679,10 +6780,23 @@ esac
 done
 }
 
+show_nat_cdn_hint(){
+yellow_line "NAT VPS 使用 Cloudflare CDN 时，客户端访问的是公网映射端口；内网监听端口本身不需要属于 CF 端口组。"
+yellow_line "操作步骤：先配置 外网 CF 端口-内网监听端口 映射并放行公网端口；再到 Cloudflare Origin Rules 按菜单输出的 Host + Path 回源到该公网端口；最后刷新订阅。"
+yellow_line "若没有对应的公网 CF 端口，仍可使用任意公网映射，但必须使用 Origin Rules，不能把内网端口直接写成 CDN 节点端口。"
+}
+
+show_first_install_port_hint(){
+yellow_line "首次端口提醒：支持后续 Cloudflare CDN 的协议，端口回车随机时会优先匹配未占用的 CF 官方端口。"
+yellow_line "HTTP 端口：80、8080、8880、2052、2082、2086、2095。HTTPS 端口：443、8443、2053、2083、2087、2096。"
+yellow_line "自动随机会排除热门的 443；XHTTP TLS TCP/UDP 优先使用其它 HTTPS 端口，实验 CDN-UDP 仍需 Cloudflare 边缘 443 + Origin Rules。"
+}
+
 prompt_port_map(){
 while :; do
 echo "NAT VPS 端口映射只改客户端节点/订阅端口，不写 iptables。"
 yellow_line "格式：外网端口-内网监听端口，多个用空格分隔，例如：54834-2096 54835-8443"
+yellow_line "CDN 建议把外网端口选为 CF 官方端口；若没有对应端口，请使用 Cloudflare Origin Rules 将边缘端口回源到这里的公网端口。"
 printf "请输入映射；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "$LUN_RESET" "${ptmap:+，当前 $ptmap}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
@@ -6950,6 +7064,7 @@ guided_summary
 prompt_vps_mode
 rc=$?
 if [ "$rc" = 0 ]; then
+show_first_install_port_hint
 if is_nat_mode; then
 if [ -z "$ptmap" ] && [ -z "$inpool" ]; then
 prompt_port_map
