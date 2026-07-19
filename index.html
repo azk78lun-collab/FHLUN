@@ -166,7 +166,7 @@
         <p><b>cdnym</b>（回源域名）：你的域名，已解析到 VPS IP。Cloudflare 通过它找到你的服务器。<br>
         <b>cfip</b>（优选地址）：客户端实际连接的 Cloudflare 入口，填 IP 或域名。<br>
         简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。普通 VPS 和 NAT VPS 都可用 Origin Rules 把 CF 边缘端口改写到协议源站端口。VLESS XHTTP TLS 只生成 HTTPS CDN 节点。</p>
-        <p>实验性 CDN-UDP 只在边缘端口 443 时生成，并要求 DNS 记录开启橙云代理、Cloudflare HTTP/3 已开启且 UDP 443 可用；其它端口不会生成伪可用 UDP 节点。</p>
+        <p>实验性 CDN-UDP 只在边缘端口 443 时生成，并要求 DNS 记录开启橙云代理、Cloudflare HTTP/3 已开启且 UDP 443 可用。订阅刷新还会探测 Host + Path 是否真正回源到 Xray；未配置 Origin Rule 或请求落到 Nginx 443 时，TCP/UDP CDN 节点都会被跳过。</p>
         <div class="grid">
           <label>回源域名 cdnym（你的域名，解析到VPS）
             <input id="cdnym" placeholder="如 proxy.example.com，须已解析到VPS">

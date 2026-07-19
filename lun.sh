@@ -5276,6 +5276,39 @@ done
 echo
 }
 
+cdn_xhttp_local_signature(){
+_cdn_probe_host=$1
+_cdn_probe_port=$2
+_cdn_probe_path=$3
+_cdn_probe_body="/tmp/lun-cdn-local-$$"
+rm -f "$_cdn_probe_body"
+_cdn_probe_code=$(curl -k -sS --connect-timeout 4 --max-time 8 --resolve "$_cdn_probe_host:$_cdn_probe_port:127.0.0.1" -o "$_cdn_probe_body" -w '%{http_code}' "https://$_cdn_probe_host:$_cdn_probe_port/$_cdn_probe_path" 2>/dev/null)
+_cdn_probe_rc=$?
+if [ "$_cdn_probe_rc" -ne 0 ]; then rm -f "$_cdn_probe_body"; return 1; fi
+_cdn_probe_sum=$(cksum < "$_cdn_probe_body" | awk '{print $1 ":" $2}')
+rm -f "$_cdn_probe_body"
+printf '%s:%s\n' "$_cdn_probe_code" "$_cdn_probe_sum"
+}
+
+cdn_xhttp_edge_probe(){
+_cdn_probe_host=$1
+_cdn_probe_edge=$2
+_cdn_probe_ip=$3
+_cdn_probe_path=$4
+_cdn_probe_connect=$(uri_host "$_cdn_probe_ip")
+_cdn_probe_header="/tmp/lun-cdn-edge-header-$$"
+_cdn_probe_body="/tmp/lun-cdn-edge-body-$$"
+rm -f "$_cdn_probe_header" "$_cdn_probe_body"
+_cdn_probe_code=$(curl -k -sS --connect-timeout 5 --max-time 12 -D "$_cdn_probe_header" -o "$_cdn_probe_body" -w '%{http_code}' --connect-to "$_cdn_probe_host:$_cdn_probe_edge:$_cdn_probe_connect:$_cdn_probe_edge" "https://$_cdn_probe_host:$_cdn_probe_edge/$_cdn_probe_path" 2>/dev/null)
+_cdn_probe_rc=$?
+if [ "$_cdn_probe_rc" -ne 0 ]; then rm -f "$_cdn_probe_header" "$_cdn_probe_body"; return 1; fi
+_cdn_probe_sum=$(cksum < "$_cdn_probe_body" | awk '{print $1 ":" $2}')
+if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$_cdn_probe_header"; then _cdn_probe_cf=yes; else _cdn_probe_cf=no; fi
+if grep -Eqi '^alt-svc:.*h3' "$_cdn_probe_header"; then _cdn_probe_h3=yes; else _cdn_probe_h3=no; fi
+rm -f "$_cdn_probe_header" "$_cdn_probe_body"
+printf '%s:%s|%s|%s\n' "$_cdn_probe_code" "$_cdn_probe_sum" "$_cdn_probe_cf" "$_cdn_probe_h3"
+}
+
 append_xhttp_tls_cdn_links(){
 port=$1
 [ -n "$xvvmcdnym" ] || { cdn_skip "VLESS XHTTP TLS 缺少 CDN 回源 Host，已跳过 CDN 变体。请在 lun → 入口网络管理 → CDN 中设置回源 Host 域名。"; return 0; }
@@ -5295,10 +5328,25 @@ echo "注：客户端 HTTPS 边缘端口 $edge_port，Cloudflare Origin Rule 目
 else
 echo "注：客户端 HTTPS 边缘端口与回源公网端口均为 $edge_port。"
 fi
+command -v curl >/dev/null 2>&1 || { cdn_skip "缺少 curl，无法确认 Cloudflare 443 是否真正回源到 XHTTP TLS 入站；已停止输出伪可用节点。"; return 0; }
+local_signature=$(cdn_xhttp_local_signature "$xvvmcdnym" "$port" "$uuid-xc")
+[ -n "$local_signature" ] || { cdn_skip "本机 XHTTP TLS 入站探测失败，已停止输出 CDN 节点。"; return 0; }
 cdn_index=0
+cdn_valid_count=0
+cdn_udp_count=0
 for cdn_ip in $ips; do
 case "$cdn_ip" in ""|-1) continue ;; esac
+edge_result=$(cdn_xhttp_edge_probe "$xvvmcdnym" "$edge_port" "$cdn_ip" "$uuid-xc")
+edge_signature=${edge_result%%|*}
+edge_rest=${edge_result#*|}
+edge_through_cf=${edge_rest%%|*}
+edge_h3=${edge_rest#*|}
+if [ -z "$edge_result" ] || [ "$edge_through_cf" != yes ] || [ "$edge_signature" != "$local_signature" ]; then
+cdn_skip "入口 $cdn_ip:$edge_port 未按 Host + UUID-xc Path 回源到源站端口 $origin_public_port，已跳过该 TCP/UDP 节点。请先配置 Cloudflare Origin Rule 后刷新订阅。"
+continue
+fi
 cdn_index=$((cdn_index + 1))
+cdn_valid_count=$((cdn_valid_count + 1))
 cdn_no=$(printf '%02d' "$cdn_index")
 cdn_kind=$(endpoint_kind "$cdn_ip")
 cdn_raw=$(json_host "$cdn_ip")
@@ -5329,7 +5377,8 @@ cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
 EOF
 printf -- '- "%s"\n' "$cdn_tcp_name" >> "$HOME/lun/.cdn_clash_names"
 
-if [ "$edge_port" = 443 ]; then
+if [ "$edge_port" = 443 ] && [ "$edge_h3" = yes ]; then
+cdn_udp_count=$((cdn_udp_count + 1))
 cdn_udp_name="${sxname}vless-xhttp-tls-CDN-UDP-EXP-443-${cdn_kind}-${cdn_no}-$hostname"
 cdn_udp_link="vless://$uuid@$cdn_uri:443?encryption=none&security=tls&sni=$xvvmcdnym&host=$xvvmcdnym&alpn=h3&fp=chrome&insecure=0&allowInsecure=0&type=xhttp&path=$uuid-xc&mode=auto#$cdn_udp_name"
 printf '%s\n' "$cdn_udp_link" >> "$HOME/lun/jhsub.txt"
@@ -5356,10 +5405,12 @@ EOF
 printf -- '- "%s"\n' "$cdn_udp_name" >> "$HOME/lun/.cdn_clash_names"
 fi
 done
-if [ "$edge_port" = 443 ]; then
-yellow_line "实验性 CDN-UDP 节点已生成：必须开启 Cloudflare 橙云代理与 HTTP/3（QUIC/UDP 443），最终以客户端实测为准。"
+if [ "$cdn_valid_count" -eq 0 ]; then
+yellow_line "未输出 VLESS XHTTP TLS CDN 节点：Cloudflare 443 当前没有回源到 Xray 的 $origin_public_port。直连节点不受影响。"
+elif [ "$cdn_udp_count" -gt 0 ]; then
+yellow_line "实验性 CDN-UDP 仅为已验证回源且公布 HTTP/3 的入口生成；最终仍以客户端实测为准。"
 else
-yellow_line "未生成实验性 CDN-UDP：Cloudflare HTTP/3 只使用 UDP 443，当前边缘端口为 $edge_port。"
+yellow_line "未生成实验性 CDN-UDP：已验证的入口没有同时满足 UDP 443 / HTTP/3 条件。"
 fi
 echo
 }

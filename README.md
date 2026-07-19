@@ -157,6 +157,8 @@ HTTPS 端口组会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在
 
 `xcpt` 的 CDN-TCP 只会在 Cloudflare 官方 HTTPS 边缘端口生成。实验性 CDN-UDP 只会在边缘端口严格为 `443` 时生成；还必须让 DNS 记录保持橙云代理状态并在 Cloudflare 开启 HTTP/3，因为 HTTP/3 使用 QUIC/UDP 443。若条件不满足，脚本只显示警告，不会把 UDP 节点伪装成可用配置。参考 [Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/) 与 [Cloudflare 代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)。
 
+刷新订阅时，脚本还会比较“本机 Xray 入站响应”与每个 Cloudflare HTTPS 入口的实际响应。只有入口确实经过 Cloudflare，且 Host + `UUID-xc` Path 已按 Origin Rule 回源到 `xcpt` 源站端口时，才输出对应 CDN-TCP；同一入口还公布 HTTP/3 时才输出实验 CDN-UDP。未配置 Origin Rule、请求落到 Nginx 443 或边缘探测失败时会明确跳过，不再生成在 v2rayN 中显示 `-1` 的伪可用节点。
+
 **示例：**
 
 普通 VPS：
@@ -184,6 +186,8 @@ domain="proxy.example.com" certmode="domain" xupt="24443" xcpt="25443" nvpt="264
 ```
 
 HTTP 端口组节点会显式写入 `security=none`，HTTPS 端口组节点写入 TLS。节点名称同时包含边缘模式和端口，避免 v2rayN 在切换模式后沿用旧的 TLS/Reality/PublicKey 字段。CDN 名称中的 `DOMAIN` 只表示 `cfip` 是域名入口，并不是另一种旧协议；新版不再自动生成未经验证的第三方 `DOMAIN` 入口，显式填写的域名仍会保留。
+
+如果 v2rayN 仍显示旧的 `vl-xhttp-enc-CDN-HTTP-8080-DOMAIN-*`，但服务器 `~/lun/jhsub.txt` 已无该名称，它属于客户端缓存或以前手动导入的节点，需要在 v2rayN 删除旧节点后重新更新订阅；服务端无法远程删除客户端本地缓存。
 
 ## 普通节点地址输出
 
