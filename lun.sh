@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.19.1"
+echo "当前版本：V26.7.19.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -6789,7 +6789,10 @@ yellow_line "若没有对应的公网 CF 端口，仍可使用任意公网映射
 show_first_install_port_hint(){
 yellow_line "首次端口提醒：支持后续 Cloudflare CDN 的协议，端口回车随机时会优先匹配未占用的 CF 官方端口。"
 yellow_line "HTTP 端口：80、8080、8880、2052、2082、2086、2095。HTTPS 端口：443、8443、2053、2083、2087、2096。"
-yellow_line "自动随机会排除热门的 443；XHTTP TLS TCP/UDP 优先使用其它 HTTPS 端口，实验 CDN-UDP 仍需 Cloudflare 边缘 443 + Origin Rules。"
+yellow_line "自动随机会排除热门的 443；XHTTP TLS TCP/UDP 优先使用其它 HTTPS 端口，实验 CDN-UDP 需要 Cloudflare 边缘 443，非 443 源站端口时还需要 Origin Rules。"
+red_line "激进测试模式：若要让 XHTTP TLS CDN-UDP 走 443 直回源，请在协议端口处手动输入 443；回车随机不会选择 443。"
+red_line "443 是献祭端口：设置前请用 ss -ltnp 或 lsof -i:443 检查占用，必要时先停止 Nginx/其他服务，确认 PID 后再 kill；脚本不会擅自杀掉未知进程。"
+red_line "xcpt=443 时可免 Origin Rule 直接测试 443→443；若保留其他服务占用 443，请改用 HTTPS 端口并按菜单配置 Origin Rule。"
 }
 
 prompt_port_map(){

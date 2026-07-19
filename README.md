@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.7.19.1`。
+当前脚本版本：`V26.7.19.2`。
 
 ## 快速开始
 
@@ -154,6 +154,8 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 首次设置或新增支持 CDN 的协议时，端口回车随机会优先从未占用的 CF 官方端口中匹配：VLESS XHTTP、VLESS WS、VMess WS 使用 HTTP 端口组，XHTTP TLS TCP/UDP 使用 HTTPS 端口组；自动随机默认排除热门的 `443`。若端口池中没有可用 CF 端口，脚本会回退普通随机端口并用黄色提示后续必须配置 Origin Rules。`xupt`、Reality 和 NaiveProxy 仍按普通端口处理，不套普通 CDN。
 
+**激进 443 测试模式：** 如果要测试 XHTTP TLS CDN-UDP 的 443 直回源，必须在协议端口提示处手动输入 `443`，不能依赖回车随机。443 可能已被 Nginx、Web 面板或其他服务占用；首次设置前请使用 `ss -ltnp` 或 `lsof -i:443` 查明 PID，确认业务影响后手动停止服务或 `kill` 对应 PID。Lun 不会自动杀掉未知占用进程。`xcpt=443` 时为 443→443，不需要 Origin Rule；若 443 不能献祭，则使用其他 HTTPS 源站端口，并为 Cloudflare 边缘 443 配置 Origin Rule。
+
 普通 VPS 在协议端口本身属于 Cloudflare 官方端口时可以继续使用同端口 CDN；协议端口不适合 CF 时，脚本自动启用 Origin Rules。XHTTP TLS 的实验 CDN-UDP 固定需要 Cloudflare 边缘 `443`，但源站不必监听 `443`，可用 Origin Rule 将 `443` 回源到随机分配的 `8443/2053/2083/2087/2096` 等 HTTPS 源站端口。普通 VPS 的规则目标是本机协议监听端口，NAT VPS 的规则目标是该协议的 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则及边缘端口。
 
 NAT VPS 需要三层设置：先在服务商/端口转发处建立“公网端口 → 内网监听端口”，再在 `lun → 入口网络管理 → Cloudflare Origin Rules` 使用菜单显示的 Host + Path 规则；Origin Rule 目标填写公网 NAT 端口，不是内网端口，Cloudflare 不能代替服务商映射。最后确认安全组放行公网端口并刷新订阅。若公网映射本身不是 CF 官方端口，也必须使用 Origin Rules 回源，不能把内网端口直接当成 CDN 节点端口。
@@ -162,7 +164,7 @@ HTTPS 端口组会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在
 
 `xcpt` 的 CDN-TCP 只会在 Cloudflare 官方 HTTPS 边缘端口生成。实验性 CDN-UDP 只会在边缘端口严格为 `443` 时生成；还必须让 DNS 记录保持橙云代理状态并在 Cloudflare 开启 HTTP/3，因为 HTTP/3 使用 QUIC/UDP 443。若条件不满足，脚本只显示警告，不会把 UDP 节点伪装成可用配置。参考 [Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/) 与 [Cloudflare 代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)。
 
-刷新订阅时，脚本还会比较“本机 Xray 入站响应”与每个 Cloudflare HTTPS 入口的实际响应。只有入口确实经过 Cloudflare，且 Host + `UUID-xc` Path 已按 Origin Rule 回源到 `xcpt` 源站端口时，才输出对应 CDN-TCP；同一入口还公布 HTTP/3 时才输出实验 CDN-UDP。未配置 Origin Rule、请求落到 Nginx 443 或边缘探测失败时会明确跳过，不再生成在 v2rayN 中显示 `-1` 的伪可用节点。
+刷新订阅时，脚本还会比较“本机 Xray 入站响应”与每个 Cloudflare HTTPS 入口的实际响应。只有入口确实经过 Cloudflare，且 Host + `UUID-xc` Path 已按默认同端口或 Origin Rule 回源到 `xcpt` 源站端口时，才输出对应 CDN-TCP；同一入口还公布 HTTP/3 时才输出实验 CDN-UDP。源站不是 443 却未配置 Origin Rule、请求落到 Nginx 443 或边缘探测失败时会明确跳过，不再生成在 v2rayN 中显示 `-1` 的伪可用节点。
 
 **示例：**
 
@@ -178,7 +180,7 @@ vxpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234" cdn
 xcpt="" cdnym="proxy.example.com" cfip="108.162.198.31" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-需要实验 CDN-UDP 时，在 Origin Rules 中将边缘 `443` 按 `UUID-xc` Path 回源到该 XHTTP TLS 源站端口，并开启橙云与 HTTP/3。
+需要实验 CDN-UDP 时，若 `xcpt` 不是 443，在 Origin Rules 中将边缘 `443` 按 `UUID-xc` Path 回源到该 XHTTP TLS 源站端口；若 `xcpt=443` 则使用默认 443→443。两种模式都要开启橙云与 HTTP/3。
 
 NAT VPS Origin Rules：
 

@@ -166,8 +166,9 @@
         <p><b>cdnym</b>（回源域名）：你的域名，已解析到 VPS IP。Cloudflare 通过它找到你的服务器。<br>
         <b>cfip</b>（优选地址）：客户端实际连接的 Cloudflare 入口，填 IP 或域名。<br>
         简单理解：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS。普通 VPS 和 NAT VPS 都可用 Origin Rules 把 CF 边缘端口改写到协议源站端口。VLESS XHTTP TLS 只生成 HTTPS CDN 节点。</p>
-        <p>实验性 CDN-UDP 只在边缘端口 443 时生成，并要求 DNS 记录开启橙云代理、Cloudflare HTTP/3 已开启且 UDP 443 可用。订阅刷新还会探测 Host + Path 是否真正回源到 Xray；未配置 Origin Rule 或请求落到 Nginx 443 时，TCP/UDP CDN 节点都会被跳过。</p>
+        <p>实验性 CDN-UDP 只在边缘端口 443 时生成，并要求 DNS 记录开启橙云代理、Cloudflare HTTP/3 已开启且 UDP 443 可用。订阅刷新还会探测 Host + Path 是否真正回源到 Xray；当源站 <code>xcpt</code> 不是 443 时，未配置 Origin Rule 或请求落到 Nginx 443 会跳过节点；<code>xcpt=443</code> 可直接进行 443→443 测试。</p>
         <p>首次设置时，支持 CDN 的协议回车随机会优先使用未占用的 CF 端口：HTTP 为 80/8080/8880/2052/2082/2086/2095，HTTPS 为 443/8443/2053/2083/2087/2096；自动随机排除 443。NAT VPS 必须先完成公网→内网映射，再按 Origin Rules 页面把 Host + Path 回源到公网 NAT 端口；没有对应 CF 公网端口时也必须使用 Origin Rules。</p>
+        <p style="color:#d00;font-weight:700">激进 443 测试：要测试 XHTTP TLS CDN-UDP 的 443 直回源，必须在协议端口处手动输入 443，回车随机不会选择 443。设置前请用 <code>ss -ltnp</code> 或 <code>lsof -i:443</code> 查明占用 PID，必要时先停止 Nginx/其他服务并确认后手动 kill；脚本不会擅自杀未知进程。若不能让出 443，请使用其他 HTTPS 端口并配置 Origin Rule。</p>
         <div class="grid">
           <label>回源域名 cdnym（你的域名，解析到VPS）
             <input id="cdnym" placeholder="如 proxy.example.com，须已解析到VPS">
