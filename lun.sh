@@ -79,7 +79,7 @@ export domain=${domain:-''}
 export certmode=${certmode:-''}
 export acme_email=${acme_email:-''}
 export acme_dns=${acme_dns:-''}
-export coremirror=${coremirror:-${LUN_CORE_MIRROR:-"https://oracle1.1223344.xyz/fhlun"}}
+export coremirror=${coremirror:-${LUN_CORE_MIRROR:-"https://oracle1.1223344.xyz:8443/fhlun"}}
 v46url="https://icanhazip.com"
 lunurl=${lunurl:-"https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh"}
 showmode_short(){
@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.19.2"
+echo "当前版本：V26.7.19.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1251,7 +1251,7 @@ fi
 rm -f "$asset_tmp"
 echo "下载 $asset_name 失败：IPv4=$core_net_v4，IPv6=$core_net_v6。"
 if [ "$core_net_v6" = yes ] && [ "$core_net_v4" != yes ]; then
-echo "已尝试 Oracle 静态镜像，请检查 oracle1.1223344.xyz/fhlun 服务和 IPv6 连通性。"
+echo "已尝试 Oracle 静态镜像，请检查 oracle1.1223344.xyz:8443/fhlun 服务和 IPv6 连通性。"
 fi
 return 1
 }

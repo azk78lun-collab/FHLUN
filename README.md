@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.7.19.2`。
+当前脚本版本：`V26.7.19.3`。
 
 ## 快速开始
 
@@ -106,9 +106,9 @@ DNS API 凭据按 acme.sh 原生环境变量保存到 `/root/lun/cert.env`，权
 
 ### IPv6 内核下载
 
-GitHub Release 下载入口 `github.com` 可能只返回 IPv4，因此纯 IPv6 VPS 会自动改用 `https://oracle1.1223344.xyz/fhlun` 静态镜像。该镜像由 Oracle 双栈服务器通过 IPv4 同步 FHLUN 的 Xray/Sing-box 与 Cloudflared 文件，再通过 HTTPS 同时提供 IPv4/IPv6 下载；不使用 Cloudflare Worker 或第三方代理。可通过 `coremirror="https://your-mirror.example/fhlun"` 覆盖，填写 `coremirror=off` 则只使用 GitHub Release。
+GitHub Release 下载入口 `github.com` 可能只返回 IPv4，因此纯 IPv6 VPS 会自动改用 `https://oracle1.1223344.xyz:8443/fhlun` 静态镜像。该镜像由 Oracle 双栈服务器通过 IPv4 同步 FHLUN 的 Xray/Sing-box 与 Cloudflared 文件，再通过 HTTPS 8443 同时提供 IPv4/IPv6 下载；443 保留给 XHTTP-TLS CDN-UDP 测试，不再由 Nginx 占用。不使用 Cloudflare Worker 或第三方代理。可通过 `coremirror="https://your-mirror.example:8443/fhlun"` 覆盖，填写 `coremirror=off` 则只使用 GitHub Release。
 
-镜像主机使用 Nginx 提供文件，并由 `fhlun-core-mirror.timer` 每日执行同步；可在镜像主机运行 `systemctl status fhlun-core-mirror.timer` 查看状态，或运行 `systemctl start fhlun-core-mirror.service` 立即同步最新 Release。
+镜像主机使用 Nginx 提供文件：HTTP 80 继续保留给 ACME，HTTPS 使用 8443 并同时监听 `[::]:8443`，由 `fhlun-core-mirror.timer` 每日执行同步；可在镜像主机运行 `systemctl status fhlun-core-mirror.timer` 查看状态，或运行 `systemctl start fhlun-core-mirror.service` 立即同步最新 Release。可复用仓库中的 [`deploy/nginx/fhlun-core-mirror-8443.conf`](deploy/nginx/fhlun-core-mirror-8443.conf)。
 
 Reality、Argo 和 CDN 仍然独立：
 
