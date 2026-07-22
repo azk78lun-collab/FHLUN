@@ -36,7 +36,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           SING_BOX_VERSION: ${{ inputs.sing_box_version }}
           SING_BOX_SOURCE_DIR: ${{ runner.temp }}/sing-box
-        run: modules/multiuser/build-singbox-enhanced.sh "$GITHUB_WORKSPACE/sing-box-multiuser-${{ matrix.arch }}" "$GITHUB_WORKSPACE/lun-sb-stats-${{ matrix.arch }}"
+        run: bash modules/multiuser/build-singbox-enhanced.sh "$GITHUB_WORKSPACE/sing-box-multiuser-${{ matrix.arch }}" "$GITHUB_WORKSPACE/lun-sb-stats-${{ matrix.arch }}"
       - name: Verify build tags
         if: matrix.arch == 'amd64'
         run: ./sing-box-multiuser-amd64 version | grep with_v2ray_api
