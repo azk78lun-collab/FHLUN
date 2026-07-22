@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.19.3"
+echo "当前版本：V26.7.22.4"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -212,16 +212,33 @@ esac
 
 normalize_ptmap(){
 out=
-seen_ext=
-seen_inner=
 for pair in $1; do
-valid_ptmap_pair "$pair" || return 1
+if ! valid_ptmap_pair "$pair"; then
+printf '%sNAT 映射格式错误：%s；请使用 公网端口-内网端口。%s\n' "$LUN_RED" "$pair" "$LUN_RESET" >&2
+return 1
+fi
 ext=${pair%%-*}
 inner=${pair#*-}
-case " $seen_ext " in *" $ext "*) return 1 ;; esac
-case " $seen_inner " in *" $inner "*) return 1 ;; esac
-seen_ext="${seen_ext:+$seen_ext }$ext"
-seen_inner="${seen_inner:+$seen_inner }$inner"
+skip=
+for exist in $out; do
+exist_ext=${exist%%-*}
+exist_inner=${exist#*-}
+if [ "$exist" = "$pair" ]; then
+printf '%s重复映射 %s 已忽略。%s\n' "$LUN_YELLOW" "$pair" "$LUN_RESET" >&2
+skip=yes
+break
+fi
+if [ "$exist_ext" = "$ext" ]; then
+printf '%s公网端口 %s 已映射到内网端口 %s，不能再映射到 %s。%s\n' "$LUN_RED" "$ext" "$exist_inner" "$inner" "$LUN_RESET" >&2
+return 1
+fi
+if [ "$exist_inner" = "$inner" ]; then
+printf '%s内网端口 %s 已使用公网端口 %s；保留首项并忽略 %s。%s\n' "$LUN_YELLOW" "$inner" "$exist_ext" "$pair" "$LUN_RESET" >&2
+skip=yes
+break
+fi
+done
+[ -n "$skip" ] && continue
 out="$out $pair"
 done
 printf '%s\n' "${out# }"
@@ -235,7 +252,7 @@ rm -f "$HOME/lun/port_map"
 ptmap=
 ;;
 *)
-normalized=$(normalize_ptmap "$ptmap") || { echo "ptmap 格式错误或存在重复公网/内网端口，请使用 外网端口-内网端口，例如：54834-2096 54835-8443"; exit 1; }
+normalized=$(normalize_ptmap "$ptmap") || exit 1
 ptmap="$normalized"
 printf "%s\n" "$ptmap" > "$HOME/lun/port_map"
 ;;
@@ -686,6 +703,13 @@ column=0
 fi
 done
 [ -z "$line" ] || echo "$line"
+}
+
+port_map_count(){
+maps=$1
+[ -n "$maps" ] || { printf '0\n'; return; }
+set -- $maps
+printf '%s\n' "$#"
 }
 
 valid_port_range(){
@@ -3037,6 +3061,134 @@ echo "Argo：未启用"
 fi
 }
 
+multiuser_module_dir(){
+printf '%s\n' "$HOME/lun/modules/multiuser"
+}
+
+multiuser_agent(){
+printf '%s\n' "$(multiuser_module_dir)/lun-agent"
+}
+
+multiuser_installed(){
+[ -x "$(multiuser_agent)" ] && [ -s "$(multiuser_module_dir)/lun_agent.py" ] && [ -s "$(multiuser_module_dir)/config.json" ]
+}
+
+multiuser_enabled(){
+multiuser_installed || return 1
+grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' "$(multiuser_module_dir)/config.json" 2>/dev/null
+}
+
+multiuser_cmd(){
+agent=$(multiuser_agent)
+[ -x "$agent" ] || { echo "多用户代理程序未安装。" >&2; return 1; }
+"$agent" --root "$HOME/lun" "$@"
+}
+
+multiuser_service_stop(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl stop lun-agent >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service lun-agent stop >/dev/null 2>&1 || true
+fi
+for P in /proc/[0-9]*; do
+[ -r "$P/cmdline" ] || continue
+PID=$(basename "$P")
+CMD=$(tr '\0' ' ' < "$P/cmdline" 2>/dev/null)
+case "$CMD" in *"/lun/modules/multiuser/lun_agent.py"*" serve"*) kill "$PID" 2>/dev/null || true ;; esac
+done
+}
+
+multiuser_service_start(){
+multiuser_enabled || return 0
+if pidof systemd >/dev/null 2>&1; then
+systemctl enable --now lun-agent >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update add lun-agent default >/dev/null 2>&1 || true
+rc-service lun-agent start >/dev/null 2>&1
+else
+echo "多用户模块要求 systemd 或 OpenRC，未启动不可靠的无 init 常驻进程。" >&2
+return 1
+fi
+}
+
+multiuser_service_restart(){
+multiuser_enabled || return 0
+if pidof systemd >/dev/null 2>&1; then
+systemctl restart lun-agent >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service lun-agent restart >/dev/null 2>&1
+else
+return 1
+fi
+}
+
+multiuser_install_service(){
+python_bin=$(command -v python3) || return 1
+agent_py="$(multiuser_module_dir)/lun_agent.py"
+if pidof systemd >/dev/null 2>&1; then
+cat > /etc/systemd/system/lun-agent.service <<EOF
+[Unit]
+Description=FHLUN multi-user and subscription agent
+After=network.target xr.service sb.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=$python_bin $agent_py --root $HOME/lun serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=$HOME/lun
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable lun-agent >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+cat > /etc/init.d/lun-agent <<EOF
+#!/sbin/openrc-run
+description="FHLUN multi-user and subscription agent"
+command="$python_bin"
+command_args="$agent_py --root $HOME/lun serve"
+command_background=yes
+pidfile="/run/lun-agent.pid"
+output_log="/var/log/lun-agent.log"
+error_log="/var/log/lun-agent.log"
+depend() {
+need net
+after xray sing-box
+}
+EOF
+chmod +x /etc/init.d/lun-agent
+rc-update add lun-agent default >/dev/null 2>&1
+else
+red_line "多用户模块要求 systemd 或 OpenRC；当前系统不提供可靠的服务管理，已拒绝安装。"
+return 1
+fi
+}
+
+multiuser_remove_service(){
+multiuser_service_stop
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable lun-agent >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/lun-agent.service
+systemctl daemon-reload >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update del lun-agent default >/dev/null 2>&1 || true
+rm -f /etc/init.d/lun-agent
+fi
+}
+
+multiuser_reconcile_configs(){
+multiuser_enabled || return 0
+multiuser_cmd reconcile
+}
+
 stop_subscription_service(){
 for P in /proc/[0-9]*; do
 [ -r "$P/cmdline" ] || continue
@@ -3051,6 +3203,15 @@ done
 }
 
 restart_subscription_service(){
+[ -s "$(multiuser_module_dir)/config.json" ] && multiuser_enabled && {
+multiuser_cmd reconcile >/dev/null 2>&1 || return 1
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-active --quiet lun-agent 2>/dev/null || multiuser_service_start
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service lun-agent status >/dev/null 2>&1 || multiuser_service_start
+fi
+return 0
+}
 [ -s "$HOME/lun/subport.log" ] || [ -n "$sub" ] || return 0
 if [ -n "$subid" ]; then
 subtoken="$subid"
@@ -4345,6 +4506,15 @@ echo "协议配置重建完成，已保留一份上次可用快照。"
 
 cleandel(){
 keep_entry=$1
+multiuser_service_stop
+if [ "$keep_entry" != "keep-entry" ]; then
+if [ -s "$(multiuser_module_dir)/data/lun.db" ]; then
+multiuser_backup_path="$HOME/lun-multiuser-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
+cp -p "$(multiuser_module_dir)/data/lun.db" "$multiuser_backup_path" 2>/dev/null && echo "多用户数据库已备份：$multiuser_backup_path"
+fi
+multiuser_bandwidth_remove
+multiuser_remove_service
+fi
 stop_lun_owned_processes
 [ -f ~/.bashrc ] || touch ~/.bashrc
 sed -i '/lun/d' ~/.bashrc
@@ -4378,6 +4548,10 @@ rc-service ip6tables save >/dev/null 2>&1
 fi
 }
 factory_reset(){
+if multiuser_installed; then
+red_line "检测到多用户模块。为避免用户数据库与新 UUID/端口失配，请先在多用户管理中停用或卸载模块。"
+return 1
+fi
 printf "%s警告：此操作将清空所有配置（端口、域名、协议、UUID等），保留内核和脚本！%s\n" "$LUN_RED" "$LUN_RESET"
 printf "确认清空配置？输入 yes 确认，其他取消："
 IFS= read -r confirm
@@ -4734,6 +4908,7 @@ return 1
 subscription_port_available(){
 p=$1
 port_valid "$p" || return 1
+[ -n "${multiuser_legacy_subport:-}" ] && [ "$p" = "$multiuser_legacy_subport" ] && return 1
 protocol_port_reserved "$p" && return 1
 port_in_use "$p" && return 1
 return 0
@@ -4960,6 +5135,9 @@ fi
 if ! port_valid "$val"; then
 echo "端口必须是 1-65535 的数字。"
 continue
+fi
+if [ "$label" = "VLESS XHTTP TLS TCP/UDP" ] && [ "$val" = 443 ]; then
+red_line "该协议将监听本机 443；请先确认 Nginx、面板或其它服务未占用，脚本不会自动结束未知进程。"
 fi
 if [ -n "$cdn_kind" ]; then
 public_val=$(client_port "$val")
@@ -6495,18 +6673,6 @@ case "$1" in
 esac
 }
 
-protocol_note(){
-case "$1" in
-3) echo "（支持后续CF优选CDN）" ;;
-4) echo "（支持后续Argo隧道/CF优选CDN）" ;;
-8) echo "（支持后续Argo隧道/CF优选CDN）" ;;
-12) echo "（UDP/QUIC，需放行 UDP 端口）" ;;
-13) echo "（源站 TCP；支持 HTTPS CDN / 实验 UDP 443）" ;;
-14) echo "（同端口 H2/H3；需公开可信域名证书）" ;;
-*) echo "" ;;
-esac
-}
-
 protocol_var(){
 case "$1" in
 1) echo vlpt ;;
@@ -6576,19 +6742,18 @@ show_protocol_picker(){
 echo "当前协议选择："
 for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
 label=$(protocol_label "$id")
-note=$(protocol_note "$id")
 port=$(protocol_current_port "$id")
 if [ -n "$port" ]; then
 if is_nat_mode; then
-printf "%2s. [已选] %s，内网端口：%s" "$id" "$label$note" "$port"
+printf "%2s. [已选] %s，内网端口：%s" "$id" "$label" "$port"
 public=$(client_port "$port")
 [ "$public" != "$port" ] && printf "，公网端口：%s" "$public"
 else
-printf "%2s. [已选] %s，端口：%s" "$id" "$label$note" "$port"
+printf "%2s. [已选] %s，端口：%s" "$id" "$label" "$port"
 fi
 printf "\n"
 else
-printf "%2s. [未选] %s\n" "$id" "$label$note"
+printf "%2s. [未选] %s\n" "$id" "$label"
 fi
 done
 }
@@ -6598,6 +6763,10 @@ id=$1
 label=$(protocol_label "$id")
 var=$(protocol_var "$id")
 [ -n "$label" ] && [ -n "$var" ] || { echo "忽略未知协议编号：$id"; return 0; }
+case "$id" in
+10|11|12) yellow_line "$label 使用 UDP/QUIC，请确认公网端口及服务商映射已放行 UDP。" ;;
+14) yellow_line "NaiveProxy 必须使用与服务域名匹配的公开可信证书。" ;;
+esac
 prompt_port "$label" "$var" "" "$(protocol_cf_port_kind "$id")"
 }
 
@@ -6719,6 +6888,17 @@ done
 [ -n "$shown" ] || echo "  未选择"
 }
 
+guided_progress(){
+mode_label="普通 VPS"
+is_nat_mode && mode_label="NAT VPS"
+proto_total=$(protocol_count)
+printf '当前：%s | 已选协议 %s 项 | 域名 %s | 证书 %s' "$mode_label" "$proto_total" "${domain:-未设置}" "${certmode:-未选择}"
+if is_nat_mode; then
+printf ' | NAT 映射 %s 组' "$(port_map_count "$ptmap")"
+fi
+printf '\n'
+}
+
 guided_summary(){
 ui_dash
 echo "当前引导配置："
@@ -6741,7 +6921,7 @@ else
 echo "节点订阅分享：未启用"
 fi
 if is_nat_mode; then
-[ -n "$ptmap" ] && show_port_map_list "$ptmap" || yellow_line "NAT端口映射：未设置（可在入口网络管理中配置）"
+[ -n "$ptmap" ] && echo "NAT端口映射：$(port_map_count "$ptmap") 组" || yellow_line "NAT端口映射：未设置（可在入口网络管理中配置）"
 [ -n "$inpool" ] && echo "内网端口池：$inpool" || { [ -n "$portpool" ] && echo "内网端口池：$portpool" || echo "内网端口池：未设置（可在入口网络管理中配置）"; }
 [ -n "$outpool" ] && echo "外网端口池：$outpool" || echo "外网端口池：未设置（可在入口网络管理中配置）"
 [ -n "$inpool" ] && [ -n "$outpool" ] && echo "NAT自动映射：外网端口池按顺序对应内网端口池"
@@ -6765,14 +6945,13 @@ case "$val" in
 ""|1)
 vpsmode=normal
 printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"
-echo "已设置为普通 VPS。"
+green_line "已设置为普通 VPS。"
 return 0
 ;;
 2)
 vpsmode=nat
 printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"
-echo "已设置为 NAT VPS。"
-show_nat_cdn_hint
+green_line "已设置为 NAT VPS。"
 return 0
 ;;
 *) echo "请输入 1、2 或 0。" ;;
@@ -6786,20 +6965,9 @@ yellow_line "操作步骤：先配置 外网 CF 端口-内网监听端口 映射
 yellow_line "若没有对应的公网 CF 端口，仍可使用任意公网映射，但必须使用 Origin Rules，不能把内网端口直接写成 CDN 节点端口。"
 }
 
-show_first_install_port_hint(){
-yellow_line "首次端口提醒：支持后续 Cloudflare CDN 的协议，端口回车随机时会优先匹配未占用的 CF 官方端口。"
-yellow_line "HTTP 端口：80、8080、8880、2052、2082、2086、2095。HTTPS 端口：443、8443、2053、2083、2087、2096。"
-yellow_line "自动随机会排除热门的 443；XHTTP TLS TCP/UDP 优先使用其它 HTTPS 端口，实验 CDN-UDP 需要 Cloudflare 边缘 443，非 443 源站端口时还需要 Origin Rules。"
-red_line "激进测试模式：若要让 XHTTP TLS CDN-UDP 走 443 直回源，请在协议端口处手动输入 443；回车随机不会选择 443。"
-red_line "443 是献祭端口：设置前请用 ss -ltnp 或 lsof -i:443 检查占用，必要时先停止 Nginx/其他服务，确认 PID 后再 kill；脚本不会擅自杀掉未知进程。"
-red_line "xcpt=443 时可免 Origin Rule 直接测试 443→443；若保留其他服务占用 443，请改用 HTTPS 端口并按菜单配置 Origin Rule。"
-}
-
 prompt_port_map(){
 while :; do
-echo "NAT VPS 端口映射只改客户端节点/订阅端口，不写 iptables。"
 yellow_line "格式：外网端口-内网监听端口，多个用空格分隔，例如：54834-2096 54835-8443"
-yellow_line "CDN 建议把外网端口选为 CF 官方端口；若没有对应端口，请使用 Cloudflare Origin Rules 将边缘端口回源到这里的公网端口。"
 printf "请输入映射；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "$LUN_RESET" "${ptmap:+，当前 $ptmap}"
 IFS= read -r val
 [ "$val" = "0" ] && return 2
@@ -6812,12 +6980,12 @@ echo "NAT 端口映射已清除。"
 return 0
 ;;
 esac
-normalized=$(normalize_ptmap "$val") || { echo "映射格式错误或存在重复公网/内网端口，请使用 外网端口-内网端口，例如：54834-2096"; continue; }
+normalized=$(normalize_ptmap "$val") || continue
 ptmap="$normalized"
 vpsmode=nat
 printf "%s\n" "$vpsmode" > "$HOME/lun/vps_mode"
 printf "%s\n" "$ptmap" > "$HOME/lun/port_map"
-echo "NAT 端口映射已保存：$ptmap"
+green_line "NAT 端口映射已保存：$(port_map_count "$ptmap") 组"
 return 0
 done
 }
@@ -6826,14 +6994,10 @@ prompt_port_pool(){
 while :; do
 echo "端口池用于协议端口和节点订阅分享端口随机取值。"
 if is_nat_mode; then
-yellow_line "格式说明：单个端口 8080；连续端口 1000+2000；NAT映射 外网端口-内网端口 例如 54834-2096"
-echo "内网端口池：服务实际监听端口，例如 8080 1000+2000。"
-echo "外网端口池：NAT 公网入口端口，例如 53273 49096+49100。按位置自动映射到内网池。"
-echo "旧格式仍兼容：portpool=\"54834-2096 49096-1003\" 会自动补充手动 NAT 映射。"
+yellow_line "内网池是监听端口，外网池是公网入口；范围写成 1000+2000，两组按顺序映射。"
 printf "请输入内网端口池；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "${inpool:+，当前 $inpool}" "$LUN_RESET"
 else
-yellow_line "格式说明：单个端口 8080；连续端口 1000+2000；NAT映射 外网端口-内网端口 例如 54834-2096"
-echo "普通 VPS 只需要一个端口池，随机端口会直接作为客户端端口。"
+yellow_line "端口池格式：单个端口 8080；连续范围 1000+2000。"
 printf "请输入端口池；%sdel 清除；回车保留/跳过；0 返回%s%s：" "$LUN_YELLOW" "${inpool:+，当前 $inpool}" "$LUN_RESET"
 fi
 IFS= read -r val
@@ -7063,11 +7227,10 @@ step=1
 while :; do
 case "$step" in
 1)
-guided_summary
+guided_progress
 prompt_vps_mode
 rc=$?
 if [ "$rc" = 0 ]; then
-show_first_install_port_hint
 if is_nat_mode; then
 if [ -z "$ptmap" ] && [ -z "$inpool" ]; then
 prompt_port_map
@@ -7080,21 +7243,21 @@ fi
 [ "$rc" = 2 ] && return 1
 ;;
 2)
-guided_summary
+guided_progress
 pick_protocols
 rc=$?
 [ "$rc" = 0 ] && step=3 && continue
 [ "$rc" = 2 ] && step=1 && continue
 ;;
 3)
-guided_summary
+guided_progress
 prompt_service_domain
 rc=$?
 [ "$rc" = 0 ] && { [ -n "$domain" ] && [ -z "$addym" ] && { addym="$domain"; addout=replace; load_addym_config; }; step=4; continue; }
 [ "$rc" = 2 ] && step=2 && continue
 ;;
 4)
-guided_summary
+guided_progress
 prompt_cert_mode_guided
 rc=$?
 [ "$rc" = 0 ] && step=5 && continue
@@ -7377,6 +7540,7 @@ ui_pause
 }
 
 stop_lun_services(){
+multiuser_service_stop
 stop_lun_owned_processes
 if pidof systemd >/dev/null 2>&1; then
 systemctl stop xr sb argo >/dev/null 2>&1 || true
@@ -7616,6 +7780,819 @@ esac
 done
 }
 
+multiuser_install_python(){
+command -v python3 >/dev/null 2>&1 && return 0
+yellow_line "多用户模块需要 Python 3（仅模块使用），正在安装……"
+if command -v apk >/dev/null 2>&1; then
+apk add --no-cache python3 >/dev/null 2>&1
+elif command -v apt-get >/dev/null 2>&1; then
+apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1
+else
+red_line "当前系统没有 apk/apt-get，请先手动安装 Python 3。"
+return 1
+fi
+command -v python3 >/dev/null 2>&1
+}
+
+multiuser_download_agent(){
+mu_dir=$(multiuser_module_dir)
+mu_target="$mu_dir/lun_agent.py"
+mu_tmp="$mu_target.tmp.$$"
+mkdir -p "$mu_dir"
+rm -f "$mu_tmp"
+if [ -n "${LUN_MULTIUSER_AGENT_SOURCE:-}" ] && [ -s "$LUN_MULTIUSER_AGENT_SOURCE" ]; then
+cp "$LUN_MULTIUSER_AGENT_SOURCE" "$mu_tmp" || return 1
+else
+mu_url=${LUN_MULTIUSER_AGENT_URL:-"https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/modules/multiuser/lun_agent.py"}
+if command -v curl >/dev/null 2>&1; then
+curl -fL --connect-timeout 10 --max-time 120 --retry 2 -o "$mu_tmp" "$mu_url" || return 1
+elif command -v wget >/dev/null 2>&1; then
+wget -O "$mu_tmp" --tries=2 --timeout=60 "$mu_url" || return 1
+else
+return 1
+fi
+fi
+python3 -m py_compile "$mu_tmp" >/dev/null 2>&1 || { rm -f "$mu_tmp"; red_line "下载的多用户代理程序语法校验失败。"; return 1; }
+mv -f "$mu_tmp" "$mu_target"
+chmod 700 "$mu_target"
+cat > "$mu_dir/lun-agent" <<EOF
+#!/bin/sh
+exec python3 "$mu_target" "\$@"
+EOF
+chmod 700 "$mu_dir/lun-agent"
+}
+
+multiuser_pick_local_api_port(){
+mu_api_start=$1
+mu_api_end=$((mu_api_start + 40))
+mu_api=$mu_api_start
+while [ "$mu_api" -le "$mu_api_end" ]; do
+if ! port_in_use "$mu_api" && ! protocol_port_reserved "$mu_api"; then
+printf '%s\n' "$mu_api"
+return 0
+fi
+mu_api=$((mu_api + 1))
+done
+return 1
+}
+
+multiuser_prepare_subscription(){
+mu_scheme=http
+mu_host=
+mu_cert_args=
+if cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key" && sync_cert_metadata; then
+mu_cert_mode=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+case "$mu_cert_mode" in
+ca|domain|dns|ip)
+mu_preferred=$(cat "$HOME/lun/domain" 2>/dev/null)
+[ -n "$mu_preferred" ] && cert_covers_domain "$HOME/lun/cert.crt" "$mu_preferred" || mu_preferred=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+if [ -n "$mu_preferred" ] && [ "$mu_preferred" != "未知" ] && cert_covers_domain "$HOME/lun/cert.crt" "$mu_preferred"; then
+mu_scheme=https
+mu_host=$(uri_host "$mu_preferred")
+mu_cert_args="--certificate $HOME/lun/cert.crt --private-key $HOME/lun/private.key"
+fi
+;;
+esac
+fi
+if [ -z "$mu_host" ]; then
+mu_host=$(cat "$HOME/lun/domain" 2>/dev/null)
+[ -z "$mu_host" ] && mu_host=$(cat "$HOME/lun/addym" 2>/dev/null)
+if [ -z "$mu_host" ]; then
+v4v6
+[ -n "$v4" ] && mu_host=$(uri_host "$v4") || mu_host=$(uri_host "$v6")
+fi
+fi
+[ -n "$mu_host" ] || { red_line "没有可用于订阅输出的域名或公网 IP。"; return 1; }
+if [ "$mu_scheme" = http ]; then
+red_line "当前没有匹配订阅地址的公开可信证书，多用户订阅只能使用 HTTP。"
+yellow_line "HTTP token 会明文经过网络；建议先申请域名证书。输入 HTTP 才继续："
+IFS= read -r mu_http_confirm
+[ "$mu_http_confirm" = HTTP ] || { echo "已取消安装。"; return 1; }
+else
+green_line "检测到公开可信证书，多用户订阅将使用 HTTPS。"
+fi
+mu_sub_requested=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+mu_legacy_http_internal=0
+mu_legacy_http_public=0
+if [ "$mu_scheme" = https ] && [ -n "$mu_sub_requested" ]; then
+mu_legacy_http_internal=$mu_sub_requested
+mu_legacy_http_public=$(client_port "$mu_legacy_http_internal")
+multiuser_legacy_subport=$mu_legacy_http_internal
+mu_sub_internal=$(select_subscription_port "") || { multiuser_legacy_subport=; return 1; }
+multiuser_legacy_subport=
+[ "$mu_sub_internal" != "$mu_legacy_http_internal" ] || { red_line "HTTPS 订阅没有取得第二个空闲端口。"; return 1; }
+printf '%s\n' "$mu_legacy_http_internal" > "$HOME/lun/subport_legacy.log"
+else
+mu_sub_internal=$(select_subscription_port "$mu_sub_requested") || return 1
+fi
+mu_sub_public=$(client_port "$mu_sub_internal")
+if is_nat_mode && [ "$mu_sub_public" = "$mu_sub_internal" ]; then
+red_line "NAT VPS 没有为订阅内网端口 $mu_sub_internal 配置公网映射。"
+yellow_line "请先在入口网络管理增加一组 公网端口-$mu_sub_internal，再安装多用户模块。"
+return 1
+fi
+printf '%s\n' "$mu_sub_internal" > "$HOME/lun/subport.log"
+return 0
+}
+
+multiuser_config_value(){
+mu_config_key=$1
+python3 - "$(multiuser_module_dir)/config.json" "$mu_config_key" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], ""))
+except (OSError, ValueError):
+    pass
+PY
+}
+
+multiuser_restore_legacy_subscription_port(){
+if [ -s "$HOME/lun/subport_legacy.log" ]; then
+cp -p "$HOME/lun/subport_legacy.log" "$HOME/lun/subport.log"
+fi
+}
+
+multiuser_abort_install(){
+mu_abort_dir=$(multiuser_module_dir)
+multiuser_service_stop
+if [ -s "$mu_abort_dir/backups/preinstall-xr.json" ]; then
+cp -p "$mu_abort_dir/backups/preinstall-xr.json" "$HOME/lun/xr.json"
+xrestart
+fi
+if [ -s "$mu_abort_dir/backups/preinstall-sb.json" ]; then
+cp -p "$mu_abort_dir/backups/preinstall-sb.json" "$HOME/lun/sb.json"
+sbrestart
+fi
+[ -x "$mu_abort_dir/lun-agent" ] && "$mu_abort_dir/lun-agent" --root "$HOME/lun" set-module --enabled no >/dev/null 2>&1 || true
+multiuser_remove_service
+multiuser_restore_legacy_subscription_port
+rm -rf "$mu_abort_dir"
+restart_subscription_service >/dev/null 2>&1 || true
+}
+
+multiuser_install(){
+[ "$(id -u 2>/dev/null)" = 0 ] || { red_line "多用户模块安装需要 root。"; return 1; }
+{ pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
+red_line "多用户模块只支持 systemd 或 OpenRC；当前无 init 模式已拒绝安装。"
+return 1
+}
+[ -s "$HOME/lun/uuid" ] || { red_line "请先完成至少一个风火轮协议安装。"; return 1; }
+multiuser_install_python || return 1
+multiuser_download_agent || { red_line "多用户代理程序下载/复制失败。"; multiuser_abort_install; return 1; }
+multiuser_prepare_subscription || { multiuser_abort_install; return 1; }
+
+mu_xapi_port=$(multiuser_pick_local_api_port 10085) || { red_line "无法分配 Xray 本机 API 端口。"; multiuser_abort_install; return 1; }
+mu_sapi_port=$(multiuser_pick_local_api_port $((mu_xapi_port + 1))) || { red_line "无法分配 Sing-box 本机 API 端口。"; multiuser_abort_install; return 1; }
+mu_ss_port=0
+mu_ss_public=0
+if grep -q '"tag":"ss-2022"' "$HOME/lun/sb.json" 2>/dev/null; then
+mu_ss_port=$(random_port 2>/dev/null) || { red_line "Shadowsocks-2022 迁移需要一个额外空闲端口。"; multiuser_abort_install; return 1; }
+mu_ss_public=$(client_port "$mu_ss_port")
+if is_nat_mode && [ "$mu_ss_public" = "$mu_ss_port" ]; then
+red_line "Shadowsocks-2022 零中断迁移需要额外 NAT 映射：公网端口-$mu_ss_port。"
+yellow_line "请先增加映射后重试；原 Shadowsocks 端口不会被修改。"
+multiuser_abort_install
+return 1
+fi
+fi
+
+mu_dir=$(multiuser_module_dir)
+mkdir -p "$mu_dir/backups"
+[ -s "$HOME/lun/xr.json" ] && cp -p "$HOME/lun/xr.json" "$mu_dir/backups/preinstall-xr.json"
+[ -s "$HOME/lun/sb.json" ] && cp -p "$HOME/lun/sb.json" "$mu_dir/backups/preinstall-sb.json"
+stop_subscription_service
+multiuser_service_stop
+set -- --port "$mu_sub_internal" --public-port "$mu_sub_public" --scheme "$mu_scheme" --public-host "$mu_host" \
+--xray-api "127.0.0.1:$mu_xapi_port" --singbox-api "127.0.0.1:$mu_sapi_port" \
+--ss-port "$mu_ss_port" --ss-public-port "$mu_ss_public" \
+--legacy-http-port "$mu_legacy_http_internal" --legacy-http-public-port "$mu_legacy_http_public"
+if [ -n "$mu_cert_args" ]; then
+set -- "$@" --certificate "$HOME/lun/cert.crt" --private-key "$HOME/lun/private.key"
+fi
+if ! multiuser_cmd init "$@"; then
+red_line "多用户数据库初始化失败。"
+multiuser_abort_install
+return 1
+fi
+if ! multiuser_cmd apply; then
+red_line "多用户配置校验或应用失败，正在恢复安装前核心配置。"
+multiuser_abort_install
+return 1
+fi
+multiuser_install_service || { multiuser_abort_install; return 1; }
+multiuser_service_start || { multiuser_abort_install; return 1; }
+crontab -l 2>/dev/null > /tmp/crontab.tmp
+sed -i '/weblun/d' /tmp/crontab.tmp
+crontab /tmp/crontab.tmp >/dev/null 2>&1 || true
+rm -f /tmp/crontab.tmp /etc/local.d/alpinesublun.start
+green_line "多用户模块安装完成；旧用户、旧 UUID、旧订阅 token 与旧 Shadowsocks 端口均已保留。"
+[ "$mu_legacy_http_internal" -gt 0 ] 2>/dev/null && yellow_line "旧 token 继续使用原 HTTP 端口：内网 $mu_legacy_http_internal / 公网 $mu_legacy_http_public；新设备使用 HTTPS 端口 $mu_sub_public。"
+[ "$mu_ss_port" -gt 0 ] 2>/dev/null && green_line "Shadowsocks 多用户并行端口：内网 $mu_ss_port / 公网 $mu_ss_public。"
+multiuser_cmd doctor
+}
+
+multiuser_apply_changes(){
+multiuser_service_stop
+if multiuser_cmd apply; then
+multiuser_service_start || true
+green_line "多用户配置已校验并生效。"
+return 0
+fi
+multiuser_service_start || true
+red_line "应用失败；核心校验未通过，请运行诊断。"
+return 1
+}
+
+multiuser_transaction(){
+multiuser_cmd backup >/dev/null 2>&1 || { red_line "无法创建操作前数据库快照。"; return 1; }
+mu_snapshot=$(ls -1t "$(multiuser_module_dir)"/backups/db-*.sqlite3 2>/dev/null | head -n 1)
+[ -n "$mu_snapshot" ] || { red_line "没有找到操作前数据库快照。"; return 1; }
+multiuser_cmd "$@" || return 1
+multiuser_apply_changes && return 0
+yellow_line "正在恢复本次操作前的数据库与核心配置……"
+multiuser_service_stop
+if multiuser_cmd restore-database --path "$mu_snapshot" >/dev/null 2>&1 && multiuser_cmd apply >/dev/null 2>&1; then
+multiuser_service_start || true
+green_line "本次操作已完整回滚。"
+else
+multiuser_service_start || true
+red_line "自动回滚未完成，请立即运行 多用户管理 → 备份/诊断。"
+fi
+return 1
+}
+
+multiuser_quota_g(){
+mu_quota_value=$1
+case "$mu_quota_value" in
+""|0) printf '0\n' ;;
+*[!0-9.]*) printf '%s\n' "$mu_quota_value" ;;
+*) printf '%sG\n' "$mu_quota_value" ;;
+esac
+}
+
+multiuser_add_user_ui(){
+ui_title "Lun 新增用户"
+printf "用户名称（唯一，输入 0 返回）："
+IFS= read -r mu_name
+[ "$mu_name" = 0 ] && return
+[ -n "$mu_name" ] || { red_line "用户名称不能为空。"; return; }
+mu_lifetime=0
+printf "每月额度（只输入数字按 G 计算，0/回车不限）："
+IFS= read -r mu_monthly
+[ -n "$mu_monthly" ] || mu_monthly=0
+mu_monthly=$(multiuser_quota_g "$mu_monthly")
+printf "每月重置日 [1-28，默认 1]："
+IFS= read -r mu_reset
+[ -n "$mu_reset" ] || mu_reset=1
+printf "到期日 [YYYY-MM-DD，回车永久]："
+IFS= read -r mu_expire
+[ -n "$mu_expire" ] || mu_expire=never
+printf "最大设备数 [默认 3]："
+IFS= read -r mu_max
+[ -n "$mu_max" ] || mu_max=3
+printf "首台设备名称 [默认 device-1]："
+IFS= read -r mu_device
+[ -n "$mu_device" ] || mu_device=device-1
+if multiuser_transaction add-user --name "$mu_name" --lifetime-quota "$mu_lifetime" --monthly-quota "$mu_monthly" \
+--reset-day "$mu_reset" --expires "$mu_expire" --max-devices "$mu_max" --device-name "$mu_device"; then
+green_line "用户与首台设备已创建。"
+fi
+ui_pause
+}
+
+multiuser_device_ui(){
+ui_title "Lun 用户 / 设备凭据"
+multiuser_cmd list-users
+printf "输入用户 ID（输入 0 返回）："
+IFS= read -r mu_uid
+[ "$mu_uid" = 0 ] && return
+multiuser_cmd show-user --user-id "$mu_uid" || { ui_pause; return; }
+echo " 1. 新增设备"
+echo " 2. 重命名设备"
+echo " 3. 启用设备"
+echo " 4. 停用设备"
+echo " 5. 轮换设备全部凭据"
+echo " 6. 硬删除设备"
+echo " 7. 再次查看凭据"
+echo " 0. 返回"
+printf "请选择（输入 0 返回）："
+IFS= read -r mu_choice
+case "$mu_choice" in
+1)
+printf "设备名称："
+IFS= read -r mu_device
+[ -n "$mu_device" ] && multiuser_transaction add-device --user-id "$mu_uid" --name "$mu_device"
+;;
+2)
+printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did
+[ "$mu_did" = 0 ] && return
+printf "新设备名称："; IFS= read -r mu_device
+[ -n "$mu_device" ] && multiuser_transaction update-device --device-id "$mu_did" --name "$mu_device"
+;;
+3) printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did; [ "$mu_did" = 0 ] && return; multiuser_transaction update-device --device-id "$mu_did" --enable ;;
+4) printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did; [ "$mu_did" = 0 ] && return; multiuser_transaction update-device --device-id "$mu_did" --disable ;;
+5)
+printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did
+[ "$mu_did" = 0 ] && return
+printf "%s轮换会立即撤销旧 UUID、密码、SS 密钥和订阅 token。请输入设备名称确认：%s" "$LUN_RED" "$LUN_RESET"
+IFS= read -r mu_confirm
+multiuser_cmd rotate-device --device-id "$mu_did" --confirm "$mu_confirm" && multiuser_apply_changes
+;;
+6)
+printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did
+[ "$mu_did" = 0 ] && return
+printf "%s硬删除会清除该设备凭据、订阅及含旧凭据的自动备份。请输入设备名称确认：%s" "$LUN_RED" "$LUN_RESET"
+IFS= read -r mu_confirm
+multiuser_cmd delete-device --device-id "$mu_did" --confirm "$mu_confirm" && multiuser_apply_changes
+;;
+7) multiuser_cmd show-user --user-id "$mu_uid" ;;
+esac
+ui_pause
+}
+
+multiuser_policy_ui(){
+ui_title "Lun 月额度 / 到期 / 停用"
+multiuser_cmd list-users
+printf "输入用户 ID（输入 0 返回）："
+IFS= read -r mu_uid
+[ "$mu_uid" = 0 ] && return
+echo " 1. 修改每月额度与重置日"
+echo " 2. 修改到期日"
+echo " 3. 修改最大设备数"
+echo " 4. 启用用户"
+echo " 5. 停用用户"
+echo " 6. 硬删除用户"
+echo " 0. 返回"
+printf "请选择（输入 0 返回）："
+IFS= read -r mu_choice
+case "$mu_choice" in
+1)
+printf "每月额度（只输入数字按 G 计算，0 不限）："; IFS= read -r mu_monthly
+mu_monthly=$(multiuser_quota_g "$mu_monthly")
+printf "每月重置日 [1-28]："; IFS= read -r mu_reset
+[ -n "$mu_reset" ] || mu_reset=1
+multiuser_transaction update-user --user-id "$mu_uid" --lifetime-quota 0 --monthly-quota "$mu_monthly" --reset-day "$mu_reset"
+;;
+2) printf "到期日 [YYYY-MM-DD/never]："; IFS= read -r mu_expire; multiuser_transaction update-user --user-id "$mu_uid" --expires "$mu_expire" ;;
+3) printf "最大设备数 [1-64]："; IFS= read -r mu_max; multiuser_transaction update-user --user-id "$mu_uid" --max-devices "$mu_max" ;;
+4) multiuser_transaction update-user --user-id "$mu_uid" --enable ;;
+5) multiuser_transaction update-user --user-id "$mu_uid" --disable ;;
+6)
+printf "%s硬删除会撤销所有凭据、订阅和含该用户的自动数据库备份。%s\n" "$LUN_RED" "$LUN_RESET"
+printf "请输入用户名称确认："
+IFS= read -r mu_confirm
+multiuser_cmd delete-user --user-id "$mu_uid" --confirm "$mu_confirm" && multiuser_apply_changes
+;;
+0|"") return ;;
+*) echo "已取消。" ;;
+esac
+ui_pause
+}
+
+multiuser_protocol_ui(){
+ui_title "Lun 用户协议权限 / 安全策略"
+multiuser_cmd list-users
+printf "输入用户 ID（输入 0 返回）："
+IFS= read -r mu_uid
+[ "$mu_uid" = 0 ] && return
+echo "协议：vl xh vx vw ss an ar vm so hy tu xu xc nv"
+printf "输入协议代码（输入 0 返回）："
+IFS= read -r mu_protocol
+[ "$mu_protocol" = 0 ] && return
+printf "启用该协议？[y/N]："
+IFS= read -r mu_enable
+case "$mu_enable" in y|Y|yes|YES) mu_enable=yes ;; *) mu_enable=no ;; esac
+multiuser_transaction set-protocol --user-id "$mu_uid" --protocol "$mu_protocol" --enabled "$mu_enable"
+yellow_line "固定安全策略：阻断私网/链路本地/云元数据和 TCP 25；TCP 465/587 保持允许。"
+ui_pause
+}
+
+multiuser_bandwidth_runner(){
+printf '%s\n' "$(multiuser_module_dir)/fair-bandwidth.sh"
+}
+
+multiuser_bandwidth_config(){
+printf '%s\n' "$(multiuser_module_dir)/bandwidth.conf"
+}
+
+multiuser_install_tc(){
+command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && return 0
+yellow_line "动态公平带宽需要 iproute2，正在安装……"
+if command -v apt-get >/dev/null 2>&1; then
+apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 >/dev/null 2>&1
+elif command -v apk >/dev/null 2>&1; then
+apk add --no-cache iproute2 >/dev/null 2>&1
+elif command -v dnf >/dev/null 2>&1; then
+dnf install -y iproute >/dev/null 2>&1
+elif command -v yum >/dev/null 2>&1; then
+yum install -y iproute >/dev/null 2>&1
+else
+return 1
+fi
+command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1
+}
+
+multiuser_bandwidth_write_runner(){
+mu_bw_runner=$(multiuser_bandwidth_runner)
+mu_bw_config=$(multiuser_bandwidth_config)
+cat > "$mu_bw_runner" <<EOF
+#!/bin/sh
+set -u
+CONFIG="$mu_bw_config"
+[ -r "\$CONFIG" ] || { echo "动态公平带宽配置不存在" >&2; exit 1; }
+. "\$CONFIG"
+case "\${RATE_MBIT:-}" in ''|*[!0-9]*) echo "总带宽必须是整数 Mbit/s" >&2; exit 1 ;; esac
+[ "\$RATE_MBIT" -ge 1 ] 2>/dev/null && [ "\$RATE_MBIT" -le 100000 ] 2>/dev/null || { echo "总带宽范围应为 1-100000 Mbit/s" >&2; exit 1; }
+IFACE=\${INTERFACE:-auto}
+if [ "\$IFACE" = auto ]; then
+IFACE=\$(ip -4 route show default 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
+[ -n "\$IFACE" ] || IFACE=\$(ip -6 route show default 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
+fi
+case "\$IFACE" in ''|*[!A-Za-z0-9_.:-]*) echo "无法识别出口网卡" >&2; exit 1 ;; esac
+ip link show dev "\$IFACE" >/dev/null 2>&1 || { echo "出口网卡不存在：\$IFACE" >&2; exit 1; }
+MODE_FILE="\${CONFIG}.mode"
+case "\${1:-status}" in
+apply)
+modprobe sch_cake >/dev/null 2>&1 || true
+if tc qdisc replace dev "\$IFACE" root cake bandwidth "\${RATE_MBIT}mbit" besteffort dual-dsthost 2>/dev/null; then
+printf '%s\n' cake > "\$MODE_FILE"
+echo "已启用 CAKE：\$IFACE / \${RATE_MBIT} Mbit/s"
+exit 0
+fi
+tc qdisc del dev "\$IFACE" root >/dev/null 2>&1 || true
+if tc qdisc add dev "\$IFACE" root handle 1: htb default 10 2>/dev/null && \
+tc class add dev "\$IFACE" parent 1: classid 1:10 htb rate "\${RATE_MBIT}mbit" ceil "\${RATE_MBIT}mbit" 2>/dev/null && \
+tc qdisc add dev "\$IFACE" parent 1:10 handle 10: fq_codel 2>/dev/null; then
+printf '%s\n' htb-fq_codel > "\$MODE_FILE"
+echo "已启用 HTB + FQ-CoDel：\$IFACE / \${RATE_MBIT} Mbit/s"
+exit 0
+fi
+tc qdisc del dev "\$IFACE" root >/dev/null 2>&1 || true
+rm -f "\$MODE_FILE"
+echo "CAKE 与 HTB + FQ-CoDel 均启用失败，已恢复系统默认队列" >&2
+exit 1
+;;
+clear)
+tc qdisc del dev "\$IFACE" root >/dev/null 2>&1 || true
+rm -f "\$MODE_FILE"
+echo "动态公平带宽已关闭：\$IFACE"
+;;
+status)
+echo "出口网卡：\$IFACE"
+echo "总下载上限：\$RATE_MBIT Mbit/s"
+if command -v python3 >/dev/null 2>&1 && tc -j -s qdisc show dev "\$IFACE" >/dev/null 2>&1; then
+tc -j -s qdisc show dev "\$IFACE" | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+root = next((item for item in items if item.get("root")), items[0] if items else {})
+kind = root.get("kind", "")
+labels = {
+    "cake": "CAKE 公平队列（已启用）",
+    "htb": "HTB 总量整形 + FQ-CoDel 公平队列（已启用）",
+    "fq_codel": "系统默认 FQ-CoDel（动态公平带宽未启用）",
+}
+print("调度算法：" + labels.get(kind, "未启用或无法识别"))
+print("累计发送：{} 字节 / {} 个数据包".format(int(root.get("bytes", 0)), int(root.get("packets", 0))))
+print("丢弃数据包：{}".format(int(root.get("drops", 0))))
+print("触发带宽整形：{} 次".format(int(root.get("overlimits", 0))))
+print("当前排队：{} 字节".format(int(root.get("backlog", 0))))
+' 2>/dev/null || echo "调度状态：暂时无法读取"
+else
+echo "调度状态：当前系统不支持中文统计解析"
+fi
+;;
+*) echo "用法：\$0 apply|clear|status" >&2; exit 2 ;;
+esac
+EOF
+chmod 700 "$mu_bw_runner"
+}
+
+multiuser_bandwidth_install_service(){
+mu_bw_runner=$(multiuser_bandwidth_runner)
+if pidof systemd >/dev/null 2>&1; then
+cat > /etc/systemd/system/lun-fair-bandwidth.service <<EOF
+[Unit]
+Description=风火轮动态公平下载带宽
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$mu_bw_runner apply
+ExecStop=$mu_bw_runner clear
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+cat > /etc/init.d/lun-fair-bandwidth <<EOF
+#!/sbin/openrc-run
+description="风火轮动态公平下载带宽"
+depend() { need net; }
+start() { ebegin "启动风火轮动态公平带宽"; $mu_bw_runner apply; eend \$?; }
+stop() { ebegin "关闭风火轮动态公平带宽"; $mu_bw_runner clear; eend \$?; }
+EOF
+chmod +x /etc/init.d/lun-fair-bandwidth
+else
+red_line "动态公平带宽要求 systemd 或 OpenRC。"
+return 1
+fi
+}
+
+multiuser_bandwidth_enable(){
+multiuser_install_tc || { red_line "iproute2 安装失败，无法启用真实带宽调度。"; return 1; }
+mu_bw_old_rate=
+mu_bw_old_iface=auto
+mu_bw_config=$(multiuser_bandwidth_config)
+if [ -r "$mu_bw_config" ]; then
+mu_bw_old_rate=$(sed -n 's/^RATE_MBIT=//p' "$mu_bw_config" | head -n 1)
+mu_bw_old_iface=$(sed -n 's/^INTERFACE=//p' "$mu_bw_config" | head -n 1)
+fi
+[ -n "$mu_bw_old_rate" ] || mu_bw_old_rate=1000
+[ -n "$mu_bw_old_iface" ] || mu_bw_old_iface=auto
+yellow_line "这是全机下载出口公平调度，不是严格的单用户限速。"
+echo "总上限建议填写服务器实测下载出口的 90%-95%。"
+printf "总下载带宽上限 Mbit/s [默认 %s]：" "$mu_bw_old_rate"
+IFS= read -r mu_bw_rate
+[ -n "$mu_bw_rate" ] || mu_bw_rate=$mu_bw_old_rate
+case "$mu_bw_rate" in *[!0-9]*|"") red_line "请输入整数 Mbit/s。"; return 1 ;; esac
+[ "$mu_bw_rate" -ge 1 ] 2>/dev/null && [ "$mu_bw_rate" -le 100000 ] 2>/dev/null || { red_line "范围应为 1-100000 Mbit/s。"; return 1; }
+printf "出口网卡 [默认 %s，auto 自动识别]：" "$mu_bw_old_iface"
+IFS= read -r mu_bw_iface
+[ -n "$mu_bw_iface" ] || mu_bw_iface=$mu_bw_old_iface
+case "$mu_bw_iface" in *[!A-Za-z0-9_.:-]*|"") red_line "出口网卡名称无效。"; return 1 ;; esac
+cat > "$mu_bw_config" <<EOF
+RATE_MBIT=$mu_bw_rate
+INTERFACE=$mu_bw_iface
+EOF
+chmod 600 "$mu_bw_config"
+multiuser_bandwidth_write_runner || return 1
+multiuser_bandwidth_install_service || return 1
+if pidof systemd >/dev/null 2>&1; then
+systemctl enable lun-fair-bandwidth >/dev/null 2>&1
+systemctl restart lun-fair-bandwidth || { red_line "动态公平带宽启动失败，已恢复系统默认队列。"; return 1; }
+else
+rc-update add lun-fair-bandwidth default >/dev/null 2>&1 || true
+rc-service lun-fair-bandwidth restart || { red_line "动态公平带宽启动失败，已恢复系统默认队列。"; return 1; }
+fi
+green_line "动态公平带宽已启用：全机下载上限 ${mu_bw_rate} Mbit/s，空闲连接可借用剩余带宽。"
+}
+
+multiuser_bandwidth_disable(){
+mu_bw_runner=$(multiuser_bandwidth_runner)
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable --now lun-fair-bandwidth >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service lun-fair-bandwidth stop >/dev/null 2>&1 || true
+rc-update del lun-fair-bandwidth default >/dev/null 2>&1 || true
+fi
+[ -x "$mu_bw_runner" ] && "$mu_bw_runner" clear >/dev/null 2>&1 || true
+green_line "动态公平带宽已关闭，出口队列已恢复系统默认设置。"
+}
+
+multiuser_bandwidth_remove(){
+multiuser_bandwidth_disable >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/lun-fair-bandwidth.service /etc/init.d/lun-fair-bandwidth
+pidof systemd >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+rm -f "$(multiuser_bandwidth_runner)" "$(multiuser_bandwidth_config)" "$(multiuser_bandwidth_config).mode"
+}
+
+multiuser_bandwidth_ui(){
+while :; do
+ui_title "Lun 动态公平带宽"
+echo "按全机下载出口公平分配：人少时可使用更多，繁忙时活跃连接自动均分。"
+mu_bw_runner=$(multiuser_bandwidth_runner)
+if [ -x "$mu_bw_runner" ] && [ -r "$(multiuser_bandwidth_config)" ]; then
+"$mu_bw_runner" status 2>/dev/null || echo "当前：配置存在，但尚未启用。"
+else
+echo "当前：未配置"
+fi
+echo " 1. 启用 / 修改总下载带宽"
+echo " 2. 刷新调度状态与统计"
+echo " 3. 关闭动态公平带宽"
+echo " 0. 返回"
+printf "请选择 [0-3]（输入 0 返回）："
+IFS= read -r mu_choice
+case "$mu_choice" in
+1) multiuser_bandwidth_enable; ui_pause ;;
+2) [ -x "$mu_bw_runner" ] && "$mu_bw_runner" status || echo "尚未配置。"; ui_pause ;;
+3) multiuser_bandwidth_disable; ui_pause ;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+multiuser_install_enhanced_singbox(){
+[ -x "$HOME/lun/sing-box" ] || { red_line "Sing-box 未安装。"; return 1; }
+if "$HOME/lun/sing-box" version 2>/dev/null | grep -q with_v2ray_api; then
+green_line "当前 Sing-box 已支持按用户统计流量。"
+return 0
+fi
+mu_sb_tmp="$HOME/lun/sing-box.multiuser.tmp.$$"
+mu_helper_tmp="$(multiuser_module_dir)/lun-sb-stats.tmp.$$"
+mu_sb_url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-multiuser-$cpu"
+mu_helper_url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/lun-sb-stats-$cpu"
+download_core_asset "sing-box-multiuser-$cpu" "$mu_sb_tmp" "$mu_sb_url" || return 1
+download_core_asset "lun-sb-stats-$cpu" "$mu_helper_tmp" "$mu_helper_url" || { rm -f "$mu_sb_tmp"; return 1; }
+chmod +x "$mu_sb_tmp"
+chmod 700 "$mu_helper_tmp"
+if ! "$mu_sb_tmp" version 2>/dev/null | grep -q with_v2ray_api; then
+rm -f "$mu_sb_tmp" "$mu_helper_tmp"
+red_line "下载的 Sing-box 不支持按用户统计流量，已拒绝替换。"
+return 1
+fi
+"$mu_helper_tmp" --help >/dev/null 2>&1 || { rm -f "$mu_sb_tmp" "$mu_helper_tmp"; red_line "Sing-box 统计辅助程序校验失败。"; return 1; }
+cp -p "$HOME/lun/sing-box" "$HOME/lun/sing-box.pre-multiuser"
+[ -s "$(multiuser_module_dir)/lun-sb-stats" ] && cp -p "$(multiuser_module_dir)/lun-sb-stats" "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser"
+mv -f "$mu_sb_tmp" "$HOME/lun/sing-box"
+mv -f "$mu_helper_tmp" "$(multiuser_module_dir)/lun-sb-stats"
+if ! multiuser_apply_changes; then
+mv -f "$HOME/lun/sing-box.pre-multiuser" "$HOME/lun/sing-box"
+if [ -s "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser" ]; then
+mv -f "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser" "$(multiuser_module_dir)/lun-sb-stats"
+else
+rm -f "$(multiuser_module_dir)/lun-sb-stats"
+fi
+sbrestart
+return 1
+fi
+rm -f "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser"
+green_line "Sing-box 增强内核安装完成；协议版本不变，已增加用户统计能力。"
+}
+
+multiuser_module_ui(){
+while :; do
+ui_title "Lun 多用户模块维护"
+multiuser_enabled && echo "当前：已启用" || echo "当前：已停用"
+echo " 1. 备份用户数据库"
+echo " 2. 检查模块运行状态"
+echo " 3. 更新多用户管理程序"
+echo " 4. 启用 / 停用模块"
+echo " 5. 安装支持用户流量统计的 Sing-box 内核"
+echo " 6. 卸载多用户模块"
+echo " 0. 返回"
+printf "请选择 [0-6]（输入 0 返回）："
+IFS= read -r mu_choice
+case "$mu_choice" in
+1) multiuser_cmd backup; ui_pause ;;
+2) multiuser_cmd doctor; ui_pause ;;
+3) multiuser_download_agent && multiuser_service_restart && green_line "多用户管理程序已更新。"; ui_pause ;;
+4)
+if multiuser_enabled; then
+multiuser_cmd set-module --enabled no && multiuser_service_stop
+multiuser_bandwidth_disable
+multiuser_restore_legacy_subscription_port
+yellow_line "模块已停用；将重建为原单用户配置，数据库和增强 Sing-box 保留。"
+LUN_MENU_ACTION=rep
+return 3
+else
+mu_primary_port=$(multiuser_config_value port)
+[ -n "$mu_primary_port" ] && printf '%s\n' "$mu_primary_port" > "$HOME/lun/subport.log"
+multiuser_cmd set-module --enabled yes && multiuser_apply_changes && multiuser_service_start
+fi
+ui_pause
+;;
+5) multiuser_install_enhanced_singbox; ui_pause ;;
+6)
+printf "%s卸载模块将恢复单用户配置。输入 PURGE 会连数据库一起删除，其他输入会先备份数据库：%s" "$LUN_RED" "$LUN_RESET"
+IFS= read -r mu_purge
+if [ "$mu_purge" != PURGE ] && [ -s "$(multiuser_module_dir)/data/lun.db" ]; then
+mu_saved="$HOME/lun-multiuser-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
+cp -p "$(multiuser_module_dir)/data/lun.db" "$mu_saved" && green_line "数据库已保留：$mu_saved"
+fi
+multiuser_cmd set-module --enabled no >/dev/null 2>&1 || true
+multiuser_bandwidth_remove
+multiuser_remove_service
+multiuser_restore_legacy_subscription_port
+rm -rf "$(multiuser_module_dir)"
+LUN_MENU_ACTION=rep
+return 3
+;;
+0|"") return 0 ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+multiuser_menu(){
+if ! multiuser_installed; then
+ui_title "Lun 多用户管理"
+echo "这是可选模块；不安装时普通风火轮行为完全不变。"
+echo "模块将导入当前 UUID 为 legacy-admin/legacy-device，并保留原订阅。"
+printf "现在安装多用户模块？[y/N]："
+IFS= read -r mu_install
+case "$mu_install" in y|Y|yes|YES) multiuser_install || { ui_pause; return; } ;; *) return ;; esac
+fi
+while :; do
+ui_title "Lun 多用户管理"
+multiuser_cmd maintenance >/dev/null 2>&1 || true
+multiuser_cmd status
+ui_dash
+echo " 1. 刷新用户与流量总览"
+echo " 2. 新增用户（自动创建首台设备）"
+echo " 3. 用户 / 设备凭据"
+echo " 4. 月额度 / 到期 / 停用 / 删除"
+echo " 5. 查看设备订阅"
+echo " 6. 用户协议权限 / 安全策略"
+echo " 7. 备份 / 运行状态检查"
+echo " 8. 动态公平带宽"
+echo " 9. 模块更新 / 停用 / 卸载"
+echo " 0. 返回"
+printf "请选择 [0-9]（输入 0 返回）："
+IFS= read -r mu_choice
+case "$mu_choice" in
+1) multiuser_cmd maintenance >/dev/null 2>&1 || true; multiuser_cmd list-users; ui_pause ;;
+2) multiuser_add_user_ui ;;
+3) multiuser_device_ui ;;
+4) multiuser_policy_ui ;;
+5)
+printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did
+[ "$mu_did" = 0 ] && continue
+multiuser_cmd show-subscription --device-id "$mu_did"; ui_pause
+;;
+6) multiuser_protocol_ui ;;
+7) multiuser_cmd backup; multiuser_cmd doctor; ui_pause ;;
+8) multiuser_bandwidth_ui ;;
+9) multiuser_module_ui; mu_rc=$?; [ "$mu_rc" = 3 ] && return 3 ;;
+0|"") return 0 ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+show_protocol_help(){
+ui_title "Lun 协议特点"
+echo " 1. VLESS TCP Reality：Xray / TCP 直连 / Reality，不要求公开证书。"
+echo " 2. VLESS XHTTP Reality：Xray / XHTTP 直连 / Reality，不要求公开证书。"
+echo " 3. VLESS XHTTP：Xray / XHTTP / 可直连或接 Cloudflare CDN。"
+echo " 4. VLESS WS：Xray / WebSocket / 支持 Cloudflare CDN 与 Argo。"
+echo " 5. Shadowsocks-2022：Sing-box / TCP+UDP / 轻量直连。"
+echo " 6. AnyTLS：Sing-box / TLS over TCP / 需要证书。"
+echo " 7. Any-Reality：Sing-box / Reality 直连 / 不要求公开证书。"
+echo " 8. VMess WS：Sing-box / WebSocket / 支持 Cloudflare CDN 与 Argo。"
+echo " 9. Socks5：Sing-box / TCP+UDP / UUID 身份验证，无 TLS 伪装。"
+echo "10. Hysteria2：Sing-box / QUIC+UDP / 需放行 UDP 并配置证书。"
+echo "11. TUIC：Sing-box / QUIC+UDP / 需放行 UDP 并配置证书。"
+echo "12. VLESS XHTTP TLS UDP：Xray / HTTP/3+UDP 直连；tcping 失败属于正常现象。"
+echo "13. VLESS XHTTP TLS TCP/UDP：Xray / 直连 TCP+UDP / HTTPS CDN-TCP / 实验 UDP 443。"
+echo "14. NaiveProxy H2/H3：Sing-box / 同端口 TCP+UDP / 只接受匹配域名的公开可信证书。"
+yellow_line "UDP/QUIC 协议必须同时放行服务商公网 UDP、系统防火墙和 NAT 映射。"
+red_line "NaiveProxy 不能使用自签证书或 Cloudflare Origin CA。"
+}
+
+show_nat_help(){
+ui_title "Lun NAT / 端口池说明"
+echo "NAT 映射格式：公网端口-内网监听端口，多个映射用空格分隔。"
+echo "脚本只改变客户端节点和订阅端口，不创建服务商端口转发，也不写 NAT iptables。"
+echo "内网端口池是协议实际监听端口；外网端口池是公网入口，两组按位置自动对应。"
+yellow_line "同一内网端口出现多个公网映射时保留首项，后续项会被提示并忽略。"
+red_line "同一公网端口不能指向多个内网端口；此类冲突会拒绝整次输入。"
+echo "Cloudflare CDN：先完成服务商公网→内网映射，再按 Host + Path 配置 Origin Rules。"
+}
+
+show_cdn_help(){
+ui_title "Lun Cloudflare / Origin Rules 说明"
+echo "HTTP 端口：80、8080、8880、2052、2082、2086、2095。"
+echo "HTTPS 端口：443、8443、2053、2083、2087、2096。"
+echo "支持 CDN 的协议随机端口会优先选择对应 CF 端口，并默认排除热门的 443。"
+yellow_line "源站端口不在 CF 端口组时，必须用精确 Host + Path 的 Origin Rule 改写回源端口。"
+yellow_line "实验 CDN-UDP 还要求橙云代理、Cloudflare HTTP/3 和边缘 UDP 443。"
+red_line "手动使用本机 443 前必须检查占用；Lun 不会自动 kill 未知进程。"
+}
+
+show_certificate_help(){
+ui_title "Lun 域名 / 证书说明"
+echo "自签证书：适合直连测试；客户端需要跳过校验或使用证书指纹。"
+echo "Cloudflare Origin CA：适合橙云回源，不是客户端直接信任的公网证书。"
+echo "公开可信证书：域名必须匹配，可通过 HTTP-01、DNS API 或本机证书导入获得。"
+yellow_line "HTTP-01 要求域名解析到本机且 TCP 80 可从公网访问。"
+red_line "NaiveProxy 必须使用与服务域名匹配的公开可信证书。"
+}
+
+help_menu(){
+while :; do
+ui_title "Lun 使用说明 / 协议特点"
+echo " 1. 协议特点"
+echo " 2. NAT / 端口池"
+echo " 3. Cloudflare / Origin Rules"
+echo " 4. 域名 / 证书"
+echo " 0. 返回"
+printf "请选择 [0-4]："
+IFS= read -r c
+case "$c" in
+1) show_protocol_help; ui_pause ;;
+2) show_nat_help; ui_pause ;;
+3) show_cdn_help; ui_pause ;;
+4) show_certificate_help; ui_pause ;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
 lun_menu(){
 while :; do
 lun_dashboard
@@ -7624,9 +8601,11 @@ printf " 2. %s节点订阅分享%s\n" "$LUN_GREEN" "$LUN_RESET"
 echo " 3. 入口网络管理"
 echo " 4. 服务与更新"
 echo " 5. 高级设置"
+printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 7. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
 echo " 0. 退出"
 ui_line
-printf "请输入数字【0-5】："
+printf "请输入数字【0-7】："
 IFS= read -r menu_choice
 case "$menu_choice" in
 1) install_protocol_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
@@ -7634,6 +8613,8 @@ case "$menu_choice" in
 3) network_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
 4) service_update_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
 5) advanced_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
+6) multiuser_menu; mu_rc=$?; [ "$mu_rc" = 3 ] && break ;;
+7) help_menu ;;
 0|"") exit ;;
 *) echo "输入错误，请重新选择。"; sleep 1 ;;
 esac
@@ -7767,14 +8748,26 @@ if ! ins; then
 echo "Lun 内核安装失败，未覆盖已有内核或启动不完整服务。"
 exit 1
 fi
+if multiuser_enabled; then
+if ! multiuser_reconcile_configs; then
+echo "多用户配置注入失败，正在恢复重建前配置。"
+[ "$_lun_rebuild_request" = yes ] && rollback_rebuild
+exit 1
+fi
+fi
 if [ "$_lun_rebuild_request" = yes ]; then
 if ! validate_rebuild; then
 rollback_rebuild
 exit 1
 fi
 commit_rebuild_snapshot
+if multiuser_enabled; then
+[ -s "$HOME/lun/xr.json" ] && xrestart
+[ -s "$HOME/lun/sb.json" ] && sbrestart
+multiuser_service_start || yellow_line "多用户代理服务未能自动启动，请进入多用户管理 → 诊断。"
 fi
-if [ -n "$sub" ]; then
+fi
+if [ -n "$sub" ] && ! multiuser_enabled; then
 subtokenipsub(){
 if [ -z "$subid" ]; then
 subtoken="$(cat "$HOME/lun/uuid")"
