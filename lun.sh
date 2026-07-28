@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.22.4"
+echo "当前版本：V26.7.29.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -3189,6 +3189,297 @@ multiuser_enabled || return 0
 multiuser_cmd reconcile
 }
 
+firewall_append_port(){
+local fw_proto=$1 fw_port=$2 fw_output=$3
+valid_port_value "$fw_port" || return 0
+case "$fw_proto" in tcp|udp) printf '%s:%s\n' "$fw_proto" "$fw_port" >> "$fw_output" ;; esac
+}
+
+firewall_append_file(){
+local fw_proto=$1 fw_file=$2 fw_output=$3 fw_port
+[ -s "$fw_file" ] || return 0
+fw_port=$(sed -n '1{s/[[:space:]]//g;p;}' "$fw_file" 2>/dev/null)
+firewall_append_port "$fw_proto" "$fw_port" "$fw_output"
+}
+
+collect_lun_firewall_ports(){
+local fw_root=${1:-"$HOME/lun"} fw_output=$2 fw_spec fw_proto fw_file fw_config fw_values fw_sorted
+[ -n "$fw_output" ] || return 1
+: > "$fw_output" || return 1
+for fw_spec in \
+"tcp port_vl_re" \
+"tcp port_xh" \
+"tcp port_vx" \
+"tcp port_vw" \
+"tcp port_ss" "udp port_ss" \
+"tcp port_an" \
+"tcp port_ar" \
+"tcp port_vm_ws" \
+"tcp port_so" "udp port_so" \
+"udp port_hy2" \
+"udp port_tu" \
+"udp port_xu" \
+"tcp port_xc" "udp port_xc" \
+"tcp port_nv" "udp port_nv"; do
+set -- $fw_spec
+fw_proto=$1
+fw_file=$2
+firewall_append_file "$fw_proto" "$fw_root/$fw_file" "$fw_output"
+done
+firewall_append_file tcp "$fw_root/subport.log" "$fw_output"
+firewall_append_file tcp "$fw_root/subport_legacy.log" "$fw_output"
+
+fw_config="$fw_root/modules/multiuser/config.json"
+if [ -s "$fw_config" ]; then
+if command -v python3 >/dev/null 2>&1; then
+fw_values=$(python3 - "$fw_config" <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    data = {}
+for key, protocols in (
+    ("port", ("tcp",)),
+    ("legacy_http_port", ("tcp",)),
+    ("ss_port", ("tcp", "udp")),
+):
+    try:
+        port = int(data.get(key) or 0)
+    except (TypeError, ValueError):
+        continue
+    if 1 <= port <= 65535:
+        for protocol in protocols:
+            print(f"{protocol}:{port}")
+PY
+)
+[ -n "$fw_values" ] && printf '%s\n' "$fw_values" >> "$fw_output"
+else
+for fw_spec in "tcp port" "tcp legacy_http_port" "tcp ss_port" "udp ss_port"; do
+set -- $fw_spec
+fw_port=$(sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$fw_config" 2>/dev/null | head -n 1)
+firewall_append_port "$1" "$fw_port" "$fw_output"
+done
+fi
+fi
+fw_sorted=$(mktemp 2>/dev/null) || return 1
+sort -u "$fw_output" > "$fw_sorted" || { rm -f "$fw_sorted"; return 1; }
+mv "$fw_sorted" "$fw_output"
+}
+
+firewall_record_owned(){
+local fw_backend=$1 fw_family=$2 fw_proto=$3 fw_port=$4 fw_owned="$HOME/lun/firewall_rules.log"
+mkdir -p "$HOME/lun"
+grep -qxF "$fw_backend $fw_family $fw_proto $fw_port" "$fw_owned" 2>/dev/null || \
+printf '%s %s %s %s\n' "$fw_backend" "$fw_family" "$fw_proto" "$fw_port" >> "$fw_owned"
+}
+
+firewall_remove_record(){
+local fw_backend=$1 fw_family=$2 fw_proto=$3 fw_port=$4
+case "$fw_backend" in
+ufw)
+command -v ufw >/dev/null 2>&1 && ufw --force delete allow "$fw_port/$fw_proto" >/dev/null 2>&1 || true
+;;
+firewalld)
+if command -v firewall-cmd >/dev/null 2>&1; then
+firewall-cmd --query-port="$fw_port/$fw_proto" >/dev/null 2>&1 && firewall-cmd --remove-port="$fw_port/$fw_proto" >/dev/null 2>&1 || true
+firewall-cmd --permanent --query-port="$fw_port/$fw_proto" >/dev/null 2>&1 && firewall-cmd --permanent --remove-port="$fw_port/$fw_proto" >/dev/null 2>&1 || true
+fi
+;;
+iptables|ip6tables)
+command -v "$fw_backend" >/dev/null 2>&1 && \
+"$fw_backend" -C INPUT -p "$fw_proto" --dport "$fw_port" -m comment --comment FHLUN -j ACCEPT >/dev/null 2>&1 && \
+"$fw_backend" -D INPUT -p "$fw_proto" --dport "$fw_port" -m comment --comment FHLUN -j ACCEPT >/dev/null 2>&1 || true
+;;
+esac
+}
+
+firewall_save_iptables(){
+if command -v netfilter-persistent >/dev/null 2>&1; then
+netfilter-persistent save >/dev/null 2>&1 || true
+fi
+if command -v rc-service >/dev/null 2>&1; then
+rc-service iptables save >/dev/null 2>&1 || true
+rc-service ip6tables save >/dev/null 2>&1 || true
+fi
+}
+
+firewall_prune_owned(){
+local fw_desired=$1 fw_owned="$HOME/lun/firewall_rules.log" fw_keep fw_backend fw_family fw_proto fw_port fw_changed
+[ -s "$fw_owned" ] || return 0
+fw_keep=$(mktemp 2>/dev/null) || return 1
+fw_changed=no
+while read -r fw_backend fw_family fw_proto fw_port; do
+[ -n "$fw_backend" ] || continue
+if grep -qxF "$fw_proto:$fw_port" "$fw_desired" 2>/dev/null; then
+printf '%s %s %s %s\n' "$fw_backend" "$fw_family" "$fw_proto" "$fw_port" >> "$fw_keep"
+else
+firewall_remove_record "$fw_backend" "$fw_family" "$fw_proto" "$fw_port"
+fw_changed=yes
+fi
+done < "$fw_owned"
+mv "$fw_keep" "$fw_owned"
+[ "$fw_changed" = yes ] && firewall_save_iptables
+}
+
+firewall_iptables_global_restrictive(){
+local fw_command=$1 fw_rules fw_line
+command -v "$fw_command" >/dev/null 2>&1 || return 1
+fw_rules=$("$fw_command" -S INPUT 2>/dev/null) || return 1
+printf '%s\n' "$fw_rules" | grep -Eq -- '^-P INPUT (DROP|REJECT)$' && return 0
+while IFS= read -r fw_line; do
+case "$fw_line" in
+"-A INPUT -j DROP"|"-A INPUT -j REJECT") return 0 ;;
+esac
+done <<EOF
+$fw_rules
+EOF
+return 1
+}
+
+firewall_iptables_port_restricted(){
+local fw_command=$1 fw_proto=$2 fw_port=$3 fw_line fw_rules
+fw_rules=$("$fw_command" -S INPUT 2>/dev/null) || return 1
+while IFS= read -r fw_line; do
+case "$fw_line" in
+*" -s "*|*" -d "*|*" -i "*|*" -o "*) continue ;;
+esac
+case "$fw_line" in
+*"-p $fw_proto "*"--dport $fw_port "*"-j DROP"*|*"-p $fw_proto "*"--dport $fw_port "*"-j REJECT"*) return 0 ;;
+esac
+done <<EOF
+$fw_rules
+EOF
+return 1
+}
+
+firewall_native_nft_restrictive(){
+command -v nft >/dev/null 2>&1 || return 1
+nft list ruleset 2>/dev/null | grep -Eq 'hook input[^;]*;[^}]*policy (drop|reject)'
+}
+
+firewall_apply_ufw(){
+local fw_desired=$1 fw_proto fw_port fw_fail=0
+while IFS=: read -r fw_proto fw_port; do
+[ -n "$fw_proto" ] || continue
+if ufw status 2>/dev/null | awk -v rule="$fw_port/$fw_proto" '$1 == rule { found=1 } END { exit !found }'; then
+continue
+fi
+if ufw allow "$fw_port/$fw_proto" comment FHLUN >/dev/null 2>&1 || ufw allow "$fw_port/$fw_proto" >/dev/null 2>&1; then
+firewall_record_owned ufw any "$fw_proto" "$fw_port"
+else
+fw_fail=1
+fi
+done < "$fw_desired"
+return "$fw_fail"
+}
+
+firewall_apply_firewalld(){
+local fw_desired=$1 fw_proto fw_port fw_fail=0 fw_owned
+while IFS=: read -r fw_proto fw_port; do
+[ -n "$fw_proto" ] || continue
+fw_owned=no
+if ! firewall-cmd --permanent --query-port="$fw_port/$fw_proto" >/dev/null 2>&1; then
+if firewall-cmd --permanent --add-port="$fw_port/$fw_proto" >/dev/null 2>&1; then
+fw_owned=yes
+else
+fw_fail=1
+fi
+fi
+firewall-cmd --query-port="$fw_port/$fw_proto" >/dev/null 2>&1 || \
+firewall-cmd --add-port="$fw_port/$fw_proto" >/dev/null 2>&1 || fw_fail=1
+[ "$fw_owned" = yes ] && firewall_record_owned firewalld any "$fw_proto" "$fw_port"
+done < "$fw_desired"
+return "$fw_fail"
+}
+
+firewall_apply_iptables_family(){
+local fw_command=$1 fw_desired=$2 fw_proto fw_port fw_fail=0 fw_applied=no fw_global=no
+command -v "$fw_command" >/dev/null 2>&1 || return 2
+"$fw_command" -S INPUT >/dev/null 2>&1 || return 2
+firewall_iptables_global_restrictive "$fw_command" && fw_global=yes
+while IFS=: read -r fw_proto fw_port; do
+[ -n "$fw_proto" ] || continue
+[ "$fw_global" = yes ] || firewall_iptables_port_restricted "$fw_command" "$fw_proto" "$fw_port" || continue
+fw_applied=yes
+if "$fw_command" -C INPUT -p "$fw_proto" --dport "$fw_port" -j ACCEPT >/dev/null 2>&1 || \
+"$fw_command" -C INPUT -p "$fw_proto" --dport "$fw_port" -m comment --comment FHLUN -j ACCEPT >/dev/null 2>&1; then
+continue
+fi
+if "$fw_command" -I INPUT 1 -p "$fw_proto" --dport "$fw_port" -m comment --comment FHLUN -j ACCEPT >/dev/null 2>&1; then
+firewall_record_owned "$fw_command" "$([ "$fw_command" = ip6tables ] && echo ipv6 || echo ipv4)" "$fw_proto" "$fw_port"
+else
+fw_fail=1
+fi
+done < "$fw_desired"
+[ "$fw_applied" = yes ] || return 2
+return "$fw_fail"
+}
+
+apply_lun_firewall_rules(){
+local fw_mode=${1:-normal} fw_desired fw_backend=none fw_fail=0 fw_v4_rc=2 fw_v6_rc=2 fw_tcp fw_udp
+fw_desired=$(mktemp 2>/dev/null) || return 1
+collect_lun_firewall_ports "$HOME/lun" "$fw_desired" || { rm -f "$fw_desired"; return 1; }
+cp -p "$fw_desired" "$HOME/lun/firewall_ports.log" 2>/dev/null || true
+if [ "$(id -u 2>/dev/null)" != 0 ]; then
+[ "$fw_mode" = quiet ] || yellow_line "当前不是 root，无法自动同步系统防火墙端口。"
+rm -f "$fw_desired"
+return 1
+fi
+firewall_prune_owned "$fw_desired" || true
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+fw_backend=UFW
+firewall_apply_ufw "$fw_desired" || fw_fail=1
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+fw_backend=Firewalld
+firewall_apply_firewalld "$fw_desired" || fw_fail=1
+else
+firewall_apply_iptables_family iptables "$fw_desired"
+fw_v4_rc=$?
+firewall_apply_iptables_family ip6tables "$fw_desired"
+fw_v6_rc=$?
+if [ "$fw_v4_rc" -ne 2 ] || [ "$fw_v6_rc" -ne 2 ]; then
+fw_backend=iptables
+if [ "$fw_v4_rc" -eq 1 ] || [ "$fw_v6_rc" -eq 1 ]; then
+fw_fail=1
+fi
+firewall_save_iptables
+elif firewall_native_nft_restrictive; then
+fw_backend="原生 nftables"
+fw_fail=1
+fi
+fi
+fw_tcp=$(grep -c '^tcp:' "$fw_desired" 2>/dev/null || true)
+fw_udp=$(grep -c '^udp:' "$fw_desired" 2>/dev/null || true)
+rm -f "$fw_desired"
+[ "$fw_mode" = quiet ] && return "$fw_fail"
+if [ "$fw_fail" -ne 0 ]; then
+yellow_line "$fw_backend 防火墙未能完整自动放行，请手动核对 $HOME/lun/firewall_ports.log。"
+elif [ "$fw_backend" = none ]; then
+green_line "未检测到启用中的限制型系统防火墙；协议/订阅端口无需新增本机规则。"
+else
+green_line "$fw_backend 已同步风火轮端口：TCP $fw_tcp 项，UDP $fw_udp 项。"
+fi
+if is_nat_mode; then
+yellow_line "系统防火墙只放行内网监听端口；服务商 NAT 公网端口映射和云安全组仍需手动配置。"
+else
+yellow_line "系统防火墙已处理；云服务商安全组仍需放行对应公网 TCP/UDP 端口。"
+fi
+return "$fw_fail"
+}
+
+remove_lun_firewall_rules(){
+local fw_owned="$HOME/lun/firewall_rules.log" fw_backend fw_family fw_proto fw_port
+[ -s "$fw_owned" ] || { rm -f "$HOME/lun/firewall_ports.log"; return 0; }
+while read -r fw_backend fw_family fw_proto fw_port; do
+[ -n "$fw_backend" ] || continue
+firewall_remove_record "$fw_backend" "$fw_family" "$fw_proto" "$fw_port"
+done < "$fw_owned"
+firewall_save_iptables
+rm -f "$fw_owned" "$HOME/lun/firewall_ports.log"
+}
+
 stop_subscription_service(){
 for P in /proc/[0-9]*; do
 [ -r "$P/cmdline" ] || continue
@@ -3210,6 +3501,7 @@ systemctl is-active --quiet lun-agent 2>/dev/null || multiuser_service_start
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-agent status >/dev/null 2>&1 || multiuser_service_start
 fi
+apply_lun_firewall_rules quiet || true
 return 0
 }
 [ -s "$HOME/lun/subport.log" ] || [ -n "$sub" ] || return 0
@@ -3260,6 +3552,7 @@ rm /tmp/crontab.tmp
 fi
 echo "本地订阅服务已刷新。"
 show_port_mapping_hint "$subport"
+apply_lun_firewall_rules quiet || true
 }
 
 cip(){
@@ -4508,6 +4801,7 @@ cleandel(){
 keep_entry=$1
 multiuser_service_stop
 if [ "$keep_entry" != "keep-entry" ]; then
+remove_lun_firewall_rules
 if [ -s "$(multiuser_module_dir)/data/lun.db" ]; then
 multiuser_backup_path="$HOME/lun-multiuser-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
 cp -p "$(multiuser_module_dir)/data/lun.db" "$multiuser_backup_path" 2>/dev/null && echo "多用户数据库已备份：$multiuser_backup_path"
@@ -4556,6 +4850,7 @@ printf "%s警告：此操作将清空所有配置（端口、域名、协议、U
 printf "确认清空配置？输入 yes 确认，其他取消："
 IFS= read -r confirm
 [ "$confirm" = "yes" ] || { echo "已取消。"; return 1; }
+remove_lun_firewall_rules
 stop_lun_owned_processes
 rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu "$HOME/lun"/port_xu "$HOME/lun"/port_xc "$HOME/lun"/port_nv
 rm -f "$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_mode "$HOME/lun"/cert_subject "$HOME/lun"/cert_source "$HOME/lun"/cert.crt "$HOME/lun"/private.key "$HOME/lun"/SHA256.txt
@@ -7985,6 +8280,7 @@ crontab -l 2>/dev/null > /tmp/crontab.tmp
 sed -i '/weblun/d' /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1 || true
 rm -f /tmp/crontab.tmp /etc/local.d/alpinesublun.start
+apply_lun_firewall_rules || true
 green_line "多用户模块安装完成；旧用户、旧 UUID、旧订阅 token 与旧 Shadowsocks 端口均已保留。"
 [ "$mu_legacy_http_internal" -gt 0 ] 2>/dev/null && yellow_line "旧 token 继续使用原 HTTP 端口：内网 $mu_legacy_http_internal / 公网 $mu_legacy_http_public；新设备使用 HTTPS 端口 $mu_sub_public。"
 [ "$mu_ss_port" -gt 0 ] 2>/dev/null && green_line "Shadowsocks 多用户并行端口：内网 $mu_ss_port / 公网 $mu_ss_public。"
@@ -8547,6 +8843,8 @@ show_nat_help(){
 ui_title "Lun NAT / 端口池说明"
 echo "NAT 映射格式：公网端口-内网监听端口，多个映射用空格分隔。"
 echo "脚本只改变客户端节点和订阅端口，不创建服务商端口转发，也不写 NAT iptables。"
+green_line "协议和订阅的内网监听端口会自动同步到 UFW、Firewalld 或限制型 iptables。"
+yellow_line "云安全组与服务商公网端口映射无法由 VPS 内脚本代办，仍需手动配置。"
 echo "内网端口池是协议实际监听端口；外网端口池是公网入口，两组按位置自动对应。"
 yellow_line "同一内网端口出现多个公网映射时保留首项，后续项会被提示并忽略。"
 red_line "同一公网端口不能指向多个内网端口；此类冲突会拒绝整次输入。"
@@ -8700,7 +8998,11 @@ fi
 ;;
 esac
 done
-sleep 5 && echo "重启完成" && sleep 3 && cip
+sleep 5
+echo "重启完成"
+apply_lun_firewall_rules || true
+sleep 3
+cip
 exit
 fi
 _lun_proc_running2=no
@@ -8735,14 +9037,7 @@ else
 echo "首次安装 Lun：仅在所选协议需要且本机缺少内核时下载。"
 fi
 if [ -n "$oap" ]; then
-setenforce 0 >/dev/null 2>&1
-iptables -P INPUT ACCEPT >/dev/null 2>&1
-iptables -P FORWARD ACCEPT >/dev/null 2>&1
-iptables -P OUTPUT ACCEPT >/dev/null 2>&1
-iptables -F >/dev/null 2>&1
-netfilter-persistent save >/dev/null 2>&1
-echo
-echo "iptables执行开放所有端口"
+yellow_line "oap 兼容参数不再清空防火墙；本版会按实际协议和订阅端口精确放行。"
 fi
 if ! ins; then
 echo "Lun 内核安装失败，未覆盖已有内核或启动不完整服务。"
@@ -8840,6 +9135,7 @@ rc-service iptables save >/dev/null 2>&1
 rc-service ip6tables save >/dev/null 2>&1
 fi
 fi
+apply_lun_firewall_rules || true
 cip
 echo
 else

@@ -335,9 +335,9 @@
         if (!q('domain').value.trim()) warnings.push('NaiveProxy 需要填写与公开证书匹配的服务域名。');
         if (!certMode || ['self', 'ip'].includes(certMode)) warnings.push('NaiveProxy 不能使用自签或 IP-only 证书；请选择 domain/dns，或先在服务器导入公开可信证书。');
       }
-      if (enabled('xupt')) warnings.push('xupt 需要在安全组与防火墙放行所选 UDP 端口。');
-      if (enabled('xcpt')) warnings.push('xcpt 源站需放行 TCP；实验 CDN-UDP 另需客户端到 Cloudflare 的 UDP 443。');
-      if (enabled('nvpt')) warnings.push('nvpt 需要同时放行所选端口的 TCP 与 UDP。');
+      if (enabled('xupt')) warnings.push('xupt 的系统防火墙 UDP 端口由脚本自动放行；云安全组与 NAT 映射仍需手动放行。');
+      if (enabled('xcpt')) warnings.push('xcpt 的系统防火墙 TCP/UDP 由脚本自动放行；实验 CDN-UDP 另需客户端到 Cloudflare 的 UDP 443。');
+      if (enabled('nvpt')) warnings.push('nvpt 的系统防火墙 TCP/UDP 由脚本自动放行；云安全组与 NAT 映射仍需手动放行。');
       if (cdnAutoAdjusted) warnings.push(`已自动使用 ${effectiveCdnPort} 作为默认 Cloudflare 边缘端口，并生成 Origin Rules 回源配置。`);
       if (enabled('xcpt') && effectiveCdnMode === 'rewrite' && xhttpTlsEdgePort !== effectiveCdnPort) warnings.push(`XHTTP TLS 不使用 HTTP ${effectiveCdnPort}，将单独使用 HTTPS ${xhttpTlsEdgePort}。`);
       if (q('cdnym').value.trim() && !q('cfip').value.trim()) warnings.push('cfip 留空时，脚本只会采用从橙云 Host 解析到且不等于本机的边缘 IP；发现灰云会要求手动填写。');
