@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.29.1"
+echo "当前版本：V26.7.29.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -321,30 +321,108 @@ clear_cdn_ip_list(){
 rm -f "$HOME/lun/cdnip" "$HOME/lun"/cdnip[0-9]* 2>/dev/null
 }
 
+valid_ipv4_value(){
+printf '%s\n' "$1" | awk -F. '
+NF != 4 { exit 1 }
+{
+  for (i = 1; i <= 4; i++) {
+    if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+  }
+ }'
+}
+
+valid_cdn_endpoint(){
+cdn_endpoint=$(normalize_host "$1")
+case "$cdn_endpoint" in
+""|*[!0-9A-Za-z:.-]*) return 1 ;;
+esac
+case "$cdn_endpoint" in
+*:*)
+printf '%s\n' "$cdn_endpoint" | grep -Eq '^[0-9A-Fa-f:]+$'
+;;
+*[!0-9.]*)
+printf '%s\n' "$cdn_endpoint" | grep -Eq '^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$'
+;;
+*)
+valid_ipv4_value "$cdn_endpoint"
+;;
+esac
+}
+
+clean_cdn_endpoint_token(){
+cdn_token=$(printf '%s' "$1" | tr -d '\r')
+while :; do
+case "$cdn_token" in
+\**|\"*|\'*|\(*|\{*|\<*) cdn_token=${cdn_token#?} ;;
+*) break ;;
+esac
+done
+case "$cdn_token" in *://*) cdn_token=${cdn_token#*://} ;; esac
+cdn_token=${cdn_token%%#*}
+cdn_token=${cdn_token%%\?*}
+cdn_token=${cdn_token%%/*}
+while :; do
+case "$cdn_token" in
+*\*|*\"|*\'|*\)|*\}|*\>|*,|*";") cdn_token=${cdn_token%?} ;;
+*) break ;;
+esac
+done
+[ -n "$cdn_token" ] || return 1
+case "$cdn_token" in
+\[*\]*)
+cdn_host=${cdn_token#\[}
+cdn_host=${cdn_host%%\]*}
+;;
+*)
+cdn_host=$cdn_token
+cdn_colons=$(printf '%s' "$cdn_host" | tr -cd ':' | wc -c | tr -d ' ')
+if [ "$cdn_colons" = 1 ]; then
+cdn_suffix=${cdn_host##*:}
+valid_port_value "$cdn_suffix" && cdn_host=${cdn_host%:*}
+fi
+;;
+esac
+cdn_host=$(normalize_host "$cdn_host")
+valid_cdn_endpoint "$cdn_host" || return 1
+printf '%s\n' "$cdn_host"
+}
+
+normalize_cdn_ip_input(){
+cdn_normalized=
+cdn_seen=
+for cdn_token in $(printf '%s\n' "$1" | tr ',;\r\n\t' '     '); do
+cdn_host=$(clean_cdn_endpoint_token "$cdn_token") || continue
+case " $cdn_seen " in *" $cdn_host "*) continue ;; esac
+cdn_seen="${cdn_seen:+$cdn_seen }$cdn_host"
+cdn_normalized="${cdn_normalized:+$cdn_normalized }$cdn_host"
+done
+printf '%s\n' "$cdn_normalized"
+}
+
 save_cdn_ip_list(){
+normalized_cdn_ips=$(normalize_cdn_ip_input "$1")
+[ -n "$normalized_cdn_ips" ] || return 1
 clear_cdn_ip_list
 idx=1
 list=
 seen=
-for one in $1; do
-case "$one" in ""|-1) continue ;; esac
-valid_addym "$one" || continue
-one=$(normalize_host "$one")
+for one in $normalized_cdn_ips; do
 case " $seen " in *" $one "*) continue ;; esac
 seen="${seen:+$seen }$one"
 list="${list:+$list }$one"
 printf "%s\n" "$one" > "$HOME/lun/cdnip$idx"
 idx=$((idx + 1))
 done
-[ -n "$list" ] && printf "%s\n" "$list" > "$HOME/lun/cdnip"
+printf "%s\n" "$list" > "$HOME/lun/cdnip"
+cfip="$list"
 }
 
 load_cdn_mode_config(){
 [ -z "$cdnym" ] && [ -s "$HOME/lun/cdnym" ] && cdnym=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 if [ -n "$cfip" ]; then
 case "$cfip" in
-del|none|off) clear_cdn_ip_list; cfip= ;;
-*) save_cdn_ip_list "$cfip" ;;
+del|none|off|-1) clear_cdn_ip_list; cfip= ;;
+*) save_cdn_ip_list "$cfip" || { echo "cfip 未识别到有效的 IPv4、IPv6 或域名。"; exit 1; } ;;
 esac
 fi
 if [ -n "$cdnmode" ]; then
@@ -4992,6 +5070,23 @@ return 0
 done
 }
 
+lun_version_is_older(){
+awk -v candidate="$1" -v current="$2" 'BEGIN {
+  gsub(/^V/, "", candidate)
+  gsub(/^V/, "", current)
+  nc = split(candidate, c, ".")
+  nn = split(current, n, ".")
+  total = nc > nn ? nc : nn
+  for (i = 1; i <= total; i++) {
+    cv = (i <= nc ? c[i] + 0 : 0)
+    nv = (i <= nn ? n[i] + 0 : 0)
+    if (cv < nv) exit 0
+    if (cv > nv) exit 1
+  }
+  exit 1
+ }'
+}
+
 update_lun_script(){
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
 target="/usr/bin/lun"
@@ -4999,8 +5094,35 @@ else
 target="$HOME/bin/lun"
 mkdir -p "$HOME/bin"
 fi
-download_lun_script "$target" || { echo "Lun 脚本更新失败，请检查网络后重试。"; return 1; }
-echo "Lun 脚本更新完成：$target"
+update_stage="${target}.update.$$"
+rm -f "$update_stage"
+current_lun_version=$(sed -n 's/.*当前版本：\(V[^"]*\)".*/\1/p' "$target" 2>/dev/null | head -n 1)
+yellow_line "正在检查 Lun 更新，请稍候……"
+if ! download_lun_script "$update_stage"; then
+rm -f "$update_stage"
+red_line "Lun 脚本更新失败：无法下载远端脚本，请检查网络后重试。"
+return 1
+fi
+new_lun_version=$(sed -n 's/.*当前版本：\(V[^"]*\)".*/\1/p' "$update_stage" 2>/dev/null | head -n 1)
+if [ -z "$new_lun_version" ] || ! grep -q 'Lun 项目地址' "$update_stage" 2>/dev/null || ! sh -n "$update_stage" 2>/dev/null; then
+rm -f "$update_stage"
+red_line "远端文件不是有效的 Lun 脚本，已拒绝覆盖当前版本。"
+return 1
+fi
+if [ -n "$current_lun_version" ] && lun_version_is_older "$new_lun_version" "$current_lun_version"; then
+rm -f "$update_stage"
+yellow_line "远端版本 $new_lun_version 低于当前 $current_lun_version，已拒绝降级。"
+return 0
+fi
+if [ -s "$target" ] && cmp -s "$target" "$update_stage" 2>/dev/null; then
+rm -f "$update_stage"
+green_line "当前已是最新版：${current_lun_version:-$new_lun_version}"
+return 0
+fi
+mv "$update_stage" "$target" || { rm -f "$update_stage"; red_line "Lun 脚本替换失败：$target"; return 1; }
+chmod +x "$target"
+green_line "Lun 脚本更新完成：${current_lun_version:-未知} → $new_lun_version"
+yellow_line "新版本将在下次运行 lun 时完全生效。"
 }
 
 lun_menu(){
@@ -5028,7 +5150,7 @@ case "$menu_choice" in
 5) LUN_MENU_ACTION=res; break ;;
 6) LUN_MENU_ACTION=upx; break ;;
 7) LUN_MENU_ACTION=ups; break ;;
-8) update_lun_script; exit ;;
+8) update_lun_script; ui_pause ;;
 9) LUN_MENU_ACTION=del; break ;;
 0|"") exit ;;
 *) echo "输入错误，请重新选择。" ;;
@@ -6708,7 +6830,7 @@ done
 prompt_cdn_ips(){
 current_ips=$(cdn_ip_list | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 while :; do
-printf "优选 IP/域名%s（多个空格分隔；空配置时回车自动解析橙云 Host；0 返回）：" "${current_ips:+，当前 $current_ips}"
+printf "优选 IP/域名%s（支持 IP:端口#测速备注；空配置时回车自动解析橙云 Host；0 返回）：" "${current_ips:+，当前 $current_ips}"
 IFS= read -r val
 [ "$val" = 0 ] && return 2
 if [ -z "$val" ]; then
@@ -6722,13 +6844,20 @@ fi
 yellow_line "没有从 CDN Host 发现 Cloudflare 边缘 IP。请先开启橙云，或手动填写已验证的 CF 优选 IP/域名。"
 continue
 fi
-bad=
-for one in $val; do
-case "$one" in -1) bad=yes ;; *) valid_addym "$one" || bad=yes ;; esac
+case "$val" in
+*#*|*"Mbps"*|*"ms]"*)
+yellow_line "检测到测速列表格式：继续粘贴剩余行，最后输入空行完成。"
+while IFS= read -r extra_line; do
+[ -n "$extra_line" ] || break
+val="$val
+$extra_line"
 done
-[ -z "$bad" ] || { echo "只接受 IPv4、IPv6 或域名。"; continue; }
-cfip="$val"
-save_cdn_ip_list "$cfip"
+;;
+esac
+cfip=$(normalize_cdn_ip_input "$val")
+[ -n "$cfip" ] || { echo "没有识别到有效的 IPv4、IPv6 或域名。"; continue; }
+save_cdn_ip_list "$cfip" || continue
+green_line "优选入口已清洗并保存：$cfip"
 return 0
 done
 }
@@ -8039,7 +8168,7 @@ case "$c" in
 1) LUN_MENU_ACTION=res; return ;;
 2) stop_lun_services; echo "已停止 Lun 服务。"; exit ;;
 3) log_menu ;;
-4) update_lun_script; exit ;;
+4) update_lun_script; ui_pause ;;
 5) LUN_MENU_ACTION=upx; return ;;
 6) LUN_MENU_ACTION=ups; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
