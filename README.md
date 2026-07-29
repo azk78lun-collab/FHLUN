@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.7.29.2`。
+当前脚本版本：`V26.7.29.7`。
 
 ## 致谢与上游
 
@@ -42,7 +42,7 @@ lun
 0. 退出
 ```
 
-引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 14 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、Cloudflare Origin Rules（端口回源）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。协议选择和增删改界面共用对齐表格，分别显示选择状态、监听/公网端口以及直连、CDN 优选、端口回源、CF 隧道能力，支持项使用绿色 `✓`。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 14 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、Cloudflare Origin Rules（端口回源）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
 “安装 / 协议管理”中的增删改操作会停止旧协议进程并重写 Xray/Sing-box 配置，这是让新增、删除和端口修改生效的必要步骤；已有内核、证书、UUID 与订阅设置会保留，只有所选协议需要的内核文件确实缺失时才下载。重建前会创建事务快照，SSH 断线、命令中断或新配置校验失败时自动恢复旧配置和服务，成功后保留 `~/lun/.last_good_rebuild`。状态区会区分“运行中”“已安装但未运行”“内核已安装但当前协议未使用”和“未安装”。
 
@@ -74,22 +74,24 @@ Xray 使用本机 API 统计用户流量，配额或到期触发时优先动态�
 
 变量值为空表示随机端口，填写数字表示指定端口。
 
-| 协议 | 变量 |
-| --- | --- |
-| VLESS TCP Reality Vision | `vlpt` |
-| VLESS XHTTP Reality ENC | `xhpt` |
-| VLESS XHTTP ENC | `vxpt` |
-| VLESS WS ENC | `vwpt` |
-| Shadowsocks-2022 | `sspt` |
-| AnyTLS | `anpt` |
-| Any-Reality | `arpt` |
-| VMess WS | `vmpt` |
-| Socks5 | `sopt` |
-| Hysteria2 | `hypt` |
-| TUIC | `tupt` |
-| VLESS XHTTP TLS UDP | `xupt` |
-| VLESS XHTTP TLS TCP/UDP | `xcpt` |
-| NaiveProxy H2/H3 | `nvpt` |
+| 协议 | 变量 | CDN 优选 | Origin Rules 端口回源 | CF 隧道 / Argo |
+| --- | --- | --- | --- | --- |
+| VLESS TCP Reality Vision | `vlpt` | 否 | 否 | 否 |
+| VLESS XHTTP Reality ENC | `xhpt` | 否 | 否 | 否 |
+| VLESS XHTTP ENC | `vxpt` | 是 | 是 | 否 |
+| VLESS WS ENC | `vwpt` | 是 | 是 | 是 |
+| Shadowsocks-2022 | `sspt` | 否 | 否 | 否 |
+| AnyTLS | `anpt` | 否 | 否 | 否 |
+| Any-Reality | `arpt` | 否 | 否 | 否 |
+| VMess WS | `vmpt` | 是 | 是 | 是 |
+| Socks5 | `sopt` | 否 | 否 | 否 |
+| Hysteria2 | `hypt` | 否 | 否 | 否 |
+| TUIC | `tupt` | 否 | 否 | 否 |
+| VLESS XHTTP TLS UDP（H3-only） | `xupt` | 否 | 否 | 否 |
+| VLESS XHTTP TLS TCP/UDP | `xcpt` | 是（TCP；实验 UDP 443） | 是 | 否 |
+| NaiveProxy H2/H3 | `nvpt` | 否 | 否 | 否 |
+
+这里的“CF 隧道 / Argo”指当前 Lun 已实现的普通 Public Hostname 节点，只绑定 VLESS WS 或 VMess WS。Cloudflare Tunnel 理论上还能发布其它 HTTP/TCP 服务，但那些模式不属于本项目现有节点输出。Origin Rules 只作用于 Cloudflare HTTP(S) 请求，因此 Reality、任意 TCP/UDP、QUIC/H3-only 和 Naive CONNECT 不能因为改写了端口就自动变成可用 CDN 协议。
 
 示例：
 
@@ -161,12 +163,12 @@ CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点
 **使用条件：**
 1. 设置 `cdnym`：Cloudflare 接收请求时使用的 Host 域名。
 2. 设置 `cfip`：可混合填写多个 IPv4、IPv6 或域名，也可直接粘贴 `108.162.198.211:2083#JP 电信优选[64ms 160Mbps]` 一类单行或多行测速结果。脚本会自动删除端口、`#` 备注、延迟/带宽说明并去重，只保存干净地址；原有 `1.1.1.1 2.2.2.2` 格式保持兼容。留空时只采用从已橙云 `cdnym` 解析到且不等于本机公网地址的 IP；无法确认橙云时不会再自动塞入第三方优选域名。
-3. 客户端直接连接 `cfip` 时，不依赖客户端把 `cdnym` 解析到哪个地址；脚本以实际 CF 边缘诊断为准。直接使用 `cdnym` 作为入口时应开启橙云。
-4. 默认生成 VLESS XHTTP CDN；`xcpt` 只在 Cloudflare HTTPS 边缘端口生成 CDN-TCP，WS 协议保留直连；需要旧式多协议输出时设置 `cdnproto=all`。
+3. 客户端直接连接 `cfip` 时，不依赖客户端把 `cdnym` 解析到哪个地址，但 Host 对应的 DNS 记录仍必须开启橙云，Cloudflare 才会承载该 Host 并执行 Origin Rules。脚本以实际 CF 边缘诊断为准。
+4. 一键 CDN 在只安装 XHTTP 类协议时使用 `cdnproto=xhttp`；检测到 VLESS WS 或 VMess WS 时自动切换为 `cdnproto=all`，同时生成对应 WS CDN 节点。`xcpt` 只在 Cloudflare HTTPS 边缘端口生成 CDN-TCP。
 
-**默认 CDN 协议：** VLESS XHTTP（非 Reality）与已启用的 VLESS XHTTP TLS
-**高级兼容协议：** 设置 `cdnproto=all` 后额外生成 VMess WS、VLESS WS
-**不支持 CDN 的协议：** Reality、XHTTP TLS UDP（`xupt`）、NaiveProxy、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
+**`cdnproto=xhttp`：** VLESS XHTTP（非 Reality）与已启用的 VLESS XHTTP TLS
+**`cdnproto=all`：** 在上项基础上额外生成 VMess WS、VLESS WS；菜单检测到已安装 WS 类协议时自动采用
+**不支持普通 CDN 的协议：** Reality、XHTTP TLS UDP（`xupt`）、NaiveProxy、AnyTLS、Hysteria2、TUIC、Shadowsocks、Socks5（保留直连节点）
 
 Cloudflare 橙云支持端口：
 
@@ -180,13 +182,17 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 **激进 443 测试模式：** 如果要测试 XHTTP TLS CDN-UDP 的 443 直回源，必须在协议端口提示处手动输入 `443`，不能依赖回车随机。443 可能已被 Nginx、Web 面板或其他服务占用；首次设置前请使用 `ss -ltnp` 或 `lsof -i:443` 查明 PID，确认业务影响后手动停止服务或 `kill` 对应 PID。Lun 不会自动杀掉未知占用进程。`xcpt=443` 时为 443→443，不需要 Origin Rule；若 443 不能献祭，则使用其他 HTTPS 源站端口，并为 Cloudflare 边缘 443 配置 Origin Rule。
 
-普通 VPS 在协议端口本身属于 Cloudflare 官方端口时可以继续使用同端口 CDN；协议端口不适合 CF 时，脚本自动启用 Origin Rules。XHTTP TLS 的实验 CDN-UDP 固定需要 Cloudflare 边缘 `443`，但源站不必监听 `443`，可用 Origin Rule 将 `443` 回源到随机分配的 `8443/2053/2083/2087/2096` 等 HTTPS 源站端口。普通 VPS 的规则目标是本机协议监听端口，NAT VPS 的规则目标是该协议的 NAT 公网映射端口。例如映射为 `56567 → 8080` 时，节点使用边缘端口 `8080`，规则目标端口填写 `56567`。不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + URI Path` 精确表达式。`xcpt` 使用 `UUID-xc` 路径，菜单会与原有 `UUID-vx` 分别输出规则及边缘端口。
+普通 VPS 在协议端口本身属于 Cloudflare 官方端口时可以继续使用同端口 CDN；协议端口不适合 CF 时，脚本自动启用 Origin Rules。XHTTP TLS 的实验 CDN-UDP 固定需要 Cloudflare 边缘 `443`，但源站不必监听 `443`，可用 Origin Rule 将 `443` 回源到随机 HTTPS 源站端口。普通 VPS 的规则目标是本机协议监听端口，NAT VPS 的规则目标是该协议的 NAT 公网映射端口。例如 `xcpt` 为内网 `8080`、映射 `56567 → 8080` 时，XHTTP TLS 节点使用 Cloudflare 边缘 `443`，而 Origin Rule 的目标端口填写公网 `56567`。不要把内网 `8080` 当成 TLS 节点边缘端口，也不要只按 HTTP/HTTPS 分流；必须使用菜单输出的 `http.host + ssl + UUID-xc Path` 精确表达式。普通明文 `vxpt` 才使用 `UUID-vx` 及其对应的 HTTP 边缘端口。
 
-NAT VPS 需要三层设置：先在服务商/端口转发处建立“公网端口 → 内网监听端口”，再在 `lun → 入口网络管理 → Cloudflare Origin Rules` 使用菜单显示的 Host + Path 规则；Origin Rule 目标填写公网 NAT 端口，不是内网端口，Cloudflare 不能代替服务商映射。风火轮会自动放行系统防火墙中的内网监听端口，但服务商安全组与公网 NAT 映射仍需手动完成。最后刷新订阅。若公网映射本身不是 CF 官方端口，也必须使用 Origin Rules 回源，不能把内网端口直接当成 CDN 节点端口。
+NAT VPS 需要先在服务商/端口转发处建立“公网端口 → 内网监听端口”。随后进入 `lun → 入口网络管理 → Cloudflare Origin Rules` 选择“一键自动部署 / 修复”；Lun 会读取 NAT 映射，把 Origin Rule 目标自动设为公网 NAT 端口，并完成验证和订阅刷新。风火轮会自动放行系统防火墙中的内网监听端口；服务商安全组与公网 NAT 映射仍由服务商控制。若公网映射本身不是 CF 官方边缘端口，也可以由 Origin Rules 回源，不能把内网端口直接写成 CDN 节点端口。
+
+首次自动配置会要求粘贴一次 Cloudflare API Token，之后保存在 `~/lun/cdn_cloudflare_token`（权限 `600`）。Token 只需当前区域的 `Zone Read`、`DNS Edit`、`Origin Rules Edit`、`Zone Settings Edit`。一键部署会自动开启该 Host 的橙云，按 `Host + 边缘端口 + TLS + UUID Path` 写入精确回源规则，将规则排在现有规则之后，按证书设置 Full/Full (Strict)，在 XHTTP TLS 443 模式开启 HTTP/3，等待生效后验证并刷新订阅。脚本只替换同一 Host 的旧 `tls/nottls` 宽泛规则及自身创建的规则，其它用户规则会保留；更新规则前会在 `~/lun/cdn_cloudflare_backup.json` 保存快照，API 中途失败会自动回滚。
+
+“输入单协议回源端口”支持直接粘贴 NAT 公网端口。例如输入 `56567` 且现有映射为 `56567→8080` 时，Lun 会自动把所选协议的真实监听端口迁移到内网 `8080`，重建配置并将 Cloudflare 回源目标设为公网 `56567`；普通 VPS 则直接迁移到输入端口。若多个协议错误共用同一内网端口，“一键自动部署 / 修复”会优先从未占用的 NAT 映射和对应 CF HTTP/HTTPS 端口中自动拆分，避免 Xray `SO_REUSEPORT` 随机命中错误入站。
 
 HTTPS 端口组会让 Lun 为 CDN 兼容入站启用源站 TLS。自签证书在 Cloudflare 使用 Full；匹配 Host 的公开 CA 或 Cloudflare Origin CA 证书可使用 Full (Strict)。切换边缘端口只重建配置并重启服务，不重新下载内核。
 
-`xcpt` 的 CDN-TCP 只会在 Cloudflare 官方 HTTPS 边缘端口生成。实验性 CDN-UDP 只会在边缘端口严格为 `443` 时生成；还必须让 DNS 记录保持橙云代理状态并在 Cloudflare 开启 HTTP/3，因为 HTTP/3 使用 QUIC/UDP 443。若条件不满足，脚本只显示警告，不会把 UDP 节点伪装成可用配置。参考 [Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/) 与 [Cloudflare 代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)。
+`xcpt` 的 CDN-TCP 只会在 Cloudflare 官方 HTTPS 边缘端口生成。实验性 CDN-UDP 只会在边缘端口严格为 `443` 且实测入口公布 HTTP/3 时生成，因为 HTTP/3 使用 QUIC/UDP 443。手动填写 CF 优选 IP 只会改变客户端连接的边缘地址，不能替灰云 Host 创建 Cloudflare 路由；灰云偶尔命中仍留存的边缘配置不属于官方保证。稳定用法是让 Host 开启橙云，并以 Lun 的实际连通诊断为准。若条件不满足，脚本只显示警告，不会把 UDP 节点伪装成可用配置。参考 [Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/) 与 [Cloudflare 代理端口](https://developers.cloudflare.com/fundamentals/reference/network-ports/)。
 
 刷新订阅时，脚本还会比较“本机 Xray 入站响应”与每个 Cloudflare HTTPS 入口的实际响应。只有入口确实经过 Cloudflare，且 Host + `UUID-xc` Path 已按默认同端口或 Origin Rule 回源到 `xcpt` 源站端口时，才输出对应 CDN-TCP；同一入口还公布 HTTP/3 时才输出实验 CDN-UDP。源站不是 443 却未配置 Origin Rule、请求落到 Nginx 443 或边缘探测失败时会明确跳过，不再生成在 v2rayN 中显示 `-1` 的伪可用节点。
 
@@ -204,7 +210,7 @@ vxpt="" cdnym="proxy.example.com" cfip="108.162.198.31 2606:4700::6810:1234" cdn
 xcpt="" cdnym="proxy.example.com" cfip="108.162.198.31" bash <(curl -Ls https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 ```
 
-需要实验 CDN-UDP 时，若 `xcpt` 不是 443，在 Origin Rules 中将边缘 `443` 按 `UUID-xc` Path 回源到该 XHTTP TLS 源站端口；若 `xcpt=443` 则使用默认 443→443。两种模式都要开启橙云与 HTTP/3。
+需要实验 CDN-UDP 时，进入 Origin Rules 选择一键部署即可：若 `xcpt` 不是 443，Lun 自动把边缘 `443` 按 `UUID-xc` Path 回源到该 XHTTP TLS 源站端口；若 `xcpt=443` 则使用 443→443，并自动开启 HTTP/3。手动 CF 优选 IP 不能替灰云 Host 建立边缘路由，一键部署会自动开启橙云并执行连通诊断。
 
 NAT VPS Origin Rules：
 

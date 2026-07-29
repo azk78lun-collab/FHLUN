@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.29.2"
+echo "当前版本：V26.7.29.7"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -569,6 +569,14 @@ cdn_protocol_enabled vmess && { [ "$vmp" = yes ] || [ -n "${port_vm_ws:-}" ] || 
 return 1
 }
 
+cdn_has_origin_rule_protocol(){
+{ [ "$vxp" = yes ] || [ -n "${port_vx:-}" ] || [ -s "$HOME/lun/port_vx" ]; } && return 0
+{ [ "$vwp" = yes ] || [ -n "${port_vw:-}" ] || [ -s "$HOME/lun/port_vw" ]; } && return 0
+{ [ "$vmp" = yes ] || [ -n "${port_vm_ws:-}" ] || [ -s "$HOME/lun/port_vm_ws" ]; } && return 0
+{ [ "$xcp" = yes ] || [ -n "${port_xc:-}" ] || [ -s "$HOME/lun/port_xc" ]; } && return 0
+return 1
+}
+
 cdn_origin_is_xhttp_tls(){
 origin=$1
 xc_origin=$(cdn_protocol_state_port "${port_xc:-}" "$HOME/lun/port_xc")
@@ -614,7 +622,9 @@ old_tls=no
 [ "$old_mode" = rewrite ] && is_cf_https_port "$old_port" && old_tls=yes
 
 if [ "$cdnmode" = rewrite ]; then
-if ! { is_cf_http_port "$cdnpt" || is_cf_https_port "$cdnpt"; }; then
+if cdn_has_generic_protocol && ! is_cf_http_port "$cdnpt"; then
+cdnpt=$(cdn_recommended_edge_port)
+elif ! { is_cf_http_port "$cdnpt" || is_cf_https_port "$cdnpt"; }; then
 cdnpt=$(cdn_recommended_edge_port)
 elif cdn_has_xhttp_tls && ! cdn_has_generic_protocol && ! is_cf_https_port "$cdnpt"; then
 cdnpt=443
@@ -5807,7 +5817,7 @@ echo "Cloudflare 支持但缓存已禁用：2052/2053/2082/2083/2086/2087/2095/2
 if cdn_rewrite_active; then
 echo "当前模式：Origin Rules 端口改写。客户端连接 Cloudflare 边缘端口 ${cdnpt:-8080}，Cloudflare 再回源到每个协议的源站端口。"
 is_cf_https_port "${cdnpt:-8080}" && echo "${cdnpt:-8080} 为 HTTPS：Lun 会启用源站 TLS；Cloudflare 自签证书使用 Full，匹配域名的有效证书可使用 Full (Strict)。"
-cdn_has_xhttp_tls && ! is_cf_https_port "${cdnpt:-8080}" && echo "VLESS XHTTP TLS 不使用 HTTP 边缘端口，将单独使用 HTTPS 443；请按 Host + UUID-xc Path 配置 Origin Rules。"
+    cdn_has_xhttp_tls && ! is_cf_https_port "${cdnpt:-8080}" && echo "VLESS XHTTP TLS 不使用 HTTP 边缘端口，将单独使用 HTTPS 443；Origin Rules 一键部署会自动按 Host + UUID-xc Path 配置。"
 else
 echo "当前模式：普通 CDN 优选。客户端直接连接优选入口，端口与协议公网端口相同；不使用 Origin Rules。"
 fi
@@ -5990,8 +6000,9 @@ if [ "$_cdn_probe_rc" -ne 0 ]; then rm -f "$_cdn_probe_header" "$_cdn_probe_body
 _cdn_probe_sum=$(cksum < "$_cdn_probe_body" | awk '{print $1 ":" $2}')
 if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$_cdn_probe_header"; then _cdn_probe_cf=yes; else _cdn_probe_cf=no; fi
 if grep -Eqi '^alt-svc:.*h3' "$_cdn_probe_header"; then _cdn_probe_h3=yes; else _cdn_probe_h3=no; fi
+if grep -Eqi '^via:.*apple\.com' "$_cdn_probe_header"; then _cdn_probe_route=reality-apple; else _cdn_probe_route=expected-or-unknown; fi
 rm -f "$_cdn_probe_header" "$_cdn_probe_body"
-printf '%s:%s|%s|%s\n' "$_cdn_probe_code" "$_cdn_probe_sum" "$_cdn_probe_cf" "$_cdn_probe_h3"
+printf '%s:%s|%s|%s|%s\n' "$_cdn_probe_code" "$_cdn_probe_sum" "$_cdn_probe_cf" "$_cdn_probe_h3" "$_cdn_probe_route"
 }
 
 append_xhttp_tls_cdn_links(){
@@ -6025,9 +6036,17 @@ edge_result=$(cdn_xhttp_edge_probe "$xvvmcdnym" "$edge_port" "$cdn_ip" "$uuid-xc
 edge_signature=${edge_result%%|*}
 edge_rest=${edge_result#*|}
 edge_through_cf=${edge_rest%%|*}
-edge_h3=${edge_rest#*|}
+edge_rest=${edge_rest#*|}
+edge_h3=${edge_rest%%|*}
+edge_route=${edge_rest#*|}
 if [ -z "$edge_result" ] || [ "$edge_through_cf" != yes ] || [ "$edge_signature" != "$local_signature" ]; then
-cdn_skip "入口 $cdn_ip:$edge_port 未按 Host + UUID-xc Path 回源到源站端口 $origin_public_port，已跳过该 TCP/UDP 节点。请先配置 Cloudflare Origin Rule 后刷新订阅。"
+if [ "$edge_route" = reality-apple ]; then
+reality_public=
+[ -s "$HOME/lun/port_xh" ] && reality_public=$(client_port "$(cat "$HOME/lun/port_xh" 2>/dev/null)")
+cdn_skip "入口 $cdn_ip:$edge_port 已进入 Cloudflare，但当前回源落到了 Reality/Apple 伪装${reality_public:+（公网端口 $reality_public）}，不是 XHTTP TLS。请删除只按 SSL/HTTPS 分流的旧 tls/nottls 规则，并把 UUID-xc 精确规则的目标端口改为 $origin_public_port。"
+else
+        cdn_skip "入口 $cdn_ip:$edge_port 尚未按 Host + UUID-xc Path 回源到源站端口 $origin_public_port，已暂缓输出该 TCP/UDP 节点。请进入“Cloudflare Origin Rules”选择“一键自动部署 / 修复”；Lun 会直接写入规则、验证并刷新订阅。"
+fi
 continue
 fi
 cdn_index=$((cdn_index + 1))
@@ -6666,6 +6685,773 @@ esac
 # 数据流向：客户端 → cfip（CF入口）→ cdnym（你的域名）→ VPS服务
 # 效果：隐藏 VPS 真实 IP，通过 CDN 中转提升连接稳定性和速度
 # 限制：只有 VMess WS、VLESS WS、VLESS XHTTP（非Reality）与 VLESS XHTTP TLS 支持
+ensure_cloudflare_origin_helper(){
+command -v python3 >/dev/null 2>&1 || {
+yellow_line "自动配置 Cloudflare 需要 Python 3，正在安装……"
+if command -v apk >/dev/null 2>&1; then
+apk add --no-cache python3 >/dev/null 2>&1
+elif command -v apt-get >/dev/null 2>&1; then
+apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1
+elif command -v dnf >/dev/null 2>&1; then
+dnf install -y python3 >/dev/null 2>&1
+elif command -v yum >/dev/null 2>&1; then
+yum install -y python3 >/dev/null 2>&1
+fi
+}
+command -v python3 >/dev/null 2>&1 || { red_line "Python 3 安装失败，无法调用 Cloudflare API。"; return 1; }
+mkdir -p "$HOME/lun"
+cat > "$HOME/lun/cdn_cloudflare_api.py" <<'PY'
+#!/usr/bin/env python3
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
+BASE = os.environ.get("CF_LUN_API_BASE", "https://api.cloudflare.com/client/v4").rstrip("/")
+TOKEN = os.environ.get("CF_LUN_TOKEN", "").strip()
+HOST = os.environ.get("CF_LUN_HOST", "").strip().lower().rstrip(".")
+BACKUP = os.environ.get("CF_LUN_BACKUP", "")
+STATE = os.environ.get("CF_LUN_STATE", "")
+
+
+class ApiError(RuntimeError):
+    pass
+
+
+def api(method, path, payload=None):
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        BASE + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": "Bearer " + TOKEN,
+            "Content-Type": "application/json",
+            "User-Agent": "FHLUN-Origin-Rules/1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            doc = json.loads(raw)
+            messages = "; ".join(str(item.get("message", "")) for item in doc.get("errors", []))
+        except (ValueError, AttributeError):
+            messages = raw[:300]
+        raise ApiError("HTTP %s: %s" % (exc.code, messages or exc.reason))
+    except urllib.error.URLError as exc:
+        raise ApiError("连接 Cloudflare API 失败: %s" % exc.reason)
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        raise ApiError("Cloudflare API 返回了无效 JSON")
+    if not doc.get("success"):
+        messages = "; ".join(str(item.get("message", "")) for item in doc.get("errors", []))
+        raise ApiError(messages or "Cloudflare API 请求失败")
+    return doc.get("result"), doc
+
+
+def atomic_json(path, value):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+
+
+def find_zone():
+    zones = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode({"per_page": 50, "page": page})
+        result, doc = api("GET", "/zones?" + query)
+        zones.extend(result or [])
+        pages = int((doc.get("result_info") or {}).get("total_pages") or 1)
+        if page >= pages:
+            break
+        page += 1
+    matches = [
+        zone for zone in zones
+        if HOST == str(zone.get("name", "")).lower()
+        or HOST.endswith("." + str(zone.get("name", "")).lower())
+    ]
+    if not matches:
+        raise ApiError("Token 看不到 %s 所属区域，请检查 Zone Read 权限和区域范围" % HOST)
+    return max(matches, key=lambda zone: len(str(zone.get("name", ""))))
+
+
+def clean_rule(rule):
+    allowed = ("action", "action_parameters", "description", "enabled", "expression", "ref", "logging")
+    cleaned = {key: rule[key] for key in allowed if key in rule}
+    cleaned.setdefault("enabled", True)
+    return cleaned
+
+
+def parse_specs():
+    specs = []
+    for line in os.environ.get("CF_LUN_RULES", "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", 5)
+        if len(parts) != 6:
+            raise ApiError("内部规则格式错误")
+        proto, edge, origin, tls, path, label = parts
+        edge, origin = int(edge), int(origin)
+        if not 1 <= edge <= 65535 or not 1 <= origin <= 65535:
+            raise ApiError("规则端口超出范围")
+        if not re.fullmatch(r"[0-9A-Za-z_-]+", path):
+            raise ApiError("协议 Path 包含不安全字符")
+        specs.append({
+            "proto": proto,
+            "edge": edge,
+            "origin": origin,
+            "tls": tls == "yes",
+            "path": path,
+            "label": label,
+        })
+    if not specs:
+        raise ApiError("没有可自动配置的 CDN 协议")
+    return specs
+
+
+def expression_quote(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def desired_rules(specs):
+    grouped = {}
+    for spec in specs:
+        grouped.setdefault(spec["origin"], []).append(spec)
+    rules = []
+    quoted_host = expression_quote(HOST)
+    for origin, items in grouped.items():
+        clauses = []
+        for item in items:
+            clause = '(http.host eq "%s" and cf.edge.server_port eq %d' % (quoted_host, item["edge"])
+            if item["tls"]:
+                clause += " and ssl"
+            clause += ' and starts_with(http.request.uri.path, "/%s"))' % expression_quote(item["path"])
+            clauses.append(clause)
+        expression = clauses[0] if len(clauses) == 1 else "(" + " or ".join(clauses) + ")"
+        labels = ", ".join(item["label"] for item in items)
+        ref_hash = hashlib.sha256((HOST + "|" + str(origin)).encode()).hexdigest()[:20]
+        rules.append({
+            "action": "route",
+            "action_parameters": {"origin": {"port": origin}},
+            "description": "FHLUN %s 自动回源 %d [%s]" % (HOST, origin, labels),
+            "enabled": True,
+            "expression": expression,
+            "ref": "fhlun_" + ref_hash,
+        })
+    return rules
+
+
+def legacy_conflict(rule):
+    description = re.sub(r"\s+", "", str(rule.get("description", "")).lower())
+    expression = str(rule.get("expression", ""))
+    host_marker = 'http.host eq "%s"' % expression_quote(HOST)
+    return (
+        description in {"tls", "nottls", "notls"}
+        and host_marker in expression
+        and "http.request.uri.path" not in expression
+        and isinstance((rule.get("action_parameters") or {}).get("origin"), dict)
+    )
+
+
+def prepare_dns(zone_id, origin_ips):
+    query = urllib.parse.urlencode({"name": HOST, "per_page": 100})
+    records, _ = api("GET", "/zones/%s/dns_records?%s" % (zone_id, query))
+    records = records or []
+    usable = [
+        record for record in records
+        if record.get("type") in {"A", "AAAA", "CNAME"} and record.get("proxiable", True)
+    ]
+    create = []
+    if not usable:
+        seen = set()
+        for value in origin_ips:
+            value = value.strip().strip("[]")
+            if not value or value in seen:
+                continue
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            seen.add(value)
+            create.append({
+                "type": "A" if address.version == 4 else "AAAA",
+                "name": HOST,
+                "content": value,
+                "ttl": 1,
+                "proxied": True,
+            })
+        if not create:
+            raise ApiError("%s 没有可代理的 A/AAAA/CNAME，且未检测到本机公网 IP" % HOST)
+    return records, usable, create
+
+
+def zone_setting(zone_id, setting_id):
+    result, _ = api("GET", "/zones/%s/settings/%s" % (zone_id, setting_id))
+    return result or {}
+
+
+def rollback(zone_id, original_ruleset, created_ruleset_id, changed_settings, changed_dns, created_dns):
+    errors = []
+    try:
+        if original_ruleset:
+            payload = {
+                "description": original_ruleset.get("description", "Zone-level origin rules"),
+                "rules": [clean_rule(rule) for rule in original_ruleset.get("rules", [])],
+            }
+            api("PUT", "/zones/%s/rulesets/%s" % (zone_id, original_ruleset["id"]), payload)
+        elif created_ruleset_id:
+            api("DELETE", "/zones/%s/rulesets/%s" % (zone_id, created_ruleset_id))
+    except Exception as exc:
+        errors.append("规则回滚失败: %s" % exc)
+    for setting_id, old_value in reversed(changed_settings):
+        try:
+            api("PATCH", "/zones/%s/settings/%s" % (zone_id, setting_id), {"value": old_value})
+        except Exception as exc:
+            errors.append("%s 回滚失败: %s" % (setting_id, exc))
+    for record_id, old_proxied in reversed(changed_dns):
+        try:
+            api("PATCH", "/zones/%s/dns_records/%s" % (zone_id, record_id), {"proxied": old_proxied})
+        except Exception as exc:
+            errors.append("DNS 回滚失败: %s" % exc)
+    for record_id in reversed(created_dns):
+        try:
+            api("DELETE", "/zones/%s/dns_records/%s" % (zone_id, record_id))
+        except Exception as exc:
+            errors.append("新 DNS 删除失败: %s" % exc)
+    return errors
+
+
+def deploy():
+    specs = parse_specs()
+    zone = find_zone()
+    zone_id = zone["id"]
+    origin_ips = os.environ.get("CF_LUN_ORIGIN_IPS", "").split()
+    dns_records, dns_usable, dns_create = prepare_dns(zone_id, origin_ips)
+    ssl_target = os.environ.get("CF_LUN_SSL_MODE", "").strip()
+    http3_target = os.environ.get("CF_LUN_HTTP3", "") == "yes"
+    settings = {}
+    if ssl_target:
+        settings["ssl"] = zone_setting(zone_id, "ssl")
+    if http3_target:
+        settings["http3"] = zone_setting(zone_id, "http3")
+
+    rulesets, _ = api("GET", "/zones/%s/rulesets" % zone_id)
+    phase = next(
+        (
+            item for item in (rulesets or [])
+            if item.get("kind") == "zone" and item.get("phase") == "http_request_origin"
+        ),
+        None,
+    )
+    original_ruleset = None
+    if phase:
+        original_ruleset, _ = api("GET", "/zones/%s/rulesets/%s" % (zone_id, phase["id"]))
+    desired = desired_rules(specs)
+    retained = []
+    if original_ruleset:
+        prefix = "FHLUN %s " % HOST
+        for rule in original_ruleset.get("rules", []):
+            if str(rule.get("description", "")).startswith(prefix) or legacy_conflict(rule):
+                continue
+            retained.append(clean_rule(rule))
+
+    atomic_json(BACKUP, {
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "zone": zone,
+        "dns_records": dns_records,
+        "settings": settings,
+        "ruleset": original_ruleset,
+    })
+
+    created_ruleset_id = None
+    changed_settings = []
+    changed_dns = []
+    created_dns = []
+    try:
+        if original_ruleset:
+            ruleset_result, _ = api(
+                "PUT",
+                "/zones/%s/rulesets/%s" % (zone_id, original_ruleset["id"]),
+                {
+                    "description": original_ruleset.get("description", "Zone-level origin rules"),
+                    "rules": retained + desired,
+                },
+            )
+        else:
+            ruleset_result, _ = api(
+                "POST",
+                "/zones/%s/rulesets" % zone_id,
+                {
+                    "name": "FHLUN Origin Rules",
+                    "description": "FHLUN 自动端口回源",
+                    "kind": "zone",
+                    "phase": "http_request_origin",
+                    "rules": desired,
+                },
+            )
+            created_ruleset_id = ruleset_result["id"]
+
+        if ssl_target:
+            current = str(settings["ssl"].get("value", ""))
+            rank = {"off": 0, "flexible": 1, "full": 2, "strict": 3, "origin_pull": 4}
+            if rank.get(current, 0) < rank.get(ssl_target, 0):
+                api("PATCH", "/zones/%s/settings/ssl" % zone_id, {"value": ssl_target})
+                changed_settings.append(("ssl", current))
+        if http3_target and settings["http3"].get("value") != "on":
+            old_value = settings["http3"].get("value", "off")
+            api("PATCH", "/zones/%s/settings/http3" % zone_id, {"value": "on"})
+            changed_settings.append(("http3", old_value))
+
+        for record in dns_usable:
+            if not record.get("proxied"):
+                api(
+                    "PATCH",
+                    "/zones/%s/dns_records/%s" % (zone_id, record["id"]),
+                    {"proxied": True},
+                )
+                changed_dns.append((record["id"], False))
+        for record in dns_create:
+            created, _ = api("POST", "/zones/%s/dns_records" % zone_id, record)
+            created_dns.append(created["id"])
+    except Exception as exc:
+        rollback_errors = rollback(
+            zone_id, original_ruleset, created_ruleset_id,
+            changed_settings, changed_dns, created_dns,
+        )
+        suffix = ("；" + "；".join(rollback_errors)) if rollback_errors else "；已自动回滚"
+        raise ApiError(str(exc) + suffix)
+
+    atomic_json(STATE, {
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "zone_id": zone_id,
+        "zone_name": zone.get("name"),
+        "host": HOST,
+        "ruleset_id": ruleset_result.get("id"),
+        "rule_refs": [rule["ref"] for rule in desired],
+        "targets": [
+            {"edge": item["edge"], "origin": item["origin"], "path": item["path"]}
+            for item in specs
+        ],
+    })
+    print("ZONE=" + str(zone.get("name", "")))
+    print("HOST=" + HOST)
+    print("DNS=proxied")
+    print("RULES=" + str(len(desired)))
+    if ssl_target:
+        print("SSL=" + ssl_target)
+    if http3_target:
+        print("HTTP3=on")
+    for item in specs:
+        print("ROUTE=%s:%d -> %d /%s" % (item["proto"], item["edge"], item["origin"], item["path"]))
+
+
+def remove():
+    zone = find_zone()
+    zone_id = zone["id"]
+    rulesets, _ = api("GET", "/zones/%s/rulesets" % zone_id)
+    phase = next(
+        (
+            item for item in (rulesets or [])
+            if item.get("kind") == "zone" and item.get("phase") == "http_request_origin"
+        ),
+        None,
+    )
+    removed = 0
+    if phase:
+        details, _ = api("GET", "/zones/%s/rulesets/%s" % (zone_id, phase["id"]))
+        prefix = "FHLUN %s " % HOST
+        kept = []
+        for rule in details.get("rules", []):
+            if str(rule.get("description", "")).startswith(prefix):
+                removed += 1
+            else:
+                kept.append(clean_rule(rule))
+        if removed:
+            api(
+                "PUT",
+                "/zones/%s/rulesets/%s" % (zone_id, phase["id"]),
+                {"description": details.get("description", "Zone-level origin rules"), "rules": kept},
+            )
+    print("REMOVED=" + str(removed))
+
+
+def main():
+    if not TOKEN:
+        raise ApiError("未提供 Cloudflare API Token")
+    action = sys.argv[1] if len(sys.argv) > 1 else ""
+    if action == "verify":
+        result, _ = api("GET", "/user/tokens/verify")
+        if str((result or {}).get("status", "")).lower() not in {"active", ""}:
+            raise ApiError("Token 状态不是 active")
+        print("TOKEN=valid")
+    elif action == "deploy":
+        if not HOST:
+            raise ApiError("未提供 CDN Host")
+        deploy()
+    elif action == "remove":
+        if not HOST:
+            raise ApiError("未提供 CDN Host")
+        remove()
+    else:
+        raise ApiError("未知操作")
+
+
+try:
+    main()
+except (ApiError, ValueError) as exc:
+    print("ERROR=" + str(exc))
+    sys.exit(1)
+PY
+chmod 700 "$HOME/lun/cdn_cloudflare_api.py"
+}
+
+cloudflare_token_file(){
+printf '%s\n' "$HOME/lun/cdn_cloudflare_token"
+}
+
+cloudflare_prompt_token(){
+ensure_cloudflare_origin_helper || return 1
+token_file=$(cloudflare_token_file)
+echo "首次自动配置需要 Cloudflare API Token，之后不再重复询问。"
+echo "Token 权限：Zone Read、DNS Edit、Origin Rules Edit、Zone Settings Edit；资源范围只选当前域名即可。"
+printf "粘贴 Token（输入隐藏，0 返回）："
+old_stty=$(stty -g 2>/dev/null)
+[ -n "$old_stty" ] && stty -echo 2>/dev/null
+IFS= read -r cf_token
+[ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null
+printf "\n"
+[ "$cf_token" = 0 ] && return 2
+case "$cf_token" in
+*CF_Token=*) cf_token=${cf_token#*CF_Token=}; cf_token=${cf_token%%[[:space:]]*} ;;
+esac
+cf_token=$(printf '%s' "$cf_token" | tr -d "\"'[:space:]")
+printf '%s' "$cf_token" | grep -Eq '^[A-Za-z0-9_-]{20,}$' || { red_line "Token 格式不正确。"; return 1; }
+token_check="/tmp/lun-cf-token.$$"
+if CF_LUN_TOKEN="$cf_token" python3 "$HOME/lun/cdn_cloudflare_api.py" verify > "$token_check" 2>&1; then
+umask 077
+printf '%s\n' "$cf_token" > "$token_file"
+chmod 600 "$token_file"
+rm -f "$token_check"
+green_line "Cloudflare API Token 已验证并安全保存。"
+return 0
+fi
+red_line "$(sed -n 's/^ERROR=//p' "$token_check" | sed -n 1p)"
+rm -f "$token_check"
+return 1
+}
+
+cloudflare_require_token(){
+token_file=$(cloudflare_token_file)
+if [ -s "$token_file" ]; then
+return 0
+fi
+cloudflare_prompt_token
+}
+
+cloudflare_protocol_state(){
+case "$1" in
+3) printf 'xhttp|VLESS XHTTP|%s|%s-vx\n' "$HOME/lun/port_vx" "$(cat "$HOME/lun/uuid" 2>/dev/null)" ;;
+4) printf 'ws|VLESS WS|%s|%s-vw\n' "$HOME/lun/port_vw" "$(cat "$HOME/lun/uuid" 2>/dev/null)" ;;
+8) printf 'vmess|VMess WS|%s|%s-vm\n' "$HOME/lun/port_vm_ws" "$(cat "$HOME/lun/uuid" 2>/dev/null)" ;;
+13) printf 'xhttp-tls|VLESS XHTTP TLS|%s|%s-xc\n' "$HOME/lun/port_xc" "$(cat "$HOME/lun/uuid" 2>/dev/null)" ;;
+esac
+}
+
+cloudflare_origin_rule_specs(){
+override_id=$1
+override_port=$2
+for id in 3 13 4 8; do
+state=$(cloudflare_protocol_state "$id")
+[ -n "$state" ] || continue
+proto=${state%%|*}; rest=${state#*|}
+label=${rest%%|*}; rest=${rest#*|}
+file=${rest%%|*}; path=${rest#*|}
+[ -s "$file" ] || continue
+case "$id" in
+3|13) cdn_protocol_enabled xhttp || continue ;;
+4) cdn_protocol_enabled ws || continue ;;
+8) cdn_protocol_enabled vmess || continue ;;
+esac
+inner=$(protocol_current_port "$id")
+[ -n "$inner" ] || inner=$(cat "$file" 2>/dev/null)
+origin=$(client_port "$inner")
+[ "$id" = "$override_id" ] && [ -n "$override_port" ] && origin=$override_port
+edge=$(cdn_client_port "$inner")
+tls=no
+is_cf_https_port "$edge" && tls=yes
+printf '%s|%s|%s|%s|%s|%s\n' "$proto" "$edge" "$origin" "$tls" "$path" "$label"
+done
+}
+
+cloudflare_reset_protocol_changes(){
+CF_CHANGED_PROTOCOLS=
+CLOUDFLARE_PROTOCOL_PORT_CHANGED=no
+}
+
+cloudflare_restore_protocol_changes(){
+[ -n "$CF_CHANGED_PROTOCOLS" ] || return 0
+for change in $CF_CHANGED_PROTOCOLS; do
+change_rest=${change#*:}
+change_var=${change_rest%%:*}
+change_old=${change_rest#*:}
+eval "export $change_var=\"\$change_old\""
+done
+refresh_protocol_flags
+CF_CHANGED_PROTOCOLS=
+CLOUDFLARE_PROTOCOL_PORT_CHANGED=no
+}
+
+cloudflare_record_protocol_change(){
+change_id=$1
+change_var=$2
+change_old=$3
+case " $CF_CHANGED_PROTOCOLS " in
+*" $change_id:"*) ;;
+*) CF_CHANGED_PROTOCOLS="$CF_CHANGED_PROTOCOLS $change_id:$change_var:$change_old" ;;
+esac
+}
+
+cloudflare_validate_origin_port(){
+id=$1
+origin=$2
+state=$(cloudflare_protocol_state "$id")
+[ -n "$state" ] || return 1
+rest=${state#*|}; rest=${rest#*|}
+file=${rest%%|*}
+[ -s "$file" ] || return 1
+inner=$(protocol_current_port "$id")
+[ -n "$inner" ] || inner=$(cat "$file" 2>/dev/null)
+if is_nat_mode; then
+mapped=$(inner_port_from_public "$origin")
+[ -n "$mapped" ] || { red_line "公网端口 $origin 不在当前 NAT 映射中；请先在 VPS 类型 / 端口池中添加该映射。"; return 1; }
+target_inner=$mapped
+else
+target_inner=$origin
+fi
+[ "$target_inner" = "$inner" ] && return 0
+if port_reserved "$target_inner"; then
+red_line "目标内网端口 $target_inner 已分配给其它协议或订阅，无法自动迁移。"
+return 1
+fi
+if port_in_use "$target_inner"; then
+red_line "目标内网端口 $target_inner 正被其它进程监听，无法自动迁移。"
+port_owner_lines "$target_inner" | sed 's/^/  /'
+return 1
+fi
+var=$(protocol_var "$id")
+[ -n "$var" ] || return 1
+cloudflare_record_protocol_change "$id" "$var" "$inner"
+eval "export $var=\"\$target_inner\""
+refresh_protocol_flags
+CDN_REBUILD_REQUIRED=yes
+CLOUDFLARE_PROTOCOL_PORT_CHANGED=yes
+if is_nat_mode; then
+green_line "已自动迁移协议监听：公网 $origin → 内网 $target_inner（原内网 $inner）；无需再到其它菜单改端口。"
+else
+green_line "已自动把协议监听端口从 $inner 改为 $target_inner；无需再到其它菜单改端口。"
+fi
+return 0
+}
+
+cloudflare_origin_port_use_count(){
+count=0
+needle=$1
+for count_id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+[ "$(protocol_current_port "$count_id")" = "$needle" ] && count=$((count + 1))
+done
+printf '%s\n' "$count"
+}
+
+cloudflare_origin_replacement_port(){
+replace_id=$1
+kind=$(protocol_cf_port_kind "$replace_id")
+if is_nat_mode; then
+for pass in preferred any; do
+for pair in $ptmap; do
+candidate=${pair#*-}
+port_valid "$candidate" || continue
+[ "$candidate" = 22 ] && continue
+if [ "$pass" = preferred ] && [ -n "$kind" ]; then
+cf_port_matches_kind "$kind" "$candidate" || continue
+fi
+port_reserved "$candidate" && continue
+port_in_use "$candidate" && continue
+printf '%s\n' "$candidate"
+return 0
+done
+done
+return 1
+fi
+if [ -n "$kind" ]; then
+random_cdn_port "$kind" 2>/dev/null && return 0
+fi
+random_port 2>/dev/null
+}
+
+cloudflare_auto_repair_origin_collisions(){
+for repair_id in 3 13 4 8; do
+state=$(cloudflare_protocol_state "$repair_id")
+[ -n "$state" ] || continue
+rest=${state#*|}; rest=${rest#*|}
+file=${rest%%|*}
+[ -s "$file" ] || continue
+case "$repair_id" in
+3|13) cdn_protocol_enabled xhttp || continue ;;
+4) cdn_protocol_enabled ws || continue ;;
+8) cdn_protocol_enabled vmess || continue ;;
+esac
+current=$(protocol_current_port "$repair_id")
+[ -n "$current" ] || current=$(cat "$file" 2>/dev/null)
+[ "$(cloudflare_origin_port_use_count "$current")" -gt 1 ] || continue
+replacement=$(cloudflare_origin_replacement_port "$repair_id")
+[ -n "$replacement" ] || {
+red_line "$(protocol_label "$repair_id") 与其它协议共用内网端口 $current，且没有可自动迁移的空闲映射端口。"
+return 1
+}
+if is_nat_mode; then replacement_origin=$(client_port "$replacement"); else replacement_origin=$replacement; fi
+yellow_line "$(protocol_label "$repair_id") 与其它协议共用内网端口 $current，正在自动拆分到 $replacement。"
+cloudflare_validate_origin_port "$repair_id" "$replacement_origin" || return 1
+done
+return 0
+}
+
+cloudflare_origin_api_deploy(){
+override_id=$1
+override_port=$2
+cloudflare_require_token || return $?
+ensure_cloudflare_origin_helper || return 1
+host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+[ -n "$host" ] || { red_line "尚未设置 CDN Host。"; return 1; }
+specs=$(cloudflare_origin_rule_specs "$override_id" "$override_port")
+[ -n "$specs" ] || { red_line "当前 CDN 范围没有兼容协议。"; return 1; }
+ssl_mode=
+http3=no
+printf '%s\n' "$specs" | while IFS='|' read -r _proto _edge _origin _tls _path _label; do
+[ "$_tls" = yes ] && printf 'tls\n'
+[ "$_proto" = xhttp-tls ] && [ "$_edge" = 443 ] && printf 'h3\n'
+done > "/tmp/lun-cf-features.$$"
+if grep -q '^tls$' "/tmp/lun-cf-features.$$"; then
+cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+cert_subject_now=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+if [ "$cert_subject_now" = "$host" ] && [ "$cert_mode_now" != self ]; then ssl_mode=strict; else ssl_mode=full; fi
+fi
+grep -q '^h3$' "/tmp/lun-cf-features.$$" && http3=yes
+rm -f "/tmp/lun-cf-features.$$"
+api_result="/tmp/lun-cf-deploy.$$"
+if CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" \
+CF_LUN_HOST="$host" \
+CF_LUN_RULES="$specs" \
+CF_LUN_ORIGIN_IPS="$(local_public_ips)" \
+CF_LUN_SSL_MODE="$ssl_mode" \
+CF_LUN_HTTP3="$http3" \
+CF_LUN_BACKUP="$HOME/lun/cdn_cloudflare_backup.json" \
+CF_LUN_STATE="$HOME/lun/cdn_cloudflare_state.json" \
+python3 "$HOME/lun/cdn_cloudflare_api.py" deploy > "$api_result" 2>&1; then
+green_line "Cloudflare 已自动配置：DNS 橙云、精确端口回源规则和所需协议设置均已部署。"
+sed -n 's/^ROUTE=/  /p' "$api_result"
+rm -f "$api_result"
+return 0
+fi
+api_error=$(sed -n 's/^ERROR=//p' "$api_result" | sed -n 1p)
+[ -n "$api_error" ] || api_error=$(tail -n 1 "$api_result" 2>/dev/null)
+red_line "Cloudflare 自动配置失败：$api_error"
+rm -f "$api_result"
+return 1
+}
+
+cloudflare_origin_quick_verify(){
+command -v curl >/dev/null 2>&1 || return 1
+host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+path=$(cdn_probe_path)
+[ -n "$host" ] && [ -n "$path" ] || return 1
+edge=
+[ -s "$HOME/lun/port_xc" ] && edge=$(cdn_client_port "$(cat "$HOME/lun/port_xc")")
+[ -n "$edge" ] || edge=${cdnpt:-$(cdn_recommended_edge_port)}
+is_cf_https_port "$edge" && scheme=https || scheme=http
+endpoints=$(cdn_ip_list)
+[ -n "$endpoints" ] || endpoints=$host
+checked=0
+for endpoint in $endpoints; do
+checked=$((checked + 1))
+connect_endpoint=$(uri_host "$endpoint")
+headerfile="/tmp/lun-cf-quick-header.$$"
+code=$(curl -k -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 8 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ] &&
+   grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$headerfile" 2>/dev/null &&
+   ! grep -Eqi '^via:.*apple\.com' "$headerfile" 2>/dev/null &&
+   { [ "$code" -lt 520 ] 2>/dev/null || [ "$code" -gt 527 ] 2>/dev/null; }; then
+rm -f "$headerfile"
+return 0
+fi
+rm -f "$headerfile"
+[ "$checked" -ge 2 ] && break
+done
+return 1
+}
+
+cloudflare_origin_wait_verify(){
+for wait_seconds in 3 7 12; do
+sleep "$wait_seconds"
+cloudflare_origin_quick_verify && return 0
+done
+return 1
+}
+
+cloudflare_origin_finalize_pending(){
+[ -s "$HOME/lun/cdn_cloudflare_pending" ] || return 0
+rm -f "$HOME/lun/cdn_cloudflare_pending"
+echo "正在等待 Cloudflare 新规则生效……"
+if cloudflare_origin_wait_verify; then
+green_line "Cloudflare 端口回源验证成功，订阅已按新规则刷新。"
+cip
+return 0
+fi
+red_line "Cloudflare API 已部署，但边缘验证尚未通过；请稍后在入口网络管理中选择“一键自动部署 / 修复”重试。"
+return 1
+}
+
+cloudflare_origin_api_remove(){
+cloudflare_require_token || return $?
+ensure_cloudflare_origin_helper || return 1
+host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+[ -n "$host" ] || return 0
+result_file="/tmp/lun-cf-remove.$$"
+if CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" CF_LUN_HOST="$host" \
+python3 "$HOME/lun/cdn_cloudflare_api.py" remove > "$result_file" 2>&1; then
+removed=$(sed -n 's/^REMOVED=//p' "$result_file" | sed -n 1p)
+rm -f "$result_file"
+green_line "Cloudflare 中由 Lun 创建的回源规则已删除（$removed 条）；DNS 橙云保持不变。"
+return 0
+fi
+api_error=$(sed -n 's/^ERROR=//p' "$result_file" | sed -n 1p)
+rm -f "$result_file"
+red_line "Cloudflare 规则删除失败：$api_error"
+return 1
+}
+
 show_cdn_origin_rules(){
 host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 [ -n "$host" ] || { echo "尚未设置 CDN Host。"; return 1; }
@@ -6675,6 +7461,8 @@ return 0
 fi
 rule_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
 base_edge=${cdnpt:-$(cdn_recommended_edge_port)}
+green_line "一键自动部署会把以下规则直接写入 Cloudflare，并自动开启该 Host 的橙云。"
+yellow_line "旧 tls/nottls 宽泛规则会由自动部署识别并替换；其它用户规则保持不变。"
 echo "Cloudflare 默认边缘端口：$base_edge（XHTTP TLS 若遇到 HTTP 端口会自动改用 HTTPS 443；443 仅是边缘端口，不代表源站必须监听 443）"
 echo "只按 HTTP/HTTPS 分流会把不同协议送到错误入站，请使用下面的 Host + Path 精确规则："
 https_used=no
@@ -6699,12 +7487,17 @@ is_cf_https_port "$edge" && https_used=yes
 [ "$label" = "VLESS XHTTP TLS" ] && [ "$edge" = 443 ] && h3_edge=yes
 printf '\n%s\n' "$label"
 printf 'Cloudflare 边缘端口：%s\n' "$edge"
+if [ "$label" = "VLESS XHTTP TLS" ]; then
+printf '匹配表达式：(http.host eq "%s" and ssl and starts_with(http.request.uri.path, "/%s"))\n' "$host" "$path"
+else
 printf '匹配表达式：(http.host eq "%s" and starts_with(http.request.uri.path, "/%s"))\n' "$host" "$path"
+fi
 if is_nat_mode; then
 printf '目标端口：%s（NAT 公网端口，内网监听 %s）\n' "$origin_public" "$inner"
 else
 printf '目标端口：%s（普通 VPS 本机监听端口）\n' "$inner"
 fi
+echo "Cloudflare 动作：重写 Destination port / 目标端口；不要改写 Host、SNI 或 URI Path。"
 done
 if [ "$https_used" = yes ]; then
 cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
@@ -6714,9 +7507,10 @@ green_line "HTTPS 源站 TLS：证书与 Host 匹配，可在 Cloudflare 使用 
 else
 yellow_line "HTTPS 源站 TLS：当前证书为自签或与 Host 不同，请在 Cloudflare 使用 Full，不要使用 Full (Strict)。"
 fi
-[ "$h3_edge" = yes ] && yellow_line "实验性 CDN-UDP 还要求该 DNS 记录开启橙云代理，并在 Cloudflare 开启 HTTP/3（QUIC/UDP 443）。"
+[ "$h3_edge" = yes ] && yellow_line "实验性 CDN-UDP 还要求 Cloudflare 开启 HTTP/3（QUIC/UDP 443）。手动优选 IP 只能指定边缘入口，不能替灰云 Host 创建路由；灰云兼容不受官方保证，必须以诊断结果为准。"
 fi
 is_nat_mode && show_nat_cdn_hint
+yellow_line "自动部署完成后 Lun 会等待 Cloudflare 生效、验证边缘回源并刷新订阅。"
 }
 
 show_cdn_dns_hint(){
@@ -6729,9 +7523,9 @@ for one in $resolved; do
 printf '%s\n' "$locals" | grep -Fx "$one" >/dev/null 2>&1 && direct=yes
 done
 if [ "$direct" = yes ]; then
-yellow_line "$host 当前直接解析到本机，属于灰云/DNS only。订阅若使用 CF 优选 IP 作为入口，仍会强制连接 Cloudflare 边缘，以实际诊断为准；直接使用该域名作为入口时应开启橙云。"
+yellow_line "$host 当前直接解析到本机，属于灰云/DNS only。手动 CF 优选 IP 只改变客户端连接地址，不能保证 Cloudflare 已承载该 Host；官方稳定用法是开启橙云，并以连通诊断为准。"
 else
-green_line "$host 未直接返回本机公网地址；使用域名入口时请在 Cloudflare 控制台确认已开启橙云。"
+    green_line "$host 未直接返回本机公网地址；Origin Rules 一键部署会核对并开启该 Host 的橙云。"
 fi
 }
 
@@ -6774,6 +7568,7 @@ code=$(curl -k -v -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-
 rc=$?
 err=$(cat "$errfile" 2>/dev/null)
 if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$headerfile" 2>/dev/null; then through_cf=yes; else through_cf=no; fi
+if grep -Eqi '^via:.*apple\.com' "$headerfile" 2>/dev/null; then edge_route=reality-apple; else edge_route=expected-or-unknown; fi
 rm -f "$errfile" "$headerfile"
 if [ "$rc" -ne 0 ]; then
 case "$err" in
@@ -6792,6 +7587,10 @@ fi
 *timed*out*|*Timeout*) red_line "$endpoint：边缘端口连接超时（入口 IP/域名或端口不可达）。" ;;
 *) red_line "$endpoint：连接失败（curl 返回码 $rc）。" ;;
 esac
+elif [ "$edge_route" = reality-apple ]; then
+reality_public=
+[ -s "$HOME/lun/port_xh" ] && reality_public=$(client_port "$(cat "$HOME/lun/port_xh" 2>/dev/null)")
+red_line "$endpoint：已进入 Cloudflare，但回源落到了 Reality/Apple 伪装${reality_public:+（公网端口 $reality_public）}。请停用旧 tls/nottls 宽泛规则，并将 UUID-xc 精确规则指向 $(client_port "$(cat "$HOME/lun/port_xc" 2>/dev/null)")。"
 elif [ "$code" -ge 520 ] 2>/dev/null && [ "$code" -le 527 ] 2>/dev/null; then
 if cdn_rewrite_active; then
 red_line "$endpoint：Cloudflare 返回 $code，边缘已到达但回源失败（检查精确 Path 规则、目标端口和源站 TLS）。"
@@ -6870,7 +7669,7 @@ echo "CDN：客户端 → 优选入口 → CDN Host → VPS；协议端口不适
 echo "XHTTP TLS CDN-TCP 只用 HTTPS 端口组；实验 CDN-UDP 只用 UDP 443。xupt/NaiveProxy 不套普通 CDN。"
 show_cdn_summary
 show_cdn_port_advice
-echo " 1. 一键启用 / 修复 XHTTP CDN"
+echo " 1. 一键启用 / 修复 HTTP CDN（XHTTP / WS）"
 echo " 2. 仅修改优选 IP / 域名"
 echo " 3. 关闭 CDN 节点"
 echo " 0. 返回"
@@ -6878,11 +7677,16 @@ printf "请选择 [0-3]："
 IFS= read -r choice
 case "$choice" in
 1)
-{ [ -s "$HOME/lun/port_vx" ] || [ -s "$HOME/lun/port_xc" ]; } || { yellow_line "尚未安装 VLESS XHTTP 或 VLESS XHTTP TLS，请先到“安装 / 协议管理”添加。"; return 1; }
+cdn_has_origin_rule_protocol || { yellow_line "尚未安装支持普通 CDN 的协议；请先添加 3.VLESS XHTTP、4.VLESS WS、8.VMess WS 或 13.VLESS XHTTP TLS TCP/UDP。"; return 1; }
 prompt_cdn_host || return $?
 prune_legacy_cdn_defaults
 prompt_cdn_ips || return $?
+if { [ "${vwp:-}" = yes ] || [ -n "${port_vw:-}" ] || [ -s "$HOME/lun/port_vw" ]; } ||
+   { [ "${vmp:-}" = yes ] || [ -n "${port_vm_ws:-}" ] || [ -s "$HOME/lun/port_vm_ws" ]; }; then
+cdnproto=all
+else
 cdnproto=xhttp
+fi
 printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
 [ -n "$cdnmode" ] || cdnmode=standard
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
@@ -6890,9 +7694,9 @@ auto_configure_cdn_edge_port
 export cdnym cfip cdnmode cdnpt cdnproto
 show_cdn_dns_hint
 if cdn_rewrite_active; then
-green_line "XHTTP CDN 已保存：边缘端口 $cdnpt；请按 Origin Rules 页面显示的 Host + Path 规则回源。"
+green_line "CDN 已保存：协议范围=$cdnproto，边缘端口 $cdnpt；进入 Origin Rules 选择“一键自动部署 / 修复”即可完成回源。"
 else
-green_line "XHTTP CDN 已保存：当前协议端口可直接使用 Cloudflare 同端口代理。"
+green_line "CDN 已保存：协议范围=$cdnproto；当前协议端口可直接使用 Cloudflare 同端口代理。"
 fi
 return 0
 ;;
@@ -6916,62 +7720,161 @@ esac
 done
 }
 
-prompt_origin_rules(){
-CDN_REBUILD_REQUIRED=no
-{ [ -s "$HOME/lun/port_vx" ] || [ -s "$HOME/lun/port_xc" ]; } || { yellow_line "Origin Rules 需要 VLESS XHTTP 或 VLESS XHTTP TLS，请先安装协议。"; return 1; }
-[ -s "$HOME/lun/cdnym" ] || { yellow_line "请先在 CDN / CF 优选中设置 Host。"; return 1; }
-while :; do
-recommended_edge=$(cdn_recommended_edge_port)
-ui_title "Lun Cloudflare Origin Rules（端口回源）"
-echo "普通 VPS 与 NAT VPS 均可把 Cloudflare 边缘端口改写到各协议源站端口。"
-echo "HTTP：80/8080/8880/2052/2082/2086/2095"
-echo "HTTPS：443/8443/2053/2083/2087/2096"
-echo " 1. 自动选择（当前推荐 $recommended_edge）"
-cdn_has_xhttp_tls && cdn_has_generic_protocol && yellow_line "混合协议将使用 HTTP $recommended_edge；XHTTP TLS 单独使用 HTTPS 443。随机源站端口默认避开 443，需按下方 Host + Path 规则回源。"
-cdn_has_xhttp_tls && is_nat_mode && yellow_line "NAT VPS：Origin Rule 的目标端口填写公网映射端口，不是内网监听端口；Cloudflare 不能替代服务商的端口映射。"
-echo " 2. 手动填写 Cloudflare 官方边缘端口"
-echo " 3. 显示精确 Host + Path 规则"
-echo " 4. 关闭端口改写，恢复普通同端口 CDN"
-echo " 0. 返回"
-printf "请选择 [0-4]："
-IFS= read -r choice
-case "$choice" in
-1|2)
-old_mode=${cdnmode:-standard}
-old_port=${cdnpt:-}
-if [ "$choice" = 1 ]; then
-new_edge=$recommended_edge
-else
-printf "请输入 Cloudflare 边缘端口（0 返回）："
-IFS= read -r new_edge
-[ "$new_edge" = 0 ] && continue
-{ is_cf_http_port "$new_edge" || is_cf_https_port "$new_edge"; } || { yellow_line "该端口不在 Cloudflare HTTP/HTTPS 官方代理端口组内。"; continue; }
-if cdn_has_xhttp_tls && ! cdn_has_generic_protocol && ! is_cf_https_port "$new_edge"; then
-yellow_line "当前只有 xcpt，边缘端口必须来自 HTTPS 端口组；推荐 443 仅用于需要实验 CDN-UDP 的回源规则。"
-continue
+cloudflare_prepare_rewrite_mode(){
+preferred_edge=$1
+CF_PREV_CDN_MODE=${cdnmode:-standard}
+CF_PREV_CDN_PORT=${cdnpt:-}
+CF_PREV_CDN_PROTO=${cdnproto:-xhttp}
+if [ "${cdnproto:-xhttp}" = xhttp ] &&
+   { [ -s "$HOME/lun/port_vw" ] || [ -s "$HOME/lun/port_vm_ws" ]; } &&
+   { [ ! -s "$HOME/lun/port_vx" ] && [ ! -s "$HOME/lun/port_xc" ]; }; then
+cdnproto=all
+yellow_line "检测到仅安装 WS 类 CDN 协议，已自动纳入 VLESS WS / VMess WS。"
 fi
-fi
-cdnpt=$new_edge
 cdnmode=rewrite
-cdnproto=xhttp
+if [ -n "$preferred_edge" ]; then
+cdnpt=$preferred_edge
+elif cdn_has_generic_protocol && ! is_cf_http_port "${cdnpt:-}"; then
+cdnpt=$(cdn_recommended_edge_port)
+elif ! { is_cf_http_port "${cdnpt:-}" || is_cf_https_port "${cdnpt:-}"; }; then
+cdnpt=$(cdn_recommended_edge_port)
+fi
+if cdn_has_xhttp_tls && ! cdn_has_generic_protocol && ! is_cf_https_port "$cdnpt"; then
+cdnpt=443
+fi
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
 printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port"
 printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
-[ "$old_mode:$old_port" != "$cdnmode:$cdnpt" ] && CDN_REBUILD_REQUIRED=yes
+if [ "$CF_PREV_CDN_MODE:$CF_PREV_CDN_PORT:$CF_PREV_CDN_PROTO" != "$cdnmode:$cdnpt:$cdnproto" ]; then
+CDN_REBUILD_REQUIRED=yes
+fi
 export cdnmode cdnpt cdnproto
-show_cdn_origin_rules
+}
+
+cloudflare_restore_rewrite_mode(){
+cdnmode=$CF_PREV_CDN_MODE
+cdnpt=$CF_PREV_CDN_PORT
+cdnproto=$CF_PREV_CDN_PROTO
+printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
+printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
+if [ -n "$cdnpt" ]; then printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port"; else rm -f "$HOME/lun/cdn_edge_port"; fi
+CDN_REBUILD_REQUIRED=no
+export cdnmode cdnpt cdnproto
+}
+
+cloudflare_finish_auto_deploy(){
+override_id=$1
+override_port=$2
+if ! cloudflare_origin_api_deploy "$override_id" "$override_port"; then
+cloudflare_restore_protocol_changes
+cloudflare_restore_rewrite_mode
+return 1
+fi
+if [ "$CDN_REBUILD_REQUIRED" = yes ]; then
+printf '%s\n' pending > "$HOME/lun/cdn_cloudflare_pending"
+green_line "Cloudflare 已部署；现在自动重建本机 TLS/端口配置，完成后会继续验证并刷新订阅。"
+return 0
+fi
+echo "正在等待 Cloudflare 新规则生效……"
+if cloudflare_origin_wait_verify; then
+green_line "Cloudflare 端口回源验证成功；正在刷新订阅。"
+return 0
+fi
+red_line "规则已通过 API 部署，但边缘尚未在等待时间内生效。请直接再次选择“一键自动部署 / 修复”，脚本会继续修复并验证。"
+return 1
+}
+
+prompt_origin_rules(){
+CDN_REBUILD_REQUIRED=no
+load_installed_protocol_flags
+cloudflare_reset_protocol_changes
+cdn_has_origin_rule_protocol || { yellow_line "Origin Rules 只适用于 3.VLESS XHTTP、4.VLESS WS、8.VMess WS 或 13.VLESS XHTTP TLS TCP/UDP；请先安装其中一项。"; return 1; }
+[ -s "$HOME/lun/cdnym" ] || { yellow_line "请先在 CDN / CF 优选中设置 Host。"; return 1; }
+while :; do
+recommended_edge=$(cdn_recommended_edge_port)
+ui_title "Lun Cloudflare Origin Rules 自动配置"
+if [ -s "$(cloudflare_token_file)" ]; then
+green_line "Cloudflare API：已授权；输入端口后可直接部署。"
+else
+yellow_line "Cloudflare API：首次使用需粘贴一次 Token，后续全自动。"
+fi
+echo "脚本会自动读取 NAT 映射、拆分冲突监听端口，并完成橙云、规则、SSL/HTTP3、验证和订阅刷新。"
+echo " 1. 一键自动部署 / 修复（推荐，自动处理端口冲突）"
+echo " 2. 输入单协议回源端口并自动迁移 / 部署"
+echo " 3. 验证当前 Cloudflare 回源"
+echo " 4. 查看将部署的精确规则"
+echo " 5. 设置 / 更换 Cloudflare API Token"
+echo " 6. 关闭端口改写并删除 Lun 云端规则"
+echo " 0. 返回"
+printf "请选择 [0-6]："
+IFS= read -r choice
+case "$choice" in
+1)
+cloudflare_reset_protocol_changes
+cloudflare_prepare_rewrite_mode ""
+cloudflare_auto_repair_origin_collisions || {
+cloudflare_restore_protocol_changes
+cloudflare_restore_rewrite_mode
+ui_pause
+continue
+}
+cloudflare_finish_auto_deploy "" "" || { ui_pause; continue; }
 return 0
 ;;
-3) show_cdn_origin_rules; ui_pause ;;
-4)
-old_mode=${cdnmode:-standard}
-old_port=${cdnpt:-}
+2)
+echo "可指定回源端口的已安装协议："
+for id in 3 4 8 13; do
+state=$(cloudflare_protocol_state "$id")
+[ -n "$state" ] || continue
+rest=${state#*|}; label=${rest%%|*}; rest=${rest#*|}; file=${rest%%|*}
+[ -s "$file" ] || continue
+inner=$(cat "$file" 2>/dev/null)
+printf " %2s. %s：内网 %s" "$id" "$label" "$inner"
+is_nat_mode && printf " / 公网 %s" "$(client_port "$inner")"
+printf "\n"
+done
+printf "协议编号（0 返回）："
+IFS= read -r origin_id
+[ "$origin_id" = 0 ] && continue
+case "$origin_id" in 3|4|8|13) ;; *) echo "请输入上方协议编号。"; continue ;; esac
+state=$(cloudflare_protocol_state "$origin_id")
+rest=${state#*|}; label=${rest%%|*}; rest=${rest#*|}; file=${rest%%|*}
+[ -s "$file" ] || { red_line "该协议未安装。"; continue; }
+inner=$(cat "$file" 2>/dev/null)
+expected_origin=$(client_port "$inner")
+printf "%s 回源目标端口（回车自动使用 %s，0 返回）：" "$label" "$expected_origin"
+IFS= read -r origin_port
+[ "$origin_port" = 0 ] && continue
+[ -n "$origin_port" ] || origin_port=$expected_origin
+port_valid "$origin_port" || { red_line "端口必须是 1-65535。"; continue; }
+cloudflare_reset_protocol_changes
+cloudflare_validate_origin_port "$origin_id" "$origin_port" || continue
+if [ "$origin_id" = 13 ]; then preferred_edge=443; else preferred_edge=; fi
+cloudflare_prepare_rewrite_mode "$preferred_edge"
+case "$origin_id" in
+4|8)
+if [ "$cdnproto" != all ]; then
+cdnproto=all
+printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
+CDN_REBUILD_REQUIRED=yes
+export cdnproto
+fi
+;;
+esac
+cloudflare_finish_auto_deploy "$origin_id" "$origin_port" || { ui_pause; continue; }
+return 0
+;;
+3) diagnose_cdn_endpoints; ui_pause ;;
+4) show_cdn_origin_rules; ui_pause ;;
+5) cloudflare_prompt_token; ui_pause ;;
+6)
+cloudflare_origin_api_remove || { ui_pause; continue; }
 cdnmode=standard; cdnpt=
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
 rm -f "$HOME/lun/cdn_edge_port"
-[ "$old_mode:$old_port" != "$cdnmode:" ] && CDN_REBUILD_REQUIRED=yes
+CDN_REBUILD_REQUIRED=yes
 export cdnmode cdnpt
-echo "已恢复普通同端口 CDN；Origin Rules 不再参与节点生成。"
+green_line "已恢复普通同端口 CDN；即将自动重建配置并刷新订阅。"
 return 0
 ;;
 0|"") return 2 ;;
@@ -7097,6 +8000,63 @@ case "$1" in
 esac
 }
 
+protocol_route_capabilities(){
+case "$1" in
+3) echo "直连 / CDN优选 / 端口回源" ;;
+4|8) echo "直连 / CDN优选 / 端口回源 / CF隧道" ;;
+13) echo "直连 / CDN优选(TCP、实验UDP443) / 端口回源" ;;
+10|11|12) echo "仅直连UDP/QUIC（无CDN、回源、隧道）" ;;
+*) echo "仅直连（无CDN、回源、隧道）" ;;
+esac
+}
+
+protocol_capability_mark(){
+id=$1
+capability=$2
+case "$capability" in
+direct) printf '✓' ;;
+cdn|origin)
+case "$id" in 3|4|8|13) printf '✓' ;; *) printf '—' ;; esac
+;;
+tunnel)
+case "$id" in 4|8) printf '✓' ;; *) printf '—' ;; esac
+;;
+esac
+}
+
+protocol_table_rows(){
+printf '编号|状态|协议|监听端口|公网端口|直连|CDN优选|端口回源|CF隧道\n'
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+label=$(protocol_label "$id")
+port=$(protocol_current_port "$id")
+if [ -n "$port" ]; then
+status=✓
+public=$(client_port "$port")
+else
+status=—
+port=—
+public=—
+fi
+cdn_mark=$(protocol_capability_mark "$id" cdn)
+[ "$id" = 13 ] && [ "$cdn_mark" = ✓ ] && cdn_mark='✓*'
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+"$id" "$status" "$label" "$port" "$public" \
+"$(protocol_capability_mark "$id" direct)" "$cdn_mark" \
+"$(protocol_capability_mark "$id" origin)" "$(protocol_capability_mark "$id" tunnel)"
+done
+}
+
+render_protocol_table(){
+if command -v column >/dev/null 2>&1; then
+protocol_table_rows | column -t -s '|'
+else
+protocol_table_rows | while IFS='|' read -r id status label inner public direct cdn origin tunnel; do
+printf '%-4s %-6s %-28s %-10s %-10s %-6s %-9s %-10s %-8s\n' \
+"$id" "$status" "$label" "$inner" "$public" "$direct" "$cdn" "$origin" "$tunnel"
+done
+fi | sed "s/✓/${LUN_GREEN}✓${LUN_RESET}/g"
+}
+
 protocol_var(){
 case "$1" in
 1) echo vlpt ;;
@@ -7164,22 +8124,10 @@ printf '%s\n' "$count"
 
 show_protocol_picker(){
 echo "当前协议选择："
-for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-label=$(protocol_label "$id")
-port=$(protocol_current_port "$id")
-if [ -n "$port" ]; then
-if is_nat_mode; then
-printf "%2s. [已选] %s，内网端口：%s" "$id" "$label" "$port"
-public=$(client_port "$port")
-[ "$public" != "$port" ] && printf "，公网端口：%s" "$public"
-else
-printf "%2s. [已选] %s，端口：%s" "$id" "$label" "$port"
-fi
-printf "\n"
-else
-printf "%2s. [未选] %s\n" "$id" "$label"
-fi
-done
+render_protocol_table
+yellow_line "绿色 ✓ 表示已选择或支持；— 表示未选择或不支持。"
+yellow_line "能力：CDN优选=Cloudflare HTTP(S)；端口回源=Origin Rules；CF隧道=当前 Lun 的 WS/Argo。"
+yellow_line "* 13 的 CDN 优选包含 TCP 与实验性 UDP 443；10/11/12 的直连使用 UDP/QUIC。"
 }
 
 prompt_protocol_by_id(){
@@ -7187,6 +8135,10 @@ id=$1
 label=$(protocol_label "$id")
 var=$(protocol_var "$id")
 [ -n "$label" ] && [ -n "$var" ] || { echo "忽略未知协议编号：$id"; return 0; }
+case "$id" in
+3|4|8|13) green_line "$label 能力：$(protocol_route_capabilities "$id")" ;;
+*) yellow_line "$label 能力：$(protocol_route_capabilities "$id")" ;;
+esac
 case "$id" in
 10|11|12) yellow_line "$label 使用 UDP/QUIC，请确认公网端口及服务商映射已放行 UDP。" ;;
 14) yellow_line "NaiveProxy 必须使用与服务域名匹配的公开可信证书。" ;;
@@ -7385,7 +8337,7 @@ done
 
 show_nat_cdn_hint(){
 yellow_line "NAT VPS 使用 Cloudflare CDN 时，客户端访问的是公网映射端口；内网监听端口本身不需要属于 CF 端口组。"
-yellow_line "操作步骤：先配置 外网 CF 端口-内网监听端口 映射并放行公网端口；再到 Cloudflare Origin Rules 按菜单输出的 Host + Path 回源到该公网端口；最后刷新订阅。"
+yellow_line "操作步骤：先在服务商完成 公网端口→内网监听端口 映射；再到 Cloudflare Origin Rules 选择一键自动部署，Lun 会自动写规则、验证并刷新订阅。"
 yellow_line "若没有对应的公网 CF 端口，仍可使用任意公网映射，但必须使用 Origin Rules，不能把内网端口直接写成 CDN 节点端口。"
 }
 
@@ -8119,7 +9071,7 @@ show_cdn_summary
 [ -s "$HOME/lun/argoip" ] && echo "Argo优选：$(cat "$HOME/lun/argoip")" || echo "Argo优选：中性默认"
 echo " 1. VPS 类型 / 端口池 / 快速改端口"
 echo " 2. CDN / CF 优选（入口地址与 Host）"
-echo " 3. Cloudflare Origin Rules（边缘端口 → 源站端口）"
+echo " 3. Cloudflare Origin Rules（输入即自动部署）"
 echo " 4. CF 隧道 / Argo（独立链路，不使用 2/3 的设置）"
 echo " 5. CDN 连通诊断"
 echo " 0. 返回"
@@ -8138,7 +9090,12 @@ return
 ;;
 3)
 prompt_origin_rules; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || { ui_pause; continue; }
-if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_MENU_ACTION=rep; else LUN_MENU_ACTION=list; fi
+if [ "$CDN_REBUILD_REQUIRED" = yes ]; then
+[ "$CLOUDFLARE_PROTOCOL_PORT_CHANGED" = yes ] || load_installed_protocol_flags
+LUN_MENU_ACTION=rep
+else
+LUN_MENU_ACTION=list
+fi
 return
 ;;
 4)
@@ -8950,20 +9907,22 @@ done
 
 show_protocol_help(){
 ui_title "Lun 协议特点"
-echo " 1. VLESS TCP Reality：Xray / TCP 直连 / Reality，不要求公开证书。"
-echo " 2. VLESS XHTTP Reality：Xray / XHTTP 直连 / Reality，不要求公开证书。"
-echo " 3. VLESS XHTTP：Xray / XHTTP / 可直连或接 Cloudflare CDN。"
-echo " 4. VLESS WS：Xray / WebSocket / 支持 Cloudflare CDN 与 Argo。"
-echo " 5. Shadowsocks-2022：Sing-box / TCP+UDP / 轻量直连。"
-echo " 6. AnyTLS：Sing-box / TLS over TCP / 需要证书。"
-echo " 7. Any-Reality：Sing-box / Reality 直连 / 不要求公开证书。"
-echo " 8. VMess WS：Sing-box / WebSocket / 支持 Cloudflare CDN 与 Argo。"
-echo " 9. Socks5：Sing-box / TCP+UDP / UUID 身份验证，无 TLS 伪装。"
-echo "10. Hysteria2：Sing-box / QUIC+UDP / 需放行 UDP 并配置证书。"
-echo "11. TUIC：Sing-box / QUIC+UDP / 需放行 UDP 并配置证书。"
-echo "12. VLESS XHTTP TLS UDP：Xray / HTTP/3+UDP 直连；tcping 失败属于正常现象。"
-echo "13. VLESS XHTTP TLS TCP/UDP：Xray / 直连 TCP+UDP / HTTPS CDN-TCP / 实验 UDP 443。"
-echo "14. NaiveProxy H2/H3：Sing-box / 同端口 TCP+UDP / 只接受匹配域名的公开可信证书。"
+yellow_line "能力标签：CDN优选=Cloudflare HTTP(S)；端口回源=Origin Rules；CF隧道=当前 Lun 的 WS/Argo。"
+yellow_line "端口回源只改写 Cloudflare HTTP(S) 的目标端口，不能把 Reality、任意 TCP/UDP 或 H3-only 转换成 CDN 协议。"
+echo " 1. VLESS TCP Reality：Xray / TCP Reality；Cloudflare 会终止普通 TLS，不能作为标准 CDN 回源。｜$(protocol_route_capabilities 1)"
+echo " 2. VLESS XHTTP Reality：Xray / XHTTP Reality；鉴权不匹配会落到伪装站，不能作为 Cloudflare HTTP 回源。｜$(protocol_route_capabilities 2)"
+echo " 3. VLESS XHTTP：Xray / XHTTP 路径（非 Reality）；支持 CDN 优选与 Host+Path 端口回源。｜$(protocol_route_capabilities 3)"
+echo " 4. VLESS WS：Xray / WebSocket；CDN 与 Argo 是两条独立入口。｜$(protocol_route_capabilities 4)"
+echo " 5. Shadowsocks-2022：Sing-box / TCP+UDP；Cloudflare 普通代理不转发任意 TCP/UDP。｜$(protocol_route_capabilities 5)"
+echo " 6. AnyTLS：Sing-box / TLS over TCP；不是 Cloudflare HTTP 回源协议。｜$(protocol_route_capabilities 6)"
+echo " 7. Any-Reality：Sing-box / Reality；只用于直连，不套普通 CDN。｜$(protocol_route_capabilities 7)"
+echo " 8. VMess WS：Sing-box / WebSocket；CDN 与 Argo 是两条独立入口。｜$(protocol_route_capabilities 8)"
+echo " 9. Socks5：Sing-box / TCP+UDP；Cloudflare 普通代理不提供公网 Socks5 转发。｜$(protocol_route_capabilities 9)"
+echo "10. Hysteria2：Sing-box / QUIC+UDP；需放行 UDP，普通 CDN 与 Origin Rules 不转发该协议。｜$(protocol_route_capabilities 10)"
+echo "11. TUIC：Sing-box / QUIC+UDP；需放行 UDP，普通 CDN 与 Origin Rules 不转发该协议。｜$(protocol_route_capabilities 11)"
+echo "12. VLESS XHTTP TLS UDP：Xray / H3-only 直连；Cloudflare HTTP/3 不以 H3 回源，tcping 失败正常。｜$(protocol_route_capabilities 12)"
+echo "13. VLESS XHTTP TLS TCP/UDP：Xray / H2、HTTP/1.1 源站；支持 CDN-TCP，实验 UDP443 仍以 TCP/TLS 回源。｜$(protocol_route_capabilities 13)"
+echo "14. NaiveProxy H2/H3：Sing-box / HTTP CONNECT；当前 Lun 不生成 CDN/Argo 节点，且只接受匹配域名的公开可信证书。｜$(protocol_route_capabilities 14)"
 yellow_line "UDP/QUIC 协议必须同时放行服务商公网 UDP、系统防火墙和 NAT 映射。"
 red_line "NaiveProxy 不能使用自签证书或 Cloudflare Origin CA。"
 }
@@ -8977,7 +9936,7 @@ yellow_line "云安全组与服务商公网端口映射无法由 VPS 内脚本�
 echo "内网端口池是协议实际监听端口；外网端口池是公网入口，两组按位置自动对应。"
 yellow_line "同一内网端口出现多个公网映射时保留首项，后续项会被提示并忽略。"
 red_line "同一公网端口不能指向多个内网端口；此类冲突会拒绝整次输入。"
-echo "Cloudflare CDN：先完成服务商公网→内网映射，再按 Host + Path 配置 Origin Rules。"
+echo "Cloudflare CDN：先完成服务商公网→内网映射，再在 Origin Rules 选择一键自动部署。"
 }
 
 show_cdn_help(){
@@ -8986,7 +9945,8 @@ echo "HTTP 端口：80、8080、8880、2052、2082、2086、2095。"
 echo "HTTPS 端口：443、8443、2053、2083、2087、2096。"
 echo "支持 CDN 的协议随机端口会优先选择对应 CF 端口，并默认排除热门的 443。"
 yellow_line "源站端口不在 CF 端口组时，必须用精确 Host + Path 的 Origin Rule 改写回源端口。"
-yellow_line "实验 CDN-UDP 还要求橙云代理、Cloudflare HTTP/3 和边缘 UDP 443。"
+green_line "菜单会通过 Cloudflare API 自动开启橙云、部署精确规则、调整 SSL/HTTP3、验证并刷新订阅；首次只需粘贴一次最小权限 Token。"
+yellow_line "实验 CDN-UDP 要求 Cloudflare HTTP/3 和边缘 UDP 443；手动优选 IP 不能替灰云 Host 创建边缘路由，官方稳定用法仍是橙云并通过连通诊断。"
 red_line "手动使用本机 443 前必须检查占用；Lun 不会自动 kill 未知进程。"
 }
 
@@ -9266,6 +10226,7 @@ fi
 fi
 apply_lun_firewall_rules || true
 cip
+cloudflare_origin_finalize_pending || true
 echo
 else
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
