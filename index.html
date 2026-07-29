@@ -174,7 +174,7 @@
             <input id="cdnym" placeholder="如 proxy.example.com，须已解析到VPS">
           </label>
           <label>优选地址 cfip（客户端连CF的入口）
-            <input id="cfip" placeholder="可留空自动解析橙云 Host，或填写已验证的优选 IP">
+            <textarea id="cfip" rows="5" placeholder="可粘贴多行测速结果，如 108.162.198.211:2083#JP 电信优选[64ms 160Mbps]；将自动去除端口和备注"></textarea>
           </label>
           <label>CDN 模式 cdnmode
             <select id="cdnmode">
@@ -284,9 +284,39 @@
 
     function q(id) { return document.querySelector(`#${id}`); }
     function quote(value) { return `"${String(value).replaceAll('"', '\\"')}"`; }
+    function sanitizeCdnEndpoints(value) {
+      const endpoints = [];
+      const seen = new Set();
+      const validIpv4 = host => {
+        const parts = host.split('.');
+        return parts.length === 4 && parts.every(part => /^\d+$/.test(part) && Number(part) <= 255);
+      };
+      String(value).split(/[\s,;]+/).forEach(raw => {
+        let token = raw.replace(/^[*"'`({<]+/, '');
+        token = token.replace(/^[a-z]+:\/\//i, '').split('#', 1)[0].split('?', 1)[0].split('/', 1)[0];
+        token = token.replace(/[*"'`)}>;,]+$/, '');
+        if (!token) return;
+        let host = token;
+        if (token.startsWith('[') && token.includes(']')) {
+          host = token.slice(1, token.indexOf(']'));
+        } else if ((token.match(/:/g) || []).length === 1 && /:\d+$/.test(token)) {
+          host = token.replace(/:\d+$/, '');
+        }
+        const isIpv6 = host.includes(':') && /^[0-9a-f:]+$/i.test(host);
+        const isDomain = /^[a-z][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/i.test(host);
+        if (!validIpv4(host) && !isIpv6 && !isDomain) return;
+        if (!seen.has(host)) {
+          seen.add(host);
+          endpoints.push(host);
+        }
+      });
+      return endpoints.join(' ');
+    }
 
     function build() {
       const vars = [];
+      const rawCfip = q('cfip').value.trim();
+      const cleanCfip = sanitizeCdnEndpoints(rawCfip);
       const enabled = id => document.querySelector(`[data-proto="${id}"]`).checked;
       const portOf = id => document.querySelector(`[data-port="${id}"]`).value.trim();
       const cfHttpPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
@@ -321,7 +351,7 @@
         if (enabled(id)) vars.push(`${id}=${quote(portOf(id))}`);
       });
       ids.forEach(id => {
-        const value = q(id).value.trim();
+        const value = id === 'cfip' ? cleanCfip : q(id).value.trim();
         if (value) vars.push(`${id}=${quote(value)}`);
       });
       if (effectiveCdnMode) vars.push(`cdnmode=${quote(effectiveCdnMode)}`);
@@ -330,6 +360,8 @@
       output.value = `${vars.join(' ')} ${SCRIPT}`.trim();
 
       const warnings = [];
+      if (rawCfip && !cleanCfip) warnings.push('cfip 没有识别到有效的 IPv4、IPv6 或域名。');
+      else if (rawCfip && cleanCfip !== rawCfip.replace(/\s+/g, ' ')) warnings.push(`cfip 已自动清洗为：${cleanCfip}`);
       if (enabled('nvpt')) {
         const certMode = q('certmode').value;
         if (!q('domain').value.trim()) warnings.push('NaiveProxy 需要填写与公开证书匹配的服务域名。');
