@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.30.2"
+echo "当前版本：V26.7.30.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1153,11 +1153,11 @@ fallback_url=
 case "$download_url" in
 https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
 fallback_url=$download_url
-download_url="https://github.com/azk78lun-collab/FHLUN/raw/refs/heads/main/lun.sh"
+download_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/lun.sh?ref=main"
 ;;
 esac
 case "$download_url" in
-https://raw.githubusercontent.com/*|https://github.com/*/raw/*)
+https://raw.githubusercontent.com/*|https://github.com/*/raw/*|https://api.github.com/*)
 case "$download_url" in
 *\?*) download_url="${download_url}&fhlun_nocache=$(date +%s)" ;;
 *) download_url="${download_url}?fhlun_nocache=$(date +%s)" ;;
@@ -1165,9 +1165,9 @@ esac
 ;;
 esac
 rm -f "$tmp"
-if command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 30 --retry 2 "$download_url" -o "$tmp"; then
+if command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 30 --retry 2 "$download_url" -o "$tmp"; then
 :
-elif command -v wget >/dev/null 2>&1 && wget -qO "$tmp" --header='Cache-Control: no-cache' --timeout=30 --tries=2 "$download_url"; then
+elif command -v wget >/dev/null 2>&1 && wget -qO "$tmp" --header='Accept: application/vnd.github.raw+json' --header='Cache-Control: no-cache' --timeout=30 --tries=2 "$download_url"; then
 :
 elif [ -n "$fallback_url" ] && command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 30 --retry 2 "${fallback_url}?fhlun_nocache=$(date +%s)" -o "$tmp"; then
 :
