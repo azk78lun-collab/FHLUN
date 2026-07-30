@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.30.3"
+echo "当前版本：V26.7.31.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -498,6 +498,60 @@ cdn_rewrite_active(){
 [ "$cdnmode" = rewrite ]
 }
 
+cloudflare_manual_rule_file(){
+printf '%s\n' "$HOME/lun/cdn_cloudflare_manual"
+}
+
+cloudflare_manual_edge_for_inner(){
+manual_inner=$1
+manual_host=${cdnym:-$(cat "$HOME/lun/cdnym" 2>/dev/null)}
+manual_file=$(cloudflare_manual_rule_file)
+[ -n "$manual_host" ] && [ -s "$manual_file" ] || return 1
+for manual_item in \
+"3:$HOME/lun/port_vx" \
+"13:$HOME/lun/port_xc" \
+"4:$HOME/lun/port_vw" \
+"8:$HOME/lun/port_vm_ws"; do
+manual_id=${manual_item%%:*}
+manual_port_file=${manual_item#*:}
+[ -s "$manual_port_file" ] || continue
+[ "$(cat "$manual_port_file" 2>/dev/null)" = "$manual_inner" ] || continue
+manual_line=$(awk -F'|' -v host="$manual_host" -v id="$manual_id" \
+'$1 == host && $2 == id { print $3 "|" $4; exit }' "$manual_file" 2>/dev/null)
+[ -n "$manual_line" ] || continue
+manual_edge=${manual_line%%|*}
+manual_origin=${manual_line#*|}
+[ "$manual_origin" = "$(client_port "$manual_inner")" ] || continue
+{ is_cf_http_port "$manual_edge" || is_cf_https_port "$manual_edge"; } || continue
+printf '%s\n' "$manual_edge"
+return 0
+done
+return 1
+}
+
+cloudflare_manual_rule_matches(){
+manual_match_id=$1
+manual_match_edge=$2
+manual_match_origin=$3
+manual_match_path=$4
+manual_match_host=${cdnym:-$(cat "$HOME/lun/cdnym" 2>/dev/null)}
+manual_match_file=$(cloudflare_manual_rule_file)
+[ -n "$manual_match_host" ] && [ -s "$manual_match_file" ] || return 1
+awk -F'|' -v host="$manual_match_host" -v id="$manual_match_id" \
+    -v edge="$manual_match_edge" -v origin="$manual_match_origin" -v path="$manual_match_path" \
+'$1 == host && $2 == id && $3 == edge && $4 == origin && $5 == path { found=1; exit }
+ END { exit(found ? 0 : 1) }' "$manual_match_file"
+}
+
+cdn_first_endpoint(){
+for first_endpoint in $1; do
+case "$first_endpoint" in ""|-1) continue ;; esac
+printf '%s\n' "$first_endpoint"
+return 0
+done
+return 1
+}
+
 cdn_protocol_enabled(){
 case "$cdnproto:$1" in
 xhttp:xhttp|all:xhttp|all:ws|all:vmess) return 0 ;;
@@ -650,6 +704,11 @@ fi
 cdn_client_port(){
 origin_inner=$1
 if cdn_rewrite_active; then
+manual_edge=$(cloudflare_manual_edge_for_inner "$origin_inner" 2>/dev/null || true)
+if [ -n "$manual_edge" ]; then
+printf '%s\n' "$manual_edge"
+return
+fi
 edge=${cdnpt:-$(cdn_recommended_edge_port)}
 if cdn_origin_is_xhttp_tls "$origin_inner" && ! is_cf_https_port "$edge"; then
 printf '443\n'
@@ -1242,11 +1301,11 @@ fi
 if [ ! -f "$dependency_marker" ]; then
 echo "执行必要的脚本依赖中，请稍等10秒……"
 if command -v apk >/dev/null 2>&1; then
-apk update >/dev/null 2>&1 && apk add --no-cache bash busybox-extras gcompat libc6-compat iptables openssl >/dev/null 2>&1
+apk update >/dev/null 2>&1 && apk add --no-cache bash busybox-extras curl gcompat libc6-compat iptables openssl >/dev/null 2>&1
 elif command -v apt >/dev/null 2>&1; then
 export DEBIAN_FRONTEND=noninteractive
 printf 'iptables-persistent iptables-persistent/autosave_v4 boolean true\niptables-persistent iptables-persistent/autosave_v6 boolean true\n' | debconf-set-selections
-apt update >/dev/null 2>&1 && apt install -y busybox coreutils util-linux iptables iptables-persistent cron openssl >/dev/null 2>&1
+apt update >/dev/null 2>&1 && apt install -y busybox coreutils curl util-linux iptables iptables-persistent cron openssl >/dev/null 2>&1
 fi
 touch "$dependency_marker"
 fi
@@ -3192,6 +3251,11 @@ agent=$(multiuser_agent)
 "$agent" --root "$HOME/lun" "$@"
 }
 
+multiuser_sync_subscription_state(){
+multiuser_enabled || return 0
+multiuser_cmd sync-subscription-state >/dev/null
+}
+
 multiuser_service_stop(){
 if pidof systemd >/dev/null 2>&1; then
 systemctl stop lun-agent >/dev/null 2>&1 || true
@@ -3206,13 +3270,58 @@ case "$CMD" in *"/lun/modules/multiuser/lun_agent.py"*" serve"*) kill "$PID" 2>/
 done
 }
 
+multiuser_clear_legacy_subscription_autostart(){
+mu_cron_tmp="/tmp/lun-crontab-$$"
+if crontab -l > "$mu_cron_tmp" 2>/dev/null; then
+sed -i '/weblun/d' "$mu_cron_tmp"
+crontab "$mu_cron_tmp" >/dev/null 2>&1 || true
+fi
+rm -f "$mu_cron_tmp"
+rm -f /etc/local.d/alpinesublun.start
+}
+
+multiuser_prepare_service_port(){
+multiuser_enabled || return 0
+stop_subscription_service
+multiuser_clear_legacy_subscription_autostart
+sleep 1
+mu_service_port=$(multiuser_config_value port)
+valid_port_value "$mu_service_port" || {
+red_line "多用户订阅端口配置无效。"
+return 1
+}
+if ! port_in_use "$mu_service_port"; then
+return 0
+fi
+yellow_line "多用户订阅端口 $mu_service_port 被非风火轮进程占用，正在自动选择可用端口。"
+mu_service_new=$(select_subscription_port "") || {
+red_line "没有可用的订阅端口；网站访问监控仍会独立运行。"
+is_nat_mode && yellow_line "请先增加一组未占用的公网端口 → 内网端口映射，再重新启动多用户订阅。"
+return 1
+}
+mu_service_public=$(client_port "$mu_service_new")
+if is_nat_mode && [ "$mu_service_public" = "$mu_service_new" ]; then
+red_line "新内网端口 $mu_service_new 没有 NAT 公网映射，已拒绝写入。"
+return 1
+fi
+multiuser_cmd set-subscription-port --port "$mu_service_new" --public-port "$mu_service_public" >/dev/null || return 1
+printf '%s\n' "$mu_service_new" > "$HOME/lun/subport.log"
+green_line "多用户订阅端口已迁移：内网 $mu_service_new / 公网 $mu_service_public。"
+apply_lun_firewall_rules quiet || true
+}
+
 multiuser_service_start(){
 multiuser_enabled || return 0
+multiuser_service_stop
+multiuser_prepare_service_port || return 1
 if pidof systemd >/dev/null 2>&1; then
-systemctl enable --now lun-agent >/dev/null 2>&1
+systemctl enable --now lun-agent >/dev/null 2>&1 || return 1
+sleep 1
+systemctl is-active --quiet lun-agent
 elif command -v rc-service >/dev/null 2>&1; then
 rc-update add lun-agent default >/dev/null 2>&1 || true
-rc-service lun-agent start >/dev/null 2>&1
+rc-service lun-agent start >/dev/null 2>&1 || return 1
+rc-service lun-agent status >/dev/null 2>&1
 else
 echo "多用户模块要求 systemd 或 OpenRC，未启动不可靠的无 init 常驻进程。" >&2
 return 1
@@ -3221,13 +3330,8 @@ fi
 
 multiuser_service_restart(){
 multiuser_enabled || return 0
-if pidof systemd >/dev/null 2>&1; then
-systemctl restart lun-agent >/dev/null 2>&1
-elif command -v rc-service >/dev/null 2>&1; then
-rc-service lun-agent restart >/dev/null 2>&1
-else
-return 1
-fi
+multiuser_service_stop
+multiuser_service_start
 }
 
 multiuser_install_service(){
@@ -3289,6 +3393,108 @@ systemctl daemon-reload >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-update del lun-agent default >/dev/null 2>&1 || true
 rm -f /etc/init.d/lun-agent
+fi
+}
+
+visit_monitor_enabled(){
+[ -x "$(multiuser_agent)" ] || return 1
+multiuser_cmd --json visit-status 2>/dev/null | grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true'
+}
+
+visit_monitor_service_stop(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl stop lun-visit-monitor >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service lun-visit-monitor stop >/dev/null 2>&1 || true
+fi
+for P in /proc/[0-9]*; do
+[ -r "$P/cmdline" ] || continue
+PID=$(basename "$P")
+CMD=$(tr '\0' ' ' < "$P/cmdline" 2>/dev/null)
+case "$CMD" in *"/lun/modules/multiuser/lun_agent.py"*" visit-serve"*) kill "$PID" 2>/dev/null || true ;; esac
+done
+}
+
+visit_monitor_service_start(){
+visit_monitor_enabled || return 0
+if pidof systemd >/dev/null 2>&1; then
+systemctl enable --now lun-visit-monitor >/dev/null 2>&1 || return 1
+sleep 1
+systemctl is-active --quiet lun-visit-monitor
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update add lun-visit-monitor default >/dev/null 2>&1 || true
+rc-service lun-visit-monitor start >/dev/null 2>&1 || return 1
+rc-service lun-visit-monitor status >/dev/null 2>&1
+else
+echo "网站访问监控要求 systemd 或 OpenRC，未启动不可靠的无 init 常驻进程。" >&2
+return 1
+fi
+}
+
+visit_monitor_service_restart(){
+visit_monitor_service_stop
+visit_monitor_service_start
+}
+
+visit_monitor_install_service(){
+python_bin=$(command -v python3) || return 1
+agent_py="$(multiuser_module_dir)/lun_agent.py"
+if pidof systemd >/dev/null 2>&1; then
+cat > /etc/systemd/system/lun-visit-monitor.service <<EOF
+[Unit]
+Description=FHLUN website visit monitor
+After=network.target xr.service sb.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=$python_bin $agent_py --root $HOME/lun visit-serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=$HOME/lun
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable lun-visit-monitor >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+cat > /etc/init.d/lun-visit-monitor <<EOF
+#!/sbin/openrc-run
+description="FHLUN website visit monitor"
+command="$python_bin"
+command_args="$agent_py --root $HOME/lun visit-serve"
+command_background=yes
+pidfile="/run/lun-visit-monitor.pid"
+output_log="/var/log/lun-visit-monitor.log"
+error_log="/var/log/lun-visit-monitor.log"
+depend() {
+need net
+after xray sing-box
+}
+EOF
+chmod +x /etc/init.d/lun-visit-monitor
+rc-update add lun-visit-monitor default >/dev/null 2>&1
+else
+red_line "网站访问监控要求 systemd 或 OpenRC；当前系统无法提供可靠常驻服务。"
+return 1
+fi
+}
+
+visit_monitor_remove_service(){
+visit_monitor_service_stop
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable lun-visit-monitor >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/lun-visit-monitor.service
+systemctl daemon-reload >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update del lun-visit-monitor default >/dev/null 2>&1 || true
+rm -f /etc/init.d/lun-visit-monitor
 fi
 }
 
@@ -3603,6 +3809,7 @@ done
 
 restart_subscription_service(){
 [ -s "$(multiuser_module_dir)/config.json" ] && multiuser_enabled && {
+multiuser_sync_subscription_state || return 1
 multiuser_cmd reconcile >/dev/null 2>&1 || return 1
 if pidof systemd >/dev/null 2>&1; then
 systemctl is-active --quiet lun-agent 2>/dev/null || multiuser_service_start
@@ -4820,12 +5027,10 @@ rules:
   - MATCH,🌍选择代理节点
 EOF
 rm -f "$HOME/lun/.cdn_sbox_entries" "$HOME/lun/.cdn_sbox_tags" "$HOME/lun/.cdn_clash_entries" "$HOME/lun/.cdn_clash_names"
-restart_subscription_service
-if [ -s $HOME/lun/subport.log ]; then
-showsubport=$(cat $HOME/lun/subport.log)
-if ps -ef 2>/dev/null | grep "$showsubport" | grep -v grep >/dev/null; then
+if restart_subscription_service; then
 show_subscription_links
-fi
+elif [ -s "$HOME/lun/subport.log" ]; then
+yellow_line "订阅服务未启动，暂不输出不可用链接；请进入“节点订阅分享”重试。"
 fi
 echo
 echo "---------------------------------------------------------"
@@ -4879,6 +5084,7 @@ done
 [ -s "$HOME/lun/sb.json" ] && rc-service sing-box restart >/dev/null 2>&1 || true
 fi
 restart_subscription_service >/dev/null 2>&1 || true
+visit_monitor_service_start >/dev/null 2>&1 || true
 echo "已恢复上一次配置。"
 return 0
 }
@@ -4908,6 +5114,7 @@ echo "协议配置重建完成，已保留一份上次可用快照。"
 cleandel(){
 keep_entry=$1
 multiuser_service_stop
+visit_monitor_service_stop
 if [ "$keep_entry" != "keep-entry" ]; then
 remove_lun_firewall_rules
 if [ -s "$(multiuser_module_dir)/data/lun.db" ]; then
@@ -4916,6 +5123,7 @@ cp -p "$(multiuser_module_dir)/data/lun.db" "$multiuser_backup_path" 2>/dev/null
 fi
 multiuser_bandwidth_remove
 multiuser_remove_service
+visit_monitor_remove_service
 fi
 stop_lun_owned_processes
 [ -f ~/.bashrc ] || touch ~/.bashrc
@@ -4952,6 +5160,10 @@ fi
 factory_reset(){
 if multiuser_installed; then
 red_line "检测到多用户模块。为避免用户数据库与新 UUID/端口失配，请先在多用户管理中停用或卸载模块。"
+return 1
+fi
+if visit_monitor_enabled; then
+red_line "检测到网站访问监控。为避免本机身份与新 UUID 失配，请先在网站访问监控中停用。"
 return 1
 fi
 printf "%s警告：此操作将清空所有配置（端口、域名、协议、UUID等），保留内核和脚本！%s\n" "$LUN_RED" "$LUN_RESET"
@@ -5458,12 +5670,7 @@ port_reserved "$p" && continue
 port_in_use "$p" || { printf '%s\n' "$p"; return 0; }
 done
 fi
-for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-p=$(shuf -i 10000-65535 -n 1)
-port_reserved "$p" && continue
-port_in_use "$p" || { printf '%s\n' "$p"; return; }
-done
-echo "没有找到可用端口，请扩容端口池或手动输入端口。" >&2
+echo "NAT 映射和端口池中没有空闲内网端口，请先增加一组映射。" >&2
 return 1
 }
 
@@ -5691,6 +5898,16 @@ fi
 }
 
 show_subscription_summary(){
+if multiuser_enabled; then
+subport=$(multiuser_config_value port)
+sub_public_port=$(multiuser_config_value public_port)
+if is_nat_mode && [ "$sub_public_port" != "$subport" ]; then
+green_line "多用户节点订阅：内网端口：$subport  公网端口：$sub_public_port  token：按设备独立管理"
+else
+green_line "多用户节点订阅：端口：$subport  token：按设备独立管理"
+fi
+return
+fi
 if [ -s "$HOME/lun/subport.log" ] && [ -s "$HOME/lun/subtoken.log" ]; then
 subport=$(cat "$HOME/lun/subport.log")
 sub_public_port=$(client_port "$subport")
@@ -5727,6 +5944,17 @@ esac
 }
 
 show_subscription_links(){
+if multiuser_enabled; then
+multiuser_sync_subscription_state || {
+red_line "多用户订阅状态同步失败，无法输出有效链接。"
+return 1
+}
+echo "**********************************************************"
+multiuser_cmd show-local-subscription
+rc=$?
+echo "**********************************************************"
+return "$rc"
+fi
 [ -s "$HOME/lun/subport.log" ] && [ -s "$HOME/lun/subtoken.log" ] || return
 showsubport=$(cat "$HOME/lun/subport.log")
 showsubtoken=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
@@ -5997,7 +6225,7 @@ _cdn_probe_port=$2
 _cdn_probe_path=$3
 _cdn_probe_body="/tmp/lun-cdn-local-$$"
 rm -f "$_cdn_probe_body"
-_cdn_probe_code=$(curl -k -sS --connect-timeout 4 --max-time 8 --resolve "$_cdn_probe_host:$_cdn_probe_port:127.0.0.1" -o "$_cdn_probe_body" -w '%{http_code}' "https://$_cdn_probe_host:$_cdn_probe_port/$_cdn_probe_path" 2>/dev/null)
+_cdn_probe_code=$(curl -k -sS --connect-timeout 2 --max-time 4 --resolve "$_cdn_probe_host:$_cdn_probe_port:127.0.0.1" -o "$_cdn_probe_body" -w '%{http_code}' "https://$_cdn_probe_host:$_cdn_probe_port/$_cdn_probe_path" 2>/dev/null)
 _cdn_probe_rc=$?
 if [ "$_cdn_probe_rc" -ne 0 ]; then rm -f "$_cdn_probe_body"; return 1; fi
 _cdn_probe_sum=$(cksum < "$_cdn_probe_body" | awk '{print $1 ":" $2}')
@@ -6014,7 +6242,7 @@ _cdn_probe_connect=$(uri_host "$_cdn_probe_ip")
 _cdn_probe_header="/tmp/lun-cdn-edge-header-$$"
 _cdn_probe_body="/tmp/lun-cdn-edge-body-$$"
 rm -f "$_cdn_probe_header" "$_cdn_probe_body"
-_cdn_probe_code=$(curl -k -sS --connect-timeout 5 --max-time 12 -D "$_cdn_probe_header" -o "$_cdn_probe_body" -w '%{http_code}' --connect-to "$_cdn_probe_host:$_cdn_probe_edge:$_cdn_probe_connect:$_cdn_probe_edge" "https://$_cdn_probe_host:$_cdn_probe_edge/$_cdn_probe_path" 2>/dev/null)
+_cdn_probe_code=$(curl -k -sS --connect-timeout 3 --max-time 6 -D "$_cdn_probe_header" -o "$_cdn_probe_body" -w '%{http_code}' --connect-to "$_cdn_probe_host:$_cdn_probe_edge:$_cdn_probe_connect:$_cdn_probe_edge" "https://$_cdn_probe_host:$_cdn_probe_edge/$_cdn_probe_path" 2>/dev/null)
 _cdn_probe_rc=$?
 if [ "$_cdn_probe_rc" -ne 0 ]; then rm -f "$_cdn_probe_header" "$_cdn_probe_body"; return 1; fi
 _cdn_probe_sum=$(cksum < "$_cdn_probe_body" | awk '{print $1 ":" $2}')
@@ -6044,15 +6272,16 @@ echo "注：客户端 HTTPS 边缘端口 $edge_port，Cloudflare Origin Rule 目
 else
 echo "注：客户端 HTTPS 边缘端口与回源公网端口均为 $edge_port。"
 fi
-command -v curl >/dev/null 2>&1 || { cdn_skip "缺少 curl，无法确认 Cloudflare 443 是否真正回源到 XHTTP TLS 入站；已停止输出伪可用节点。"; return 0; }
+edge_h3=no
+if cloudflare_manual_rule_matches 13 "$edge_port" "$origin_public_port" "$uuid-xc"; then
+yellow_line "已按手动登记的 Origin Rule 生成 CDN-TCP 节点；本次不逐个探测优选 IP。实验 CDN-UDP 仍需通过 HTTP/3 实测后才生成。"
+else
+command -v curl >/dev/null 2>&1 || { cdn_skip "缺少 curl，无法确认 Cloudflare 是否真正回源到 XHTTP TLS 入站；已停止输出伪可用节点。"; return 0; }
 local_signature=$(cdn_xhttp_local_signature "$xvvmcdnym" "$port" "$uuid-xc")
 [ -n "$local_signature" ] || { cdn_skip "本机 XHTTP TLS 入站探测失败，已停止输出 CDN 节点。"; return 0; }
-cdn_index=0
-cdn_valid_count=0
-cdn_udp_count=0
-for cdn_ip in $ips; do
-case "$cdn_ip" in ""|-1) continue ;; esac
-edge_result=$(cdn_xhttp_edge_probe "$xvvmcdnym" "$edge_port" "$cdn_ip" "$uuid-xc")
+probe_ip=$(cdn_first_endpoint "$ips")
+[ -n "$probe_ip" ] || { cdn_skip "没有可用于快速验证的 Cloudflare 优选入口。"; return 0; }
+edge_result=$(cdn_xhttp_edge_probe "$xvvmcdnym" "$edge_port" "$probe_ip" "$uuid-xc")
 edge_signature=${edge_result%%|*}
 edge_rest=${edge_result#*|}
 edge_through_cf=${edge_rest%%|*}
@@ -6063,12 +6292,19 @@ if [ -z "$edge_result" ] || [ "$edge_through_cf" != yes ] || [ "$edge_signature"
 if [ "$edge_route" = reality-apple ]; then
 reality_public=
 [ -s "$HOME/lun/port_xh" ] && reality_public=$(client_port "$(cat "$HOME/lun/port_xh" 2>/dev/null)")
-cdn_skip "入口 $cdn_ip:$edge_port 已进入 Cloudflare，但当前回源落到了 Reality/Apple 伪装${reality_public:+（公网端口 $reality_public）}，不是 XHTTP TLS。请删除只按 SSL/HTTPS 分流的旧 tls/nottls 规则，并把 UUID-xc 精确规则的目标端口改为 $origin_public_port。"
+cdn_skip "首个入口 $probe_ip:$edge_port 已进入 Cloudflare，但回源落到了 Reality/Apple 伪装${reality_public:+（公网端口 $reality_public）}，不是 XHTTP TLS。已停止检测其余入口；请删除旧 tls/nottls 宽泛规则，并把 UUID-xc 精确规则指向 $origin_public_port。"
 else
-        cdn_skip "入口 $cdn_ip:$edge_port 尚未按 Host + UUID-xc Path 回源到源站端口 $origin_public_port，已暂缓输出该 TCP/UDP 节点。请进入“Cloudflare Origin Rules”选择“一键自动部署 / 修复”；Lun 会直接写入规则、验证并刷新订阅。"
+cdn_skip "首个入口 $probe_ip:$edge_port 未按 Host + UUID-xc Path 回源到 $origin_public_port，已停止检测其余入口。可在 Origin Rules 菜单手动登记现有规则，或使用 API 自动部署。"
 fi
-continue
+return 0
 fi
+green_line "首个入口 $probe_ip:$edge_port 验证成功；其余优选 IP 复用同一 Host 与规则，不再逐个检测。"
+fi
+cdn_index=0
+cdn_valid_count=0
+cdn_udp_count=0
+for cdn_ip in $ips; do
+case "$cdn_ip" in ""|-1) continue ;; esac
 cdn_index=$((cdn_index + 1))
 cdn_valid_count=$((cdn_valid_count + 1))
 cdn_no=$(printf '%02d' "$cdn_index")
@@ -6555,6 +6791,11 @@ fi
 }
 
 prompt_subscription(){
+if multiuser_enabled; then
+yellow_line "当前为多用户模式：订阅 token 按设备独立管理，不能用单一 token/端口覆盖。"
+green_line "请用“刷新并查看节点信息”查看本机设备链接；其他设备在“多用户管理”中查看或轮换。"
+return 3
+fi
 printf "是否启用节点订阅分享？[y/N]，0 返回："
 IFS= read -r val
 case "$val" in
@@ -6639,14 +6880,18 @@ while :; do
 ui_title "Lun 节点订阅分享"
 show_subscription_summary
 echo " 1. 刷新并查看节点信息"
+if multiuser_enabled; then
+echo " 2. 多用户订阅说明（token 按设备管理）"
+else
 echo " 2. 设置订阅 token / 端口"
+fi
 echo " 3. 设置订阅 IPv4/IPv6 输出"
 echo " 0. 返回"
 printf "请选择 [0-3]："
 IFS= read -r c
 case "$c" in
 1) LUN_MENU_ACTION=list; return ;;
-2) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
+2) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 3 ] && { ui_pause; continue; }; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 3) prompt_subscription_ip_mode; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
@@ -7155,13 +7400,15 @@ cloudflare_prompt_token(){
 ensure_cloudflare_origin_helper || return 1
 token_file=$(cloudflare_token_file)
 echo "首次自动配置需要 Cloudflare API Token，之后不再重复询问。"
-echo "Token 权限：Zone Read、DNS Edit、Origin Rules Edit、Zone Settings Edit；资源范围只选当前域名即可。"
-printf "粘贴 Token（输入隐藏，0 返回）："
-old_stty=$(stty -g 2>/dev/null)
-[ -n "$old_stty" ] && stty -echo 2>/dev/null
+echo "创建位置：我的个人资料 → API 令牌 → 创建自定义令牌（不要使用“账户 API 令牌”）。"
+echo "添加 4 行权限："
+echo "  区域 → 区域 → 读取"
+echo "  区域 → Origin Rules → 编辑"
+echo "  区域 → DNS → 编辑"
+echo "  区域 → 区域设置 → 编辑"
+echo "区域资源只选择当前域名。这里只需要令牌正文，不需要 Token ID、用户 ID、账户 ID 或邮箱。"
+printf "粘贴 Token（输入会显示，0 返回）："
 IFS= read -r cf_token
-[ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null
-printf "\n"
 [ "$cf_token" = 0 ] && return 2
 case "$cf_token" in
 *CF_Token=*) cf_token=${cf_token#*CF_Token=}; cf_token=${cf_token%%[[:space:]]*} ;;
@@ -7178,6 +7425,7 @@ green_line "Cloudflare API Token 已验证并安全保存。"
 return 0
 fi
 red_line "$(sed -n 's/^ERROR=//p' "$token_check" | sed -n 1p)"
+yellow_line "请确认粘贴的是“用户 API 令牌”的令牌正文；创建结果里的 Token ID/ID 不需要填写。"
 rm -f "$token_check"
 return 1
 }
@@ -7391,6 +7639,7 @@ CF_LUN_STATE="$HOME/lun/cdn_cloudflare_state.json" \
 python3 "$HOME/lun/cdn_cloudflare_api.py" deploy > "$api_result" 2>&1; then
 green_line "Cloudflare 已自动配置：DNS 橙云、精确端口回源规则和所需协议设置均已部署。"
 sed -n 's/^ROUTE=/  /p' "$api_result"
+rm -f "$(cloudflare_manual_rule_file)"
 rm -f "$api_result"
 return 0
 fi
@@ -7417,7 +7666,7 @@ for endpoint in $endpoints; do
 checked=$((checked + 1))
 connect_endpoint=$(uri_host "$endpoint")
 headerfile="/tmp/lun-cf-quick-header.$$"
-code=$(curl -k -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 8 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>/dev/null)
+code=$(curl -k -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>/dev/null)
 rc=$?
 if [ "$rc" -eq 0 ] &&
    grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$headerfile" 2>/dev/null &&
@@ -7427,13 +7676,13 @@ rm -f "$headerfile"
 return 0
 fi
 rm -f "$headerfile"
-[ "$checked" -ge 2 ] && break
+[ "$checked" -ge 1 ] && break
 done
 return 1
 }
 
 cloudflare_origin_wait_verify(){
-for wait_seconds in 3 7 12; do
+for wait_seconds in 2 4; do
 sleep "$wait_seconds"
 cloudflare_origin_quick_verify && return 0
 done
@@ -7463,6 +7712,7 @@ if CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" CF_LUN_HOST="$host" \
 python3 "$HOME/lun/cdn_cloudflare_api.py" remove > "$result_file" 2>&1; then
 removed=$(sed -n 's/^REMOVED=//p' "$result_file" | sed -n 1p)
 rm -f "$result_file"
+rm -f "$HOME/lun/cdn_cloudflare_state.json"
 green_line "Cloudflare 中由 Lun 创建的回源规则已删除（$removed 条）；DNS 橙云保持不变。"
 return 0
 fi
@@ -7481,6 +7731,7 @@ return 0
 fi
 rule_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
 base_edge=${cdnpt:-$(cdn_recommended_edge_port)}
+[ -s "$(cloudflare_manual_rule_file)" ] && green_line "当前含手动登记规则：Lun 信任控制台现有配置，不会调用 API 或逐个探测优选 IP。"
 green_line "一键自动部署会把以下规则直接写入 Cloudflare，并自动开启该 Host 的橙云。"
 yellow_line "旧 tls/nottls 宽泛规则会由自动部署识别并替换；其它用户规则保持不变。"
 echo "Cloudflare 默认边缘端口：$base_edge（XHTTP TLS 若遇到 HTTP 端口会自动改用 HTTPS 443；443 仅是边缘端口，不代表源站必须监听 443）"
@@ -7580,11 +7831,12 @@ ips=$(cdn_ip_list)
 [ -n "$ips" ] || { echo "尚未设置 CDN 优选入口。"; return 1; }
 echo "诊断 Host=$host，边缘端口=$edge，Path=/$path"
 echo "说明：本项检查 Cloudflare HTTP 路由；400/404 只表示到达入站，不等于代理测速成功。"
+yellow_line "快速诊断只检查首个优选入口；首项不通时不会继续等待其余 IP。"
 for endpoint in $ips; do
 connect_endpoint=$(uri_host "$endpoint")
 errfile="/tmp/lun-cdn-diag.$$"
 headerfile="/tmp/lun-cdn-header.$$"
-code=$(curl -k -v -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 10 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>"$errfile")
+code=$(curl -k -v -sS -D "$headerfile" -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 6 --connect-to "$host:$edge:$connect_endpoint:$edge" "$scheme://$host:$edge/$path" 2>"$errfile")
 rc=$?
 err=$(cat "$errfile" 2>/dev/null)
 if grep -Eqi '^(server:[[:space:]]*cloudflare|cf-ray:)' "$headerfile" 2>/dev/null; then through_cf=yes; else through_cf=no; fi
@@ -7624,6 +7876,7 @@ yellow_line "$endpoint：已进入 Cloudflare 并到达 HTTP 入站，状态 $co
 else
 green_line "$endpoint：Cloudflare HTTP 路由可达，状态 $code；最终代理能力仍以外部客户端测试为准。"
 fi
+break
 done
 is_nat_mode && yellow_line "NAT VPS 在服务器自身发起 CF 回环测试时可能误判；客户端外部测试结果优先。"
 }
@@ -7727,7 +7980,7 @@ export cfip
 return 0
 ;;
 3)
-rm -f "$HOME/lun/cdnym" "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port" "$HOME/lun/cdn_protocol"
+rm -f "$HOME/lun/cdnym" "$HOME/lun/cdn_mode" "$HOME/lun/cdn_edge_port" "$HOME/lun/cdn_protocol" "$(cloudflare_manual_rule_file)"
 clear_cdn_ip_list
 cdnym=; cfip=; cdnmode=standard; cdnpt=; cdnproto=xhttp
 CDN_REBUILD_REQUIRED=yes
@@ -7804,6 +8057,105 @@ red_line "规则已通过 API 部署，但边缘尚未在等待时间内生效�
 return 1
 }
 
+cloudflare_save_manual_rule(){
+manual_save_id=$1
+manual_save_edge=$2
+manual_save_origin=$3
+manual_save_state=$(cloudflare_protocol_state "$manual_save_id")
+[ -n "$manual_save_state" ] || return 1
+manual_save_rest=${manual_save_state#*|}
+manual_save_rest=${manual_save_rest#*|}
+manual_save_rest=${manual_save_rest#*|}
+manual_save_path=$manual_save_rest
+manual_save_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+manual_save_file=$(cloudflare_manual_rule_file)
+manual_save_tmp="$manual_save_file.tmp.$$"
+umask 077
+if [ -s "$manual_save_file" ]; then
+awk -F'|' -v host="$manual_save_host" -v id="$manual_save_id" \
+'$1 != host || $2 != id' "$manual_save_file" > "$manual_save_tmp"
+else
+: > "$manual_save_tmp"
+fi
+printf '%s|%s|%s|%s|%s\n' "$manual_save_host" "$manual_save_id" "$manual_save_edge" "$manual_save_origin" "$manual_save_path" >> "$manual_save_tmp"
+mv "$manual_save_tmp" "$manual_save_file"
+chmod 600 "$manual_save_file"
+}
+
+cloudflare_prompt_manual_origin(){
+echo "已安装且支持端口回源的协议："
+for manual_id in 3 4 8 13; do
+manual_state=$(cloudflare_protocol_state "$manual_id")
+[ -n "$manual_state" ] || continue
+manual_rest=${manual_state#*|}; manual_label=${manual_rest%%|*}; manual_rest=${manual_rest#*|}; manual_port_file=${manual_rest%%|*}
+[ -s "$manual_port_file" ] || continue
+manual_inner=$(cat "$manual_port_file" 2>/dev/null)
+printf " %2s. %-24s 监听 %s" "$manual_id" "$manual_label" "$manual_inner"
+is_nat_mode && printf " / NAT 公网 %s" "$(client_port "$manual_inner")"
+printf "\n"
+done
+printf "协议编号（输入 0 返回）："
+IFS= read -r manual_id
+[ "$manual_id" = 0 ] && return 2
+case "$manual_id" in 3|4|8|13) ;; *) red_line "请输入上方已安装的协议编号。"; return 1 ;; esac
+manual_state=$(cloudflare_protocol_state "$manual_id")
+manual_rest=${manual_state#*|}; manual_label=${manual_rest%%|*}; manual_rest=${manual_rest#*|}; manual_port_file=${manual_rest%%|*}; manual_path=${manual_rest#*|}
+[ -s "$manual_port_file" ] || { red_line "该协议未安装。"; return 1; }
+manual_inner=$(cat "$manual_port_file" 2>/dev/null)
+manual_expected_origin=$(client_port "$manual_inner")
+manual_existing=$(awk -F'|' -v host="$(cat "$HOME/lun/cdnym" 2>/dev/null)" -v id="$manual_id" \
+'$1 == host && $2 == id { print $3 "|" $4; exit }' "$(cloudflare_manual_rule_file)" 2>/dev/null)
+manual_default_edge=${manual_existing%%|*}
+[ "$manual_existing" = "$manual_default_edge" ] && manual_default_edge=
+manual_default_origin=${manual_existing#*|}
+[ -n "$manual_default_edge" ] || {
+if [ "$manual_id" = 13 ]; then manual_default_edge=443
+elif { is_cf_http_port "${cdnpt:-}" || is_cf_https_port "${cdnpt:-}"; }; then manual_default_edge=$cdnpt
+else manual_default_edge=8080
+fi
+}
+[ -n "$manual_default_origin" ] || manual_default_origin=$manual_expected_origin
+printf "Cloudflare 边缘端口（客户端连接，回车默认 %s，0 返回）：" "$manual_default_edge"
+IFS= read -r manual_edge
+[ "$manual_edge" = 0 ] && return 2
+[ -n "$manual_edge" ] || manual_edge=$manual_default_edge
+{ is_cf_http_port "$manual_edge" || is_cf_https_port "$manual_edge"; } || { red_line "边缘端口必须是 Cloudflare 官方 HTTP/HTTPS 代理端口。"; return 1; }
+if [ "$manual_id" = 13 ] && ! is_cf_https_port "$manual_edge"; then
+red_line "VLESS XHTTP TLS 的边缘端口必须使用 Cloudflare HTTPS 端口。"
+return 1
+fi
+printf "Cloudflare 规则中的回源目标端口（Destination port，回车默认 %s，0 返回）：" "$manual_default_origin"
+IFS= read -r manual_origin
+[ "$manual_origin" = 0 ] && return 2
+[ -n "$manual_origin" ] || manual_origin=$manual_default_origin
+port_valid "$manual_origin" || { red_line "回源目标端口必须是 1-65535。"; return 1; }
+if is_nat_mode; then
+manual_mapped_inner=$(inner_port_from_public "$manual_origin")
+[ "$manual_mapped_inner" = "$manual_inner" ] || {
+red_line "NAT 映射不匹配：公网 $manual_origin 当前没有映射到该协议监听端口 $manual_inner。"
+return 1
+}
+else
+[ "$manual_origin" = "$manual_inner" ] || {
+red_line "普通 VPS 的回源目标端口必须等于协议监听端口 $manual_inner；当前没有服务监听 $manual_origin。"
+return 1
+}
+fi
+cloudflare_save_manual_rule "$manual_id" "$manual_edge" "$manual_origin" || { red_line "手动规则保存失败。"; return 1; }
+if [ "$manual_id" = 13 ]; then cloudflare_prepare_rewrite_mode ""; else cloudflare_prepare_rewrite_mode "$manual_edge"; fi
+case "$manual_id" in
+4|8)
+cdnproto=all
+printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
+export cdnproto
+;;
+esac
+CDN_REBUILD_REQUIRED=yes
+green_line "已登记：$manual_label，Cloudflare 边缘 $manual_edge → 回源目标 $manual_origin → 本机监听 $manual_inner。"
+yellow_line "本操作不调用 Cloudflare API；Lun 将信任你已在控制台设置好的规则，并在重建后直接输出对应节点。"
+return 0
+}
+
 prompt_origin_rules(){
 CDN_REBUILD_REQUIRED=no
 load_installed_protocol_flags
@@ -7812,24 +8164,26 @@ cdn_has_origin_rule_protocol || { yellow_line "Origin Rules 只适用于 3.VLESS
 [ -s "$HOME/lun/cdnym" ] || { yellow_line "请先在 CDN / CF 优选中设置 Host。"; return 1; }
 while :; do
 recommended_edge=$(cdn_recommended_edge_port)
-ui_title "Lun Cloudflare Origin Rules 自动配置"
+ui_title "Lun Cloudflare Origin Rules 端口回源"
+[ -s "$(cloudflare_manual_rule_file)" ] && green_line "手动规则：已登记；可直接生成对应节点，不需要 API Token。"
 if [ -s "$(cloudflare_token_file)" ]; then
 green_line "Cloudflare API：已授权；输入端口后可直接部署。"
 else
-yellow_line "Cloudflare API：首次使用需粘贴一次 Token，后续全自动。"
+yellow_line "Cloudflare API：未授权；手动登记不受影响，自动部署才需要 Token。"
 fi
-echo "脚本会自动读取 NAT 映射、拆分冲突监听端口，并完成橙云、规则、SSL/HTTP3、验证和订阅刷新。"
-echo " 1. 一键自动部署 / 修复（推荐，自动处理端口冲突）"
-echo " 2. 输入单协议回源端口并自动迁移 / 部署"
-echo " 3. 验证当前 Cloudflare 回源"
-echo " 4. 查看将部署的精确规则"
-echo " 5. 设置 / 更换 Cloudflare API Token"
-echo " 6. 关闭端口改写并删除 Lun 云端规则"
+echo " 1. 手动登记已设置的规则（无需 API，已有规则推荐）"
+echo " 2. 一键自动部署 / 修复（需要用户 API Token）"
+echo " 3. 输入单协议回源端口并自动迁移 / 部署"
+echo " 4. 快速验证当前回源（只测首个优选入口）"
+echo " 5. 查看精确规则与端口"
+echo " 6. 设置 / 更换 Cloudflare 用户 API Token"
+echo " 7. 关闭端口改写并清除 Lun 规则状态"
 echo " 0. 返回"
-printf "请选择 [0-6]："
+printf "请选择 [0-7]："
 IFS= read -r choice
 case "$choice" in
-1)
+1) cloudflare_prompt_manual_origin || continue; return 0 ;;
+2)
 cloudflare_reset_protocol_changes
 cloudflare_prepare_rewrite_mode ""
 cloudflare_auto_repair_origin_collisions || {
@@ -7841,7 +8195,7 @@ continue
 cloudflare_finish_auto_deploy "" "" || { ui_pause; continue; }
 return 0
 ;;
-2)
+3)
 echo "可指定回源端口的已安装协议："
 for id in 3 4 8 13; do
 state=$(cloudflare_protocol_state "$id")
@@ -7884,14 +8238,20 @@ esac
 cloudflare_finish_auto_deploy "$origin_id" "$origin_port" || { ui_pause; continue; }
 return 0
 ;;
-3) diagnose_cdn_endpoints; ui_pause ;;
-4) show_cdn_origin_rules; ui_pause ;;
-5) cloudflare_prompt_token; ui_pause ;;
-6)
+4) diagnose_cdn_endpoints; ui_pause ;;
+5) show_cdn_origin_rules; ui_pause ;;
+6) cloudflare_prompt_token; ui_pause ;;
+7)
+if [ -s "$HOME/lun/cdn_cloudflare_state.json" ]; then
+if [ -s "$(cloudflare_token_file)" ]; then
 cloudflare_origin_api_remove || { ui_pause; continue; }
+else
+yellow_line "缺少用户 API Token，无法删除云端规则；只清除本机状态，Cloudflare 控制台中的规则请手动删除。"
+fi
+fi
 cdnmode=standard; cdnpt=
 printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
-rm -f "$HOME/lun/cdn_edge_port"
+rm -f "$HOME/lun/cdn_edge_port" "$(cloudflare_manual_rule_file)"
 CDN_REBUILD_REQUIRED=yes
 export cdnmode cdnpt
 green_line "已恢复普通同端口 CDN；即将自动重建配置并刷新订阅。"
@@ -8923,6 +9283,7 @@ return
 prompt_subscription
 rc=$?
 [ "$rc" = 2 ] && continue
+[ "$rc" = 3 ] && { ui_pause; continue; }
 load_installed_protocol_flags
 LUN_MENU_ACTION=rep
 return
@@ -9102,7 +9463,7 @@ show_cdn_summary
 [ -s "$HOME/lun/argoip" ] && echo "Argo优选：$(cat "$HOME/lun/argoip")" || echo "Argo优选：中性默认"
 echo " 1. VPS 类型 / 端口池 / 快速改端口"
 echo " 2. CDN / CF 优选（入口地址与 Host）"
-echo " 3. Cloudflare Origin Rules（输入即自动部署）"
+echo " 3. Cloudflare Origin Rules（手动登记 / API 自动部署）"
 echo " 4. CF 隧道 / Argo（独立链路，不使用 2/3 的设置）"
 echo " 5. CDN 连通诊断"
 echo " 0. 返回"
@@ -9215,12 +9576,27 @@ rm -f "$mu_tmp"
 if [ -n "${LUN_MULTIUSER_AGENT_SOURCE:-}" ] && [ -s "$LUN_MULTIUSER_AGENT_SOURCE" ]; then
 cp "$LUN_MULTIUSER_AGENT_SOURCE" "$mu_tmp" || return 1
 else
-mu_url=${LUN_MULTIUSER_AGENT_URL:-"https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/modules/multiuser/lun_agent.py"}
-if command -v curl >/dev/null 2>&1; then
-curl -fL --connect-timeout 10 --max-time 120 --retry 2 -o "$mu_tmp" "$mu_url" || return 1
-elif command -v wget >/dev/null 2>&1; then
-wget -O "$mu_tmp" --tries=2 --timeout=60 "$mu_url" || return 1
+mu_fallback=
+if [ -n "${LUN_MULTIUSER_AGENT_URL:-}" ]; then
+mu_url=$LUN_MULTIUSER_AGENT_URL
 else
+mu_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/modules/multiuser/lun_agent.py?ref=main&fhlun_nocache=$(date +%s)"
+mu_fallback="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/modules/multiuser/lun_agent.py?fhlun_nocache=$(date +%s)"
+fi
+if command -v curl >/dev/null 2>&1 && curl -fL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' \
+--connect-timeout 10 --max-time 120 --retry 2 -o "$mu_tmp" "$mu_url"; then
+:
+elif command -v wget >/dev/null 2>&1 && wget -O "$mu_tmp" --header='Accept: application/vnd.github.raw+json' \
+--header='Cache-Control: no-cache' --tries=2 --timeout=60 "$mu_url"; then
+:
+elif [ -n "$mu_fallback" ] && command -v curl >/dev/null 2>&1 && curl -fL -H 'Cache-Control: no-cache' \
+--connect-timeout 10 --max-time 120 --retry 2 -o "$mu_tmp" "$mu_fallback"; then
+:
+elif [ -n "$mu_fallback" ] && command -v wget >/dev/null 2>&1 && wget -O "$mu_tmp" \
+--header='Cache-Control: no-cache' --tries=2 --timeout=60 "$mu_fallback"; then
+:
+else
+rm -f "$mu_tmp"
 return 1
 fi
 fi
@@ -9232,6 +9608,71 @@ cat > "$mu_dir/lun-agent" <<EOF
 exec python3 "$mu_target" "\$@"
 EOF
 chmod 700 "$mu_dir/lun-agent"
+}
+
+visit_monitor_prepare(){
+[ "$(id -u 2>/dev/null)" = 0 ] || { red_line "网站访问监控安装需要 root。"; return 1; }
+{ pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
+red_line "网站访问监控只支持 systemd 或 OpenRC。"
+return 1
+}
+[ -s "$HOME/lun/uuid" ] || {
+red_line "请先完成至少一个风火轮代理协议安装。"
+return 1
+}
+multiuser_install_python || return 1
+if [ ! -x "$(multiuser_agent)" ] || ! "$(multiuser_agent)" --help 2>/dev/null | grep -q 'visit-serve'; then
+multiuser_download_agent || { red_line "网站监控程序下载 / 复制失败。"; return 1; }
+fi
+multiuser_cmd visit-init >/dev/null || return 1
+visit_monitor_install_service || return 1
+}
+
+visit_monitor_enable(){
+visit_was_enabled=no
+visit_monitor_enabled && visit_was_enabled=yes
+visit_monitor_prepare || return 1
+multiuser_cmd backup >/dev/null 2>&1 || true
+multiuser_cmd visit-config --enabled yes >/dev/null || return 1
+if ! multiuser_cmd visit-apply; then
+if [ "$visit_was_enabled" = no ]; then
+multiuser_cmd visit-config --enabled no >/dev/null 2>&1 || true
+multiuser_cmd visit-apply >/dev/null 2>&1 || true
+fi
+red_line "网站监控配置未能应用，核心配置已保留 / 回滚。"
+return 1
+fi
+if ! visit_monitor_service_restart; then
+if [ "$visit_was_enabled" = no ]; then
+multiuser_cmd visit-config --enabled no >/dev/null 2>&1 || true
+multiuser_cmd visit-apply >/dev/null 2>&1 || true
+fi
+red_line "网站监控常驻服务启动失败。"
+return 1
+fi
+green_line "网站访问监控已启用。"
+multiuser_cmd visit-status
+}
+
+visit_monitor_disable(){
+visit_monitor_enabled || { yellow_line "网站访问监控当前未启用。"; return 0; }
+visit_monitor_service_stop
+multiuser_cmd visit-config --enabled no >/dev/null || return 1
+if multiuser_cmd visit-apply; then
+yellow_line "网站访问监控已停用；已有记录仍保留。"
+return 0
+fi
+multiuser_cmd visit-config --enabled yes >/dev/null 2>&1 || true
+multiuser_cmd visit-apply >/dev/null 2>&1 || true
+visit_monitor_service_start >/dev/null 2>&1 || true
+red_line "停用时核心配置校验失败，已恢复监控设置。"
+return 1
+}
+
+visit_monitor_reapply(){
+visit_monitor_enabled || return 0
+multiuser_cmd visit-apply || return 1
+visit_monitor_service_restart
 }
 
 multiuser_pick_local_api_port(){
@@ -9277,9 +9718,7 @@ fi
 [ -n "$mu_host" ] || { red_line "没有可用于订阅输出的域名或公网 IP。"; return 1; }
 if [ "$mu_scheme" = http ]; then
 red_line "当前没有匹配订阅地址的公开可信证书，多用户订阅只能使用 HTTP。"
-yellow_line "HTTP token 会明文经过网络；建议先申请域名证书。输入 HTTP 才继续："
-IFS= read -r mu_http_confirm
-[ "$mu_http_confirm" = HTTP ] || { echo "已取消安装。"; return 1; }
+yellow_line "已自动使用 HTTP 继续安装；订阅 token 会明文传输，建议稍后申请域名证书升级 HTTPS。"
 else
 green_line "检测到公开可信证书，多用户订阅将使用 HTTPS。"
 fi
@@ -9338,8 +9777,14 @@ fi
 [ -x "$mu_abort_dir/lun-agent" ] && "$mu_abort_dir/lun-agent" --root "$HOME/lun" set-module --enabled no >/dev/null 2>&1 || true
 multiuser_remove_service
 multiuser_restore_legacy_subscription_port
+if [ "${multiuser_had_visit:-no}" = yes ]; then
+rm -f "$mu_abort_dir/config.json" "$mu_abort_dir/lun-sb-stats"
+rm -rf "$mu_abort_dir/generated"
+else
 rm -rf "$mu_abort_dir"
+fi
 restart_subscription_service >/dev/null 2>&1 || true
+visit_monitor_service_start >/dev/null 2>&1 || true
 }
 
 multiuser_install(){
@@ -9349,6 +9794,9 @@ red_line "多用户模块只支持 systemd 或 OpenRC；当前无 init 模式已
 return 1
 }
 [ -s "$HOME/lun/uuid" ] || { red_line "请先完成至少一个风火轮协议安装。"; return 1; }
+multiuser_had_visit=no
+visit_monitor_enabled && multiuser_had_visit=yes
+visit_monitor_service_stop
 multiuser_install_python || return 1
 multiuser_download_agent || { red_line "多用户代理程序下载/复制失败。"; multiuser_abort_install; return 1; }
 multiuser_prepare_subscription || { multiuser_abort_install; return 1; }
@@ -9358,13 +9806,13 @@ mu_sapi_port=$(multiuser_pick_local_api_port $((mu_xapi_port + 1))) || { red_lin
 mu_ss_port=0
 mu_ss_public=0
 if grep -q '"tag":"ss-2022"' "$HOME/lun/sb.json" 2>/dev/null; then
-mu_ss_port=$(random_port 2>/dev/null) || { red_line "Shadowsocks-2022 迁移需要一个额外空闲端口。"; multiuser_abort_install; return 1; }
+if mu_ss_port=$(random_nat_port 2>/dev/null); then
 mu_ss_public=$(client_port "$mu_ss_port")
-if is_nat_mode && [ "$mu_ss_public" = "$mu_ss_port" ]; then
-red_line "Shadowsocks-2022 零中断迁移需要额外 NAT 映射：公网端口-$mu_ss_port。"
-yellow_line "请先增加映射后重试；原 Shadowsocks 端口不会被修改。"
-multiuser_abort_install
-return 1
+green_line "Shadowsocks-2022 多用户端口已自动分配：内网 $mu_ss_port / 公网 $mu_ss_public。"
+else
+mu_ss_port=0
+mu_ss_public=0
+yellow_line "没有空闲 NAT 映射，已跳过 Shadowsocks-2022 多用户节点；其他协议继续安装，原 Shadowsocks 不受影响。"
 fi
 fi
 
@@ -9393,12 +9841,14 @@ return 1
 fi
 multiuser_install_service || { multiuser_abort_install; return 1; }
 multiuser_service_start || { multiuser_abort_install; return 1; }
+visit_monitor_service_start || true
 crontab -l 2>/dev/null > /tmp/crontab.tmp
 sed -i '/weblun/d' /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1 || true
 rm -f /tmp/crontab.tmp /etc/local.d/alpinesublun.start
 apply_lun_firewall_rules || true
 green_line "多用户模块安装完成；旧用户、旧 UUID、旧订阅 token 与旧 Shadowsocks 端口均已保留。"
+[ "$mu_scheme" = http ] && yellow_line "当前设备订阅使用 HTTP；节点协议本身不受影响，申请公开可信证书后可升级 HTTPS。"
 [ "$mu_legacy_http_internal" -gt 0 ] 2>/dev/null && yellow_line "旧 token 继续使用原 HTTP 端口：内网 $mu_legacy_http_internal / 公网 $mu_legacy_http_public；新设备使用 HTTPS 端口 $mu_sub_public。"
 [ "$mu_ss_port" -gt 0 ] 2>/dev/null && green_line "Shadowsocks 多用户并行端口：内网 $mu_ss_port / 公网 $mu_ss_public。"
 multiuser_cmd doctor
@@ -9836,6 +10286,138 @@ rm -f "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser"
 green_line "Sing-box 增强内核安装完成；协议版本不变，已增加用户统计能力。"
 }
 
+multiuser_visit_refresh(){
+multiuser_cmd visit-collect >/dev/null 2>&1 || true
+}
+
+multiuser_visit_filter_ui(){
+printf "查看最近几天 [默认 7，输入 0 返回]："
+IFS= read -r mu_visit_days
+[ "$mu_visit_days" = 0 ] && return
+[ -n "$mu_visit_days" ] || mu_visit_days=7
+case "$mu_visit_days" in *[!0-9]*) red_line "天数必须是整数。"; return ;; esac
+printf "用户 ID [回车全部，输入 0 返回]："
+IFS= read -r mu_visit_uid
+[ "$mu_visit_uid" = 0 ] && return
+case "$mu_visit_uid" in ""|*[!0-9]*) [ -z "$mu_visit_uid" ] || { red_line "用户 ID 必须是整数。"; return; } ;; esac
+printf "设备 ID [回车全部，输入 0 返回]："
+IFS= read -r mu_visit_did
+[ "$mu_visit_did" = 0 ] && return
+case "$mu_visit_did" in ""|*[!0-9]*) [ -z "$mu_visit_did" ] || { red_line "设备 ID 必须是整数。"; return; } ;; esac
+printf "域名关键字 [回车全部，输入 0 返回]："
+IFS= read -r mu_visit_domain
+[ "$mu_visit_domain" = 0 ] && return
+set -- visit-recent --days "$mu_visit_days" --limit 100
+[ -n "$mu_visit_uid" ] && set -- "$@" --user-id "$mu_visit_uid"
+[ -n "$mu_visit_did" ] && set -- "$@" --device-id "$mu_visit_did"
+[ -n "$mu_visit_domain" ] && set -- "$@" --domain "$mu_visit_domain"
+multiuser_visit_refresh
+multiuser_cmd "$@"
+ui_pause
+}
+
+visit_monitor_status_ui(){
+if [ ! -x "$(multiuser_agent)" ]; then
+echo "监控状态：尚未初始化"
+return 0
+fi
+multiuser_cmd visit-status
+if pidof systemd >/dev/null 2>&1; then
+if systemctl is-active --quiet lun-visit-monitor 2>/dev/null; then
+green_line "采集服务：运行中（不监听网络端口）"
+elif visit_monitor_enabled; then
+red_line "采集服务：未运行"
+else
+echo "采集服务：未启用"
+fi
+elif command -v rc-service >/dev/null 2>&1; then
+if rc-service lun-visit-monitor status >/dev/null 2>&1; then
+green_line "采集服务：运行中（不监听网络端口）"
+elif visit_monitor_enabled; then
+red_line "采集服务：未运行"
+else
+echo "采集服务：未启用"
+fi
+fi
+if visit_monitor_enabled; then
+if [ -s "$HOME/lun/xr.json" ]; then
+grep -Fq "$(multiuser_module_dir)/data/xray-access.log" "$HOME/lun/xr.json" \
+&& green_line "Xray 日志接入：正常" || red_line "Xray 日志接入：未生效"
+fi
+if [ -s "$HOME/lun/sb.json" ]; then
+grep -Fq "$(multiuser_module_dir)/data/singbox-access.log" "$HOME/lun/sb.json" \
+&& green_line "Sing-box 日志接入：正常" || red_line "Sing-box 日志接入：未生效"
+fi
+fi
+}
+
+visit_monitor_storage_ui(){
+visit_monitor_enabled && visit_storage_enabled=yes || visit_storage_enabled=no
+multiuser_cmd visit-status
+printf "逐条明细保留天数 [1-30，回车保持当前，输入 0 返回]："
+IFS= read -r visit_detail
+[ "$visit_detail" = 0 ] && return
+printf "每日汇总保留天数 [1-365，回车保持当前，输入 0 返回]："
+IFS= read -r visit_summary
+[ "$visit_summary" = 0 ] && return
+case "$visit_detail:$visit_summary" in
+*[!0-9:]*)
+red_line "保留天数只能输入整数。"
+return 1
+;;
+esac
+set -- visit-config --enabled "$visit_storage_enabled"
+[ -n "$visit_detail" ] && set -- "$@" --detail-days "$visit_detail"
+[ -n "$visit_summary" ] && set -- "$@" --summary-days "$visit_summary"
+multiuser_cmd "$@" || return 1
+green_line "存储设置已保存。"
+}
+
+visit_monitor_ui(){
+while :; do
+ui_title "Lun 网站访问监控"
+visit_monitor_status_ui
+yellow_line "仅记录域名、端口和连接次数，不记录网页路径、查询参数或传输内容。"
+echo " 1. 一键开启 / 修复监控"
+echo " 2. 运行状态 / 自检"
+echo " 3. 今日最近访问"
+echo " 4. 七天热门域名"
+echo " 5. 七天用户访问排行"
+echo " 6. 按用户 / 设备 / 域名筛选"
+echo " 7. 立即采集"
+echo " 8. 存储设置"
+echo " 9. 清空全部访问记录"
+echo "10. 停用监控（保留已有记录）"
+echo " 0. 返回"
+printf "请选择 [0-10]（输入 0 返回）："
+IFS= read -r mu_choice
+case "$mu_choice" in
+1) visit_monitor_enable; ui_pause ;;
+2) visit_monitor_status_ui; ui_pause ;;
+3) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100; ui_pause ;;
+4) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group domain; ui_pause ;;
+5) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group user; ui_pause ;;
+6) multiuser_visit_filter_ui ;;
+7) multiuser_cmd visit-collect; ui_pause ;;
+8) visit_monitor_storage_ui; ui_pause ;;
+9)
+printf "%s此操作不可恢复。输入 CLEAR 清空数据库访问记录和原始日志（输入 0 返回）：%s" "$LUN_RED" "$LUN_RESET"
+IFS= read -r mu_visit_clear
+[ "$mu_visit_clear" = 0 ] && continue
+multiuser_cmd visit-clear --confirm "$mu_visit_clear"
+ui_pause
+;;
+10) visit_monitor_disable; ui_pause ;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+multiuser_visit_monitor_ui(){
+visit_monitor_ui
+}
+
 multiuser_module_ui(){
 while :; do
 ui_title "Lun 多用户模块维护"
@@ -9852,7 +10434,14 @@ IFS= read -r mu_choice
 case "$mu_choice" in
 1) multiuser_cmd backup; ui_pause ;;
 2) multiuser_cmd doctor; ui_pause ;;
-3) multiuser_download_agent && multiuser_service_restart && green_line "多用户管理程序已更新。"; ui_pause ;;
+3)
+if multiuser_download_agent; then
+multiuser_service_restart || true
+visit_monitor_service_restart || true
+green_line "多用户管理 / 网站监控程序已更新。"
+fi
+ui_pause
+;;
 4)
 if multiuser_enabled; then
 multiuser_cmd set-module --enabled no && multiuser_service_stop
@@ -9880,7 +10469,13 @@ multiuser_cmd set-module --enabled no >/dev/null 2>&1 || true
 multiuser_bandwidth_remove
 multiuser_remove_service
 multiuser_restore_legacy_subscription_port
+if visit_monitor_enabled; then
+rm -f "$(multiuser_module_dir)/config.json" "$(multiuser_module_dir)/lun-sb-stats"
+rm -rf "$(multiuser_module_dir)/generated"
+yellow_line "网站访问监控仍在使用共享程序和数据库；已仅移除多用户订阅服务。"
+else
 rm -rf "$(multiuser_module_dir)"
+fi
 LUN_MENU_ACTION=rep
 return 3
 ;;
@@ -9967,7 +10562,7 @@ yellow_line "云安全组与服务商公网端口映射无法由 VPS 内脚本�
 echo "内网端口池是协议实际监听端口；外网端口池是公网入口，两组按位置自动对应。"
 yellow_line "同一内网端口出现多个公网映射时保留首项，后续项会被提示并忽略。"
 red_line "同一公网端口不能指向多个内网端口；此类冲突会拒绝整次输入。"
-echo "Cloudflare CDN：先完成服务商公网→内网映射，再在 Origin Rules 选择一键自动部署。"
+echo "Cloudflare CDN：先完成服务商公网→内网映射；已有云端规则选手动登记，否则使用 API 自动部署。"
 }
 
 show_cdn_help(){
@@ -9976,7 +10571,10 @@ echo "HTTP 端口：80、8080、8880、2052、2082、2086、2095。"
 echo "HTTPS 端口：443、8443、2053、2083、2087、2096。"
 echo "支持 CDN 的协议随机端口会优先选择对应 CF 端口，并默认排除热门的 443。"
 yellow_line "源站端口不在 CF 端口组时，必须用精确 Host + Path 的 Origin Rule 改写回源端口。"
-green_line "菜单会通过 Cloudflare API 自动开启橙云、部署精确规则、调整 SSL/HTTP3、验证并刷新订阅；首次只需粘贴一次最小权限 Token。"
+green_line "已经在控制台建好规则：选择“手动登记”，输入边缘端口和 Destination port，不需要 API Token。"
+echo "自动部署使用“我的个人资料”中的用户 API 令牌；权限为 区域/区域/读取、区域/Origin Rules/编辑、区域/DNS/编辑、区域/区域设置/编辑。"
+echo "脚本只要令牌正文，不需要 Token ID、用户 ID、账户 ID 或邮箱。"
+green_line "API 自动部署会开启橙云、部署精确规则、调整 SSL/HTTP3、验证并刷新订阅。"
 yellow_line "实验 CDN-UDP 要求 Cloudflare HTTP/3 和边缘 UDP 443；手动优选 IP 不能替灰云 Host 创建边缘路由，官方稳定用法仍是橙云并通过连通诊断。"
 red_line "手动使用本机 443 前必须检查占用；Lun 不会自动 kill 未知进程。"
 }
@@ -10020,10 +10618,11 @@ echo " 3. 入口网络管理"
 echo " 4. 服务与更新"
 echo " 5. 高级设置"
 printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 7. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
+printf " 7. %s网站访问监控%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 8. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
 echo " 0. 退出"
 ui_line
-printf "请输入数字【0-7】："
+printf "请输入数字【0-8】："
 IFS= read -r menu_choice
 case "$menu_choice" in
 1) install_protocol_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
@@ -10032,7 +10631,8 @@ case "$menu_choice" in
 4) service_update_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
 5) advanced_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
 6) multiuser_menu; mu_rc=$?; [ "$mu_rc" = 3 ] && break ;;
-7) help_menu ;;
+7) visit_monitor_ui ;;
+8) help_menu ;;
 0|"") exit ;;
 *) echo "输入错误，请重新选择。"; sleep 1 ;;
 esac
@@ -10169,6 +10769,12 @@ echo "多用户配置注入失败，正在恢复重建前配置。"
 [ "$_lun_rebuild_request" = yes ] && rollback_rebuild
 exit 1
 fi
+elif visit_monitor_enabled; then
+if ! multiuser_cmd visit-apply; then
+echo "网站监控配置注入失败，正在恢复重建前配置。"
+[ "$_lun_rebuild_request" = yes ] && rollback_rebuild
+exit 1
+fi
 fi
 if [ "$_lun_rebuild_request" = yes ]; then
 if ! validate_rebuild; then
@@ -10181,6 +10787,7 @@ if multiuser_enabled; then
 [ -s "$HOME/lun/sb.json" ] && sbrestart
 multiuser_service_start || yellow_line "多用户代理服务未能自动启动，请进入多用户管理 → 诊断。"
 fi
+visit_monitor_service_start || yellow_line "网站监控服务未能自动启动，请进入网站访问监控 → 运行状态 / 自检。"
 fi
 if [ -n "$sub" ] && ! multiuser_enabled; then
 subtokenipsub(){

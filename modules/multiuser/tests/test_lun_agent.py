@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -69,6 +70,64 @@ class AgentTestCase(unittest.TestCase):
         self.assertEqual(device["token"], "legacy-token")
         self.assertEqual(device["legacy"], 1)
 
+    def test_visit_init_without_multiuser_config_is_reused_by_later_init(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "lun"
+            root.mkdir()
+            (root / "uuid").write_text(
+                "22222222-2222-4222-8222-222222222222\n", encoding="utf-8"
+            )
+            agent = lun_agent.Agent(root)
+            try:
+                result = agent.initialize_visit()
+                self.assertFalse(agent.config_path.exists())
+                self.assertEqual(result["device_id"], 1)
+                args = argparse.Namespace(
+                    legacy_uuid=None,
+                    legacy_token=None,
+                    bind="127.0.0.1",
+                    port=31000,
+                    public_port=31000,
+                    legacy_http_port=0,
+                    legacy_http_public_port=0,
+                    scheme="http",
+                    public_host="example.com",
+                    certificate=None,
+                    private_key=None,
+                    xray_api="127.0.0.1:10085",
+                    singbox_api="127.0.0.1:10086",
+                    poll_interval=30,
+                    ss_port=0,
+                    ss_public_port=0,
+                    ss_server_password="AAAAAAAAAAAAAAAAAAAAAA==",
+                )
+                agent.initialize(args)
+                self.assertEqual(
+                    agent.db.connection.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    agent.db.connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
+                    1,
+                )
+            finally:
+                agent.close()
+
+    def test_visit_init_reuses_legacy_device_when_root_uuid_changed(self):
+        legacy = self.agent.db.connection.execute(
+            "SELECT * FROM devices WHERE legacy=1"
+        ).fetchone()
+        (self.root / "uuid").write_text(
+            "33333333-3333-4333-8333-333333333333\n", encoding="utf-8"
+        )
+        result = self.agent.initialize_visit()
+        self.assertEqual(result["device_id"], legacy["id"])
+        self.assertEqual(result["uuid"], legacy["uuid"])
+        self.assertEqual(
+            self.agent.db.connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
+            1,
+        )
+
     def test_user_device_and_permissions(self):
         device = self.add_user()
         self.assertNotEqual(device["uuid"], device["password"])
@@ -117,6 +176,25 @@ class AgentTestCase(unittest.TestCase):
              ):
             with self.assertRaises(lun_agent.AgentError):
                 self.agent.apply()
+        self.assertEqual(json.loads(current.read_text(encoding="utf-8"))["state"], "old")
+
+    def test_apply_visit_restores_core_config_when_restart_fails(self):
+        self.agent.config_path.unlink()
+        current = self.root / "xr.json"
+        previous = self.agent.generated / "previous-visit-xr.json"
+        current.write_text('{"state":"new"}\n', encoding="utf-8")
+        previous.write_text('{"state":"old"}\n', encoding="utf-8")
+        with mock.patch.object(
+            self.agent,
+            "reconcile_visit",
+            return_value={"xray": True, "singbox": False},
+        ), mock.patch.object(
+            self.agent,
+            "restart_cores",
+            side_effect=[lun_agent.AgentError("restart failed"), None],
+        ):
+            with self.assertRaises(lun_agent.AgentError):
+                self.agent.apply_visit()
         self.assertEqual(json.loads(current.read_text(encoding="utf-8"))["state"], "old")
 
     def test_systemd_restart_clears_start_limit_first(self):
@@ -202,6 +280,298 @@ class AgentTestCase(unittest.TestCase):
         legacy = next(item for item in second["inbounds"] if item["tag"] == "ss-2022")
         self.assertEqual(legacy["password"], "legacy")
 
+    def test_visit_monitor_is_opt_in_and_controls_core_logs(self):
+        self.assertFalse(self.agent.visit_monitor_settings()["enabled"])
+        self.agent.set_visit_monitor(True, 7, 30)
+        xray = self.agent._reconcile_xray(
+            {
+                "log": {"access": "/var/log/xray/original.log", "error": "/var/log/xray/error.log"},
+                "inbounds": [], "outbounds": [], "routing": {"rules": []},
+            },
+            self.agent.active_devices(),
+            self.agent.load_config(),
+        )
+        singbox = self.agent._reconcile_singbox(
+            {
+                "log": {
+                    "disabled": True,
+                    "level": "warn",
+                    "output": "/var/log/sing-box/original.log",
+                    "timestamp": False,
+                },
+                "inbounds": [], "route": {"rules": []},
+            },
+            self.agent.active_devices(),
+            self.agent.load_config(),
+        )
+        self.assertEqual(xray["log"]["access"], str(self.agent.visit_log_paths()["xray"]))
+        self.assertEqual(xray["log"]["loglevel"], "warning")
+        self.assertEqual(singbox["log"]["output"], str(self.agent.visit_log_paths()["singbox"]))
+        self.agent.set_visit_monitor(False, 7, 30)
+        xray = self.agent._reconcile_xray(xray, self.agent.active_devices(), self.agent.load_config())
+        singbox = self.agent._reconcile_singbox(singbox, self.agent.active_devices(), self.agent.load_config())
+        self.assertEqual(xray["log"]["access"], "/var/log/xray/original.log")
+        self.assertEqual(xray["log"]["error"], "/var/log/xray/error.log")
+        self.assertEqual(singbox["log"]["output"], "/var/log/sing-box/original.log")
+        self.assertTrue(singbox["log"]["disabled"])
+        self.assertEqual(singbox["log"]["level"], "warn")
+        self.assertFalse(singbox["log"]["timestamp"])
+
+    def test_standalone_visit_fields_are_added_and_restored(self):
+        self.agent.config_path.unlink()
+        self.agent.set_visit_monitor(True, 7, 30)
+        xray_original = {
+            "log": {"loglevel": "none"},
+            "inbounds": [{
+                "tag": "reality-vision",
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{
+                        "id": "11111111-1111-4111-8111-111111111111",
+                        "flow": "xtls-rprx-vision",
+                    }]
+                },
+            }],
+        }
+        singbox_original = {
+            "log": {"disabled": False, "level": "info", "timestamp": True},
+            "inbounds": [{
+                "type": "hysteria2",
+                "tag": "hy2-sb",
+                "users": [{"password": "11111111-1111-4111-8111-111111111111"}],
+            }],
+            "route": {"rules": []},
+        }
+        devices = self.agent.active_devices()
+        xray = self.agent._reconcile_visit_xray(
+            json.loads(json.dumps(xray_original)), devices
+        )
+        singbox = self.agent._reconcile_visit_singbox(
+            json.loads(json.dumps(singbox_original)), devices
+        )
+        identity = "lun:u:1:d:1"
+        self.assertEqual(
+            xray["inbounds"][0]["settings"]["clients"][0]["email"], identity
+        )
+        self.assertTrue(xray["inbounds"][0]["sniffing"]["enabled"])
+        self.assertEqual(singbox["inbounds"][0]["users"][0]["name"], identity)
+        self.assertEqual(singbox["route"]["rules"][0], {"action": "sniff"})
+        self.agent.set_visit_monitor(False, 7, 30)
+        restored_xray = self.agent._reconcile_visit_xray(xray, devices)
+        restored_singbox = self.agent._reconcile_visit_singbox(singbox, devices)
+        self.assertEqual(restored_xray, xray_original)
+        self.assertEqual(restored_singbox, singbox_original)
+
+    def test_visit_reconcile_validation_failure_keeps_config_and_settings(self):
+        self.agent.config_path.unlink()
+        self.agent.set_visit_monitor(True, 7, 30)
+        target = self.root / "xr.json"
+        original = {
+            "log": {"loglevel": "none"},
+            "inbounds": [{
+                "tag": "reality-vision",
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{
+                        "id": "11111111-1111-4111-8111-111111111111"
+                    }]
+                },
+            }],
+        }
+        target.write_text(json.dumps(original), encoding="utf-8")
+        with mock.patch.object(
+            self.agent, "_validate_core", side_effect=lun_agent.AgentError("invalid")
+        ):
+            with self.assertRaises(lun_agent.AgentError):
+                self.agent.reconcile_visit()
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), original)
+        self.assertEqual(
+            self.agent.db.setting("visit_xray_identity_before", ""), ""
+        )
+        self.assertEqual(
+            self.agent.db.setting("visit_xray_log_fields_before", ""), ""
+        )
+
+    def test_visit_log_parsers_keep_domains_and_drop_ips(self):
+        identity = "lun:u:2:d:3"
+        xray = lun_agent.Agent.parse_visit_line(
+            "xray",
+            "2026/07/30 12:00:00 from tcp:1.2.3.4:5000 accepted "
+            f"tcp:www.example.com:443 [reality-vision -> direct] email: {identity}",
+        )
+        self.assertEqual(xray["domain"], "www.example.com")
+        self.assertEqual(xray["identity"], identity)
+        self.assertEqual(xray["inbound"], "reality-vision")
+        singbox = lun_agent.Agent.parse_visit_line(
+            "singbox",
+            "INFO [123456 0ms] inbound/hysteria2[hy2-sb]: "
+            f"[{identity}] inbound packet connection to video.example.net:443",
+        )
+        self.assertEqual(singbox["domain"], "video.example.net")
+        self.assertEqual(singbox["network"], "udp")
+        self.assertIsNone(lun_agent.Agent.parse_visit_line(
+            "xray",
+            "from tcp:1.2.3.4:5000 accepted tcp:8.8.8.8:443 "
+            f"[reality-vision -> direct] email: {identity}",
+        ))
+
+    def test_visit_logs_are_incremental_aggregated_and_clearable(self):
+        device = self.add_user()
+        identity = f"lun:u:{device['user_id']}:d:{device['id']}"
+        self.agent.set_visit_monitor(True, 7, 30)
+        paths = self.agent.visit_log_paths()
+        paths["xray"].write_text(
+            "2026/07/30 12:00:00 from tcp:1.2.3.4:5000 accepted "
+            f"tcp:www.example.com:443 [reality-vision -> direct] email: {identity}\n"
+            "2026/07/30 12:00:01 from tcp:1.2.3.4:5001 accepted "
+            "tcp:ignored.example:443 [reality-vision -> direct] email: unknown\n",
+            encoding="utf-8",
+        )
+        paths["singbox"].write_text(
+            "INFO [123456 0ms] inbound/hysteria2[hy2-sb]: "
+            f"[{identity}] inbound packet connection to video.example.net:443\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.agent.collect_visit_logs(), 2)
+        self.assertEqual(self.agent.collect_visit_logs(), 0)
+        recent = self.agent.visit_recent(1, 20, user_id=device["user_id"])
+        self.assertEqual({row["domain"] for row in recent}, {"www.example.com", "video.example.net"})
+        top = self.agent.visit_top(7, 20)
+        self.assertEqual(sum(row["connections"] for row in top), 2)
+        status = self.agent.visit_status()
+        self.assertEqual(status["events"], 2)
+        self.assertEqual(status["summaries"], 2)
+        self.agent.clear_visit_history("CLEAR")
+        self.assertEqual(self.agent.visit_status()["events"], 0)
+        self.assertEqual(paths["xray"].stat().st_size, 0)
+
+    def test_single_user_singbox_log_without_identity_is_attributed_locally(self):
+        self.agent.config_path.unlink()
+        self.agent.set_visit_monitor(True, 7, 30)
+        path = self.agent.visit_log_paths()["singbox"]
+        path.write_text(
+            "INFO inbound/shadowsocks[ss-2022]: "
+            "inbound connection to downloads.example.org:443\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.agent.collect_visit_logs(), 1)
+        recent = self.agent.visit_recent(1, 10)
+        self.assertEqual(recent[0]["user_name"], "本机用户")
+        self.assertEqual(recent[0]["device_name"], "本机设备")
+
+    def test_visit_retention_keeps_daily_summary_after_detail_expires(self):
+        self.agent.set_visit_monitor(True, 7, 30)
+        now = lun_agent.utc_now()
+        device_id = self.agent.db.connection.execute(
+            "SELECT id FROM devices WHERE legacy=1"
+        ).fetchone()[0]
+        old_event = now - 8 * 86400
+        kept_day = (
+            lun_agent.dt.datetime.fromtimestamp(old_event, lun_agent.dt.timezone.utc)
+        ).strftime("%Y-%m-%d")
+        expired_day = (
+            lun_agent.dt.datetime.fromtimestamp(
+                now - 31 * 86400, lun_agent.dt.timezone.utc
+            )
+        ).strftime("%Y-%m-%d")
+        with self.agent.db.connection:
+            self.agent.db.connection.execute(
+                "INSERT INTO visit_events(occurred_at,device_id,core,network,inbound,domain,port) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (old_event, device_id, "xray", "tcp", "test", "kept.example", 443),
+            )
+            for day, domain in (
+                (kept_day, "kept.example"),
+                (expired_day, "expired.example"),
+            ):
+                self.agent.db.connection.execute(
+                    "INSERT INTO visit_daily(day,device_id,core,network,inbound,domain,port,"
+                    "connections,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (day, device_id, "xray", "tcp", "test", domain, 443, 1, old_event, old_event),
+                )
+            self.agent._prune_visit_history(
+                self.agent.visit_monitor_settings(), now
+            )
+        self.assertEqual(
+            self.agent.db.connection.execute("SELECT COUNT(*) FROM visit_events").fetchone()[0],
+            0,
+        )
+        domains = {
+            row[0] for row in self.agent.db.connection.execute(
+                "SELECT domain FROM visit_daily"
+            )
+        }
+        self.assertEqual(domains, {"kept.example"})
+
+    def test_visit_service_collects_once_before_waiting(self):
+        self.agent.config_path.unlink()
+        self.agent.set_visit_monitor(True, 7, 30)
+        with mock.patch.object(self.agent, "collect_visit_logs") as collect, \
+             mock.patch.object(lun_agent.threading.Event, "wait", return_value=True):
+            lun_agent.serve_visits(self.agent)
+        collect.assert_called_once_with()
+
+    def test_subscription_port_can_be_updated_atomically(self):
+        result = self.agent.set_subscription_port(32001, 52001)
+        self.assertEqual(result, {"port": 32001, "public_port": 52001})
+        config = self.agent.load_config()
+        self.assertEqual(config["port"], 32001)
+        self.assertEqual(config["public_port"], 52001)
+        self.assertEqual((self.root / "subport.log").read_text(encoding="utf-8").strip(), "32001")
+
+    def test_subscription_state_repairs_stale_legacy_files(self):
+        device = self.agent.db.connection.execute(
+            "SELECT * FROM devices WHERE legacy=1"
+        ).fetchone()
+        config = self.agent.load_config()
+        config["legacy_token"] = "stale-config-token"
+        self.agent.save_config(config)
+        (self.root / "subtoken.log").write_text("stale-file-token\n", encoding="utf-8")
+        (self.root / "subport.log").write_text("9999\n", encoding="utf-8")
+
+        result = self.agent.sync_legacy_subscription_state()
+
+        self.assertEqual(result["device_id"], device["id"])
+        self.assertEqual(result["port"], 31000)
+        self.assertEqual(result["public_port"], 31000)
+        self.assertEqual(
+            (self.root / "subtoken.log").read_text(encoding="utf-8").strip(),
+            device["token"],
+        )
+        self.assertEqual((self.root / "subport.log").read_text(encoding="utf-8").strip(), "31000")
+        self.assertEqual(self.agent.load_config()["legacy_token"], device["token"])
+        if os.name != "nt":
+            self.assertEqual((self.root / "subtoken.log").stat().st_mode & 0o777, 0o600)
+
+    def test_local_subscription_output_uses_database_device_token(self):
+        device = self.agent.local_subscription_device()
+        (self.root / "subtoken.log").write_text("stale-file-token\n", encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            lun_agent.print_subscription_links(device, self.agent.load_config())
+        self.assertIn(f"/{device['token']}/jhsub.txt", output.getvalue())
+        self.assertNotIn("stale-file-token", output.getvalue())
+
+    def test_visit_collector_waits_for_a_complete_log_line(self):
+        device = self.add_user()
+        identity = f"lun:u:{device['user_id']}:d:{device['id']}"
+        self.agent.set_visit_monitor(True, 7, 30)
+        path = self.agent.visit_log_paths()["xray"]
+        path.write_text(
+            "2026/07/30 12:00:00 accepted tcp:partial.example.com:443 "
+            "[reality-vision -> direct]",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.agent.collect_visit_logs(), 0)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f" email: {identity}\n")
+        self.assertEqual(self.agent.collect_visit_logs(), 1)
+        self.assertEqual(self.agent.visit_recent(1, 10)[0]["domain"], "partial.example.com")
+
+    def test_visit_retention_requires_summary_not_shorter_than_detail(self):
+        with self.assertRaises(lun_agent.AgentError):
+            self.agent.set_visit_monitor(True, 10, 7)
+
     def test_subscription_preserves_server_path_and_rewrites_identity(self):
         device = self.add_user()
         old = "11111111-1111-4111-8111-111111111111"
@@ -220,6 +590,43 @@ class AgentTestCase(unittest.TestCase):
         self.assertIn(self.agent.load_config()["ss_server_password"], decoded)
         self.assertIn(device["ss_password"], decoded)
         self.assertTrue(decoded.endswith(":32000"))
+
+    def test_shadowsocks_is_omitted_when_nat_has_no_parallel_mapping(self):
+        device = self.add_user()
+        config = self.agent.load_config()
+        config["ss_port"] = 0
+        config["ss_public_port"] = 0
+        permissions = self.agent.device_permissions(device["user_id"])
+        payload = "2022-blake3-aes-128-gcm:legacy@example.com:20000"
+        generic = "ss://" + base64.b64encode(payload.encode()).decode() + "#Shadowsocks-2022-test\n"
+        self.assertEqual(self.agent.render_generic(generic, device, permissions, config), "")
+        singbox = {
+            "outbounds": [
+                {"type": "shadowsocks", "tag": "Shadowsocks-2022-test", "server_port": 20000},
+                {"type": "direct", "tag": "direct"},
+            ]
+        }
+        rendered_singbox = json.loads(
+            self.agent.render_singbox(json.dumps(singbox), device, permissions, config)
+        )
+        self.assertEqual([item["tag"] for item in rendered_singbox["outbounds"]], ["direct"])
+        clash = """proxies:
+- name: Shadowsocks-2022-test
+  type: ss
+  server: example.com
+  port: 20000
+  cipher: 2022-blake3-aes-128-gcm
+  password: legacy
+proxy-groups:
+- name: AUTO
+  type: select
+  proxies:
+  - Shadowsocks-2022-test
+rules:
+- MATCH,AUTO
+"""
+        rendered_clash = self.agent.render_clash(clash, device, permissions, config)
+        self.assertNotIn("Shadowsocks-2022-test", rendered_clash)
 
     def test_hard_delete_revokes_token_and_replaces_backups(self):
         device = self.add_user()

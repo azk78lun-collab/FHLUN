@@ -12,6 +12,9 @@ for helper in \
   valid_cdn_endpoint \
   clean_cdn_endpoint_token \
   normalize_cdn_ip_input \
+  cloudflare_manual_rule_file \
+  cloudflare_manual_rule_matches \
+  cdn_first_endpoint \
   lun_version_is_older; do
   eval "$(sed -n "/^${helper}(){/,/^}/p" "$SCRIPT")"
 done
@@ -42,6 +45,18 @@ lun_version_is_older V26.7.29.1 V26.7.29.2
 ! lun_version_is_older V26.7.29.2 V26.7.29.2
 ! lun_version_is_older V26.7.30.1 V26.7.29.2
 
+test_home=$(mktemp -d)
+original_home=$HOME
+HOME=$test_home
+mkdir -p "$HOME/lun"
+cdnym=proxy.example.com
+printf '%s\n' 'proxy.example.com|3|8080|56567|test-uuid-vx' > "$HOME/lun/cdn_cloudflare_manual"
+cloudflare_manual_rule_matches 3 8080 56567 test-uuid-vx
+! cloudflare_manual_rule_matches 3 443 56567 test-uuid-vx
+[[ $(cdn_first_endpoint '-1 108.162.198.211 162.159.38.68') == 108.162.198.211 ]]
+HOME=$original_home
+rm -rf "$test_home"
+
 grep -q '输入协议代码（输入 0 返回）' "$SCRIPT"
 grep -q '设备 ID（输入 0 返回）' "$SCRIPT"
 grep -q '输入用户 ID（输入 0 返回）' "$SCRIPT"
@@ -49,5 +64,71 @@ grep -q '每月额度（只输入数字按 G 计算' "$SCRIPT"
 grep -q '正在检查 Lun 更新，请稍候' "$SCRIPT"
 grep -q '当前已是最新版' "$SCRIPT"
 ! grep -q 'update_lun_script; exit' "$SCRIPT"
+grep -q '已自动使用 HTTP 继续安装' "$SCRIPT"
+grep -q 'mu_ss_port=$(random_nat_port' "$SCRIPT"
+! grep -q '输入 HTTP 才继续' "$SCRIPT"
+grep -q '手动登记已设置的规则（无需 API' "$SCRIPT"
+grep -q '粘贴 Token（输入会显示，0 返回）' "$SCRIPT"
+grep -q '区域 → Origin Rules → 编辑' "$SCRIPT"
+! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
+grep -q '当前版本：V26.7.31.2' "$SCRIPT"
+grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
+grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
+grep -q '7. %s网站访问监控%s' "$SCRIPT"
+grep -q '8. %s使用说明 / 协议特点%s' "$SCRIPT"
+grep -q '一键开启 / 修复监控' "$SCRIPT"
+grep -q 'ExecStart=.* visit-serve' "$SCRIPT"
+grep -q 'set-subscription-port --port' "$SCRIPT"
+grep -q 'sync-subscription-state' "$SCRIPT"
+grep -q 'show-local-subscription' "$SCRIPT"
+grep -q 'token：按设备独立管理' "$SCRIPT"
+grep -q 'multiuser_clear_legacy_subscription_autostart' "$SCRIPT"
+! grep -q 'ps -ef 2>/dev/null | grep "$showsubport"' "$SCRIPT"
+! grep -q '输入 ENABLE 确认启用' "$SCRIPT"
+! grep -q '启用 / 修改保留时间' "$SCRIPT"
+
+extract_shell_function() {
+  awk -v target="$1" '
+    $0 ~ "^" target "\\(\\)\\{" { capture=1 }
+    capture {
+      print
+      line=$0
+      opens=gsub(/\{/, "{", line)
+      closes=gsub(/\}/, "}", line)
+      depth+=opens-closes
+      if (started && depth==0) exit
+      started=1
+    }
+  ' "$SCRIPT"
+}
+
+eval "$(extract_shell_function multiuser_prepare_service_port)"
+multiuser_enabled() { return 0; }
+multiuser_clear_legacy_subscription_autostart() { :; }
+multiuser_config_value() { printf '443\n'; }
+valid_port_value() { return 0; }
+sleep() { :; }
+yellow_line() { :; }
+green_line() { :; }
+red_line() { :; }
+apply_lun_firewall_rules() { :; }
+
+owned_busybox_stopped=no
+stop_subscription_service() { owned_busybox_stopped=yes; }
+port_in_use() { [[ $owned_busybox_stopped != yes ]]; }
+multiuser_prepare_service_port
+
+stop_subscription_service() { :; }
+port_in_use() { return 0; }
+select_subscription_port() { printf '12344\n'; }
+client_port() { printf '51286\n'; }
+is_nat_mode() { return 0; }
+captured_port_update=
+multiuser_cmd() { captured_port_update="$*"; }
+multiuser_prepare_service_port
+[[ $captured_port_update == "set-subscription-port --port 12344 --public-port 51286" ]]
+
+select_subscription_port() { return 1; }
+! multiuser_prepare_service_port
 
 echo "multi-user shell helper tests passed"

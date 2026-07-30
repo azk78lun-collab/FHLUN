@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.0"
+VERSION = "0.3.1"
 PROTOCOLS = (
     "vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"
 )
@@ -87,6 +87,12 @@ PRIVATE_CIDRS = [
 BLOCKED_METADATA_DOMAINS = [
     "metadata.google.internal", "metadata.azure.internal", "instance-data.ec2.internal"
 ]
+VISIT_DETAIL_DAYS = 7
+VISIT_SUMMARY_DAYS = 30
+VISIT_EVENT_LIMIT = 100_000
+VISIT_SUMMARY_LIMIT = 200_000
+VISIT_LOG_MAX_BYTES = 10 * 1024 * 1024
+VISIT_READ_MAX_BYTES = 4 * 1024 * 1024
 
 
 class AgentError(RuntimeError):
@@ -149,6 +155,10 @@ def format_gib(value: int) -> str:
     return f"{max(0, value) / (1024 ** 3):.2f}G"
 
 
+def format_storage(value: int) -> str:
+    return "0 B" if value <= 0 else format_size(value)
+
+
 def display_width(value: str) -> int:
     return sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
 
@@ -174,6 +184,53 @@ def print_status_table(rows: list[dict[str, Any]]) -> None:
     print("  ".join(display_pad(value, width) for value, width in zip(headers, widths)))
     for row in values:
         print("  ".join(display_pad(value, width) for value, width in zip(row, widths)))
+
+
+def print_visit_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
+    if not rows:
+        print("暂无访问记录。")
+        return
+    widths = [display_width(header) for header in headers]
+    for row in rows:
+        widths = [max(current, display_width(value)) for current, value in zip(widths, row)]
+    print("  ".join(display_pad(value, width) for value, width in zip(headers, widths)))
+    for row in rows:
+        print("  ".join(display_pad(value, width) for value, width in zip(row, widths)))
+
+
+def print_visit_recent(rows: list[dict[str, Any]]) -> None:
+    values = []
+    for row in rows:
+        timestamp = dt.datetime.fromtimestamp(row["occurred_at"], dt.timezone.utc).strftime("%m-%d %H:%M:%S")
+        values.append((
+            timestamp,
+            f"{row['user_name']}/{row['device_name']}",
+            row["core"],
+            row["network"].upper(),
+            row["inbound"],
+            f"{row['domain']}:{row['port']}",
+        ))
+    print_visit_table(("时间(UTC)", "用户/设备", "内核", "网络", "入口", "访问域名"), values)
+
+
+def print_visit_top(rows: list[dict[str, Any]], group: str) -> None:
+    values = []
+    for row in rows:
+        last_seen = dt.datetime.fromtimestamp(row["last_seen"], dt.timezone.utc).strftime("%m-%d %H:%M")
+        if group == "user":
+            values.append((
+                str(row["user_id"]), row["user_name"], str(row["domains"]),
+                str(row["connections"]), last_seen,
+            ))
+        else:
+            values.append((
+                f"{row['domain']}:{row['port']}", str(row["users"]),
+                str(row["connections"]), last_seen,
+            ))
+    if group == "user":
+        print_visit_table(("ID", "用户", "域名数", "连接次数", "最后访问(UTC)"), values)
+    else:
+        print_visit_table(("域名", "用户数", "连接次数", "最后访问(UTC)"), values)
 
 
 def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
@@ -316,7 +373,51 @@ class Database:
               target TEXT NOT NULL,
               detail TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS visit_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              occurred_at INTEGER NOT NULL,
+              device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+              core TEXT NOT NULL,
+              network TEXT NOT NULL,
+              inbound TEXT NOT NULL,
+              domain TEXT NOT NULL,
+              port INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS visit_events_time_idx
+              ON visit_events(occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS visit_events_device_time_idx
+              ON visit_events(device_id, occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS visit_events_domain_time_idx
+              ON visit_events(domain, occurred_at DESC);
+            CREATE TABLE IF NOT EXISTS visit_daily (
+              day TEXT NOT NULL,
+              device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+              core TEXT NOT NULL,
+              network TEXT NOT NULL,
+              inbound TEXT NOT NULL,
+              domain TEXT NOT NULL,
+              port INTEGER NOT NULL,
+              connections INTEGER NOT NULL DEFAULT 0,
+              first_seen INTEGER NOT NULL,
+              last_seen INTEGER NOT NULL,
+              PRIMARY KEY(day,device_id,core,network,inbound,domain,port)
+            );
+            CREATE INDEX IF NOT EXISTS visit_daily_day_idx
+              ON visit_daily(day DESC);
+            UPDATE schema_meta SET version=2 WHERE version<2;
             """
+        )
+        defaults = {
+            "visit_monitor_enabled": "0",
+            "visit_detail_days": str(VISIT_DETAIL_DAYS),
+            "visit_summary_days": str(VISIT_SUMMARY_DAYS),
+            "visit_event_limit": str(VISIT_EVENT_LIMIT),
+            "visit_summary_limit": str(VISIT_SUMMARY_LIMIT),
+            "visit_log_max_bytes": str(VISIT_LOG_MAX_BYTES),
+        }
+        self.connection.executemany(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            defaults.items(),
         )
         self.connection.commit()
 
@@ -362,6 +463,510 @@ class Agent:
     def save_config(self, config: dict[str, Any]) -> None:
         atomic_write(self.config_path, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
 
+    def set_subscription_port(self, port: int, public_port: int) -> dict[str, int]:
+        if not 1 <= port <= 65535 or not 1 <= public_port <= 65535:
+            raise AgentError("订阅端口必须在 1-65535 范围内")
+        config = self.load_config()
+        config["port"] = port
+        config["public_port"] = public_port
+        self.save_config(config)
+        with self.db.connection:
+            self.db.audit(
+                "subscription.port",
+                "module",
+                f"internal={port},public={public_port}",
+            )
+        self.sync_legacy_subscription_state()
+        return {"port": port, "public_port": public_port}
+
+    def local_subscription_device(self) -> sqlite3.Row:
+        config = self.load_config()
+        device = self.db.connection.execute(
+            "SELECT * FROM devices WHERE legacy=1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        if not device and config.get("legacy_token"):
+            device = self.db.connection.execute(
+                "SELECT * FROM devices WHERE token=? ORDER BY id LIMIT 1",
+                (config["legacy_token"],),
+            ).fetchone()
+        if not device:
+            devices = self.db.connection.execute(
+                "SELECT * FROM devices ORDER BY id LIMIT 2"
+            ).fetchall()
+            if len(devices) == 1:
+                device = devices[0]
+        if not device:
+            raise AgentError("没有唯一的本机设备，请在多用户管理中按设备查看订阅")
+        return device
+
+    def sync_legacy_subscription_state(self) -> dict[str, int]:
+        config = self.load_config()
+        device = self.local_subscription_device()
+        token = str(device["token"])
+        if config.get("legacy_token") != token or config.get("version") != VERSION:
+            config["legacy_token"] = token
+            config["version"] = VERSION
+            self.save_config(config)
+        port = int(config["port"])
+        public_port = int(config.get("public_port") or port)
+        atomic_write(self.root / "subtoken.log", token + "\n", 0o600)
+        atomic_write(self.root / "subport.log", f"{port}\n", 0o600)
+        return {
+            "device_id": int(device["id"]),
+            "port": port,
+            "public_port": public_port,
+        }
+
+    def multiuser_enabled(self) -> bool:
+        try:
+            return bool(self.load_config().get("enabled"))
+        except (AgentError, OSError, json.JSONDecodeError):
+            return False
+
+    def visit_log_paths(self) -> dict[str, Path]:
+        return {
+            "xray": self.data_dir / "xray-access.log",
+            "singbox": self.data_dir / "singbox-access.log",
+        }
+
+    def secure_sensitive_files(self) -> None:
+        for directory in (self.module, self.data_dir, self.backups):
+            if directory.exists():
+                with contextlib.suppress(OSError):
+                    os.chmod(directory, 0o700)
+        paths = [
+            self.db.path,
+            self.db.path.with_name(self.db.path.name + "-wal"),
+            self.db.path.with_name(self.db.path.name + "-shm"),
+            *self.visit_log_paths().values(),
+            *self.backups.glob("db-*.sqlite3"),
+        ]
+        for path in paths:
+            if path.exists():
+                with contextlib.suppress(OSError):
+                    os.chmod(path, 0o600)
+
+    def visit_monitor_settings(self) -> dict[str, Any]:
+        def number(key: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                value = int(self.db.setting(key, str(default)))
+            except ValueError:
+                value = default
+            return min(maximum, max(minimum, value))
+
+        paths = self.visit_log_paths()
+        return {
+            "enabled": self.db.setting("visit_monitor_enabled", "0") == "1",
+            "detail_days": number("visit_detail_days", VISIT_DETAIL_DAYS, 1, 30),
+            "summary_days": number("visit_summary_days", VISIT_SUMMARY_DAYS, 1, 365),
+            "event_limit": number("visit_event_limit", VISIT_EVENT_LIMIT, 1_000, 1_000_000),
+            "summary_limit": number("visit_summary_limit", VISIT_SUMMARY_LIMIT, 1_000, 2_000_000),
+            "log_max_bytes": number(
+                "visit_log_max_bytes", VISIT_LOG_MAX_BYTES, 1024 * 1024, 100 * 1024 * 1024
+            ),
+            "xray_log": str(paths["xray"]),
+            "singbox_log": str(paths["singbox"]),
+        }
+
+    def set_visit_monitor(self, enabled: bool, detail_days: int, summary_days: int) -> dict[str, Any]:
+        if not 1 <= detail_days <= 30:
+            raise AgentError("访问明细保留范围应为 1-30 天")
+        if not 1 <= summary_days <= 365:
+            raise AgentError("访问汇总保留范围应为 1-365 天")
+        if summary_days < detail_days:
+            raise AgentError("访问汇总保留天数不能少于明细保留天数")
+        with self.db.connection:
+            self.db.set_setting("visit_monitor_enabled", int(enabled))
+            self.db.set_setting("visit_detail_days", detail_days)
+            self.db.set_setting("visit_summary_days", summary_days)
+            self.db.audit(
+                "visit-monitor.configure",
+                "module",
+                f"enabled={int(enabled)},detail_days={detail_days},summary_days={summary_days}",
+            )
+        return self.visit_monitor_settings()
+
+    def _configure_visit_log(
+        self,
+        data: dict[str, Any],
+        core: str,
+        enabled: bool,
+        owner_field: str,
+        desired: dict[str, Any],
+    ) -> None:
+        backup_key = f"visit_{core}_log_fields_before"
+        log = data.get("log")
+        owned = isinstance(log, dict) and log.get(owner_field) == desired[owner_field]
+        backup = self.db.setting(backup_key, "")
+        if enabled:
+            if not owned and not backup:
+                original = log if isinstance(log, dict) else {}
+                snapshot = {
+                    "log_present": isinstance(log, dict),
+                    "fields": {
+                        key: {"present": key in original, "value": original.get(key)}
+                        for key in desired
+                    },
+                }
+                self.db.set_setting(backup_key, json.dumps(snapshot, ensure_ascii=False))
+            if not isinstance(log, dict):
+                log = {}
+                data["log"] = log
+            log.update(desired)
+            return
+
+        if owned:
+            restored = False
+            if backup:
+                try:
+                    snapshot = json.loads(backup)
+                    fields = snapshot["fields"]
+                    for key, module_value in desired.items():
+                        # Keep an operator's explicit change made while monitoring was active.
+                        if key != owner_field and log.get(key) != module_value:
+                            continue
+                        state = fields[key]
+                        if state["present"]:
+                            log[key] = state["value"]
+                        else:
+                            log.pop(key, None)
+                    if not snapshot["log_present"] and not log:
+                        data.pop("log", None)
+                    restored = True
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    restored = False
+            if not restored:
+                for key, module_value in desired.items():
+                    if log.get(key) == module_value:
+                        log.pop(key, None)
+                if not log:
+                    data.pop("log", None)
+        if backup:
+            self.db.connection.execute("DELETE FROM settings WHERE key=?", (backup_key,))
+
+    def _configure_xray_visit_identity(
+        self, data: dict[str, Any], devices: list[dict[str, Any]], enabled: bool
+    ) -> None:
+        backup_key = "visit_xray_identity_before"
+        try:
+            snapshot = json.loads(self.db.setting(backup_key, "") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        client_states = snapshot.setdefault("clients", [])
+        sniffing_states = snapshot.setdefault("sniffing", [])
+        if not isinstance(client_states, list) or not isinstance(sniffing_states, list):
+            client_states, sniffing_states = [], []
+            snapshot = {"clients": client_states, "sniffing": sniffing_states}
+        device_by_uuid = {item["uuid"]: item for item in devices}
+
+        if enabled:
+            client_index = {
+                (item.get("tag"), item.get("client_id")): item
+                for item in client_states if isinstance(item, dict)
+            }
+            sniffing_index = {
+                item.get("tag"): item
+                for item in sniffing_states if isinstance(item, dict)
+            }
+            for inbound in data.get("inbounds", []):
+                tag = str(inbound.get("tag", ""))
+                if tag not in XRAY_TAG_PROTOCOL:
+                    continue
+                settings = inbound.get("settings")
+                if isinstance(settings, dict):
+                    clients = settings.get("clients")
+                    if isinstance(clients, list):
+                        for client in clients:
+                            if not isinstance(client, dict):
+                                continue
+                            client_id = str(client.get("id", ""))
+                            device = device_by_uuid.get(client_id)
+                            if not device:
+                                continue
+                            key = (tag, client_id)
+                            applied = device["identity"]
+                            state = client_index.get(key)
+                            if state is None:
+                                state = {
+                                    "tag": tag,
+                                    "client_id": client_id,
+                                    "present": "email" in client,
+                                    "value": client.get("email"),
+                                    "applied": applied,
+                                }
+                                client_states.append(state)
+                                client_index[key] = state
+                            else:
+                                state["applied"] = applied
+                            client["email"] = applied
+
+                current = inbound.get("sniffing")
+                desired = copy.deepcopy(current) if isinstance(current, dict) else {}
+                desired["enabled"] = True
+                overrides = desired.get("destOverride")
+                if not isinstance(overrides, list):
+                    overrides = []
+                desired["destOverride"] = list(dict.fromkeys([*overrides, "http", "tls", "quic"]))
+                desired["metadataOnly"] = False
+                state = sniffing_index.get(tag)
+                if state is None:
+                    state = {
+                        "tag": tag,
+                        "present": "sniffing" in inbound,
+                        "value": copy.deepcopy(current),
+                        "applied": copy.deepcopy(desired),
+                    }
+                    sniffing_states.append(state)
+                    sniffing_index[tag] = state
+                else:
+                    state["applied"] = copy.deepcopy(desired)
+                inbound["sniffing"] = desired
+            if client_states or sniffing_states:
+                self.db.set_setting(backup_key, json.dumps(snapshot, ensure_ascii=False))
+            return
+
+        inbounds = {
+            str(item.get("tag", "")): item
+            for item in data.get("inbounds", []) if isinstance(item, dict)
+        }
+        for state in client_states:
+            if not isinstance(state, dict):
+                continue
+            inbound = inbounds.get(str(state.get("tag", "")))
+            settings = inbound.get("settings") if inbound else None
+            clients = settings.get("clients") if isinstance(settings, dict) else None
+            if not isinstance(clients, list):
+                continue
+            for client in clients:
+                if not isinstance(client, dict) or str(client.get("id", "")) != str(state.get("client_id", "")):
+                    continue
+                if client.get("email") != state.get("applied"):
+                    break
+                if state.get("present"):
+                    client["email"] = state.get("value")
+                else:
+                    client.pop("email", None)
+                break
+        for state in sniffing_states:
+            if not isinstance(state, dict):
+                continue
+            inbound = inbounds.get(str(state.get("tag", "")))
+            if not inbound or inbound.get("sniffing") != state.get("applied"):
+                continue
+            if state.get("present"):
+                inbound["sniffing"] = state.get("value")
+            else:
+                inbound.pop("sniffing", None)
+        if self.db.setting(backup_key, ""):
+            self.db.connection.execute("DELETE FROM settings WHERE key=?", (backup_key,))
+
+    def _configure_singbox_visit_identity(
+        self, data: dict[str, Any], devices: list[dict[str, Any]], enabled: bool
+    ) -> None:
+        backup_key = "visit_singbox_identity_before"
+        try:
+            states = json.loads(self.db.setting(backup_key, "") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            states = []
+        if not isinstance(states, list):
+            states = []
+        supported = {"hysteria2", "tuic", "anytls", "vmess"}
+        device_by_uuid = {item["uuid"]: item for item in devices}
+
+        if enabled:
+            state_index = {
+                (item.get("tag"), item.get("credential")): item
+                for item in states if isinstance(item, dict)
+            }
+            for inbound in data.get("inbounds", []):
+                if not isinstance(inbound, dict) or inbound.get("type") not in supported:
+                    continue
+                tag = str(inbound.get("tag", ""))
+                users = inbound.get("users")
+                if not isinstance(users, list):
+                    continue
+                for user in users:
+                    if not isinstance(user, dict):
+                        continue
+                    credential = str(user.get("uuid") or user.get("username") or user.get("password") or "")
+                    device = device_by_uuid.get(credential)
+                    if not device:
+                        continue
+                    key = (tag, credential)
+                    applied = device["identity"]
+                    state = state_index.get(key)
+                    if state is None:
+                        state = {
+                            "tag": tag,
+                            "credential": credential,
+                            "present": "name" in user,
+                            "value": user.get("name"),
+                            "applied": applied,
+                        }
+                        states.append(state)
+                        state_index[key] = state
+                    else:
+                        state["applied"] = applied
+                    user["name"] = applied
+            if states:
+                self.db.set_setting(backup_key, json.dumps(states, ensure_ascii=False))
+            route = data.setdefault("route", {})
+            rules = route.setdefault("rules", [])
+            if not any(isinstance(rule, dict) and rule.get("action") == "sniff" for rule in rules):
+                rules.insert(0, {"action": "sniff"})
+                self.db.set_setting("visit_singbox_sniff_inserted", 1)
+            return
+
+        inbounds = {
+            str(item.get("tag", "")): item
+            for item in data.get("inbounds", []) if isinstance(item, dict)
+        }
+        for state in states:
+            if not isinstance(state, dict):
+                continue
+            inbound = inbounds.get(str(state.get("tag", "")))
+            users = inbound.get("users") if inbound else None
+            if not isinstance(users, list):
+                continue
+            for user in users:
+                if not isinstance(user, dict):
+                    continue
+                credential = str(user.get("uuid") or user.get("username") or user.get("password") or "")
+                if credential != str(state.get("credential", "")) or user.get("name") != state.get("applied"):
+                    continue
+                if state.get("present"):
+                    user["name"] = state.get("value")
+                else:
+                    user.pop("name", None)
+                break
+        if self.db.setting(backup_key, ""):
+            self.db.connection.execute("DELETE FROM settings WHERE key=?", (backup_key,))
+        if self.db.setting("visit_singbox_sniff_inserted", "") == "1":
+            route = data.get("route")
+            rules = route.get("rules") if isinstance(route, dict) else None
+            if isinstance(rules, list):
+                for index, rule in enumerate(rules):
+                    if rule == {"action": "sniff"}:
+                        rules.pop(index)
+                        break
+            self.db.connection.execute(
+                "DELETE FROM settings WHERE key='visit_singbox_sniff_inserted'"
+            )
+
+    def _reconcile_visit_xray(
+        self, data: dict[str, Any], devices: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        monitor = self.visit_monitor_settings()
+        self._configure_visit_log(
+            data,
+            "xray",
+            monitor["enabled"],
+            "access",
+            {
+                "access": monitor["xray_log"],
+                # Xray 26.3.27 does not create access logs when loglevel is "none".
+                "loglevel": "warning",
+            },
+        )
+        self._configure_xray_visit_identity(data, devices, monitor["enabled"])
+        return data
+
+    def _reconcile_visit_singbox(
+        self, data: dict[str, Any], devices: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        monitor = self.visit_monitor_settings()
+        self._configure_visit_log(
+            data,
+            "singbox",
+            monitor["enabled"],
+            "output",
+            {
+                "disabled": False,
+                "level": "info",
+                "output": monitor["singbox_log"],
+                "timestamp": True,
+            },
+        )
+        self._configure_singbox_visit_identity(data, devices, monitor["enabled"])
+        return data
+
+    def _ensure_legacy_identity(
+        self, legacy_uuid: str | None = None, legacy_token: str | None = None
+    ) -> sqlite3.Row:
+        legacy_uuid = legacy_uuid or self._read_text("uuid")
+        if not legacy_uuid:
+            raise AgentError("未找到本机 UUID，请先安装至少一个代理协议")
+        legacy_token = legacy_token or self._read_text("subtoken.log") or legacy_uuid
+        now = utc_now()
+        user = self.db.connection.execute(
+            "SELECT * FROM users WHERE name='legacy-admin'"
+        ).fetchone()
+        if user:
+            user_id = user["id"]
+        else:
+            cursor = self.db.connection.execute(
+                "INSERT INTO users(name,reset_day,max_devices,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("legacy-admin", 1, 3, now, now),
+            )
+            user_id = cursor.lastrowid
+        self._insert_protocol_defaults(user_id)
+        device = self.db.connection.execute(
+            "SELECT * FROM devices WHERE user_id=? AND legacy=1 ORDER BY id LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if not device:
+            device = self.db.connection.execute(
+                "SELECT * FROM devices WHERE uuid=?", (legacy_uuid,)
+            ).fetchone()
+        if device and device["user_id"] != user_id:
+            raise AgentError("本机 UUID 已属于其他用户，无法创建本机监控身份")
+        if not device:
+            self.db.connection.execute(
+                "INSERT INTO devices(user_id,name,uuid,password,ss_password,token,enabled,legacy,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    user_id,
+                    "legacy-device",
+                    legacy_uuid,
+                    legacy_uuid,
+                    base64.b64encode(secrets.token_bytes(16)).decode(),
+                    legacy_token,
+                    1,
+                    1,
+                    now,
+                    now,
+                ),
+            )
+            device = self.db.connection.execute(
+                "SELECT * FROM devices WHERE uuid=?", (legacy_uuid,)
+            ).fetchone()
+        elif not device["legacy"]:
+            self.db.connection.execute(
+                "UPDATE devices SET legacy=1,updated_at=? WHERE id=?",
+                (now, device["id"]),
+            )
+            device = self.db.connection.execute(
+                "SELECT * FROM devices WHERE id=?", (device["id"],)
+            ).fetchone()
+        assert device is not None
+        return device
+
+    def initialize_visit(self) -> dict[str, Any]:
+        self.module.mkdir(parents=True, exist_ok=True)
+        self.generated.mkdir(parents=True, exist_ok=True)
+        self.backups.mkdir(parents=True, exist_ok=True)
+        with self.db.connection:
+            device = self._ensure_legacy_identity()
+            self.db.audit("visit-monitor.init", "module", f"device={device['id']}")
+        self.secure_sensitive_files()
+        return {
+            "user_id": device["user_id"],
+            "device_id": device["id"],
+            "uuid": device["uuid"],
+        }
+
     def initialize(self, args: argparse.Namespace) -> dict[str, Any]:
         self.module.mkdir(parents=True, exist_ok=True)
         self.generated.mkdir(parents=True, exist_ok=True)
@@ -395,30 +1000,12 @@ class Agent:
             if not Path(config["certificate"]).is_file() or not Path(config["private_key"]).is_file():
                 raise AgentError("HTTPS 订阅证书文件不存在")
         self.save_config(config)
-        now = utc_now()
-        row = self.db.connection.execute("SELECT id FROM users WHERE name='legacy-admin'").fetchone()
-        if row:
-            user_id = row[0]
-        else:
-            cursor = self.db.connection.execute(
-                "INSERT INTO users(name,reset_day,max_devices,created_at,updated_at) VALUES(?,?,?,?,?)",
-                ("legacy-admin", 1, 3, now, now),
-            )
-            user_id = cursor.lastrowid
-            self._insert_protocol_defaults(user_id)
-        device = self.db.connection.execute(
-            "SELECT id FROM devices WHERE user_id=? AND legacy=1", (user_id,)
-        ).fetchone()
-        if not device:
-            self.db.connection.execute(
-                "INSERT INTO devices(user_id,name,uuid,password,ss_password,token,enabled,legacy,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (user_id, "legacy-device", legacy_uuid, legacy_uuid,
-                 base64.b64encode(secrets.token_bytes(16)).decode(), legacy_token, 1, 1, now, now),
-            )
-        self.db.audit("module.init", "module", f"scheme={args.scheme},port={args.port}")
-        self.db.connection.commit()
+        with self.db.connection:
+            self._ensure_legacy_identity(legacy_uuid, legacy_token)
+            self.db.audit("module.init", "module", f"scheme={args.scheme},port={args.port}")
+        self.sync_legacy_subscription_state()
         self.backup_database()
+        self.secure_sensitive_files()
         return config
 
     def _read_text(self, name: str) -> str:
@@ -715,7 +1302,78 @@ class Agent:
             self.db.connection.commit()
             return changed
 
+    def reconcile_visit(self, validate: bool = True) -> dict[str, bool]:
+        if self.multiuser_enabled():
+            return self.reconcile(validate=validate)
+        if not self.db.connection.execute("SELECT 1 FROM devices LIMIT 1").fetchone():
+            self.initialize_visit()
+        with FileLock(self.lock_path):
+            devices = self.active_devices()
+            self.generated.mkdir(parents=True, exist_ok=True)
+            changed = {"xray": False, "singbox": False}
+            pending: list[tuple[Path, dict[str, Any], str]] = []
+            temporary: list[tuple[Path, Path, str]] = []
+            replaced: list[tuple[Path, Path]] = []
+            connection = self.db.connection
+            connection.execute("SAVEPOINT visit_reconcile")
+            try:
+                for core, filename, updater in (
+                    ("xray", "xr.json", self._reconcile_visit_xray),
+                    ("singbox", "sb.json", self._reconcile_visit_singbox),
+                ):
+                    target = self.root / filename
+                    if not target.exists():
+                        continue
+                    original = json.loads(target.read_text(encoding="utf-8"))
+                    updated = updater(copy.deepcopy(original), devices)
+                    if updated != original:
+                        pending.append((target, updated, core))
+                        changed[core] = True
+                for target, payload, core in pending:
+                    temp = target.with_name(
+                        f".{target.stem}.visit-monitor.{os.getpid()}{target.suffix}"
+                    )
+                    atomic_write(temp, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                    temporary.append((target, temp, core))
+                if validate:
+                    for _, temp, core in temporary:
+                        self._validate_core(core, temp)
+                for target, temp, _ in temporary:
+                    previous = self.generated / f"previous-visit-{target.name}"
+                    shutil.copy2(target, previous)
+                    os.replace(temp, target)
+                    replaced.append((target, previous))
+                connection.execute("RELEASE SAVEPOINT visit_reconcile")
+            except Exception:
+                with contextlib.suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK TO SAVEPOINT visit_reconcile")
+                    connection.execute("RELEASE SAVEPOINT visit_reconcile")
+                for target, previous in reversed(replaced):
+                    if previous.exists():
+                        shutil.copy2(previous, target)
+                raise
+            finally:
+                for _, temp, _ in temporary:
+                    temp.unlink(missing_ok=True)
+            self.db.audit("visit-monitor.reconcile", "cores", json.dumps(changed))
+            self.db.connection.commit()
+            self.secure_sensitive_files()
+            return changed
+
     def _reconcile_xray(self, data: dict[str, Any], devices: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+        monitor = self.visit_monitor_settings()
+        if monitor["enabled"]:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._configure_visit_log(
+            data,
+            "xray",
+            monitor["enabled"],
+            "access",
+            {
+                "access": monitor["xray_log"],
+                "loglevel": "warning",
+            },
+        )
         for inbound in data.get("inbounds", []):
             tag = inbound.get("tag", "")
             protocol_key = XRAY_TAG_PROTOCOL.get(tag)
@@ -762,6 +1420,21 @@ class Agent:
         return data
 
     def _reconcile_singbox(self, data: dict[str, Any], devices: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+        monitor = self.visit_monitor_settings()
+        if monitor["enabled"]:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._configure_visit_log(
+            data,
+            "singbox",
+            monitor["enabled"],
+            "output",
+            {
+                "disabled": False,
+                "level": "info",
+                "output": monitor["singbox_log"],
+                "timestamp": True,
+            },
+        )
         inbounds = data.setdefault("inbounds", [])
         inbounds[:] = [item for item in inbounds if item.get("tag") != "ss-2022-mu"]
         ss_template: dict[str, Any] | None = None
@@ -854,6 +1527,8 @@ class Agent:
 
     def restart_cores(self, changed: dict[str, bool] | None = None) -> None:
         changed = changed or {"xray": (self.root / "xr.json").exists(), "singbox": (self.root / "sb.json").exists()}
+        if not any(changed.values()):
+            return
         if Path("/run/systemd/system").exists() and shutil.which("systemctl"):
             if changed.get("xray"):
                 self._run(["systemctl", "reset-failed", "xr"], check=False)
@@ -888,6 +1563,31 @@ class Agent:
             except AgentError as rollback_exc:
                 rollback_error = f"；回滚配置已写回，但核心重启仍失败：{rollback_exc}"
             raise AgentError(f"核心重启失败，已恢复应用前配置：{exc}{rollback_error}") from exc
+        return changed
+
+    def apply_visit(self) -> dict[str, bool]:
+        if self.multiuser_enabled():
+            changed = self.apply()
+            self.secure_sensitive_files()
+            return changed
+        changed = self.reconcile_visit(validate=True)
+        try:
+            self.restart_cores(changed)
+        except AgentError as exc:
+            restored: dict[str, bool] = {"xray": False, "singbox": False}
+            for core, filename in (("xray", "xr.json"), ("singbox", "sb.json")):
+                previous = self.generated / f"previous-visit-{filename}"
+                target = self.root / filename
+                if changed.get(core) and previous.exists():
+                    shutil.copy2(previous, target)
+                    restored[core] = True
+            rollback_error = ""
+            try:
+                self.restart_cores(restored)
+            except AgentError as rollback_exc:
+                rollback_error = f"；回滚配置已写回，但核心重启仍失败：{rollback_exc}"
+            raise AgentError(f"监控配置启动失败，已恢复应用前配置：{exc}{rollback_error}") from exc
+        self.secure_sensitive_files()
         return changed
 
     def _protocol_from_name(self, name: str, scheme: str = "") -> str:
@@ -935,6 +1635,8 @@ class Agent:
             name = urllib.parse.unquote(line.rsplit("#", 1)[-1]) if "#" in line else line
             protocol = self._protocol_from_name(name, scheme)
             if protocol and not permissions.get(protocol, True):
+                continue
+            if protocol == "ss" and not config.get("ss_public_port"):
                 continue
             try:
                 if scheme == "vmess":
@@ -994,6 +1696,9 @@ class Agent:
             if protocol and protocol in PROTOCOLS and not permissions.get(protocol, True):
                 removed.add(tag)
                 continue
+            if protocol == "ss" and not config.get("ss_public_port"):
+                removed.add(tag)
+                continue
             if kind in {"vless", "vmess"}:
                 outbound["uuid"] = device["uuid"]
             elif kind in {"hysteria2", "anytls"}:
@@ -1041,6 +1746,9 @@ class Agent:
             name = match.group(1) if match else joined
             protocol = self._protocol_from_name(name)
             if protocol and not permissions.get(protocol, True):
+                removed_names.add(name)
+                continue
+            if protocol == "ss" and not config.get("ss_public_port"):
                 removed_names.add(name)
                 continue
             if protocol == "ss":
@@ -1174,6 +1882,339 @@ class Agent:
                 )
         return sum(totals.values())
 
+    def _visit_identity_map(self) -> dict[str, int]:
+        identities: dict[str, int] = {}
+        rows = self.db.connection.execute(
+            "SELECT d.id,d.user_id,d.uuid FROM devices d"
+        )
+        for row in rows:
+            identities[f"lun:u:{row['user_id']}:d:{row['id']}"] = row["id"]
+            identities[row["uuid"]] = row["id"]
+        return identities
+
+    @staticmethod
+    def _visit_target(value: str) -> tuple[str, int] | None:
+        target = value.strip().strip("\"'")
+        if target.startswith("["):
+            end = target.find("]")
+            if end < 1 or end + 2 > len(target) or target[end + 1] != ":":
+                return None
+            host, raw_port = target[1:end], target[end + 2:]
+        else:
+            host, separator, raw_port = target.rpartition(":")
+            if not separator:
+                return None
+        if not raw_port.isdigit() or not 1 <= int(raw_port) <= 65535:
+            return None
+        host = host.rstrip(".").lower()
+        try:
+            ipaddress.ip_address(host)
+            return None
+        except ValueError:
+            pass
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+        if len(host) > 253 or "." not in host:
+            return None
+        labels = host.split(".")
+        if any(
+            not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?", label)
+            for label in labels
+        ):
+            return None
+        return host, int(raw_port)
+
+    @classmethod
+    def parse_visit_line(cls, core: str, line: str) -> dict[str, Any] | None:
+        if core == "xray":
+            match = re.search(r"\baccepted\s+(tcp|udp):(\[[^\]]+\]:[0-9]+|\S+)", line)
+            identity = re.search(r"\bemail:\s*(\S+)", line)
+            if not match or not identity:
+                return None
+            target = cls._visit_target(match.group(2))
+            if not target:
+                return None
+            route = re.search(r"\[([^\]]+?)\s+(?:->|>>)\s+[^\]]+\]", line)
+            inbound = route.group(1).strip() if route else "xray"
+            network = match.group(1)
+            user_identity = identity.group(1)
+        elif core == "singbox":
+            match = re.search(
+                r"inbound/[^\s:]+\[([^\]]+)\]:\s+"
+                r"(?:\[([^\]]+)\]\s+)?inbound\s+"
+                r"(?:(packet|multiplex)\s+)?connection\s+to\s+(\[[^\]]+\]:[0-9]+|\S+)",
+                line,
+            )
+            if not match:
+                return None
+            target = cls._visit_target(match.group(4))
+            if not target:
+                return None
+            inbound = match.group(1)
+            network = "udp" if match.group(3) == "packet" else "tcp"
+            user_identity = match.group(2) or ""
+        else:
+            return None
+        return {
+            "identity": user_identity,
+            "core": core,
+            "network": network,
+            "inbound": inbound[:80],
+            "domain": target[0],
+            "port": target[1],
+        }
+
+    def _read_visit_chunk(self, core: str, path: Path) -> tuple[list[str], int, int, int] | None:
+        try:
+            stat = path.stat()
+            os.chmod(path, 0o600)
+        except OSError:
+            return None
+        try:
+            inode = int(self.db.setting(f"visit_{core}_inode", "0"))
+            offset = int(self.db.setting(f"visit_{core}_offset", "0"))
+        except ValueError:
+            inode, offset = 0, 0
+        if inode != stat.st_ino or offset < 0 or stat.st_size < offset:
+            offset = 0
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                payload = handle.read(VISIT_READ_MAX_BYTES)
+        except OSError:
+            return None
+        new_offset = offset + len(payload)
+        if payload and not payload.endswith(b"\n"):
+            boundary = payload.rfind(b"\n")
+            if boundary >= 0:
+                payload = payload[:boundary + 1]
+                new_offset = offset + boundary + 1
+            elif len(payload) >= VISIT_READ_MAX_BYTES:
+                # Skip one malformed/hostile oversized line instead of blocking collection forever.
+                payload = b""
+            else:
+                payload = b""
+                new_offset = offset
+        lines = payload.decode("utf-8", "replace").splitlines()
+        return lines, stat.st_ino, new_offset, stat.st_size
+
+    def _prune_visit_history(self, settings: dict[str, Any], now: int) -> None:
+        detail_cutoff = now - settings["detail_days"] * 86400
+        summary_cutoff = (
+            dt.datetime.fromtimestamp(now, dt.timezone.utc)
+            - dt.timedelta(days=settings["summary_days"] - 1)
+        ).strftime("%Y-%m-%d")
+        self.db.connection.execute("DELETE FROM visit_events WHERE occurred_at<?", (detail_cutoff,))
+        self.db.connection.execute("DELETE FROM visit_daily WHERE day<?", (summary_cutoff,))
+        event_count = self.db.connection.execute("SELECT COUNT(*) FROM visit_events").fetchone()[0]
+        if event_count > settings["event_limit"]:
+            self.db.connection.execute(
+                "DELETE FROM visit_events WHERE id IN ("
+                "SELECT id FROM visit_events ORDER BY occurred_at DESC,id DESC LIMIT -1 OFFSET ?)",
+                (settings["event_limit"],),
+            )
+        summary_count = self.db.connection.execute("SELECT COUNT(*) FROM visit_daily").fetchone()[0]
+        if summary_count > settings["summary_limit"]:
+            self.db.connection.execute(
+                "DELETE FROM visit_daily WHERE rowid IN ("
+                "SELECT rowid FROM visit_daily ORDER BY day DESC,last_seen DESC LIMIT -1 OFFSET ?)",
+                (settings["summary_limit"],),
+            )
+
+    def collect_visit_logs(self) -> int:
+        with FileLock(self.lock_path):
+            return self._collect_visit_logs_unlocked()
+
+    def _collect_visit_logs_unlocked(self) -> int:
+        settings = self.visit_monitor_settings()
+        if not settings["enabled"]:
+            return 0
+        identities = self._visit_identity_map()
+        device_ids = set(identities.values())
+        local_device = (
+            next(iter(device_ids))
+            if len(device_ids) == 1 and not self.multiuser_enabled()
+            else None
+        )
+        now = utc_now()
+        day = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%d")
+        pending: list[dict[str, Any]] = []
+        cursors: list[tuple[str, Path, int, int, int]] = []
+        for core, path in self.visit_log_paths().items():
+            chunk = self._read_visit_chunk(core, path)
+            if not chunk:
+                continue
+            lines, inode, offset, size = chunk
+            for line in lines:
+                event = self.parse_visit_line(core, line)
+                if not event:
+                    continue
+                device_id = identities.get(event["identity"])
+                if device_id is None and not event["identity"]:
+                    device_id = local_device
+                if device_id is not None:
+                    event["device_id"] = device_id
+                    pending.append(event)
+            cursors.append((core, path, inode, offset, size))
+        with self.db.connection:
+            for event in pending:
+                values = (
+                    now, event["device_id"], event["core"], event["network"],
+                    event["inbound"], event["domain"], event["port"],
+                )
+                self.db.connection.execute(
+                    "INSERT INTO visit_events(occurred_at,device_id,core,network,inbound,domain,port) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    values,
+                )
+                self.db.connection.execute(
+                    "INSERT INTO visit_daily(day,device_id,core,network,inbound,domain,port,"
+                    "connections,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(day,device_id,core,network,inbound,domain,port) DO UPDATE SET "
+                    "connections=connections+1,last_seen=excluded.last_seen",
+                    (day, *values[1:], 1, now, now),
+                )
+            for core, _, inode, offset, _ in cursors:
+                self.db.set_setting(f"visit_{core}_inode", inode)
+                self.db.set_setting(f"visit_{core}_offset", offset)
+            self.db.set_setting("visit_last_collect", now)
+            self._prune_visit_history(settings, now)
+        for core, path, inode, offset, size in cursors:
+            if size <= settings["log_max_bytes"] or offset < size:
+                continue
+            try:
+                with path.open("r+b") as handle:
+                    current = os.fstat(handle.fileno())
+                    if current.st_ino != inode or current.st_size != offset:
+                        continue
+                    handle.truncate(0)
+                with self.db.connection:
+                    self.db.set_setting(f"visit_{core}_inode", inode)
+                    self.db.set_setting(f"visit_{core}_offset", 0)
+            except OSError:
+                pass
+        self.secure_sensitive_files()
+        return len(pending)
+
+    def visit_status(self) -> dict[str, Any]:
+        settings = self.visit_monitor_settings()
+        settings.update({
+            "mode": "multiuser" if self.multiuser_enabled() else "local",
+            "identities": self.db.connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
+            "events": self.db.connection.execute("SELECT COUNT(*) FROM visit_events").fetchone()[0],
+            "summaries": self.db.connection.execute("SELECT COUNT(*) FROM visit_daily").fetchone()[0],
+            "last_collect": int(self.db.setting("visit_last_collect", "0") or 0),
+        })
+        for core, path in self.visit_log_paths().items():
+            try:
+                settings[f"{core}_log_bytes"] = path.stat().st_size
+            except OSError:
+                settings[f"{core}_log_bytes"] = 0
+        return settings
+
+    @staticmethod
+    def _visit_filters(
+        days: int, user_id: int | None, device_id: int | None, domain: str | None
+    ) -> tuple[list[str], list[Any]]:
+        clauses = ["e.occurred_at>=?"]
+        values: list[Any] = [utc_now() - max(1, days) * 86400]
+        if user_id:
+            clauses.append("u.id=?")
+            values.append(user_id)
+        if device_id:
+            clauses.append("d.id=?")
+            values.append(device_id)
+        if domain:
+            clauses.append("e.domain LIKE ?")
+            values.append(f"%{domain.strip().lower()}%")
+        return clauses, values
+
+    def _visit_display_rows(self, rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+        result = [dict(row) for row in rows]
+        if not self.multiuser_enabled():
+            for row in result:
+                if row.get("user_name") == "legacy-admin":
+                    row["user_name"] = "本机用户"
+                if row.get("device_name") == "legacy-device":
+                    row["device_name"] = "本机设备"
+        return result
+
+    def visit_recent(
+        self, days: int, limit: int, user_id: int | None = None,
+        device_id: int | None = None, domain: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses, values = self._visit_filters(days, user_id, device_id, domain)
+        values.append(min(max(1, limit), 500))
+        rows = self.db.connection.execute(
+            "SELECT e.occurred_at,u.id user_id,u.name user_name,d.id device_id,d.name device_name,"
+            "e.core,e.network,e.inbound,e.domain,e.port FROM visit_events e "
+            "JOIN devices d ON d.id=e.device_id JOIN users u ON u.id=d.user_id WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY e.occurred_at DESC,e.id DESC LIMIT ?",
+            values,
+        ).fetchall()
+        return self._visit_display_rows(rows)
+
+    def visit_top(
+        self, days: int, limit: int, group: str = "domain",
+        user_id: int | None = None, device_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        cutoff = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max(1, days) - 1)
+        ).strftime("%Y-%m-%d")
+        clauses = ["v.day>=?"]
+        values: list[Any] = [cutoff]
+        if user_id:
+            clauses.append("u.id=?")
+            values.append(user_id)
+        if device_id:
+            clauses.append("d.id=?")
+            values.append(device_id)
+        values.append(min(max(1, limit), 500))
+        if group == "user":
+            select = (
+                "u.id user_id,u.name user_name,COUNT(DISTINCT v.domain) domains,"
+                "SUM(v.connections) connections,MAX(v.last_seen) last_seen"
+            )
+            grouping = "u.id,u.name"
+        else:
+            select = (
+                "v.domain,v.port,COUNT(DISTINCT u.id) users,"
+                "SUM(v.connections) connections,MAX(v.last_seen) last_seen"
+            )
+            grouping = "v.domain,v.port"
+        rows = self.db.connection.execute(
+            f"SELECT {select} FROM visit_daily v "
+            "JOIN devices d ON d.id=v.device_id JOIN users u ON u.id=d.user_id WHERE "
+            + " AND ".join(clauses)
+            + f" GROUP BY {grouping} ORDER BY connections DESC,last_seen DESC LIMIT ?",
+            values,
+        ).fetchall()
+        return self._visit_display_rows(rows)
+
+    def clear_visit_history(self, confirmation: str) -> None:
+        if confirmation != "CLEAR":
+            raise AgentError("清空访问记录需要输入 CLEAR")
+        with FileLock(self.lock_path):
+            with self.db.connection:
+                self.db.connection.execute("DELETE FROM visit_events")
+                self.db.connection.execute("DELETE FROM visit_daily")
+                for core in self.visit_log_paths():
+                    self.db.set_setting(f"visit_{core}_inode", 0)
+                    self.db.set_setting(f"visit_{core}_offset", 0)
+                self.db.set_setting("visit_last_collect", 0)
+                self.db.audit("visit-monitor.clear", "module")
+            for path in self.visit_log_paths().values():
+                try:
+                    with path.open("wb"):
+                        pass
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+        self.secure_sensitive_files()
+
     def collect_stats(self) -> int:
         config = self.load_config()
         total = self.sample_core_stats("xray", config.get("xray_api", "127.0.0.1:10085"))
@@ -1256,6 +2297,7 @@ class Agent:
         backups = sorted(self.backups.glob("db-*.sqlite3"), reverse=True)
         for old in backups[7:]:
             old.unlink(missing_ok=True)
+        self.secure_sensitive_files()
         return target
 
     def restore_database(self, source_path: str) -> None:
@@ -1272,6 +2314,7 @@ class Agent:
                 raise AgentError("数据库备份完整性检查失败")
             with FileLock(self.lock_path):
                 backup.backup(self.db.connection)
+                self.db.migrate()
                 self.db.audit("database.restore", source.name)
                 self.db.connection.commit()
         finally:
@@ -1302,6 +2345,8 @@ class Agent:
             "scheme": config.get("scheme"),
             "port": config.get("port"),
             "legacy_http_port": config.get("legacy_http_port", 0),
+            "visit_monitor": self.visit_monitor_settings()["enabled"],
+            "visit_events": self.db.connection.execute("SELECT COUNT(*) FROM visit_events").fetchone()[0],
         }
         if (self.root / "xray").exists():
             checks["xray_validate"] = self._run([str(self.root / "xray"), "run", "-test", "-c", str(self.root / "xr.json")], check=False).returncode == 0
@@ -1379,6 +2424,8 @@ def serve(agent: Agent) -> None:
     config = agent.load_config()
     if not config.get("enabled"):
         raise AgentError("多用户模块已停用")
+    agent.sync_legacy_subscription_state()
+    config = agent.load_config()
     agent.reconcile(validate=False)
     bind = config.get("bind", "::")
     server_class: type[http.server.ThreadingHTTPServer] = DualStackServer if ":" in bind else http.server.ThreadingHTTPServer
@@ -1428,18 +2475,45 @@ def serve(agent: Agent) -> None:
             legacy_server.server_close()
 
 
-def print_device(device: sqlite3.Row, config: dict[str, Any]) -> None:
+def serve_visits(agent: Agent) -> None:
+    if not agent.visit_monitor_settings()["enabled"]:
+        raise AgentError("网站访问监控尚未启用")
+    interval = 30
+    if agent.config_path.exists():
+        with contextlib.suppress(OSError, ValueError, json.JSONDecodeError):
+            interval = max(15, int(agent.load_config().get("poll_interval", 30)))
+    stopping = threading.Event()
+
+    def stop(*_: Any) -> None:
+        stopping.set()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while not stopping.is_set() and agent.visit_monitor_settings()["enabled"]:
+        try:
+            agent.collect_visit_logs()
+        except Exception as exc:
+            sys.stderr.write(f"visit collection failed: {exc}\n")
+        if stopping.wait(interval):
+            break
+
+
+def print_subscription_links(device: sqlite3.Row, config: dict[str, Any]) -> None:
     host = config.get("public_host") or "SERVER"
     port = config.get("public_port") or config.get("port")
     scheme = config.get("scheme", "http")
+    for filename, label in (("clmi.yaml", "Clash/Mihomo"), ("sbox.json", "Sing-box"), ("jhsub.txt", "聚合")):
+        print(f"{label}订阅地址：{scheme}://{host}:{port}/{device['token']}/{filename}")
+
+
+def print_device(device: sqlite3.Row, config: dict[str, Any]) -> None:
     print(f"设备 ID：{device['id']}")
     print(f"设备名称：{device['name']}")
     print(f"UUID：{device['uuid']}")
     print(f"通用密码：{device['password']}")
     print(f"SS-2022 用户密钥：{device['ss_password']}")
     print(f"订阅 token：{device['token']}")
-    for filename, label in (("clmi.yaml", "Clash/Mihomo"), ("sbox.json", "Sing-box"), ("jhsub.txt", "聚合")):
-        print(f"{label}：{scheme}://{host}:{port}/{device['token']}/{filename}")
+    print_subscription_links(device, config)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1521,6 +2595,7 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--user-id", type=int, required=True)
     show_sub = sub.add_parser("show-subscription")
     show_sub.add_argument("--device-id", type=int, required=True)
+    sub.add_parser("show-local-subscription")
     sub.add_parser("list-users")
     sub.add_parser("status")
     sub.add_parser("usage")
@@ -1534,6 +2609,33 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("serve")
     enable = sub.add_parser("set-module")
     enable.add_argument("--enabled", choices=("yes", "no"), required=True)
+    subscription_port = sub.add_parser("set-subscription-port")
+    subscription_port.add_argument("--port", type=int, required=True)
+    subscription_port.add_argument("--public-port", type=int, required=True)
+    sub.add_parser("sync-subscription-state")
+    sub.add_parser("visit-init")
+    sub.add_parser("visit-apply")
+    sub.add_parser("visit-serve")
+    visit_config = sub.add_parser("visit-config")
+    visit_config.add_argument("--enabled", choices=("yes", "no"), required=True)
+    visit_config.add_argument("--detail-days", type=int)
+    visit_config.add_argument("--summary-days", type=int)
+    sub.add_parser("visit-status")
+    sub.add_parser("visit-collect")
+    visit_recent = sub.add_parser("visit-recent")
+    visit_recent.add_argument("--days", type=int, default=1)
+    visit_recent.add_argument("--limit", type=int, default=50)
+    visit_recent.add_argument("--user-id", type=int)
+    visit_recent.add_argument("--device-id", type=int)
+    visit_recent.add_argument("--domain")
+    visit_top = sub.add_parser("visit-top")
+    visit_top.add_argument("--days", type=int, default=7)
+    visit_top.add_argument("--limit", type=int, default=30)
+    visit_top.add_argument("--group", choices=("domain", "user"), default="domain")
+    visit_top.add_argument("--user-id", type=int)
+    visit_top.add_argument("--device-id", type=int)
+    visit_clear = sub.add_parser("visit-clear")
+    visit_clear.add_argument("--confirm", required=True)
     return parser
 
 
@@ -1597,6 +2699,11 @@ def main(argv: list[str] | None = None) -> int:
             result = dict(device)
             if not args.json:
                 print_device(device, agent.load_config())
+        elif args.command == "show-local-subscription":
+            device = agent.local_subscription_device()
+            result = {"device_id": device["id"]}
+            if not args.json:
+                print_subscription_links(device, agent.load_config())
         elif args.command == "reconcile":
             result = agent.reconcile()
             print(f"配置注入完成：{result}")
@@ -1624,11 +2731,15 @@ def main(argv: list[str] | None = None) -> int:
                     "xray_validate": "Xray 配置校验", "singbox_validate": "Sing-box 配置校验",
                     "singbox_v2ray_api": "Sing-box 用户统计能力",
                     "singbox_stats_helper": "Sing-box 流量统计组件",
+                    "visit_monitor": "网站访问监控",
+                    "visit_events": "访问明细记录数",
                 }
                 for key, value in result.items():
                     if isinstance(value, bool):
-                        if key == "enabled":
+                        if key in {"enabled", "visit_monitor"}:
                             value = "已启用" if value else "已停用"
+                        elif key in {"singbox_v2ray_api", "singbox_stats_helper"}:
+                            value = "已安装" if value else "可选组件未安装（不影响基础多用户）"
                         else:
                             value = "正常" if value else "异常/未安装"
                     elif key == "database" and value == "ok":
@@ -1642,8 +2753,86 @@ def main(argv: list[str] | None = None) -> int:
             agent.save_config(config)
             result = {"enabled": config["enabled"]}
             print("模块已启用。" if config["enabled"] else "模块已停用。")
+        elif args.command == "set-subscription-port":
+            result = agent.set_subscription_port(args.port, args.public_port)
+            print(
+                f"多用户订阅端口已更新：内网 {result['port']} / 公网 {result['public_port']}。"
+            )
+        elif args.command == "sync-subscription-state":
+            result = agent.sync_legacy_subscription_state()
+            print(
+                f"订阅状态已同步：设备 {result['device_id']}，"
+                f"内网 {result['port']} / 公网 {result['public_port']}。"
+            )
+        elif args.command == "visit-init":
+            result = agent.initialize_visit()
+            print("本机网站监控身份已初始化。")
+        elif args.command == "visit-apply":
+            result = agent.apply_visit()
+            print(f"网站访问监控配置已校验并应用：{result}")
+        elif args.command == "visit-config":
+            current = agent.visit_monitor_settings()
+            result = agent.set_visit_monitor(
+                args.enabled == "yes",
+                args.detail_days if args.detail_days is not None else current["detail_days"],
+                args.summary_days if args.summary_days is not None else current["summary_days"],
+            )
+            print("网站访问监控设置已保存。")
+        elif args.command == "visit-status":
+            result = agent.visit_status()
+            if not args.json:
+                print(f"监控状态：{'已启用' if result['enabled'] else '未启用'}")
+                print(
+                    "运行模式："
+                    + ("多用户归属" if result["mode"] == "multiuser" else "本机用户 / 本机设备")
+                )
+                print(
+                    f"保留策略：逐条明细 {result['detail_days']} 天；"
+                    f"每日汇总 {result['summary_days']} 天"
+                )
+                if result["summary_days"] > result["detail_days"]:
+                    print(
+                        f"说明：第 {result['detail_days'] + 1}-{result['summary_days']} 天"
+                        "仅保留每日访问次数，不保留逐条明细。"
+                    )
+                print(f"数据库：明细 {result['events']} 条 / 汇总 {result['summaries']} 条")
+                print(
+                    "原始日志：Xray {} / Sing-box {}".format(
+                        format_storage(result["xray_log_bytes"]),
+                        format_storage(result["singbox_log_bytes"]),
+                    )
+                )
+                print(
+                    "最后采集："
+                    + (
+                        iso_time(result["last_collect"])
+                        if result["last_collect"] else "尚未采集"
+                    )
+                )
+        elif args.command == "visit-collect":
+            collected = agent.collect_visit_logs()
+            result = {"collected": collected}
+            print(f"本次新增访问记录：{collected} 条")
+        elif args.command == "visit-recent":
+            result = agent.visit_recent(
+                args.days, args.limit, args.user_id, args.device_id, args.domain
+            )
+            if not args.json:
+                print_visit_recent(result)
+        elif args.command == "visit-top":
+            result = agent.visit_top(
+                args.days, args.limit, args.group, args.user_id, args.device_id
+            )
+            if not args.json:
+                print_visit_top(result, args.group)
+        elif args.command == "visit-clear":
+            agent.clear_visit_history(args.confirm)
+            result = {"cleared": True}
+            print("网站访问记录与原始日志已清空。")
         elif args.command == "serve":
             serve(agent)
+        elif args.command == "visit-serve":
+            serve_visits(agent)
         if args.json and result is not None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
