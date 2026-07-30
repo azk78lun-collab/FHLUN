@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.29.7"
+echo "当前版本：V26.7.29.8"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -8047,14 +8047,25 @@ done
 }
 
 render_protocol_table(){
-if command -v column >/dev/null 2>&1; then
-protocol_table_rows | column -t -s '|'
-else
-protocol_table_rows | while IFS='|' read -r id status label inner public direct cdn origin tunnel; do
-printf '%-4s %-6s %-28s %-10s %-10s %-6s %-9s %-10s %-8s\n' \
-"$id" "$status" "$label" "$inner" "$public" "$direct" "$cdn" "$origin" "$tunnel"
+table_border='+------+------+---------------------------+-------+-------+------+---------+------+--------+'
+{
+printf '%s\n' "$table_border"
+printf '| 编号 | 状态 | 协议                      | 监听  | 公网  | 直连 | CDN优选 | 回源 | CF隧道 |\n'
+printf '%s\n' "$table_border"
+protocol_table_rows | sed '1d' | while IFS='|' read -r id status label inner public direct cdn origin tunnel; do
+case "$status" in ✓) status_cell='✓   ' ;; *) status_cell='—   ' ;; esac
+case "$inner" in —) inner='—    ' ;; esac
+case "$public" in —) public='—    ' ;; esac
+case "$direct" in ✓) direct_cell='✓   ' ;; *) direct_cell='—   ' ;; esac
+case "$cdn" in '✓*') cdn_cell='✓*     ' ;; ✓) cdn_cell='✓      ' ;; *) cdn_cell='—      ' ;; esac
+case "$origin" in ✓) origin_cell='✓   ' ;; *) origin_cell='—   ' ;; esac
+case "$tunnel" in ✓) tunnel_cell='✓     ' ;; *) tunnel_cell='—     ' ;; esac
+printf '| %-4s | %s | %-25s | %-5s | %-5s | %s | %s | %s | %s |\n' \
+"$id" "$status_cell" "$label" "$inner" "$public" \
+"$direct_cell" "$cdn_cell" "$origin_cell" "$tunnel_cell"
 done
-fi | sed "s/✓/${LUN_GREEN}✓${LUN_RESET}/g"
+printf '%s\n' "$table_border"
+} | sed "s/✓/${LUN_GREEN}✓${LUN_RESET}/g"
 }
 
 protocol_var(){
