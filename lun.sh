@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.29.8"
+echo "当前版本：V26.7.30.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1148,10 +1148,19 @@ fi
 download_lun_script(){
 target=$1
 tmp="${target}.tmp.$$"
+download_url=$lunurl
+case "$download_url" in
+https://raw.githubusercontent.com/*)
+case "$download_url" in
+*\?*) download_url="${download_url}&fhlun_nocache=$(date +%s)" ;;
+*) download_url="${download_url}?fhlun_nocache=$(date +%s)" ;;
+esac
+;;
+esac
 rm -f "$tmp"
-if command -v curl >/dev/null 2>&1 && curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 "$lunurl" -o "$tmp"; then
+if command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 30 --retry 2 "$download_url" -o "$tmp"; then
 :
-elif command -v wget >/dev/null 2>&1 && wget -qO "$tmp" --timeout=30 --tries=2 "$lunurl"; then
+elif command -v wget >/dev/null 2>&1 && wget -qO "$tmp" --header='Cache-Control: no-cache' --timeout=30 --tries=2 "$download_url"; then
 :
 else
 rm -f "$tmp"
