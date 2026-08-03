@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.7.31.2"
+echo "当前版本：V26.8.2.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -10291,6 +10291,15 @@ multiuser_cmd visit-collect >/dev/null 2>&1 || true
 }
 
 multiuser_visit_filter_ui(){
+echo "查看方式：1. 智能活动（过滤并合并）  2. 原始连接明细"
+printf "请选择 [默认 1，输入 0 返回]："
+IFS= read -r mu_visit_view
+[ "$mu_visit_view" = 0 ] && return
+case "$mu_visit_view" in
+""|1) mu_visit_view=smart; mu_visit_noise=auto ;;
+2) mu_visit_view=raw; mu_visit_noise=show ;;
+*) red_line "请输入 1 或 2。"; return ;;
+esac
 printf "查看最近几天 [默认 7，输入 0 返回]："
 IFS= read -r mu_visit_days
 [ "$mu_visit_days" = 0 ] && return
@@ -10307,13 +10316,71 @@ case "$mu_visit_did" in ""|*[!0-9]*) [ -z "$mu_visit_did" ] || { red_line "设�
 printf "域名关键字 [回车全部，输入 0 返回]："
 IFS= read -r mu_visit_domain
 [ "$mu_visit_domain" = 0 ] && return
-set -- visit-recent --days "$mu_visit_days" --limit 100
+set -- visit-recent --days "$mu_visit_days" --limit 100 --view "$mu_visit_view" --noise "$mu_visit_noise"
 [ -n "$mu_visit_uid" ] && set -- "$@" --user-id "$mu_visit_uid"
 [ -n "$mu_visit_did" ] && set -- "$@" --device-id "$mu_visit_did"
 [ -n "$mu_visit_domain" ] && set -- "$@" --domain "$mu_visit_domain"
 multiuser_visit_refresh
 multiuser_cmd "$@"
 ui_pause
+}
+
+visit_monitor_filter_ui(){
+while :; do
+ui_title "网站监控过滤与合并设置"
+multiuser_cmd visit-filter
+echo " 1. 使用标准过滤（推荐）"
+echo " 2. 关闭过滤"
+echo " 3. 修改活动合并分钟数"
+echo " 4. 添加自定义隐藏域名"
+echo " 5. 删除自定义隐藏域名"
+echo " 6. 添加始终显示域名"
+echo " 7. 删除始终显示域名"
+echo " 8. 清空自定义规则并恢复默认"
+echo " 0. 返回"
+printf "请选择 [0-8]（输入 0 返回）："
+IFS= read -r visit_filter_choice
+case "$visit_filter_choice" in
+1) multiuser_cmd visit-filter --mode standard ;;
+2) multiuser_cmd visit-filter --mode off ;;
+3)
+printf "同一设备、域名和端口的合并窗口 [1-60 分钟，输入 0 返回]："
+IFS= read -r visit_merge_minutes
+[ "$visit_merge_minutes" = 0 ] && continue
+case "$visit_merge_minutes" in
+""|*[!0-9]*) red_line "合并窗口必须是 1-60 的整数。"; ui_pause; continue ;;
+esac
+if [ "$visit_merge_minutes" -lt 1 ] || [ "$visit_merge_minutes" -gt 60 ]; then
+red_line "合并窗口必须是 1-60 分钟。"
+ui_pause
+continue
+fi
+multiuser_cmd visit-filter --merge-minutes "$visit_merge_minutes"
+;;
+4|5|6|7)
+printf "输入完整域名（输入 0 返回）："
+IFS= read -r visit_filter_domain
+[ "$visit_filter_domain" = 0 ] && continue
+[ -n "$visit_filter_domain" ] || { red_line "域名不能为空。"; ui_pause; continue; }
+case "$visit_filter_choice" in
+4) visit_filter_action=add-hide ;;
+5) visit_filter_action=remove-hide ;;
+6) visit_filter_action=add-show ;;
+7) visit_filter_action=remove-show ;;
+esac
+multiuser_cmd visit-filter --action "$visit_filter_action" --domain "$visit_filter_domain"
+;;
+8)
+printf "输入 RESET 清空自定义隐藏/显示规则（输入 0 返回）："
+IFS= read -r visit_filter_reset
+[ "$visit_filter_reset" = 0 ] && continue
+[ "$visit_filter_reset" = RESET ] && multiuser_cmd visit-filter --action reset || red_line "未输入 RESET，设置未变更。"
+;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+ui_pause
+done
 }
 
 visit_monitor_status_ui(){
@@ -10377,37 +10444,41 @@ visit_monitor_ui(){
 while :; do
 ui_title "Lun 网站访问监控"
 visit_monitor_status_ui
-yellow_line "仅记录域名、端口和连接次数，不记录网页路径、查询参数或传输内容。"
+yellow_line "这里记录的是代理连接，不是浏览器点击历史；不记录网页路径、查询参数或传输内容。"
 echo " 1. 一键开启 / 修复监控"
 echo " 2. 运行状态 / 自检"
-echo " 3. 今日最近访问"
-echo " 4. 七天热门域名"
-echo " 5. 七天用户访问排行"
-echo " 6. 按用户 / 设备 / 域名筛选"
-echo " 7. 立即采集"
-echo " 8. 存储设置"
-echo " 9. 清空全部访问记录"
-echo "10. 停用监控（保留已有记录）"
+echo " 3. 今日智能活动（过滤并合并）"
+echo " 4. 今日原始连接明细"
+echo " 5. 七天热门域名（过滤后）"
+echo " 6. 七天用户 / 设备活动汇总"
+echo " 7. 按用户 / 设备 / 域名筛选"
+echo " 8. 过滤与合并设置"
+echo " 9. 立即采集"
+echo "10. 存储设置"
+echo "11. 清空全部连接记录"
+echo "12. 停用监控（保留已有记录）"
 echo " 0. 返回"
-printf "请选择 [0-10]（输入 0 返回）："
+printf "请选择 [0-12]（输入 0 返回）："
 IFS= read -r mu_choice
 case "$mu_choice" in
 1) visit_monitor_enable; ui_pause ;;
 2) visit_monitor_status_ui; ui_pause ;;
-3) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100; ui_pause ;;
-4) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group domain; ui_pause ;;
-5) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group user; ui_pause ;;
-6) multiuser_visit_filter_ui ;;
-7) multiuser_cmd visit-collect; ui_pause ;;
-8) visit_monitor_storage_ui; ui_pause ;;
-9)
+3) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100 --view smart --noise auto; ui_pause ;;
+4) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100 --view raw --noise show; ui_pause ;;
+5) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group domain --noise auto; ui_pause ;;
+6) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group user --noise auto; ui_pause ;;
+7) multiuser_visit_filter_ui ;;
+8) visit_monitor_filter_ui ;;
+9) multiuser_cmd visit-collect; ui_pause ;;
+10) visit_monitor_storage_ui; ui_pause ;;
+11)
 printf "%s此操作不可恢复。输入 CLEAR 清空数据库访问记录和原始日志（输入 0 返回）：%s" "$LUN_RED" "$LUN_RESET"
 IFS= read -r mu_visit_clear
 [ "$mu_visit_clear" = 0 ] && continue
 multiuser_cmd visit-clear --confirm "$mu_visit_clear"
 ui_pause
 ;;
-10) visit_monitor_disable; ui_pause ;;
+12) visit_monitor_disable; ui_pause ;;
 0|"") return ;;
 *) echo "输入错误。" ;;
 esac

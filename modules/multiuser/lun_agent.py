@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 PROTOCOLS = (
     "vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"
 )
@@ -93,6 +93,19 @@ VISIT_EVENT_LIMIT = 100_000
 VISIT_SUMMARY_LIMIT = 200_000
 VISIT_LOG_MAX_BYTES = 10 * 1024 * 1024
 VISIT_READ_MAX_BYTES = 4 * 1024 * 1024
+VISIT_FILTER_MODE = "standard"
+VISIT_MERGE_MINUTES = 10
+VISIT_NOISE_SUFFIXES = frozenset({
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "adtrafficquality.google", "googletagmanager.com", "google-analytics.com",
+    "clarity.ms", "cloudflareinsights.com", "visualwebsiteoptimizer.com",
+    "adobedc.net", "adobedtm.com", "zi-scripts.com", "51.la", "owox.com",
+    "mktoresp.com", "srv.stackadapt.com", "cookiehub.net", "cookiehub.eu",
+})
+VISIT_NOISE_EXACT = frozenset({
+    "px.ads.linkedin.com", "snap.licdn.com", "connect.facebook.net",
+    "a.nel.cloudflare.com",
+})
 
 
 class AgentError(RuntimeError):
@@ -210,7 +223,27 @@ def print_visit_recent(rows: list[dict[str, Any]]) -> None:
             row["inbound"],
             f"{row['domain']}:{row['port']}",
         ))
-    print_visit_table(("时间(UTC)", "用户/设备", "内核", "网络", "入口", "访问域名"), values)
+    print_visit_table(("时间(UTC)", "用户/设备", "内核", "网络", "入口", "目标域名"), values)
+
+
+def print_visit_activity(rows: list[dict[str, Any]]) -> None:
+    values = []
+    for row in rows:
+        first_seen = dt.datetime.fromtimestamp(row["first_seen"], dt.timezone.utc).strftime("%m-%d %H:%M:%S")
+        last_seen = dt.datetime.fromtimestamp(row["last_seen"], dt.timezone.utc).strftime("%H:%M:%S")
+        time_range = first_seen if row["first_seen"] == row["last_seen"] else f"{first_seen}-{last_seen}"
+        networks = "/".join(
+            name for name, present in (("TCP", row["has_tcp"]), ("UDP", row["has_udp"])) if present
+        )
+        values.append((
+            time_range,
+            f"{row['user_name']}/{row['device_name']}",
+            f"{row['domain']}:{row['port']}",
+            str(row["connections"]),
+            networks or "-",
+            str(row["inbounds"]),
+        ))
+    print_visit_table(("时间段(UTC)", "用户/设备", "目标域名", "连接数", "网络", "入口数"), values)
 
 
 def print_visit_top(rows: list[dict[str, Any]], group: str) -> None:
@@ -231,6 +264,17 @@ def print_visit_top(rows: list[dict[str, Any]], group: str) -> None:
         print_visit_table(("ID", "用户", "域名数", "连接次数", "最后访问(UTC)"), values)
     else:
         print_visit_table(("域名", "用户数", "连接次数", "最后访问(UTC)"), values)
+
+
+def print_visit_filter_status(settings: dict[str, Any]) -> None:
+    mode = "标准过滤" if settings["filter_mode"] == "standard" else "不过滤"
+    print(f"智能过滤：{mode}")
+    print(f"活动合并窗口：{settings['merge_minutes']} 分钟")
+    hidden = settings["hidden_domains"]
+    allowed = settings["allowed_domains"]
+    print("自定义隐藏：" + (" ".join(hidden) if hidden else "无"))
+    print("始终显示：" + (" ".join(allowed) if allowed else "无"))
+    print("说明：过滤只影响智能视图，不阻断代理流量，不删除原始记录。")
 
 
 def atomic_write(path: Path, data: str | bytes, mode: int = 0o600) -> None:
@@ -414,6 +458,10 @@ class Database:
             "visit_event_limit": str(VISIT_EVENT_LIMIT),
             "visit_summary_limit": str(VISIT_SUMMARY_LIMIT),
             "visit_log_max_bytes": str(VISIT_LOG_MAX_BYTES),
+            "visit_filter_mode": VISIT_FILTER_MODE,
+            "visit_merge_minutes": str(VISIT_MERGE_MINUTES),
+            "visit_filter_hidden": "[]",
+            "visit_filter_allowed": "[]",
         }
         self.connection.executemany(
             "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
@@ -546,6 +594,47 @@ class Agent:
                 with contextlib.suppress(OSError):
                     os.chmod(path, 0o600)
 
+    @staticmethod
+    def normalize_visit_domain(value: str) -> str:
+        domain = value.strip().lower().rstrip(".")
+        if domain.startswith("*."):
+            domain = domain[2:]
+        try:
+            domain = domain.encode("idna").decode("ascii")
+            ipaddress.ip_address(domain)
+        except UnicodeError as exc:
+            raise AgentError("域名格式无效") from exc
+        except ValueError:
+            pass
+        else:
+            raise AgentError("过滤规则只接受域名，不接受 IP")
+        if len(domain) > 253 or "." not in domain:
+            raise AgentError("请输入完整域名")
+        labels = domain.split(".")
+        if any(
+            not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels
+        ):
+            raise AgentError("域名格式无效")
+        return domain
+
+    def _visit_rule_setting(self, key: str) -> list[str]:
+        try:
+            values = json.loads(self.db.setting(key, "[]"))
+        except json.JSONDecodeError:
+            values = []
+        if not isinstance(values, list):
+            return []
+        result = []
+        for value in values:
+            try:
+                normalized = self.normalize_visit_domain(str(value))
+            except AgentError:
+                continue
+            if normalized not in result:
+                result.append(normalized)
+        return result[:256]
+
     def visit_monitor_settings(self) -> dict[str, Any]:
         def number(key: str, default: int, minimum: int, maximum: int) -> int:
             try:
@@ -555,6 +644,9 @@ class Agent:
             return min(maximum, max(minimum, value))
 
         paths = self.visit_log_paths()
+        filter_mode = self.db.setting("visit_filter_mode", VISIT_FILTER_MODE)
+        if filter_mode not in {"standard", "off"}:
+            filter_mode = VISIT_FILTER_MODE
         return {
             "enabled": self.db.setting("visit_monitor_enabled", "0") == "1",
             "detail_days": number("visit_detail_days", VISIT_DETAIL_DAYS, 1, 30),
@@ -564,6 +656,10 @@ class Agent:
             "log_max_bytes": number(
                 "visit_log_max_bytes", VISIT_LOG_MAX_BYTES, 1024 * 1024, 100 * 1024 * 1024
             ),
+            "filter_mode": filter_mode,
+            "merge_minutes": number("visit_merge_minutes", VISIT_MERGE_MINUTES, 1, 60),
+            "hidden_domains": self._visit_rule_setting("visit_filter_hidden"),
+            "allowed_domains": self._visit_rule_setting("visit_filter_allowed"),
             "xray_log": str(paths["xray"]),
             "singbox_log": str(paths["singbox"]),
         }
@@ -584,6 +680,53 @@ class Agent:
                 "module",
                 f"enabled={int(enabled)},detail_days={detail_days},summary_days={summary_days}",
             )
+        return self.visit_monitor_settings()
+
+    def set_visit_filter(self, mode: str | None, merge_minutes: int | None) -> dict[str, Any]:
+        current = self.visit_monitor_settings()
+        mode = mode if mode is not None else current["filter_mode"]
+        merge_minutes = merge_minutes if merge_minutes is not None else current["merge_minutes"]
+        if mode not in {"standard", "off"}:
+            raise AgentError("过滤模式必须是 standard 或 off")
+        if not 1 <= merge_minutes <= 60:
+            raise AgentError("合并窗口必须是 1-60 分钟")
+        with self.db.connection:
+            self.db.set_setting("visit_filter_mode", mode)
+            self.db.set_setting("visit_merge_minutes", merge_minutes)
+            self.db.audit(
+                "visit-monitor.filter-config", "module",
+                f"mode={mode},merge_minutes={merge_minutes}",
+            )
+        return self.visit_monitor_settings()
+
+    def update_visit_filter_rule(self, action: str, value: str) -> dict[str, Any]:
+        domain = self.normalize_visit_domain(value)
+        mapping = {
+            "add-hide": ("visit_filter_hidden", True),
+            "remove-hide": ("visit_filter_hidden", False),
+            "add-show": ("visit_filter_allowed", True),
+            "remove-show": ("visit_filter_allowed", False),
+        }
+        if action not in mapping:
+            raise AgentError("未知的域名规则操作")
+        key, adding = mapping[action]
+        values = self._visit_rule_setting(key)
+        if adding and domain not in values:
+            if len(values) >= 256:
+                raise AgentError("自定义域名规则最多 256 条")
+            values.append(domain)
+        elif not adding and domain in values:
+            values.remove(domain)
+        with self.db.connection:
+            self.db.set_setting(key, json.dumps(sorted(values), ensure_ascii=False))
+            self.db.audit("visit-monitor.filter-rule", domain, action)
+        return self.visit_monitor_settings()
+
+    def reset_visit_filter_rules(self) -> dict[str, Any]:
+        with self.db.connection:
+            self.db.set_setting("visit_filter_hidden", "[]")
+            self.db.set_setting("visit_filter_allowed", "[]")
+            self.db.audit("visit-monitor.filter-reset", "module")
         return self.visit_monitor_settings()
 
     def _configure_visit_log(
@@ -1893,6 +2036,56 @@ class Agent:
         return identities
 
     @staticmethod
+    def _visit_suffix_match(domain: str, rule: str) -> bool:
+        return domain == rule or domain.endswith(f".{rule}")
+
+    def visit_domain_is_noise(
+        self, domain: str, settings: dict[str, Any] | None = None
+    ) -> bool:
+        settings = settings or self.visit_monitor_settings()
+        if any(self._visit_suffix_match(domain, rule) for rule in settings["allowed_domains"]):
+            return False
+        if any(self._visit_suffix_match(domain, rule) for rule in settings["hidden_domains"]):
+            return True
+        if settings["filter_mode"] == "off":
+            return False
+        if domain in VISIT_NOISE_EXACT:
+            return True
+        return any(self._visit_suffix_match(domain, rule) for rule in VISIT_NOISE_SUFFIXES)
+
+    @staticmethod
+    def _visit_suffix_sql(alias: str, rules: Iterable[str]) -> tuple[str, list[str]]:
+        clauses = []
+        values = []
+        for rule in rules:
+            clauses.append(f"({alias}.domain=? OR {alias}.domain LIKE ?)")
+            values.extend((rule, f"%.{rule}"))
+        return " OR ".join(clauses), values
+
+    def _visit_noise_sql(
+        self, alias: str, include_noise: bool
+    ) -> tuple[str | None, list[str]]:
+        if include_noise:
+            return None, []
+        settings = self.visit_monitor_settings()
+        hidden_rules = list(settings["hidden_domains"])
+        exact_rules: list[str] = []
+        if settings["filter_mode"] == "standard":
+            hidden_rules.extend(sorted(VISIT_NOISE_SUFFIXES))
+            exact_rules.extend(sorted(VISIT_NOISE_EXACT))
+        hidden_sql, hidden_values = self._visit_suffix_sql(alias, dict.fromkeys(hidden_rules))
+        if exact_rules:
+            exact_sql = " OR ".join(f"{alias}.domain=?" for _ in exact_rules)
+            hidden_sql = " OR ".join(part for part in (hidden_sql, exact_sql) if part)
+            hidden_values.extend(exact_rules)
+        if not hidden_sql:
+            return None, []
+        allowed_sql, allowed_values = self._visit_suffix_sql(alias, settings["allowed_domains"])
+        if allowed_sql:
+            return f"(({allowed_sql}) OR NOT ({hidden_sql}))", [*allowed_values, *hidden_values]
+        return f"NOT ({hidden_sql})", hidden_values
+
+    @staticmethod
     def _visit_target(value: str) -> tuple[str, int] | None:
         target = value.strip().strip("\"'")
         if target.startswith("["):
@@ -1925,6 +2118,46 @@ class Agent:
         ):
             return None
         return host, int(raw_port)
+
+    @staticmethod
+    def _visit_line_timestamp(core: str, line: str) -> int | None:
+        local_zone = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+        if core == "xray":
+            match = re.match(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)", line)
+            if not match:
+                return None
+            raw = match.group(1)
+            fmt = "%Y/%m/%d %H:%M:%S.%f" if "." in raw else "%Y/%m/%d %H:%M:%S"
+            with contextlib.suppress(ValueError, OverflowError):
+                parsed = dt.datetime.strptime(raw, fmt).replace(tzinfo=local_zone)
+                return int(parsed.timestamp())
+            return None
+        if core != "singbox":
+            return None
+        prefixed = re.match(
+            r"([+-]\d{4})\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)",
+            line,
+        )
+        if prefixed:
+            with contextlib.suppress(ValueError, OverflowError):
+                zone = dt.datetime.strptime(prefixed.group(1), "%z").tzinfo
+                parsed = dt.datetime.fromisoformat(prefixed.group(2)).replace(tzinfo=zone)
+                return int(parsed.timestamp())
+        match = re.match(
+            r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+            line,
+        )
+        if not match:
+            return None
+        raw = match.group(1).replace("Z", "+00:00")
+        if re.search(r"[+-]\d{4}$", raw):
+            raw = f"{raw[:-5]}{raw[-5:-2]}:{raw[-2:]}"
+        with contextlib.suppress(ValueError, OverflowError):
+            parsed = dt.datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=local_zone)
+            return int(parsed.timestamp())
+        return None
 
     @classmethod
     def parse_visit_line(cls, core: str, line: str) -> dict[str, Any] | None:
@@ -1964,6 +2197,7 @@ class Agent:
             "inbound": inbound[:80],
             "domain": target[0],
             "port": target[1],
+            "occurred_at": cls._visit_line_timestamp(core, line),
         }
 
     def _read_visit_chunk(self, core: str, path: Path) -> tuple[list[str], int, int, int] | None:
@@ -2039,7 +2273,6 @@ class Agent:
             else None
         )
         now = utc_now()
-        day = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%d")
         pending: list[dict[str, Any]] = []
         cursors: list[tuple[str, Path, int, int, int]] = []
         for core, path in self.visit_log_paths().items():
@@ -2060,8 +2293,12 @@ class Agent:
             cursors.append((core, path, inode, offset, size))
         with self.db.connection:
             for event in pending:
+                occurred_at = event.get("occurred_at") or now
+                if occurred_at < 1 or occurred_at > now + 86400:
+                    occurred_at = now
+                day = dt.datetime.fromtimestamp(occurred_at, dt.timezone.utc).strftime("%Y-%m-%d")
                 values = (
-                    now, event["device_id"], event["core"], event["network"],
+                    occurred_at, event["device_id"], event["core"], event["network"],
                     event["inbound"], event["domain"], event["port"],
                 )
                 self.db.connection.execute(
@@ -2073,8 +2310,10 @@ class Agent:
                     "INSERT INTO visit_daily(day,device_id,core,network,inbound,domain,port,"
                     "connections,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(day,device_id,core,network,inbound,domain,port) DO UPDATE SET "
-                    "connections=connections+1,last_seen=excluded.last_seen",
-                    (day, *values[1:], 1, now, now),
+                    "connections=connections+1,"
+                    "first_seen=MIN(first_seen,excluded.first_seen),"
+                    "last_seen=MAX(last_seen,excluded.last_seen)",
+                    (day, *values[1:], 1, occurred_at, occurred_at),
                 )
             for core, _, inode, offset, _ in cursors:
                 self.db.set_setting(f"visit_{core}_inode", inode)
@@ -2157,9 +2396,49 @@ class Agent:
         ).fetchall()
         return self._visit_display_rows(rows)
 
+    def visit_activity(
+        self, days: int, limit: int, user_id: int | None = None,
+        device_id: int | None = None, domain: str | None = None,
+        include_noise: bool = False,
+    ) -> list[dict[str, Any]]:
+        clauses, values = self._visit_filters(days, user_id, device_id, domain)
+        noise_clause, noise_values = self._visit_noise_sql("e", include_noise)
+        if noise_clause:
+            clauses.append(noise_clause)
+            values.extend(noise_values)
+        settings = self.visit_monitor_settings()
+        values.extend((settings["merge_minutes"] * 60, min(max(1, limit), 500)))
+        rows = self.db.connection.execute(
+            "WITH ordered AS ("
+            "SELECT e.*,LAG(e.occurred_at) OVER ("
+            "PARTITION BY e.device_id,e.domain,e.port ORDER BY e.occurred_at,e.id"
+            ") previous_at FROM visit_events e "
+            "JOIN devices d ON d.id=e.device_id JOIN users u ON u.id=d.user_id WHERE "
+            + " AND ".join(clauses)
+            + "),marked AS ("
+            "SELECT ordered.*,CASE WHEN previous_at IS NULL OR occurred_at-previous_at>? "
+            "THEN 1 ELSE 0 END new_activity FROM ordered"
+            "),sessionized AS ("
+            "SELECT marked.*,SUM(new_activity) OVER ("
+            "PARTITION BY device_id,domain,port ORDER BY occurred_at,id ROWS UNBOUNDED PRECEDING"
+            ") activity_id FROM marked"
+            ") SELECT MIN(s.occurred_at) first_seen,MAX(s.occurred_at) last_seen,"
+            "u.id user_id,u.name user_name,d.id device_id,d.name device_name,"
+            "s.domain,s.port,COUNT(*) connections,"
+            "MAX(CASE WHEN s.network='tcp' THEN 1 ELSE 0 END) has_tcp,"
+            "MAX(CASE WHEN s.network='udp' THEN 1 ELSE 0 END) has_udp,"
+            "COUNT(DISTINCT s.inbound) inbounds FROM sessionized s "
+            "JOIN devices d ON d.id=s.device_id JOIN users u ON u.id=d.user_id "
+            "GROUP BY s.device_id,s.domain,s.port,s.activity_id "
+            "ORDER BY last_seen DESC LIMIT ?",
+            values,
+        ).fetchall()
+        return self._visit_display_rows(rows)
+
     def visit_top(
         self, days: int, limit: int, group: str = "domain",
         user_id: int | None = None, device_id: int | None = None,
+        include_noise: bool = True,
     ) -> list[dict[str, Any]]:
         cutoff = (
             dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max(1, days) - 1)
@@ -2172,6 +2451,10 @@ class Agent:
         if device_id:
             clauses.append("d.id=?")
             values.append(device_id)
+        noise_clause, noise_values = self._visit_noise_sql("v", include_noise)
+        if noise_clause:
+            clauses.append(noise_clause)
+            values.extend(noise_values)
         values.append(min(max(1, limit), 500))
         if group == "user":
             select = (
@@ -2628,12 +2911,22 @@ def build_parser() -> argparse.ArgumentParser:
     visit_recent.add_argument("--user-id", type=int)
     visit_recent.add_argument("--device-id", type=int)
     visit_recent.add_argument("--domain")
+    visit_recent.add_argument("--view", choices=("raw", "smart"), default="raw")
+    visit_recent.add_argument("--noise", choices=("auto", "show"), default="show")
     visit_top = sub.add_parser("visit-top")
     visit_top.add_argument("--days", type=int, default=7)
     visit_top.add_argument("--limit", type=int, default=30)
     visit_top.add_argument("--group", choices=("domain", "user"), default="domain")
     visit_top.add_argument("--user-id", type=int)
     visit_top.add_argument("--device-id", type=int)
+    visit_top.add_argument("--noise", choices=("auto", "show"), default="show")
+    visit_filter = sub.add_parser("visit-filter")
+    visit_filter.add_argument("--mode", choices=("standard", "off"))
+    visit_filter.add_argument("--merge-minutes", type=int)
+    visit_filter.add_argument(
+        "--action", choices=("add-hide", "remove-hide", "add-show", "remove-show", "reset")
+    )
+    visit_filter.add_argument("--domain")
     visit_clear = sub.add_parser("visit-clear")
     visit_clear.add_argument("--confirm", required=True)
     return parser
@@ -2809,22 +3102,45 @@ def main(argv: list[str] | None = None) -> int:
                         if result["last_collect"] else "尚未采集"
                     )
                 )
+                print_visit_filter_status(result)
         elif args.command == "visit-collect":
             collected = agent.collect_visit_logs()
             result = {"collected": collected}
             print(f"本次新增访问记录：{collected} 条")
         elif args.command == "visit-recent":
-            result = agent.visit_recent(
-                args.days, args.limit, args.user_id, args.device_id, args.domain
-            )
+            if args.view == "smart":
+                result = agent.visit_activity(
+                    args.days, args.limit, args.user_id, args.device_id, args.domain,
+                    include_noise=args.noise == "show",
+                )
+            else:
+                result = agent.visit_recent(
+                    args.days, args.limit, args.user_id, args.device_id, args.domain
+                )
             if not args.json:
-                print_visit_recent(result)
+                if args.view == "smart":
+                    print_visit_activity(result)
+                else:
+                    print_visit_recent(result)
         elif args.command == "visit-top":
             result = agent.visit_top(
-                args.days, args.limit, args.group, args.user_id, args.device_id
+                args.days, args.limit, args.group, args.user_id, args.device_id,
+                include_noise=args.noise == "show",
             )
             if not args.json:
                 print_visit_top(result, args.group)
+        elif args.command == "visit-filter":
+            result = agent.visit_monitor_settings()
+            if args.mode is not None or args.merge_minutes is not None:
+                result = agent.set_visit_filter(args.mode, args.merge_minutes)
+            if args.action == "reset":
+                result = agent.reset_visit_filter_rules()
+            elif args.action:
+                if not args.domain:
+                    raise AgentError("该规则操作必须提供 --domain")
+                result = agent.update_visit_filter_rule(args.action, args.domain)
+            if not args.json:
+                print_visit_filter_status(result)
         elif args.command == "visit-clear":
             agent.clear_visit_history(args.confirm)
             result = {"cleared": True}

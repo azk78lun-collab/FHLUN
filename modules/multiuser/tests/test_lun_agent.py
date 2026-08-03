@@ -402,13 +402,28 @@ class AgentTestCase(unittest.TestCase):
         self.assertEqual(xray["domain"], "www.example.com")
         self.assertEqual(xray["identity"], identity)
         self.assertEqual(xray["inbound"], "reality-vision")
+        expected = int(lun_agent.dt.datetime(
+            2026, 7, 30, 12, 0, 0,
+            tzinfo=lun_agent.dt.datetime.now().astimezone().tzinfo,
+        ).timestamp())
+        self.assertEqual(xray["occurred_at"], expected)
         singbox = lun_agent.Agent.parse_visit_line(
             "singbox",
-            "INFO [123456 0ms] inbound/hysteria2[hy2-sb]: "
+            "+0000 2026-07-30 12:00:01.250 INFO [123456 0ms] inbound/hysteria2[hy2-sb]: "
             f"[{identity}] inbound packet connection to video.example.net:443",
         )
         self.assertEqual(singbox["domain"], "video.example.net")
         self.assertEqual(singbox["network"], "udp")
+        self.assertEqual(
+            singbox["occurred_at"],
+            int(lun_agent.dt.datetime(2026, 7, 30, 12, 0, 1, tzinfo=lun_agent.dt.timezone.utc).timestamp()),
+        )
+        without_timestamp = lun_agent.Agent.parse_visit_line(
+            "xray",
+            "accepted tcp:fallback.example.com:443 "
+            f"[reality-vision -> direct] email: {identity}",
+        )
+        self.assertIsNone(without_timestamp["occurred_at"])
         self.assertIsNone(lun_agent.Agent.parse_visit_line(
             "xray",
             "from tcp:1.2.3.4:5000 accepted tcp:8.8.8.8:443 "
@@ -420,10 +435,13 @@ class AgentTestCase(unittest.TestCase):
         identity = f"lun:u:{device['user_id']}:d:{device['id']}"
         self.agent.set_visit_monitor(True, 7, 30)
         paths = self.agent.visit_log_paths()
+        current = lun_agent.dt.datetime.now().astimezone()
+        first = current.strftime("%Y/%m/%d %H:%M:%S")
+        second = (current + lun_agent.dt.timedelta(seconds=1)).strftime("%Y/%m/%d %H:%M:%S")
         paths["xray"].write_text(
-            "2026/07/30 12:00:00 from tcp:1.2.3.4:5000 accepted "
+            f"{first} from tcp:1.2.3.4:5000 accepted "
             f"tcp:www.example.com:443 [reality-vision -> direct] email: {identity}\n"
-            "2026/07/30 12:00:01 from tcp:1.2.3.4:5001 accepted "
+            f"{second} from tcp:1.2.3.4:5001 accepted "
             "tcp:ignored.example:443 [reality-vision -> direct] email: unknown\n",
             encoding="utf-8",
         )
@@ -557,8 +575,9 @@ class AgentTestCase(unittest.TestCase):
         identity = f"lun:u:{device['user_id']}:d:{device['id']}"
         self.agent.set_visit_monitor(True, 7, 30)
         path = self.agent.visit_log_paths()["xray"]
+        current = lun_agent.dt.datetime.now().astimezone().strftime("%Y/%m/%d %H:%M:%S")
         path.write_text(
-            "2026/07/30 12:00:00 accepted tcp:partial.example.com:443 "
+            f"{current} accepted tcp:partial.example.com:443 "
             "[reality-vision -> direct]",
             encoding="utf-8",
         )
@@ -571,6 +590,63 @@ class AgentTestCase(unittest.TestCase):
     def test_visit_retention_requires_summary_not_shorter_than_detail(self):
         with self.assertRaises(lun_agent.AgentError):
             self.agent.set_visit_monitor(True, 10, 7)
+
+    def test_visit_smart_activity_merges_connections_and_hides_standard_noise(self):
+        device = self.agent.db.connection.execute(
+            "SELECT * FROM devices WHERE legacy=1"
+        ).fetchone()
+        now = lun_agent.utc_now()
+        events = (
+            (now - 1300, "tcp", "xhttp-h23", "www.semrush.com"),
+            (now - 800, "udp", "reality-vision", "www.semrush.com"),
+            (now - 100, "tcp", "xhttp-h23", "www.semrush.com"),
+            (now - 90, "tcp", "xhttp-h23", "pagead2.googlesyndication.com"),
+        )
+        with self.agent.db.connection:
+            self.agent.db.connection.executemany(
+                "INSERT INTO visit_events(occurred_at,device_id,core,network,inbound,domain,port) "
+                "VALUES(?,?,?,?,?,?,443)",
+                [
+                    (occurred_at, device["id"], "xray", network, inbound, domain)
+                    for occurred_at, network, inbound, domain in events
+                ],
+            )
+        smart = self.agent.visit_activity(1, 20)
+        self.assertEqual(len(smart), 2)
+        self.assertEqual({row["domain"] for row in smart}, {"www.semrush.com"})
+        self.assertEqual(sorted(row["connections"] for row in smart), [1, 2])
+        merged = next(row for row in smart if row["connections"] == 2)
+        self.assertEqual((merged["has_tcp"], merged["has_udp"], merged["inbounds"]), (1, 1, 2))
+        with_noise = self.agent.visit_activity(1, 20, include_noise=True)
+        self.assertEqual(len(with_noise), 3)
+        self.assertEqual(self.agent.visit_status()["events"], 4)
+
+    def test_visit_filter_rules_use_allow_precedence_and_validate_domains(self):
+        settings = self.agent.visit_monitor_settings()
+        self.assertEqual(settings["filter_mode"], "standard")
+        self.assertEqual(settings["merge_minutes"], 10)
+        self.assertTrue(self.agent.visit_domain_is_noise("pagead2.googlesyndication.com"))
+        self.assertFalse(self.agent.visit_domain_is_noise("mtalk.google.com"))
+        self.assertFalse(self.agent.visit_domain_is_noise("client.crisp.chat"))
+        self.assertFalse(self.agent.visit_domain_is_noise("www.semrush.com"))
+
+        self.agent.update_visit_filter_rule("add-show", "googlesyndication.com")
+        self.assertFalse(self.agent.visit_domain_is_noise("pagead2.googlesyndication.com"))
+        self.agent.update_visit_filter_rule("add-hide", "semrush.com")
+        self.assertTrue(self.agent.visit_domain_is_noise("www.semrush.com"))
+        self.agent.update_visit_filter_rule("add-show", "www.semrush.com")
+        self.assertFalse(self.agent.visit_domain_is_noise("www.semrush.com"))
+
+        with self.assertRaises(lun_agent.AgentError):
+            self.agent.update_visit_filter_rule("add-hide", "8.8.8.8")
+        with self.assertRaises(lun_agent.AgentError):
+            self.agent.update_visit_filter_rule("add-hide", "invalid")
+        with self.assertRaises(lun_agent.AgentError):
+            self.agent.set_visit_filter("standard", 0)
+
+        reset = self.agent.reset_visit_filter_rules()
+        self.assertEqual(reset["hidden_domains"], [])
+        self.assertEqual(reset["allowed_domains"], [])
 
     def test_subscription_preserves_server_path_and_rewrites_identity(self):
         device = self.add_user()
