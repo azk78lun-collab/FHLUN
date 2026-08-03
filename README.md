@@ -25,8 +25,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lu
 lun
 ```
 
-旧入口 `argosbx.sh` 仅保留为兼容包装器，会自动转到 `lun.sh`。
-
 ## 终端菜单
 
 无参数运行 `lun` 会进入风火轮多协议交互面板，顶部显示系统、IP、内核、协议、证书、节点订阅分享和 Argo 状态，下方提供：
