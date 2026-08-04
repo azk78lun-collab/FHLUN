@@ -96,7 +96,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.2.1"
+echo "当前版本：V26.8.4.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -3201,6 +3201,14 @@ echo "Xray：内核已安装，当前协议未使用"
 else
 echo "Xray：未安装"
 fi
+if cluster_enabled; then
+if { pidof systemd >/dev/null 2>&1 && systemctl is-active --quiet lun-cluster-agent 2>/dev/null; } \
+|| { command -v rc-service >/dev/null 2>&1 && rc-service lun-cluster-agent status >/dev/null 2>&1; }; then
+echo "服务器联动：$(cluster_role) / 运行中"
+else
+echo "服务器联动：$(cluster_role) / 未运行"
+fi
+fi
 }
 
 argo_status_line(){
@@ -3498,6 +3506,681 @@ rm -f /etc/init.d/lun-visit-monitor
 fi
 }
 
+cluster_module_dir(){
+printf '%s\n' "$HOME/lun/modules/cluster"
+}
+
+cluster_agent(){
+printf '%s\n' "$(cluster_module_dir)/lun-cluster"
+}
+
+cluster_installed(){
+[ -x "$(cluster_agent)" ] && [ -s "$(cluster_module_dir)/lun_cluster.py" ] && [ -s "$(cluster_module_dir)/config.json" ]
+}
+
+cluster_enabled(){
+cluster_installed || return 1
+grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' "$(cluster_module_dir)/config.json" 2>/dev/null
+}
+
+cluster_config_value(){
+cluster_key=$1
+cluster_file="$(cluster_module_dir)/config.json"
+[ -s "$cluster_file" ] || return 1
+if command -v python3 >/dev/null 2>&1; then
+python3 - "$cluster_file" "$cluster_key" <<'PY'
+import json
+import sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], "")
+except (OSError, ValueError):
+    value = ""
+print(str(value).lower() if isinstance(value, bool) else value)
+PY
+else
+sed -n "s/^[[:space:]]*\"$cluster_key\"[[:space:]]*:[[:space:]]*[\"']*\([^\"',}]*\).*/\1/p" "$cluster_file" | head -n1
+fi
+}
+
+cluster_role(){
+cluster_config_value role
+}
+
+cluster_cmd(){
+cluster_exec=$(cluster_agent)
+[ -x "$cluster_exec" ] || { echo "服务器联动程序未安装。" >&2; return 1; }
+"$cluster_exec" --root "$HOME/lun" "$@"
+}
+
+cluster_service_stop(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl stop lun-cluster-agent >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service lun-cluster-agent stop >/dev/null 2>&1 || true
+fi
+for P in /proc/[0-9]*; do
+[ -r "$P/cmdline" ] || continue
+PID=$(basename "$P")
+CMD=$(tr '\0' ' ' < "$P/cmdline" 2>/dev/null)
+case "$CMD" in *"/lun/modules/cluster/lun_cluster.py"*" serve"*) kill "$PID" 2>/dev/null || true ;; esac
+done
+}
+
+cluster_service_start(){
+cluster_enabled || return 0
+if pidof systemd >/dev/null 2>&1; then
+systemctl enable --now lun-cluster-agent >/dev/null 2>&1 || return 1
+sleep 1
+systemctl is-active --quiet lun-cluster-agent
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update add lun-cluster-agent default >/dev/null 2>&1 || true
+rc-service lun-cluster-agent restart >/dev/null 2>&1 || return 1
+rc-service lun-cluster-agent status >/dev/null 2>&1
+else
+return 1
+fi
+}
+
+cluster_service_restart(){
+cluster_service_stop
+cluster_service_start
+}
+
+cluster_install_service(){
+python_bin=$(command -v python3) || return 1
+agent_py="$(cluster_module_dir)/lun_cluster.py"
+if pidof systemd >/dev/null 2>&1; then
+cat > /etc/systemd/system/lun-cluster-agent.service <<EOF
+[Unit]
+Description=FHLUN on-demand cluster controller and managed-node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=LUN_SCRIPT=/usr/bin/lun
+ExecStart=$python_bin $agent_py --root $HOME/lun serve
+Restart=always
+RestartSec=3s
+PrivateTmp=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable lun-cluster-agent >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+cat > /etc/init.d/lun-cluster-agent <<EOF
+#!/sbin/openrc-run
+description="FHLUN on-demand cluster controller and managed-node agent"
+command="$python_bin"
+command_args="$agent_py --root $HOME/lun serve"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+pidfile="/run/lun-cluster-agent.pid"
+output_log="/var/log/lun-cluster-agent.log"
+error_log="/var/log/lun-cluster-agent.log"
+export LUN_SCRIPT="/usr/bin/lun"
+depend() {
+need net
+}
+EOF
+chmod +x /etc/init.d/lun-cluster-agent
+rc-update add lun-cluster-agent default >/dev/null 2>&1
+else
+red_line "服务器联动要求 systemd 或 OpenRC；当前系统无法安装可靠服务。"
+return 1
+fi
+}
+
+cluster_remove_service(){
+cluster_service_stop
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable lun-cluster-agent >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/lun-cluster-agent.service
+systemctl daemon-reload >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update del lun-cluster-agent default >/dev/null 2>&1 || true
+rm -f /etc/init.d/lun-cluster-agent
+fi
+}
+
+cluster_download_agent(){
+cluster_dir=$(cluster_module_dir)
+cluster_target="$cluster_dir/lun_cluster.py"
+cluster_tmp="$cluster_target.tmp.$$"
+mkdir -p "$cluster_dir"
+rm -f "$cluster_tmp"
+if [ -n "${LUN_CLUSTER_AGENT_SOURCE:-}" ] && [ -s "$LUN_CLUSTER_AGENT_SOURCE" ]; then
+cp "$LUN_CLUSTER_AGENT_SOURCE" "$cluster_tmp" || return 1
+else
+cluster_fallback=
+if [ -n "${LUN_CLUSTER_AGENT_URL:-}" ]; then
+cluster_url=$LUN_CLUSTER_AGENT_URL
+else
+cluster_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/modules/cluster/lun_cluster.py?ref=main&fhlun_nocache=$(date +%s)"
+cluster_fallback="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/modules/cluster/lun_cluster.py?fhlun_nocache=$(date +%s)"
+fi
+if command -v curl >/dev/null 2>&1 && curl -fL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' \
+--connect-timeout 10 --max-time 120 --retry 2 -o "$cluster_tmp" "$cluster_url"; then
+:
+elif command -v wget >/dev/null 2>&1 && wget -O "$cluster_tmp" --header='Accept: application/vnd.github.raw+json' \
+--header='Cache-Control: no-cache' --tries=2 --timeout=60 "$cluster_url"; then
+:
+elif [ -n "$cluster_fallback" ] && command -v curl >/dev/null 2>&1 && curl -fL -H 'Cache-Control: no-cache' \
+--connect-timeout 10 --max-time 120 --retry 2 -o "$cluster_tmp" "$cluster_fallback"; then
+:
+elif [ -n "$cluster_fallback" ] && command -v wget >/dev/null 2>&1 && wget -O "$cluster_tmp" \
+--header='Cache-Control: no-cache' --tries=2 --timeout=60 "$cluster_fallback"; then
+:
+else
+rm -f "$cluster_tmp"
+return 1
+fi
+fi
+python3 -m py_compile "$cluster_tmp" >/dev/null 2>&1 || { rm -f "$cluster_tmp"; red_line "服务器联动程序语法校验失败。"; return 1; }
+mv -f "$cluster_tmp" "$cluster_target"
+chmod 700 "$cluster_target"
+cat > "$cluster_dir/lun-cluster" <<EOF
+#!/bin/sh
+exec python3 "$cluster_target" "\$@"
+EOF
+chmod 700 "$cluster_dir/lun-cluster"
+}
+
+cluster_pick_port(){
+cluster_existing=$(cluster_config_value internal_port 2>/dev/null)
+if port_valid "$cluster_existing" && { [ "$cluster_existing" != 443 ] || [ "${LUN_CLUSTER_ALLOW_443:-no}" = yes ]; }; then
+printf '%s\n' "$cluster_existing"
+return 0
+fi
+for cluster_try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+if is_nat_mode; then
+cluster_candidate=$(random_nat_port 2>/dev/null) || return 1
+else
+cluster_candidate=$(random_port 2>/dev/null) || return 1
+fi
+[ "$cluster_candidate" = 443 ] && continue
+port_reserved "$cluster_candidate" && continue
+port_in_use "$cluster_candidate" && continue
+printf '%s\n' "$cluster_candidate"
+return 0
+done
+return 1
+}
+
+cluster_detect_public_host(){
+cluster_host=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
+cluster_host=${cluster_host#\[}; cluster_host=${cluster_host%\]}
+if [ -z "$cluster_host" ]; then
+cluster_host=$(local_public_ips | sed -n '1p')
+fi
+printf '%s\n' "$cluster_host"
+}
+
+cluster_push_event(){
+[ "$(cluster_role 2>/dev/null)" = child ] || return 0
+cluster_cmd push >/dev/null 2>&1 || true
+}
+
+cluster_refresh_profiles(){
+[ "$(cluster_role 2>/dev/null)" = master ] || return 1
+cluster_cmd refresh-profiles || return 1
+if multiuser_enabled; then
+multiuser_service_restart || true
+else
+restart_subscription_service >/dev/null 2>&1 || true
+fi
+}
+
+cluster_install(){
+cluster_new_role=$1
+[ "$(id -u 2>/dev/null)" = 0 ] || { red_line "服务器联动安装需要 root。"; return 1; }
+{ pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
+red_line "服务器联动只支持 systemd 或 OpenRC。"
+return 1
+}
+[ -s "$HOME/lun/uuid" ] || { red_line "请先完成至少一个风火轮代理协议安装。"; return 1; }
+multiuser_install_python || return 1
+multiuser_download_agent || { red_line "服务器联动需要的多用户程序下载 / 复制失败。"; return 1; }
+command -v openssl >/dev/null 2>&1 || { red_line "服务器联动需要 OpenSSL。"; return 1; }
+cluster_download_agent || { red_line "服务器联动程序下载 / 复制失败。"; return 1; }
+cluster_host=$(cluster_detect_public_host)
+[ -n "$cluster_host" ] || { red_line "未检测到公网 IP，请先在节点地址设置中指定本机地址。"; return 1; }
+cluster_default_port=$(cluster_pick_port) || {
+red_line "没有可用于服务器联动的空闲端口。"
+is_nat_mode && yellow_line "NAT VPS 必须先增加一组未被协议占用的公网端口 → 内网端口映射。"
+return 1
+}
+cluster_default_public=$(client_port "$cluster_default_port")
+if is_nat_mode; then
+echo "自动分配：内网端口 $cluster_default_port / 公网端口 $cluster_default_public"
+else
+echo "自动分配通信端口：$cluster_default_port"
+fi
+printf "内网监听端口（回车使用自动值 %s，输入 0 返回）：" "$cluster_default_port"
+IFS= read -r cluster_input_port
+[ "$cluster_input_port" = 0 ] && return 1
+[ -n "$cluster_input_port" ] && cluster_default_port=$cluster_input_port
+port_valid "$cluster_default_port" || { red_line "通信端口无效。"; return 1; }
+[ "$cluster_default_port" = 443 ] && { red_line "服务器联动默认禁止使用热门端口 443，请换一个高位 TCP 端口。"; return 1; }
+port_reserved "$cluster_default_port" && { red_line "端口已被风火轮协议或订阅占用。"; return 1; }
+port_in_use "$cluster_default_port" && { red_line "端口已被其他服务占用。"; return 1; }
+cluster_default_public=$(client_port "$cluster_default_port")
+if is_nat_mode && [ "$cluster_default_public" = "$cluster_default_port" ]; then
+cluster_mapped=no
+for cluster_pair in $ptmap; do
+[ "${cluster_pair#*-}" = "$cluster_default_port" ] && cluster_mapped=yes
+done
+[ "$cluster_mapped" = yes ] || {
+red_line "内网端口 $cluster_default_port 没有公网 NAT 映射。"
+yellow_line "请在服务商面板新增 公网 TCP 端口 → $cluster_default_port，再更新 Lun NAT 映射。"
+return 1
+}
+fi
+printf "节点备注（可留空）："
+IFS= read -r cluster_remark
+if [ "$cluster_new_role" = master ]; then
+cluster_cmd init-master --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public" --remark "$cluster_remark" || return 1
+else
+cluster_cmd init-child --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public" --remark "$cluster_remark" || return 1
+fi
+cluster_install_service || return 1
+apply_lun_firewall_rules || true
+cluster_service_start || { red_line "服务器联动服务启动失败。"; return 1; }
+if [ "$cluster_new_role" = master ]; then
+cluster_refresh_profiles >/dev/null 2>&1 || true
+green_line "主 VPS 集群控制器已启用。"
+else
+green_line "子 VPS 联动服务已启用；把上方整条 lunjoin:// 加入地址粘贴到主 VPS。"
+is_nat_mode && yellow_line "还需确认服务商公网 TCP $cluster_default_public 已映射到内网 $cluster_default_port。"
+fi
+return 0
+}
+
+cluster_read_password_file(){
+cluster_password_prompt=$1
+cluster_password_file=$(mktemp 2>/dev/null) || return 1
+chmod 600 "$cluster_password_file"
+printf "%s" "$cluster_password_prompt" >&2
+if [ -t 0 ]; then stty -echo 2>/dev/null || true; fi
+IFS= read -r cluster_password
+if [ -t 0 ]; then stty echo 2>/dev/null || true; echo >&2; fi
+printf '%s' "$cluster_password" > "$cluster_password_file"
+unset cluster_password
+printf '%s\n' "$cluster_password_file"
+}
+
+cluster_backup_ui(){
+while :; do
+ui_title "Lun 集群备份 / 加载备份"
+echo " 1. 创建加密备份"
+echo " 2. 加载备份"
+echo " 3. 查看集群状态"
+echo " 0. 返回"
+printf "请选择 [0-3]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in
+1)
+cluster_backup_path="$HOME/lun-cluster-backup-$(date +%Y%m%d-%H%M%S).lcb"
+cluster_password_file=$(cluster_read_password_file "输入备份口令（至少8位，输入不显示）：") || continue
+cluster_cmd backup --path "$cluster_backup_path" --password-file "$cluster_password_file"
+cluster_rc=$?
+rm -f "$cluster_password_file"
+[ "$cluster_rc" = 0 ] && green_line "集群备份已保存：$cluster_backup_path"
+ui_pause
+;;
+2)
+printf "备份文件绝对路径（输入 0 返回）："
+IFS= read -r cluster_backup_path
+[ "$cluster_backup_path" = 0 ] && continue
+[ -s "$cluster_backup_path" ] || { red_line "备份文件不存在。"; ui_pause; continue; }
+cluster_password_file=$(cluster_read_password_file "输入备份口令（输入不显示）：") || continue
+cluster_cmd restore --path "$cluster_backup_path" --password-file "$cluster_password_file"
+cluster_rc=$?
+rm -f "$cluster_password_file"
+if [ "$cluster_rc" = 0 ]; then
+cluster_install_service && cluster_service_restart
+apply_lun_firewall_rules || true
+green_line "备份已加载；请运行立即同步更新所有子机的主 VPS 地址。"
+fi
+ui_pause
+;;
+3) cluster_cmd status; ui_pause ;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+cluster_show_subscription_links(){
+cluster_refresh_profiles >/dev/null || return 1
+cluster_host=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
+cluster_host=${cluster_host#\[}; cluster_host=${cluster_host%\]}
+cluster_scheme=http
+cluster_sub_port=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+if multiuser_enabled; then
+cluster_scheme=$(multiuser_config_value scheme)
+cluster_host=$(multiuser_config_value public_host)
+cluster_sub_port=$(multiuser_config_value public_port)
+else
+cluster_sub_port=$(client_port "$cluster_sub_port")
+fi
+[ -n "$cluster_host" ] && [ -n "$cluster_sub_port" ] || { red_line "没有可用于输出订阅的地址或端口。"; return 1; }
+cluster_profiles_file=$(mktemp 2>/dev/null) || return 1
+cluster_cmd --json profiles > "$cluster_profiles_file" 2>/dev/null || { rm -f "$cluster_profiles_file"; return 1; }
+python3 - "$cluster_scheme" "$cluster_host" "$cluster_sub_port" "$cluster_profiles_file" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[4], encoding="utf-8") as handle:
+        rows = json.load(handle)
+except ValueError:
+    rows = []
+scheme, host, port = sys.argv[1:4]
+if ":" in host and not host.startswith("["):
+    host = f"[{host}]"
+for row in rows:
+    base = f"{scheme}://{host}:{port}/{row['token']}"
+    print(f"\n{row['name']}：")
+    print(f"  v2rayN：{base}/jhsub.txt")
+    print(f"  Clash： {base}/clmi.yaml")
+    print(f"  Sing-box：{base}/sbox.json")
+PY
+cluster_rc=$?
+rm -f "$cluster_profiles_file"
+return "$cluster_rc"
+}
+
+cluster_parse_action_payload(){
+cluster_pairs=$1
+python3 - "$cluster_pairs" <<'PY'
+import json
+import shlex
+import sys
+result = {}
+for item in shlex.split(sys.argv[1]):
+    if "=" not in item:
+        raise SystemExit("每项必须使用 变量=值")
+    key, value = item.split("=", 1)
+    result[key] = value
+print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+cluster_node_action_ui(){
+printf "子 VPS 节点编号（输入 0 返回）："
+IFS= read -r cluster_node_id
+[ "$cluster_node_id" = 0 ] && return
+while :; do
+ui_title "Lun 远程配置子 VPS"
+echo "目标节点：$cluster_node_id"
+echo " 1. 刷新状态"
+echo " 2. 重启代理服务"
+echo " 3. 更新 Xray 内核"
+echo " 4. 更新 Sing-box 内核"
+echo " 5. 同步防火墙"
+echo " 6. 应用协议变量组"
+echo " 7. 创建远程快照"
+echo " 8. 清空配置（危险）"
+echo " 9. 卸载 Lun（危险）"
+echo " 0. 返回"
+printf "请选择 [0-9]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in
+1) cluster_cmd sync --node-id "$cluster_node_id" ;;
+2) cluster_cmd action --node-id "$cluster_node_id" --action service.restart ;;
+3) cluster_cmd action --node-id "$cluster_node_id" --action core.update --payload '{"core":"xray"}' ;;
+4) cluster_cmd action --node-id "$cluster_node_id" --action core.update --payload '{"core":"singbox"}' ;;
+5) cluster_cmd action --node-id "$cluster_node_id" --action firewall.apply ;;
+6)
+yellow_line "格式示例：vlpt=443 vxpt=8080 vpsmode=nat ptmap='52581-443 56567-8080'"
+yellow_line "只接受 Lun 公开变量，不执行命令文本；敏感 Token 仅当次加密转交。"
+printf "变量组（输入 0 返回）："
+IFS= read -r cluster_pairs
+[ "$cluster_pairs" = 0 ] && continue
+cluster_payload=$(cluster_parse_action_payload "$cluster_pairs") || { red_line "变量组格式错误。"; ui_pause; continue; }
+cluster_cmd action --node-id "$cluster_node_id" --action protocol.apply --payload "$cluster_payload"
+;;
+7) cluster_cmd action --node-id "$cluster_node_id" --action snapshot.create --payload '{"label":"manual-remote"}' ;;
+8|9)
+cluster_action=$([ "$cluster_choice" = 8 ] && echo lun.factory-reset || echo lun.uninstall)
+red_line "危险操作只能单机执行；子机将先创建快照。"
+printf "再次输入目标节点编号确认（输入 0 返回）："
+IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && continue
+cluster_cmd action --node-id "$cluster_node_id" --action "$cluster_action" --payload "{\"confirm\":\"$cluster_confirm\"}"
+;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+ui_pause
+done
+}
+
+cluster_add_node_ui(){
+ui_title "Lun 添加子 VPS"
+yellow_line "在子 VPS 进入同一模块并生成 lunjoin:// 地址，然后整条粘贴到这里。"
+printf "加入地址（输入 0 返回）："
+IFS= read -r cluster_join_uri
+[ "$cluster_join_uri" = 0 ] && return
+printf "节点备注（可留空）："
+IFS= read -r cluster_remark
+printf "预期代理 UUID（可留空，仅用于防止加错服务器）："
+IFS= read -r cluster_expected_uuid
+set -- add-node --uri "$cluster_join_uri" --remark "$cluster_remark"
+[ -n "$cluster_expected_uuid" ] && set -- "$@" --expected-uuid "$cluster_expected_uuid"
+if cluster_cmd "$@"; then
+cluster_service_restart || true
+cluster_refresh_profiles >/dev/null 2>&1 || true
+green_line "子 VPS 已加入；其一次性加入地址已经失效。"
+fi
+ui_pause
+}
+
+cluster_assignment_ui(){
+ui_title "Lun 用户与服务器授权"
+multiuser_enabled || { yellow_line "多用户管理未启用；当前使用单用户全部/地区聚合订阅。"; ui_pause; return; }
+multiuser_cmd list-users
+cluster_cmd nodes
+printf "用户 ID（输入 0 返回）："
+IFS= read -r cluster_user_id
+[ "$cluster_user_id" = 0 ] && return
+printf "允许的节点编号，多个用逗号分隔；留空表示不开放子机："
+IFS= read -r cluster_node_ids
+cluster_cmd assign-user --user-id "$cluster_user_id" --nodes "$cluster_node_ids"
+if [ $? = 0 ]; then
+yellow_line "正在把该用户凭据、协议权限和订阅下发到授权节点……"
+cluster_cmd sync-users || red_line "授权已保存，但有子 VPS 未完成同步；请在服务器总览检查通信。"
+fi
+ui_pause
+}
+
+cluster_batch_action_ui(){
+ui_title "Lun 批量配置（金丝雀）"
+cluster_cmd nodes
+yellow_line "第一台为金丝雀；只有它成功后才会继续，其余最多 3 台并行。"
+printf "子 VPS 节点编号（多个用空格或逗号分隔，输入 0 返回）："
+IFS= read -r cluster_node_ids
+[ "$cluster_node_ids" = 0 ] && return
+echo " 1. 重启代理服务"
+echo " 2. 同步防火墙"
+echo " 3. 更新 Xray 内核"
+echo " 4. 更新 Sing-box 内核"
+echo " 5. 应用同一组协议变量"
+echo " 0. 返回"
+printf "请选择 [0-5]："
+IFS= read -r cluster_choice
+cluster_payload='{}'
+case "$cluster_choice" in
+1) cluster_action=service.restart ;;
+2) cluster_action=firewall.apply ;;
+3) cluster_action=core.update; cluster_payload='{"core":"xray"}' ;;
+4) cluster_action=core.update; cluster_payload='{"core":"singbox"}' ;;
+5)
+printf "变量组（例如 vlpt=443 vxpt=8080，输入 0 返回）："
+IFS= read -r cluster_pairs
+[ "$cluster_pairs" = 0 ] && return
+cluster_payload=$(cluster_parse_action_payload "$cluster_pairs") || { red_line "变量组格式错误。"; ui_pause; return; }
+cluster_action=protocol.apply
+;;
+0|"") return ;;
+*) red_line "输入错误。"; ui_pause; return ;;
+esac
+cluster_cmd batch-action --nodes "$cluster_node_ids" --action "$cluster_action" --payload "$cluster_payload"
+cluster_rc=$?
+[ "$cluster_rc" = 0 ] && cluster_refresh_profiles >/dev/null 2>&1 || true
+ui_pause
+}
+
+cluster_master_menu(){
+while :; do
+ui_title "Lun 节点集群 / 主 VPS"
+cluster_cmd nodes
+ui_dash
+echo " 1. 刷新服务器总览"
+echo " 2. 添加子 VPS"
+echo " 3. 配置单台子 VPS"
+echo " 4. 批量配置（金丝雀 + 失败回滚）"
+echo " 5. 立即同步子 VPS"
+echo " 6. 刷新并查看聚合订阅"
+echo " 7. 用户与服务器授权"
+echo " 8. 地区设置"
+echo " 9. 集群备份 / 加载备份"
+echo "10. 通信状态 / 修复服务"
+echo "11. 更新服务器联动程序"
+echo "12. 移除子 VPS / 撤销访问"
+echo "13. 停用并卸载服务器联动模块"
+echo " 0. 返回"
+printf "请选择 [0-13]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in
+1) cluster_cmd nodes; ui_pause ;;
+2) cluster_add_node_ui ;;
+3) cluster_node_action_ui ;;
+4) cluster_batch_action_ui ;;
+5)
+printf "节点编号（输入 all 同步全部，输入 0 返回）："
+IFS= read -r cluster_node_id
+[ "$cluster_node_id" = 0 ] && continue
+if [ "$cluster_node_id" = all ]; then
+cluster_cmd sync-users || true
+cluster_cmd --json nodes 2>/dev/null | python3 -c 'import json,sys; print(" ".join(x["id"] for x in json.load(sys.stdin) if x["role"]=="child"))' | while read -r cluster_ids; do
+for cluster_id in $cluster_ids; do cluster_cmd sync --node-id "$cluster_id" || true; done
+done
+else
+cluster_cmd sync-users --node-id "$cluster_node_id" || true
+cluster_cmd sync --node-id "$cluster_node_id"
+fi
+cluster_refresh_profiles >/dev/null 2>&1 || true
+ui_pause
+;;
+6) cluster_show_subscription_links; ui_pause ;;
+7) cluster_assignment_ui ;;
+8)
+printf "节点编号（输入 0 返回）："; IFS= read -r cluster_node_id; [ "$cluster_node_id" = 0 ] && continue
+printf "地区（如 日本-大阪 / 美国-洛杉矶 / 德国）："; IFS= read -r cluster_region
+[ -n "$cluster_region" ] || { red_line "地区不能为空。"; ui_pause; continue; }
+cluster_cmd set-location --node-id "$cluster_node_id" --region "$cluster_region"
+cluster_refresh_profiles >/dev/null 2>&1 || true
+ui_pause
+;;
+9) cluster_backup_ui ;;
+10) cluster_cmd status; cluster_install_service; cluster_service_restart; apply_lun_firewall_rules; ui_pause ;;
+11) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
+12)
+cluster_cmd nodes
+printf "要移除的子 VPS 节点编号（输入 0 返回）："; IFS= read -r cluster_node_id
+[ "$cluster_node_id" = 0 ] && continue
+printf "再次输入该节点编号确认（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && continue
+if cluster_cmd remove-node --node-id "$cluster_node_id" --confirm "$cluster_confirm"; then
+cluster_cmd sync-users >/dev/null 2>&1 || true
+cluster_refresh_profiles >/dev/null 2>&1 || true
+fi
+ui_pause
+;;
+13)
+red_line "卸载只移除本机集群控制面；不会卸载代理协议或远端子 VPS。"
+printf "输入 REMOVE 确认（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = REMOVE ] || continue
+cluster_remove_service
+rm -rf "$(cluster_module_dir)"
+apply_lun_firewall_rules quiet || true
+green_line "服务器联动模块已卸载。"
+return
+;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+cluster_child_menu(){
+while :; do
+ui_title "Lun 节点集群 / 子 VPS"
+cluster_cmd status
+ui_dash
+echo " 1. 生成新的一次性加入地址"
+echo " 2. 立即向主 VPS 推送配置与订阅"
+echo " 3. 修复 / 重启联动服务"
+echo " 4. 集群备份 / 加载备份"
+echo " 5. 更新服务器联动程序"
+echo " 6. 解除并卸载本机联动模块"
+echo " 0. 返回"
+printf "请选择 [0-6]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in
+1) cluster_cmd join-code; ui_pause ;;
+2) cluster_cmd push; ui_pause ;;
+3) cluster_install_service; cluster_service_restart; apply_lun_firewall_rules; ui_pause ;;
+4) cluster_backup_ui ;;
+5) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
+6)
+red_line "解除后主 VPS 不能再管理本机；代理协议不会删除。"
+printf "输入 REMOVE 确认（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = REMOVE ] || continue
+cluster_remove_service
+rm -rf "$(cluster_module_dir)"
+apply_lun_firewall_rules quiet || true
+green_line "本机服务器联动模块已卸载。"
+return
+;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
+cluster_menu(){
+if ! cluster_installed; then
+ui_title "Lun 节点集群（服务器联动）"
+echo "可选模块；不开启时不会安装 Python 服务或开放通信端口。"
+echo "服务器之间使用专用 TCP + mTLS，仅按需通信，不需要 SSH 密钥。"
+echo " 1. 本机作为主 VPS / 控制器"
+echo " 2. 本机作为子 VPS / 受管节点"
+echo " 0. 返回"
+printf "请选择 [0-2]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in
+1) cluster_install master || { ui_pause; return; } ;;
+2) cluster_install child || { ui_pause; return; } ;;
+0|"") return ;;
+*) echo "输入错误。"; return ;;
+esac
+fi
+case "$(cluster_role 2>/dev/null)" in
+master) cluster_master_menu ;;
+child) cluster_child_menu ;;
+*) red_line "集群角色配置无效，请卸载模块后重新初始化。"; ui_pause ;;
+esac
+}
+
 multiuser_reconcile_configs(){
 multiuser_enabled || return 0
 multiuser_cmd reconcile
@@ -3575,6 +4258,29 @@ set -- $fw_spec
 fw_port=$(sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$fw_config" 2>/dev/null | head -n 1)
 firewall_append_port "$1" "$fw_port" "$fw_output"
 done
+fi
+fi
+fw_config="$fw_root/modules/cluster/config.json"
+if [ -s "$fw_config" ]; then
+if command -v python3 >/dev/null 2>&1; then
+fw_values=$(python3 - "$fw_config" <<'PY'
+import json
+import sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    port = int(data.get("internal_port") or 0)
+    enabled = bool(data.get("enabled"))
+except (OSError, TypeError, ValueError):
+    port = 0
+    enabled = False
+if enabled and 1 <= port <= 65535:
+    print(f"tcp:{port}")
+PY
+)
+[ -n "$fw_values" ] && printf '%s\n' "$fw_values" >> "$fw_output"
+else
+fw_port=$(sed -n 's/^[[:space:]]*"internal_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$fw_config" | head -n1)
+grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' "$fw_config" && firewall_append_port tcp "$fw_port" "$fw_output"
 fi
 fi
 fw_sorted=$(mktemp 2>/dev/null) || return 1
@@ -5116,6 +5822,7 @@ keep_entry=$1
 multiuser_service_stop
 visit_monitor_service_stop
 if [ "$keep_entry" != "keep-entry" ]; then
+cluster_remove_service
 remove_lun_firewall_rules
 if [ -s "$(multiuser_module_dir)/data/lun.db" ]; then
 multiuser_backup_path="$HOME/lun-multiuser-backup-$(date +%Y%m%d-%H%M%S).sqlite3"
@@ -5158,6 +5865,10 @@ rc-service ip6tables save >/dev/null 2>&1
 fi
 }
 factory_reset(){
+if cluster_enabled && [ "${LUN_CLUSTER_DESTRUCTIVE:-no}" != yes ]; then
+red_line "本机已加入服务器联动；请先在主 VPS 中解除，或从联动模块执行带快照的远程清空。"
+return 1
+fi
 if multiuser_installed; then
 red_line "检测到多用户模块。为避免用户数据库与新 UUID/端口失配，请先在多用户管理中停用或卸载模块。"
 return 1
@@ -5167,8 +5878,12 @@ red_line "检测到网站访问监控。为避免本机身份与新 UUID 失配�
 return 1
 fi
 printf "%s警告：此操作将清空所有配置（端口、域名、协议、UUID等），保留内核和脚本！%s\n" "$LUN_RED" "$LUN_RESET"
+if [ "${LUN_CLUSTER_DESTRUCTIVE:-no}" = yes ]; then
+confirm=yes
+else
 printf "确认清空配置？输入 yes 确认，其他取消："
 IFS= read -r confirm
+fi
 [ "$confirm" = "yes" ] || { echo "已取消。"; return 1; }
 remove_lun_firewall_rules
 stop_lun_owned_processes
@@ -5462,6 +6177,7 @@ pid_is_lun_owned(){
 pid=$1
 exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
 cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+case "$cmd" in *"/lun/modules/cluster/lun_cluster.py"*" serve"*) return 1 ;; esac
 case "$exe" in
 */lun/*|*/agsbx/*) return 0 ;;
 esac
@@ -5553,7 +6269,7 @@ port_reserved(){
 p=$1
 protocol_port_reserved "$p" && return 0
 p_public=$(client_port "$p")
-for used in "$subpt" "$(cat "$HOME/lun/subport.log" 2>/dev/null)"; do
+for used in "$subpt" "$(cat "$HOME/lun/subport.log" 2>/dev/null)" "$(cluster_config_value internal_port 2>/dev/null)"; do
 [ -n "$used" ] || continue
 used_public=$(client_port "$used")
 [ "$used" = "$p" ] && return 0
@@ -9859,6 +10575,10 @@ multiuser_service_stop
 if multiuser_cmd apply; then
 multiuser_service_start || true
 green_line "多用户配置已校验并生效。"
+if cluster_enabled && [ "$(cluster_role 2>/dev/null)" = master ]; then
+yellow_line "正在同步已授权子 VPS 的用户与订阅……"
+cluster_cmd sync-users || yellow_line "本机已生效，但至少一台子 VPS 暂未同步。"
+fi
 return 0
 fi
 multiuser_service_start || true
@@ -10690,10 +11410,11 @@ echo " 4. 服务与更新"
 echo " 5. 高级设置"
 printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
 printf " 7. %s网站访问监控%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 8. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
+printf " 8. %s服务器联动 / 节点集群%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 9. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
 echo " 0. 退出"
 ui_line
-printf "请输入数字【0-8】："
+printf "请输入数字【0-9】："
 IFS= read -r menu_choice
 case "$menu_choice" in
 1) install_protocol_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
@@ -10703,7 +11424,8 @@ case "$menu_choice" in
 5) advanced_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; break ;;
 6) multiuser_menu; mu_rc=$?; [ "$mu_rc" = 3 ] && break ;;
 7) visit_monitor_ui ;;
-8) help_menu ;;
+8) cluster_menu ;;
+9) help_menu ;;
 0|"") exit ;;
 *) echo "输入错误，请重新选择。"; sleep 1 ;;
 esac
@@ -10724,7 +11446,29 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "del" ]; then
+if [ "$1" = "cluster-prepare-multiuser" ]; then
+if multiuser_enabled; then
+exit 0
+fi
+multiuser_install
+exit $?
+elif [ "$1" = "cluster-firewall" ]; then
+apply_lun_firewall_rules
+exit $?
+elif [ "$1" = "cluster-factory-reset" ]; then
+sleep 3
+LUN_CLUSTER_DESTRUCTIVE=yes
+export LUN_CLUSTER_DESTRUCTIVE
+factory_reset
+exit $?
+elif [ "$1" = "cluster-uninstall" ]; then
+sleep 3
+LUN_CLUSTER_DESTRUCTIVE=yes
+export LUN_CLUSTER_DESTRUCTIVE
+cleandel
+rm -rf sbx_update "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx"
+exit 0
+elif [ "$1" = "del" ]; then
 cleandel
 rm -rf sbx_update "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx"
 echo "卸载完成"
@@ -10934,6 +11678,11 @@ rc-service ip6tables save >/dev/null 2>&1
 fi
 fi
 apply_lun_firewall_rules || true
+if cluster_enabled; then
+cluster_service_start || yellow_line "服务器联动服务未能自动启动。"
+cluster_push_event >/dev/null 2>&1 || true
+[ "$(cluster_role 2>/dev/null)" = master ] && cluster_refresh_profiles >/dev/null 2>&1 || true
+fi
 cip
 cloudflare_origin_finalize_pending || true
 echo

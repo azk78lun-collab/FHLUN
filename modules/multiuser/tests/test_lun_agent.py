@@ -138,6 +138,49 @@ class AgentTestCase(unittest.TestCase):
         second = self.agent.add_device(device["user_id"], "laptop")
         self.assertNotEqual(device["uuid"], second["uuid"])
 
+    def test_cluster_users_are_idempotent_and_read_only_on_child(self):
+        source = self.add_user("central-user")
+        bundle = self.agent.export_cluster_users([source["user_id"]])
+        origin = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "lun"
+            root.mkdir()
+            (root / "uuid").write_text(
+                "22222222-2222-4222-8222-222222222222\n", encoding="utf-8"
+            )
+            (root / "subtoken.log").write_text("child-legacy-token\n", encoding="utf-8")
+            child = lun_agent.Agent(root)
+            args = argparse.Namespace(
+                legacy_uuid=None, legacy_token=None, bind="127.0.0.1", port=31001,
+                public_port=31001, legacy_http_port=0, legacy_http_public_port=0,
+                scheme="http", public_host="child.example.com", certificate=None,
+                private_key=None, xray_api="127.0.0.1:10185",
+                singbox_api="127.0.0.1:10186", poll_interval=30, ss_port=0,
+                ss_public_port=0, ss_server_password="BBBBBBBBBBBBBBBBBBBBBB==",
+            )
+            child.initialize(args)
+            try:
+                first = child.import_cluster_users(bundle, origin)
+                second = child.import_cluster_users(bundle, origin)
+                self.assertEqual(first, second)
+                managed = child.db.connection.execute(
+                    "SELECT * FROM users WHERE cluster_managed=1"
+                ).fetchone()
+                device = child.db.connection.execute(
+                    "SELECT * FROM devices WHERE user_id=?", (managed["id"],)
+                ).fetchone()
+                self.assertEqual(device["uuid"], source["uuid"])
+                self.assertEqual(device["token"], source["token"])
+                with self.assertRaisesRegex(lun_agent.AgentError, "主 VPS"):
+                    child.add_device(managed["id"], "blocked")
+                self.assertEqual(child.export_cluster_users()["users"][0]["name"], "legacy-admin")
+                child.import_cluster_users({"schema_version": 1, "users": []}, origin)
+                self.assertIsNone(child.db.connection.execute(
+                    "SELECT 1 FROM users WHERE cluster_managed=1"
+                ).fetchone())
+            finally:
+                child.close()
+
     def test_device_disable_rotate_and_hard_delete(self):
         device = self.add_user()
         old_uuid = device["uuid"]

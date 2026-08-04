@@ -451,6 +451,20 @@ class Database:
             UPDATE schema_meta SET version=2 WHERE version<2;
             """
         )
+        user_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(users)")}
+        if "cluster_managed" not in user_columns:
+            self.connection.execute("ALTER TABLE users ADD COLUMN cluster_managed INTEGER NOT NULL DEFAULT 0")
+        if "cluster_key" not in user_columns:
+            self.connection.execute("ALTER TABLE users ADD COLUMN cluster_key TEXT")
+        device_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(devices)")}
+        if "cluster_key" not in device_columns:
+            self.connection.execute("ALTER TABLE devices ADD COLUMN cluster_key TEXT")
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_cluster_key_idx ON users(cluster_key) WHERE cluster_key IS NOT NULL"
+        )
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS devices_cluster_key_idx ON devices(cluster_key) WHERE cluster_key IS NOT NULL"
+        )
         defaults = {
             "visit_monitor_enabled": "0",
             "visit_detail_days": str(VISIT_DETAIL_DAYS),
@@ -1201,6 +1215,9 @@ class Agent:
         return self.db.connection.execute("SELECT * FROM devices WHERE id=?", (cursor.lastrowid,)).fetchone()
 
     def add_device(self, user_id: int, name: str) -> sqlite3.Row:
+        user = self.db.connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if user and user["cluster_managed"]:
+            raise AgentError("该用户由主 VPS 统一管理，请在主 VPS 修改")
         with self.db.connection:
             device = self._create_device(user_id, name)
             self.db.audit("device.add", str(device["id"]), f"user={user_id}")
@@ -1211,6 +1228,9 @@ class Agent:
         device = self.db.connection.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
         if not device:
             raise AgentError("设备不存在")
+        user = self.db.connection.execute("SELECT * FROM users WHERE id=?", (device["user_id"],)).fetchone()
+        if user["cluster_managed"]:
+            raise AgentError("该设备由主 VPS 统一管理，请在主 VPS 修改")
         new_name = name.strip() if name is not None else device["name"]
         if not new_name:
             raise AgentError("设备名称不能为空")
@@ -1228,6 +1248,9 @@ class Agent:
         device = self.db.connection.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
         if not device:
             raise AgentError("设备不存在")
+        user = self.db.connection.execute("SELECT * FROM users WHERE id=?", (device["user_id"],)).fetchone()
+        if user["cluster_managed"]:
+            raise AgentError("该设备由主 VPS 统一管理，请在主 VPS 修改")
         if confirmation != device["name"]:
             raise AgentError("确认名称不匹配，未轮换")
         old_token = device["token"]
@@ -1253,6 +1276,9 @@ class Agent:
         device = self.db.connection.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
         if not device:
             raise AgentError("设备不存在")
+        user = self.db.connection.execute("SELECT * FROM users WHERE id=?", (device["user_id"],)).fetchone()
+        if user["cluster_managed"]:
+            raise AgentError("该设备由主 VPS 统一管理，请在主 VPS 修改")
         if confirmation != device["name"]:
             raise AgentError("确认名称不匹配，未删除")
         with self.db.connection:
@@ -1265,6 +1291,8 @@ class Agent:
         row = self.db.connection.execute("SELECT * FROM users WHERE id=?", (args.user_id,)).fetchone()
         if not row:
             raise AgentError("用户不存在")
+        if row["cluster_managed"]:
+            raise AgentError("该用户由主 VPS 统一管理，请在主 VPS 修改")
         values = dict(row)
         if args.lifetime_quota is not None:
             values["lifetime_quota"] = parse_size(args.lifetime_quota)
@@ -1291,8 +1319,11 @@ class Agent:
     def set_protocol(self, user_id: int, protocol: str, enabled: bool) -> None:
         if protocol not in PROTOCOLS:
             raise AgentError(f"未知协议：{protocol}")
-        if not self.db.connection.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+        user = self.db.connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
             raise AgentError("用户不存在")
+        if user["cluster_managed"]:
+            raise AgentError("该用户由主 VPS 统一管理，请在主 VPS 修改")
         with self.db.connection:
             self.db.connection.execute(
                 "INSERT INTO protocol_permissions(user_id,protocol,enabled) VALUES(?,?,?) "
@@ -1306,6 +1337,8 @@ class Agent:
         user = self.db.connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not user:
             raise AgentError("用户不存在")
+        if user["cluster_managed"]:
+            raise AgentError("该用户由主 VPS 统一管理，请在主 VPS 修改")
         if confirmation != user["name"]:
             raise AgentError("确认名称不匹配，未删除")
         tokens = [
@@ -1319,6 +1352,186 @@ class Agent:
         for token in tokens:
             shutil.rmtree(self.generated / token, ignore_errors=True)
         self._replace_security_backups()
+
+    def export_cluster_users(self, user_ids: list[int] | None = None) -> dict[str, Any]:
+        params: list[Any] = []
+        where = "WHERE cluster_managed=0"
+        if user_ids is not None:
+            unique = list(dict.fromkeys(user_ids))
+            if not unique:
+                return {"schema_version": 1, "users": []}
+            where += " AND id IN (%s)" % ",".join("?" for _ in unique)
+            params.extend(unique)
+        users: list[dict[str, Any]] = []
+        for user in self.db.connection.execute(f"SELECT * FROM users {where} ORDER BY id", params):
+            devices = [dict(row) for row in self.db.connection.execute(
+                "SELECT name,uuid,password,ss_password,token,enabled FROM devices WHERE user_id=? ORDER BY id",
+                (user["id"],),
+            )]
+            permissions = {
+                row["protocol"]: bool(row["enabled"])
+                for row in self.db.connection.execute(
+                    "SELECT protocol,enabled FROM protocol_permissions WHERE user_id=?", (user["id"],)
+                )
+            }
+            users.append({
+                "key": str(user["id"]), "name": user["name"],
+                "manual_disabled": bool(user["manual_disabled"]),
+                "lifetime_quota": int(user["lifetime_quota"]),
+                "monthly_quota": int(user["monthly_quota"]),
+                "reset_day": int(user["reset_day"]), "expires_at": user["expires_at"],
+                "max_devices": max(int(user["max_devices"]), len(devices)),
+                "devices": devices, "permissions": permissions,
+            })
+        return {"schema_version": 1, "users": users}
+
+    @staticmethod
+    def _validate_cluster_bundle(bundle: dict[str, Any], origin: str) -> list[dict[str, Any]]:
+        if int(bundle.get("schema_version", 0)) != 1:
+            raise AgentError("主 VPS 用户数据版本不兼容")
+        if not re.fullmatch(r"[0-9a-f]{32}", origin):
+            raise AgentError("主 VPS 集群身份无效")
+        users = bundle.get("users")
+        if not isinstance(users, list) or len(users) > 1000:
+            raise AgentError("主 VPS 用户数据无效")
+        normalized: list[dict[str, Any]] = []
+        seen_users: set[str] = set()
+        seen_credentials: set[str] = set()
+        for raw in users:
+            if not isinstance(raw, dict):
+                raise AgentError("用户数据必须是对象")
+            key = str(raw.get("key", ""))
+            name = str(raw.get("name", "")).strip()
+            if not re.fullmatch(r"[0-9]{1,18}", key) or key in seen_users or not name or len(name) > 128:
+                raise AgentError("用户标识或名称无效")
+            seen_users.add(key)
+            reset_day = int(raw.get("reset_day", 1))
+            max_devices = int(raw.get("max_devices", 3))
+            devices = raw.get("devices")
+            if reset_day not in range(1, 29) or not isinstance(devices, list) or len(devices) > 64:
+                raise AgentError(f"用户 {name} 的策略或设备数无效")
+            max_devices = max(max_devices, len(devices), 1)
+            if max_devices > 64:
+                raise AgentError("设备上限无效")
+            checked_devices: list[dict[str, Any]] = []
+            for index, device in enumerate(devices):
+                if not isinstance(device, dict):
+                    raise AgentError("设备数据无效")
+                device_name = str(device.get("name", "")).strip()
+                device_uuid = str(device.get("uuid", ""))
+                try:
+                    device_uuid = str(__import__("uuid").UUID(device_uuid))
+                except ValueError as exc:
+                    raise AgentError("设备 UUID 无效") from exc
+                password = str(device.get("password", ""))
+                ss_password = str(device.get("ss_password", ""))
+                token = str(device.get("token", ""))
+                if (not device_name or len(device_name) > 128 or not 8 <= len(password) <= 256
+                        or not 8 <= len(ss_password) <= 256 or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token)):
+                    raise AgentError("设备凭据无效")
+                for value in (device_uuid, token):
+                    if value in seen_credentials:
+                        raise AgentError("设备 UUID 或订阅 token 重复")
+                    seen_credentials.add(value)
+                checked_devices.append({
+                    "key": str(index), "name": device_name, "uuid": device_uuid,
+                    "password": password, "ss_password": ss_password, "token": token,
+                    "enabled": int(bool(device.get("enabled", True))),
+                })
+            permissions = raw.get("permissions") if isinstance(raw.get("permissions"), dict) else {}
+            normalized.append({
+                "key": key, "name": name, "manual_disabled": int(bool(raw.get("manual_disabled"))),
+                "lifetime_quota": max(0, int(raw.get("lifetime_quota", 0))),
+                "monthly_quota": max(0, int(raw.get("monthly_quota", 0))),
+                "reset_day": reset_day, "expires_at": raw.get("expires_at"),
+                "max_devices": max_devices, "devices": checked_devices,
+                "permissions": {key: bool(value) for key, value in permissions.items() if key in PROTOCOLS},
+            })
+        return normalized
+
+    def import_cluster_users(self, bundle: dict[str, Any], origin: str) -> dict[str, int]:
+        users = self._validate_cluster_bundle(bundle, origin)
+        prefix = f"{origin}:user:"
+        keep_users: set[str] = set()
+        keep_devices: set[str] = set()
+        now = utc_now()
+        with self.db.connection:
+            for item in users:
+                user_key = prefix + item["key"]
+                keep_users.add(user_key)
+                row = self.db.connection.execute("SELECT * FROM users WHERE cluster_key=?", (user_key,)).fetchone()
+                if row is None:
+                    display_name = item["name"]
+                    collision = self.db.connection.execute(
+                        "SELECT 1 FROM users WHERE name=? COLLATE NOCASE", (display_name,)
+                    ).fetchone()
+                    if collision:
+                        display_name = f"{display_name} [主VPS-{origin[:6]}]"
+                    cursor = self.db.connection.execute(
+                        """INSERT INTO users(name,manual_disabled,lifetime_quota,monthly_quota,reset_day,
+                        expires_at,max_devices,created_at,updated_at,cluster_managed,cluster_key)
+                        VALUES(?,?,?,?,?,?,?,?,?,1,?)""",
+                        (display_name, item["manual_disabled"], item["lifetime_quota"], item["monthly_quota"],
+                         item["reset_day"], item["expires_at"], item["max_devices"], now, now, user_key),
+                    )
+                    user_id = int(cursor.lastrowid)
+                else:
+                    user_id = int(row["id"])
+                    self.db.connection.execute(
+                        """UPDATE users SET manual_disabled=?,lifetime_quota=?,monthly_quota=?,reset_day=?,
+                        expires_at=?,max_devices=?,updated_at=? WHERE id=?""",
+                        (item["manual_disabled"], item["lifetime_quota"], item["monthly_quota"],
+                         item["reset_day"], item["expires_at"], item["max_devices"], now, user_id),
+                    )
+                self.db.connection.execute("DELETE FROM protocol_permissions WHERE user_id=?", (user_id,))
+                self.db.connection.executemany(
+                    "INSERT INTO protocol_permissions(user_id,protocol,enabled) VALUES(?,?,?)",
+                    ((user_id, protocol, int(item["permissions"].get(protocol, True))) for protocol in PROTOCOLS),
+                )
+                for device in item["devices"]:
+                    device_key = f"{user_key}:device:{device['key']}"
+                    keep_devices.add(device_key)
+                    existing = self.db.connection.execute(
+                        "SELECT * FROM devices WHERE cluster_key=?", (device_key,)
+                    ).fetchone()
+                    conflict = self.db.connection.execute(
+                        "SELECT * FROM devices WHERE (uuid=? OR token=?) AND cluster_key IS NOT ?",
+                        (device["uuid"], device["token"], device_key),
+                    ).fetchone()
+                    if conflict:
+                        raise AgentError("主 VPS 设备凭据与子 VPS 本地设备冲突")
+                    values = (
+                        user_id, device["name"], device["uuid"], device["password"],
+                        device["ss_password"], device["token"], device["enabled"], now, device_key,
+                    )
+                    if existing:
+                        self.db.connection.execute(
+                            """UPDATE devices SET user_id=?,name=?,uuid=?,password=?,ss_password=?,token=?,
+                            enabled=?,updated_at=?,cluster_key=? WHERE id=?""", (*values, existing["id"]),
+                        )
+                    else:
+                        self.db.connection.execute(
+                            """INSERT INTO devices(user_id,name,uuid,password,ss_password,token,enabled,
+                            created_at,updated_at,cluster_key) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                            (*values[:7], now, now, device_key),
+                        )
+            stale_devices = self.db.connection.execute(
+                "SELECT token,cluster_key FROM devices WHERE cluster_key LIKE ?", (prefix + "%",)
+            ).fetchall()
+            for row in stale_devices:
+                if row["cluster_key"] not in keep_devices:
+                    self.db.connection.execute("DELETE FROM devices WHERE cluster_key=?", (row["cluster_key"],))
+                    shutil.rmtree(self.generated / row["token"], ignore_errors=True)
+            stale_users = self.db.connection.execute(
+                "SELECT cluster_key FROM users WHERE cluster_managed=1 AND cluster_key LIKE ?", (prefix + "%",)
+            ).fetchall()
+            for row in stale_users:
+                if row["cluster_key"] not in keep_users:
+                    self.db.connection.execute("DELETE FROM users WHERE cluster_key=?", (row["cluster_key"],))
+            self.db.audit("cluster.users.import", origin, f"users={len(users)}")
+        self.backup_database()
+        self.render_all_subscriptions()
+        return {"users": len(users), "devices": len(keep_devices)}
 
     def _replace_security_backups(self) -> None:
         for backup in self.backups.glob("db-*.sqlite3"):
@@ -1359,12 +1572,58 @@ class Agent:
         ).fetchone()
         return int(row["lifetime"]), int(row["monthly"])
 
+    def cluster_usage_for_user(self, user: sqlite3.Row) -> tuple[int, int]:
+        database = self.root / "modules" / "cluster" / "data" / "cluster.db"
+        config_path = self.root / "modules" / "cluster" / "config.json"
+        if not database.exists() or not config_path.exists():
+            return 0, 0
+        devices = [
+            row["uuid"] for row in self.db.connection.execute(
+                "SELECT uuid FROM devices WHERE user_id=?", (user["id"],)
+            )
+        ]
+        if not devices:
+            return 0, 0
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+            connection.row_factory = sqlite3.Row
+            epoch = self.month_period(int(user["reset_day"]))
+            if config.get("role") == "master":
+                placeholders = ",".join("?" for _ in devices)
+                row = connection.execute(
+                    f"""SELECT COALESCE(SUM(uplink+downlink),0) lifetime,
+                    COALESCE(SUM(month_uplink+month_downlink),0) monthly FROM usage_reports
+                    WHERE epoch=? AND device_uuid IN ({placeholders})""",
+                    (epoch, *devices),
+                ).fetchone()
+                return int(row["lifetime"]), int(row["monthly"])
+            lifetime = monthly = 0
+            for device_uuid in devices:
+                row = connection.execute(
+                    "SELECT value FROM settings WHERE key=?",
+                    (f"usage-sent:{device_uuid}:{epoch}",),
+                ).fetchone()
+                if row:
+                    state = json.loads(row["value"])
+                    lifetime += int(state.get("global_total", 0))
+                    monthly += int(state.get("global_month", 0))
+            return lifetime, monthly
+        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError):
+            return 0, 0
+        finally:
+            if "connection" in locals():
+                connection.close()
+
     def effective_user(self, user: sqlite3.Row) -> tuple[bool, str]:
         if user["manual_disabled"]:
             return False, "管理员停用"
         if user["expires_at"] and utc_now() >= user["expires_at"]:
             return False, "已到期"
         lifetime, monthly = self.usage_for_user(user["id"])
+        cluster_lifetime, cluster_monthly = self.cluster_usage_for_user(user)
+        lifetime = max(lifetime, cluster_lifetime)
+        monthly = max(monthly, cluster_monthly)
         if user["lifetime_quota"] and lifetime >= user["lifetime_quota"]:
             return False, "永久流量已用尽"
         if user["monthly_quota"] and monthly >= user["monthly_quota"]:
@@ -1969,6 +2228,27 @@ class Agent:
         if not device["enabled"]:
             return device, False, "设备停用"
         return device, active, reason
+
+    def cluster_subscription_path(self, token: str, filename: str) -> Path | None:
+        """Return an enabled cluster profile without making cluster a module dependency."""
+        if filename not in {"jhsub.txt", "clmi.yaml", "sbox.json"}:
+            return None
+        database = self.root / "modules" / "cluster" / "data" / "cluster.db"
+        target = self.root / "modules" / "cluster" / "generated" / token / filename
+        if not database.exists() or not target.exists() or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+            return None
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+            row = connection.execute(
+                "SELECT 1 FROM profiles WHERE token=? AND enabled=1", (token,)
+            ).fetchone()
+            return target if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            if connection is not None:
+                connection.close()
 
     def sample_core_stats(self, core: str, server: str) -> int:
         if core == "singbox":
@@ -2662,6 +2942,18 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             if token != config.get("legacy_token"):
                 self.send_error(404)
                 return
+        cluster_target = agent.cluster_subscription_path(token, filename)
+        if cluster_target is not None:
+            payload = cluster_target.read_bytes()
+            content_type = {"jhsub.txt": "text/plain", "clmi.yaml": "text/yaml", "sbox.json": "application/json"}[filename]
+            self.send_response(200)
+            self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if send_body:
+                self.wfile.write(payload)
+            return
         device, active, reason = agent.find_device_by_token(token)
         if not device:
             self.send_error(404)
@@ -2896,6 +3188,11 @@ def build_parser() -> argparse.ArgumentParser:
     subscription_port.add_argument("--port", type=int, required=True)
     subscription_port.add_argument("--public-port", type=int, required=True)
     sub.add_parser("sync-subscription-state")
+    cluster_export = sub.add_parser("cluster-export")
+    cluster_export.add_argument("--user-ids", default="")
+    cluster_import = sub.add_parser("cluster-import")
+    cluster_import.add_argument("--path", required=True)
+    cluster_import.add_argument("--origin", required=True)
     sub.add_parser("visit-init")
     sub.add_parser("visit-apply")
     sub.add_parser("visit-serve")
@@ -3057,6 +3354,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"订阅状态已同步：设备 {result['device_id']}，"
                 f"内网 {result['port']} / 公网 {result['public_port']}。"
             )
+        elif args.command == "cluster-export":
+            user_ids = None
+            if args.user_ids.strip():
+                try:
+                    user_ids = [int(item) for item in re.split(r"[,\s]+", args.user_ids.strip())]
+                except ValueError as exc:
+                    raise AgentError("用户 ID 列表无效") from exc
+            result = agent.export_cluster_users(user_ids)
+            if not args.json:
+                print(f"已导出 {len(result['users'])} 个主 VPS 用户。")
+        elif args.command == "cluster-import":
+            try:
+                bundle = json.loads(Path(args.path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AgentError(f"主 VPS 用户数据无法读取：{exc}") from exc
+            if not isinstance(bundle, dict):
+                raise AgentError("主 VPS 用户数据必须是 JSON 对象")
+            result = agent.import_cluster_users(bundle, args.origin)
+            print(f"已同步 {result['users']} 个用户 / {result['devices']} 台设备。")
         elif args.command == "visit-init":
             result = agent.initialize_visit()
             print("本机网站监控身份已初始化。")

@@ -71,11 +71,12 @@ grep -q '手动登记已设置的规则（无需 API' "$SCRIPT"
 grep -q '粘贴 Token（输入会显示，0 返回）' "$SCRIPT"
 grep -q '区域 → Origin Rules → 编辑' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.2.1' "$SCRIPT"
+grep -q '当前版本：V26.8.4.2' "$SCRIPT"
 grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"
-grep -q '8. %s使用说明 / 协议特点%s' "$SCRIPT"
+grep -q '8. %s服务器联动 / 节点集群%s' "$SCRIPT"
+grep -q '9. %s使用说明 / 协议特点%s' "$SCRIPT"
 grep -q '一键开启 / 修复监控' "$SCRIPT"
 grep -q 'ExecStart=.* visit-serve' "$SCRIPT"
 grep -q 'set-subscription-port --port' "$SCRIPT"
@@ -136,5 +137,22 @@ multiuser_prepare_service_port
 
 select_subscription_port() { return 1; }
 ! multiuser_prepare_service_port
+
+eval "$(extract_shell_function cluster_show_subscription_links)"
+cluster_refresh_profiles() { :; }
+multiuser_enabled() { return 1; }
+client_port() { [[ $1 == 443 ]] && printf '52581\n' || printf '%s\n' "$1"; }
+cluster_cmd() {
+  [[ $* == "--json profiles" ]] || return 1
+  printf '%s\n' '[{"name":"全部节点","token":"test-token"}]'
+}
+HOME=$(mktemp -d)
+mkdir -p "$HOME/lun"
+printf '%s\n' '77.90.28.162' > "$HOME/lun/server_ip.log"
+printf '%s\n' '443' > "$HOME/lun/subport.log"
+cluster_links=$(cluster_show_subscription_links)
+[[ $cluster_links == *'http://77.90.28.162:52581/test-token/jhsub.txt'* ]]
+rm -rf "$HOME"
+HOME=$original_home
 
 echo "multi-user shell helper tests passed"
