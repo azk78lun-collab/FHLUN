@@ -694,10 +694,38 @@ class AgentTestCase(unittest.TestCase):
     def test_subscription_preserves_server_path_and_rewrites_identity(self):
         device = self.add_user()
         old = "11111111-1111-4111-8111-111111111111"
-        source = f"vless://{old}@example.com:443?type=xhttp&path={old}-xc#vless-xhttp-tls-tcp-test\n"
+        name = "[德国-法兰克福]vless-xhttp-tls-tcp-01"
+        source = f"vless://{old}@example.com:443?type=xhttp&path={old}-xc#{name}\n"
         rendered = self.agent.render_generic(source, device, self.agent.device_permissions(device["user_id"]), self.agent.load_config())
         self.assertIn(f"vless://{device['uuid']}@", rendered)
         self.assertIn(f"path={old}-xc", rendered)
+        self.assertIn(name, rendered)
+
+        singbox = {"outbounds": [{"type": "vless", "tag": name, "uuid": old}]}
+        rendered_singbox = json.loads(self.agent.render_singbox(
+            json.dumps(singbox, ensure_ascii=False), device,
+            self.agent.device_permissions(device["user_id"]), self.agent.load_config(),
+        ))
+        self.assertEqual(rendered_singbox["outbounds"][0]["tag"], name)
+
+        clash = f"""proxies:
+- name: {name}
+  type: vless
+  server: example.com
+  port: 443
+  uuid: {old}
+proxy-groups:
+- name: AUTO
+  type: select
+  proxies:
+    - {name}
+rules:
+  - MATCH,AUTO
+"""
+        rendered_clash = self.agent.render_clash(
+            clash, device, self.agent.device_permissions(device["user_id"]), self.agent.load_config()
+        )
+        self.assertIn(f"- name: {name}", rendered_clash)
 
     def test_shadowsocks_subscription_uses_parallel_credentials(self):
         device = self.add_user()

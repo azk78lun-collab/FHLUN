@@ -96,9 +96,8 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.4.2"
+echo "当前版本：V26.8.5.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-hostname=$(uname -a | awk '{print $2}')
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
 [ -z "$(systemd-detect-virt 2>/dev/null)" ] && vi=$(virt-what 2>/dev/null) || vi=$(systemd-detect-virt 2>/dev/null)
 case $(uname -m) in
@@ -165,6 +164,117 @@ printf 'V4\n'
 else
 printf 'DOMAIN\n'
 fi
+}
+
+normalize_server_number(){
+number=$1
+printf '%s\n' "$number" | grep -Eq '^[0-9]+$' || return 1
+number=$(printf '%s\n' "$number" | sed 's/^0*//')
+[ -n "$number" ] || number=0
+[ "$number" -ge 1 ] 2>/dev/null || return 1
+if [ "$number" -lt 100 ]; then
+printf '%02d\n' "$number"
+else
+printf '%d\n' "$number"
+fi
+}
+
+sanitize_server_place(){
+place=$(printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/\[//g; s/\]//g; s#[/#?@]#-#g; s/[[:space:]][[:space:]]*/-/g; s/--*/-/g; s/^-//; s/-$//')
+[ -n "$place" ] || return 1
+[ "${#place}" -le 48 ] || return 1
+printf '%s\n' "$place"
+}
+
+server_country_zh(){
+case "$1" in
+AU) printf '澳大利亚\n' ;; CA) printf '加拿大\n' ;; DE) printf '德国\n' ;;
+FR) printf '法国\n' ;; GB) printf '英国\n' ;; HK) printf '中国香港\n' ;;
+JP) printf '日本\n' ;; KR) printf '韩国\n' ;; NL) printf '荷兰\n' ;;
+SG) printf '新加坡\n' ;; TW) printf '中国台湾\n' ;; US) printf '美国\n' ;;
+*) return 1 ;;
+esac
+}
+
+server_city_zh(){
+city=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+case "$city" in
+frankfurt) printf '法兰克福\n' ;; "hong kong") printf '香港\n' ;;
+"los angeles") printf '洛杉矶\n' ;; minoh) printf '箕面\n' ;;
+osaka) printf '大阪\n' ;; seoul) printf '首尔\n' ;;
+singapore) printf '新加坡\n' ;; tokyo) printf '东京\n' ;;
+*) return 1 ;;
+esac
+}
+
+detect_server_place(){
+identity_host=${v4:-${v6:-}}
+[ -n "$identity_host" ] || identity_host=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
+identity_host=${identity_host#\[}; identity_host=${identity_host%\]}
+[ -n "$identity_host" ] || { printf '未设置地区\n'; return; }
+identity_url="https://ipwho.is/$(printf '%s' "$identity_host" | sed 's/:/%3A/g')"
+identity_json=$( (command -v curl >/dev/null 2>&1 && curl -fsSL --connect-timeout 3 --max-time 6 "$identity_url" 2>/dev/null) || (command -v wget >/dev/null 2>&1 && timeout 7 wget -qO- "$identity_url" 2>/dev/null) )
+identity_code=$(printf '%s' "$identity_json" | sed -n 's/.*"country_code"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' | tr '[:lower:]' '[:upper:]')
+identity_city=$(printf '%s' "$identity_json" | sed -n 's/.*"city"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+identity_country=$(server_country_zh "$identity_code" 2>/dev/null || true)
+identity_city_zh=$(server_city_zh "$identity_city" 2>/dev/null || true)
+if [ -n "$identity_country" ] && [ -n "$identity_city_zh" ] && [ "$identity_country" != "$identity_city_zh" ]; then
+printf '%s-%s\n' "$identity_country" "$identity_city_zh"
+elif [ -n "$identity_country" ]; then
+printf '%s\n' "$identity_country"
+else
+printf '未设置地区\n'
+fi
+}
+
+load_server_identity(){
+server_number=$(normalize_server_number "$(cat "$HOME/lun/server_number" 2>/dev/null)" 2>/dev/null || printf '01\n')
+server_place=$(sanitize_server_place "$(cat "$HOME/lun/server_place" 2>/dev/null)" 2>/dev/null || true)
+}
+
+save_server_identity(){
+identity_number=$(normalize_server_number "${2:-${server_number:-01}}") || return 1
+identity_place=$(sanitize_server_place "$1") || return 1
+printf '%s\n' "$identity_number" > "$HOME/lun/server_number"
+printf '%s\n' "$identity_place" > "$HOME/lun/server_place"
+chmod 600 "$HOME/lun/server_number" "$HOME/lun/server_place" 2>/dev/null || true
+server_number=$identity_number
+server_place=$identity_place
+}
+
+ensure_server_identity(){
+load_server_identity
+if [ -z "$server_place" ]; then
+server_place=$(detect_server_place)
+save_server_identity "$server_place" "$server_number" || return 1
+fi
+node_name_prefix="[$server_place]"
+[ "$server_place" != "未设置地区" ] || yellow_line "未能自动识别服务器地区；节点暂用 [未设置地区]，可在“节点订阅分享 → 服务器身份 / 节点命名”中修改。"
+}
+
+address_variant_code(){
+case "$1" in
+DOMAIN) printf 'D4\n' ;; IPv4|V4) printf 'V4\n' ;; IPv6|V6) printf 'V6\n' ;;
+*) return 1 ;;
+esac
+}
+
+direct_node_suffix(){
+variant=$1
+if [ "${direct_entry_count:-1}" -gt 1 ]; then
+variant=$(address_variant_code "$variant") || return 1
+printf -- '-%s-%s\n' "$variant" "$server_number"
+else
+printf -- '-%s\n' "$server_number"
+fi
+}
+
+direct_node_name(){
+printf '%s%s%s\n' "$node_name_prefix" "$1" "$node_name_suffix"
+}
+
+routed_node_name(){
+printf '%s%s-%s\n' "$node_name_prefix" "$1" "$server_number"
 }
 
 valid_domain(){
@@ -1328,10 +1438,9 @@ wpv6=$(echo "$warpurl" | awk -F'：' '/IPV6/{print $2}' | xargs)
 res=$(echo "$warpurl" | awk -F'：' '/reserved/{print $2}' | xargs)
 fi
 if [ -n "$name" ]; then
-sxname=$name-
-echo "$sxname" > "$HOME/lun/name"
+echo "$name" > "$HOME/lun/name"
 echo
-echo "所有节点名称前缀：$name"
+echo "服务器备注：$name（仅用于管理界面，不加入节点名称）"
 fi
 v4v6
 if echo "$v6" | grep -q '^2a09' || echo "$v4" | grep -q '^104.28'; then
@@ -4038,6 +4147,33 @@ cluster_rc=$?
 ui_pause
 }
 
+cluster_switch_master_ui(){
+ui_title "Lun 主 VPS / 子 VPS 角色互换"
+cluster_cmd nodes || return 1
+yellow_line "请选择要提升为新主 VPS 的子机；当前主 VPS 会在成功后自动降为子机。"
+yellow_line "服务器编号、地区和节点名称保持不变，不会因角色变化重新编号。"
+red_line "聚合订阅地址会改为新主 VPS；切换期间请勿关闭 SSH 或重启任一服务器。"
+printf "目标子 VPS 编号（输入 0 返回）："
+IFS= read -r cluster_node_id
+[ "$cluster_node_id" = 0 ] && return 2
+case "$cluster_node_id" in ''|*[!0-9]*) red_line "请输入服务器编号。"; return 1 ;; esac
+cluster_number=$(printf '%s' "$cluster_node_id" | sed 's/^0*//')
+[ -n "$cluster_number" ] || cluster_number=0
+[ "$cluster_number" -gt 0 ] 2>/dev/null || { red_line "服务器编号无效。"; return 1; }
+if [ "$cluster_number" -lt 100 ]; then cluster_number=$(printf '%02d' "$cluster_number"); fi
+red_line "将转移集群数据库和 CA 私钥，并更新全部子机的主控授权；失败会自动回滚。"
+printf "输入 SWITCH-%s 确认（输入 0 返回）：" "$cluster_number"
+IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && return 2
+if cluster_cmd switch-master --node-id "$cluster_node_id" --confirm "$cluster_confirm"; then
+cluster_service_restart || yellow_line "本机已降为子 VPS，但联动服务重启失败；请执行 systemctl restart lun-cluster-agent。"
+apply_lun_firewall_rules >/dev/null 2>&1 || true
+green_line "角色互换完成。请登录新主 VPS 查看新的聚合订阅地址。"
+return 0
+fi
+return 1
+}
+
 cluster_master_menu(){
 while :; do
 ui_title "Lun 节点集群 / 主 VPS"
@@ -4056,8 +4192,9 @@ echo "10. 通信状态 / 修复服务"
 echo "11. 更新服务器联动程序"
 echo "12. 移除子 VPS / 撤销访问"
 echo "13. 停用并卸载服务器联动模块"
+printf "14. %s主 VPS / 子 VPS 角色互换%s\n" "$LUN_RED" "$LUN_RESET"
 echo " 0. 返回"
-printf "请选择 [0-13]："
+printf "请选择 [0-14]："
 IFS= read -r cluster_choice
 case "$cluster_choice" in
 1) cluster_cmd nodes; ui_pause ;;
@@ -4114,6 +4251,13 @@ rm -rf "$(cluster_module_dir)"
 apply_lun_firewall_rules quiet || true
 green_line "服务器联动模块已卸载。"
 return
+;;
+14)
+if cluster_switch_master_ui; then
+ui_pause
+return
+fi
+ui_pause
 ;;
 0|"") return ;;
 *) echo "输入错误。" ;;
@@ -4634,11 +4778,11 @@ rm -f "$HOME/lun/server_ip6.log"
 fi
 }
 ipchange
+ensure_server_identity || { red_line "服务器身份初始化失败，请在节点订阅分享中重新设置地区。"; return 1; }
 rm -rf "$HOME/lun/jhsub.txt"
 rm -f "$HOME/lun/.cdn_sbox_entries" "$HOME/lun/.cdn_sbox_tags" "$HOME/lun/.cdn_clash_entries" "$HOME/lun/.cdn_clash_names"
 uuid=$(cat "$HOME/lun/uuid")
 server_ip=$(cat "$HOME/lun/server_ip.log")
-sxname=$(cat "$HOME/lun/name" 2>/dev/null)
 xvvmcdnym=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 argoip_cfg=$(cat "$HOME/lun/argoip" 2>/dev/null)
 [ -z "$argoip_cfg" ] && argoip_cfg="162.159.192.1 162.159.192.2"
@@ -4647,12 +4791,13 @@ if [ -z "$direct_entries" ]; then
 echo "当前地址输出模式 $(address_mode_label) 没有可用地址，请在高级设置中重新选择。"
 return 1
 fi
+direct_entry_count=$(printf '%s\n' "$direct_entries" | sed '/^$/d' | wc -l | tr -d ' ')
 primary_entry=$(printf '%s\n' "$direct_entries" | sed -n '1p')
 client_addr_raw=${primary_entry%%|*}
 primary_name_suffix=${primary_entry#*|}
 client_addr=$(uri_host "$client_addr_raw")
 client_addr_json=$(json_host "$client_addr_raw")
-node_name_suffix="-$primary_name_suffix"
+node_name_suffix=$(direct_node_suffix "$primary_name_suffix")
 cert_client_vars
 
 sed_escape(){
@@ -4675,8 +4820,9 @@ old_uri_esc=$(sed_escape "$old_uri")
 new_uri_esc=$(sed_replacement_escape "$new_uri")
 old_json_esc=$(sed_escape "$old_json")
 new_json_esc=$(sed_replacement_escape "$new_json")
-old_suffix_esc=$(sed_escape "-$primary_name_suffix")
-new_suffix_esc=$(sed_replacement_escape "-$new_suffix")
+old_suffix_esc=$(sed_escape "$node_name_suffix")
+new_name_suffix=$(direct_node_suffix "$new_suffix")
+new_suffix_esc=$(sed_replacement_escape "$new_name_suffix")
 case "$link" in
 vmess://*)
 payload=${link#vmess://}
@@ -4742,7 +4888,7 @@ if grep xhttp-reality "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-xhttp-reality-enc 】支持ENC加密，节点信息如下："
 port_xh=$(cat "$HOME/lun/port_xh")
 client_port_xh=$(client_port "$port_xh")
-vl_xh_link="vless://$uuid@$client_addr:$client_port_xh?encryption=$enkey&flow=xtls-rprx-vision&security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=xhttp&path=$uuid-xh&mode=auto#${sxname}vl-xhttp-reality-enc-$hostname$node_name_suffix"
+vl_xh_link="vless://$uuid@$client_addr:$client_port_xh?encryption=$enkey&flow=xtls-rprx-vision&security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=xhttp&path=$uuid-xh&mode=auto#$(direct_node_name vless-xhttp-reality)"
 append_share_link "$vl_xh_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "VLESS XHTTP Reality 不套用普通橙云 CDN，Reality SNI/回源逻辑保持独立，已保留直连节点。"
 echo
@@ -4755,24 +4901,24 @@ vx_direct_extra="&security=none"
 if cdn_origin_tls_for_port "$port_vx"; then
 vx_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
 fi
-vl_vx_link="vless://$uuid@$client_addr:$client_port_vx?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto$vx_direct_extra#${sxname}vl-xhttp-enc-$hostname$node_name_suffix"
+vl_vx_link="vless://$uuid@$client_addr:$client_port_vx?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto$vx_direct_extra#$(direct_node_name vless-xhttp)"
 append_share_link "$vl_vx_link"
 echo
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled xhttp; then
-append_vless_cdn_links "Vless-xhttp-enc-cdn" "vl-xhttp-enc" "$port_vx" "encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto"
+append_vless_cdn_links "Vless-xhttp-enc-cdn" "vless-xhttp" "$port_vx" "encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&path=$uuid-vx&mode=auto"
 fi
 fi
 if grep xhttp-h3 "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-xhttp-tls-UDP 】节点信息如下："
 port_xu=$(cat "$HOME/lun/port_xu")
 client_port_xu=$(client_port "$port_xu")
-vl_xu_link="vless://$uuid@$client_addr:$client_port_xu?encryption=none&security=tls&sni=$cert_sni&alpn=h3&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure$generic_tls_pin_arg&type=xhttp&path=$uuid-xu&mode=auto#${sxname}vless-xhttp-tls-udp-$hostname$node_name_suffix"
+vl_xu_link="vless://$uuid@$client_addr:$client_port_xu?encryption=none&security=tls&sni=$cert_sni&alpn=h3&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure$generic_tls_pin_arg&type=xhttp&path=$uuid-xu&mode=auto#$(direct_node_name vless-xhttp-tls-udp)"
 append_share_link "$vl_xu_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "VLESS XHTTP TLS UDP 为直连 QUIC/UDP 协议，不生成普通 CDN 变体。"
 echo
 clxupt(){
 cat <<EOF
-- name: ${sxname}vless-xhttp-tls-udp-$hostname$node_name_suffix
+- name: $(direct_node_name vless-xhttp-tls-udp)
   type: vless
   server: $client_addr
   port: $client_port_xu
@@ -4791,19 +4937,19 @@ cat <<EOF
 EOF
 }
 clxupt1(){
-echo "- ${sxname}vless-xhttp-tls-udp-$hostname$node_name_suffix"
+echo "- $(direct_node_name vless-xhttp-tls-udp)"
 }
 fi
 if grep xhttp-h23 "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-xhttp-tls-TCP/UDP 】直连节点信息如下："
 port_xc=$(cat "$HOME/lun/port_xc")
 client_port_xc=$(client_port "$port_xc")
-vl_xc_link="vless://$uuid@$client_addr:$client_port_xc?encryption=none&security=tls&sni=$cert_sni&alpn=h2,http/1.1&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure$generic_tls_pin_arg&type=xhttp&path=$uuid-xc&mode=auto#${sxname}vless-xhttp-tls-tcp-$hostname$node_name_suffix"
+vl_xc_link="vless://$uuid@$client_addr:$client_port_xc?encryption=none&security=tls&sni=$cert_sni&alpn=h2,http/1.1&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure$generic_tls_pin_arg&type=xhttp&path=$uuid-xc&mode=auto#$(direct_node_name vless-xhttp-tls-tcp)"
 append_share_link "$vl_xc_link"
 echo
 clxcpt(){
 cat <<EOF
-- name: ${sxname}vless-xhttp-tls-tcp-$hostname$node_name_suffix
+- name: $(direct_node_name vless-xhttp-tls-tcp)
   type: vless
   server: $client_addr
   port: $client_port_xc
@@ -4823,7 +4969,7 @@ cat <<EOF
 EOF
 }
 clxcpt1(){
-echo "- ${sxname}vless-xhttp-tls-tcp-$hostname$node_name_suffix"
+echo "- $(direct_node_name vless-xhttp-tls-tcp)"
 }
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled xhttp; then
 append_xhttp_tls_cdn_links "$port_xc"
@@ -4837,18 +4983,18 @@ vw_direct_extra="&security=none"
 if cdn_origin_tls_for_port "$port_vw"; then
 vw_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
 fi
-vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&type=ws&path=$uuid-vw$vw_direct_extra#${sxname}vl-ws-enc-$hostname$node_name_suffix"
+vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&type=ws&path=$uuid-vw$vw_direct_extra#$(direct_node_name vless-ws)"
 append_share_link "$vl_vw_link"
 echo
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled ws; then
-append_vless_cdn_links "Vless-ws-enc-cdn" "vl-ws-enc" "$port_vw" "encryption=$enkey&type=ws&path=$uuid-vw"
+append_vless_cdn_links "Vless-ws-enc-cdn" "vless-ws" "$port_vw" "encryption=$enkey&type=ws&path=$uuid-vw"
 fi
 fi
 if grep reality-vision "$HOME/lun/xr.json" >/dev/null 2>&1; then
 echo "【 Vless-tcp-reality-vision 】节点信息如下："
 port_vl_re=$(cat "$HOME/lun/port_vl_re")
 client_port_vl_re=$(client_port "$port_vl_re")
-vl_link="vless://$uuid@$client_addr:$client_port_vl_re?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=tcp&headerType=none#${sxname}vl-reality-vision-$hostname$node_name_suffix"
+vl_link="vless://$uuid@$client_addr:$client_port_vl_re?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_x&sid=$short_id_x&type=tcp&headerType=none#$(direct_node_name vless-tcp-reality)"
 append_share_link "$vl_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "VLESS TCP Reality 不是 HTTP/WS 回源协议，不生成普通橙云 CDN 变体。"
 echo
@@ -4856,7 +5002,7 @@ sbvlpt(){
 cat <<EOF
     {
       "type": "vless",
-      "tag": "${sxname}vless-$hostname$node_name_suffix",
+      "tag": "$(direct_node_name vless-tcp-reality)",
       "server": "$client_addr",
       "server_port": $client_port_vl_re,
       "uuid": "$uuid",
@@ -4878,11 +5024,11 @@ cat <<EOF
 EOF
 }
 sbvlpt1(){
-echo "\"${sxname}vless-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name vless-tcp-reality)\","
 }
 clvlpt(){
 cat <<EOF
-- name: ${sxname}vless-reality-vision-$hostname$node_name_suffix
+- name: $(direct_node_name vless-tcp-reality)
   type: vless
   server: $client_addr
   port: $client_port_vl_re
@@ -4899,14 +5045,14 @@ cat <<EOF
 EOF
 }
 clvlpt1(){
-echo "- ${sxname}vless-reality-vision-$hostname$node_name_suffix"
+echo "- $(direct_node_name vless-tcp-reality)"
 }
 fi
 if grep ss-2022 "$HOME/lun/sb.json" >/dev/null 2>&1; then
 echo "【 Shadowsocks-2022 】节点信息如下："
 port_ss=$(cat "$HOME/lun/port_ss")
 client_port_ss=$(client_port "$port_ss")
-ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$sskey@$client_addr:$client_port_ss" | base64 -w0)#${sxname}Shadowsocks-2022-$hostname$node_name_suffix"
+ss_link="ss://$(echo -n "2022-blake3-aes-128-gcm:$sskey@$client_addr:$client_port_ss" | base64 -w0)#$(direct_node_name shadowsocks-2022)"
 append_share_link "$ss_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "Shadowsocks-2022 不是 HTTP/WS 回源协议，不生成普通橙云 CDN 变体。"
 echo
@@ -4914,7 +5060,7 @@ sbsspt(){
 cat <<EOF
 {
        "type": "shadowsocks",
-       "tag": "${sxname}Shadowsocks-2022-$hostname$node_name_suffix",
+       "tag": "$(direct_node_name shadowsocks-2022)",
        "server": "$client_addr",
        "server_port": $client_port_ss,
        "method": "2022-blake3-aes-128-gcm",
@@ -4927,11 +5073,11 @@ cat <<EOF
 EOF
 }
 sbsspt1(){
-echo "\"${sxname}Shadowsocks-2022-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name shadowsocks-2022)\","
 }
 clsspt(){
 cat <<EOF
-- name: "${sxname}Shadowsocks-2022-$hostname$node_name_suffix"
+- name: "$(direct_node_name shadowsocks-2022)"
   type: ss
   server: $client_addr
   port: $client_port_ss
@@ -4943,7 +5089,7 @@ cat <<EOF
 EOF
 }
 clsspt1(){
-echo "- ${sxname}Shadowsocks-2022-$hostname$node_name_suffix"
+echo "- $(direct_node_name shadowsocks-2022)"
 }
 fi
 if grep vmess-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep vmess-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
@@ -4958,7 +5104,7 @@ vm_direct_host=$xvvmcdnym
 vm_direct_tls=tls
 vm_direct_tls_enabled=true
 fi
-vm_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${sxname}vm-ws-$hostname$node_name_suffix\", \"add\": \"$client_addr_json\", \"port\": \"$client_port_vm_ws\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$vm_direct_host\", \"path\": \"/$uuid-vm\", \"tls\": \"$vm_direct_tls\", \"sni\": \"$vm_direct_host\", \"allowInsecure\": \"$generic_link_insecure\"}" | base64 -w0)"
+vm_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"$(direct_node_name vmess-ws)\", \"add\": \"$client_addr_json\", \"port\": \"$client_port_vm_ws\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$vm_direct_host\", \"path\": \"/$uuid-vm\", \"tls\": \"$vm_direct_tls\", \"sni\": \"$vm_direct_host\", \"allowInsecure\": \"$generic_link_insecure\"}" | base64 -w0)"
 append_share_link "$vm_link"
 echo
 sbvmpt(){
@@ -4966,7 +5112,7 @@ cat <<EOF
 {
             "server": "$client_addr",
             "server_port": $client_port_vm_ws,
-            "tag": "${sxname}vmess-$hostname$node_name_suffix",
+            "tag": "$(direct_node_name vmess-ws)",
             "tls": {
                 "enabled": $vm_direct_tls_enabled,
                 "server_name": "$vm_direct_host",
@@ -4993,11 +5139,11 @@ cat <<EOF
 EOF
 }
 sbvmpt1(){
-echo "\"${sxname}vmess-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name vmess-ws)\","
 }
 clvmpt(){
 cat <<EOF
-- name: ${sxname}vmess-ws-$hostname$node_name_suffix
+- name: $(direct_node_name vmess-ws)
   type: vmess
   server: $client_addr
   port: $client_port_vm_ws
@@ -5016,7 +5162,7 @@ cat <<EOF
 EOF
 }
 clvmpt1(){
-echo "- ${sxname}vmess-ws-$hostname$node_name_suffix"
+echo "- $(direct_node_name vmess-ws)"
 }
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled vmess; then
 append_vmess_cdn_links "$port_vm_ws"
@@ -5026,10 +5172,10 @@ if grep naive-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
 echo "【 NaiveProxy H2/H3 】节点信息如下："
 port_nv=$(cat "$HOME/lun/port_nv")
 client_port_nv=$(client_port "$port_nv")
-nv_https_link="naive+https://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0#${sxname}naive-h2-$hostname$node_name_suffix"
-nv_quic_link="naive+quic://$uuid:$uuid@$client_addr:$client_port_nv?congestion_control=bbr&security=tls&sni=$cert_sni&insecure=0&allowInsecure=0#${sxname}naive-h3-$hostname$node_name_suffix"
-nv_http2_link="http2://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0&padding=1&tfo=1#${sxname}naive-h2-$hostname$node_name_suffix"
-nv_http3_link="http3://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0&padding=1&tfo=1#${sxname}naive-h3-$hostname$node_name_suffix"
+nv_https_link="naive+https://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0#$(direct_node_name naive-h2-native)"
+nv_quic_link="naive+quic://$uuid:$uuid@$client_addr:$client_port_nv?congestion_control=bbr&security=tls&sni=$cert_sni&insecure=0&allowInsecure=0#$(direct_node_name naive-h3-native)"
+nv_http2_link="http2://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0&padding=1&tfo=1#$(direct_node_name naive-h2-http2)"
+nv_http3_link="http3://$uuid:$uuid@$client_addr:$client_port_nv?security=tls&sni=$cert_sni&insecure=0&allowInsecure=0&padding=1&tfo=1#$(direct_node_name naive-h3-http3)"
 echo "V2rayN / Karing / NekoBox："
 append_share_link "$nv_https_link"
 append_share_link "$nv_quic_link"
@@ -5043,7 +5189,7 @@ sbnvpt(){
 cat <<EOF
     {
       "type": "naive",
-      "tag": "${sxname}naive-h3-$hostname$node_name_suffix",
+      "tag": "$(direct_node_name naive-h3)",
       "server": "$client_addr",
       "server_port": $client_port_nv,
       "username": "$uuid",
@@ -5058,7 +5204,7 @@ cat <<EOF
     },
     {
       "type": "naive",
-      "tag": "${sxname}naive-h2-$hostname$node_name_suffix",
+      "tag": "$(direct_node_name naive-h2)",
       "server": "$client_addr",
       "server_port": $client_port_nv,
       "username": "$uuid",
@@ -5073,15 +5219,15 @@ cat <<EOF
 EOF
 }
 sbnvpt1(){
-echo "\"${sxname}naive-h3-$hostname$node_name_suffix\","
-echo "\"${sxname}naive-h2-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name naive-h3)\","
+echo "\"$(direct_node_name naive-h2)\","
 }
 fi
 if grep anytls-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
 echo "【 AnyTLS 】节点信息如下："
 port_an=$(cat "$HOME/lun/port_an")
 client_port_an=$(client_port "$port_an")
-an_link="anytls://$uuid@$client_addr:$client_port_an?sni=$cert_sni&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure#${sxname}anytls-$hostname$node_name_suffix"
+an_link="anytls://$uuid@$client_addr:$client_port_an?sni=$cert_sni&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure#$(direct_node_name anytls)"
 append_share_link "$an_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "AnyTLS 不是普通 HTTP/WS 回源协议，不生成普通橙云 CDN 变体。"
 echo
@@ -5089,7 +5235,7 @@ sbanpt(){
 cat <<EOF
          {
             "type": "anytls",
-            "tag": "${sxname}anytls-$hostname$node_name_suffix",
+            "tag": "$(direct_node_name anytls)",
             "server": "$client_addr",
             "server_port": $client_port_an,
             "password": "$uuid",
@@ -5105,11 +5251,11 @@ cat <<EOF
 EOF
 }
 sbanpt1(){
-echo "\"${sxname}anytls-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name anytls)\","
 }
 clanpt(){
 cat <<EOF
-- name: ${sxname}anytls-$hostname$node_name_suffix
+- name: $(direct_node_name anytls)
   type: anytls
   server: $client_addr
   port: $client_port_an
@@ -5123,14 +5269,14 @@ cat <<EOF
 EOF
 }
 clanpt1(){
-echo "- ${sxname}anytls-$hostname$node_name_suffix"
+echo "- $(direct_node_name anytls)"
 }
 fi
 if grep anyreality-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
 echo "【 Any-Reality 】节点信息如下："
 port_ar=$(cat "$HOME/lun/port_ar")
 client_port_ar=$(client_port "$port_ar")
-ar_link="anytls://$uuid@$client_addr:$client_port_ar?security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_s&sid=$short_id_s&type=tcp&headerType=none#${sxname}any-reality-$hostname$node_name_suffix"
+ar_link="anytls://$uuid@$client_addr:$client_port_ar?security=reality&sni=$ym_vl_re&fp=chrome&pbk=$public_key_s&sid=$short_id_s&type=tcp&headerType=none#$(direct_node_name any-reality)"
 append_share_link "$ar_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "Any-Reality 不套用普通橙云 CDN，Reality SNI/回源逻辑保持独立。"
 echo
@@ -5138,7 +5284,7 @@ sbarpt(){
 cat <<EOF
     {
         "type": "anytls",
-        "tag": "${sxname}any-reality-$hostname$node_name_suffix",
+        "tag": "$(direct_node_name any-reality)",
         "server": "$client_addr",
         "server_port": $client_port_ar,
         "password": "$uuid",
@@ -5162,7 +5308,7 @@ cat <<EOF
 EOF
 }
 sbarpt1(){
-echo "\"${sxname}any-reality-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name any-reality)\","
 }
 fi
 if grep hy2-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
@@ -5184,7 +5330,7 @@ EOF
 else
 hyps=
 fi
-hy2_link="hysteria2://$uuid@$client_addr:$client_port_hy2?security=tls&alpn=h3&insecure=$hy2_link_insecure&allowInsecure=$hy2_link_insecure$hyps&sni=$cert_sni$hy2_pin_arg#${sxname}hy2-$hostname$node_name_suffix"
+hy2_link="hysteria2://$uuid@$client_addr:$client_port_hy2?security=tls&alpn=h3&insecure=$hy2_link_insecure&allowInsecure=$hy2_link_insecure$hyps&sni=$cert_sni$hy2_pin_arg#$(direct_node_name hysteria2)"
 append_share_link "$hy2_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "Hysteria2 使用 UDP/QUIC 语义，不走 Cloudflare 普通橙云 CDN。"
 echo
@@ -5192,7 +5338,7 @@ sbhypt(){
 cat <<EOF
     {
         "type": "hysteria2",
-        "tag": "${sxname}hy2-$hostname$node_name_suffix",
+        "tag": "$(direct_node_name hysteria2)",
         "server": "$client_addr",
         "server_port": $client_port_hy2,
 $(sbhy2ports 2>/dev/null)
@@ -5209,11 +5355,11 @@ $(sbhy2ports 2>/dev/null)
 EOF
 }
 sbhypt1(){
-echo "\"${sxname}hy2-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name hysteria2)\","
 }
 clhypt(){
 cat <<EOF
-- name: ${sxname}hysteria2-$hostname$node_name_suffix
+- name: $(direct_node_name hysteria2)
   type: hysteria2
   server: $client_addr
   port: $client_port_hy2
@@ -5227,14 +5373,14 @@ cat <<EOF
 EOF
 }
 clhypt1(){
-echo "- ${sxname}hysteria2-$hostname$node_name_suffix"
+echo "- $(direct_node_name hysteria2)"
 }
 fi
 if grep tuic5-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
 echo "【 Tuic 】节点信息如下："
 port_tu=$(cat "$HOME/lun/port_tu")
 client_port_tu=$(client_port "$port_tu")
-tuic5_link="tuic://$uuid:$uuid@$client_addr:$client_port_tu?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$cert_sni&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure&allow_insecure=$generic_link_insecure#${sxname}tuic-$hostname$node_name_suffix"
+tuic5_link="tuic://$uuid:$uuid@$client_addr:$client_port_tu?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$cert_sni&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure&allow_insecure=$generic_link_insecure#$(direct_node_name tuic)"
 append_share_link "$tuic5_link"
 [ -f "$HOME/lun/cdnym" ] && cdn_skip "TUIC 使用 UDP/QUIC 语义，不走 Cloudflare 普通橙云 CDN。"
 echo
@@ -5242,7 +5388,7 @@ sbtupt(){
 cat <<EOF
         {
             "type":"tuic",
-            "tag": "${sxname}tuic5-$hostname$node_name_suffix",
+            "tag": "$(direct_node_name tuic)",
             "server": "$client_addr",
             "server_port": $client_port_tu,
             "uuid": "$uuid",
@@ -5264,11 +5410,11 @@ cat <<EOF
 EOF
 }
 sbtupt1(){
-echo "\"${sxname}tuic5-$hostname$node_name_suffix\","
+echo "\"$(direct_node_name tuic)\","
 }
 cltupt(){
 cat <<EOF
-- name: ${sxname}tuic5-$hostname$node_name_suffix
+- name: $(direct_node_name tuic)
   server: $client_addr
   port: $client_port_tu
   type: tuic
@@ -5284,7 +5430,7 @@ cat <<EOF
 EOF
 }
 cltupt1(){
-echo "- ${sxname}tuic5-$hostname$node_name_suffix"
+echo "- $(direct_node_name tuic)"
 }
 fi
 if grep socks5-xr "$HOME/lun/xr.json" >/dev/null 2>&1 || grep socks5-sb "$HOME/lun/sb.json" >/dev/null 2>&1; then
@@ -5313,7 +5459,7 @@ argo_addr=$(json_host "$argo_addr")
 case " $argo_seen " in *" $argo_addr "*) continue ;; esac
 argo_seen="${argo_seen:+$argo_seen }$argo_addr"
 argo_index=$((argo_index + 1))
-argo_suffix="$(endpoint_kind "$argo_addr")-$(printf '%02d' "$argo_index")"
+argo_suffix=$(printf '%02d' "$argo_index")
 argo_entries="$argo_entries $argo_addr|$argo_suffix"
 done
 
@@ -5322,8 +5468,8 @@ if [ "$vlvm" = "Vmess" ]; then
 for argo_entry in $argo_entries; do
 argo_addr=${argo_entry%%|*}
 argo_suffix=${argo_entry#*|}
-tls_name="${sxname}vmess-ws-argo-TLS-443-$hostname-$argo_suffix"
-http_name="${sxname}vmess-ws-argo-HTTP-80-$hostname-$argo_suffix"
+tls_name=$(routed_node_name "vmess-ws-argo-tls-443-ar$argo_suffix")
+http_name=$(routed_node_name "vmess-ws-argo-http-80-ar$argo_suffix")
 tls_link="vmess://$(printf '%s' "{ \"v\": \"2\", \"ps\": \"$tls_name\", \"add\": \"$argo_addr\", \"port\": \"443\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"fp\": \"chrome\"}" | base64 -w0)"
 http_link="vmess://$(printf '%s' "{ \"v\": \"2\", \"ps\": \"$http_name\", \"add\": \"$argo_addr\", \"port\": \"80\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}" | base64 -w0)"
 printf '%s\n%s\n' "$tls_link" "$http_link" >> "$HOME/lun/jhsub.txt"
@@ -5340,7 +5486,7 @@ cat <<EOF
 {
   "server": "$argo_addr",
   "server_port": $argo_port,
-  "tag": "${sxname}vmess-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix",
+  "tag": "$(routed_node_name "vmess-ws-argo-$(printf '%s' "$argo_label" | tr '[:upper:]' '[:lower:]')-$argo_port-ar$argo_suffix")",
   "tls": {"enabled": $argo_tls, "server_name": "$argodomain", "insecure": false, "utls": {"enabled": true, "fingerprint": "chrome"}},
   "packet_encoding": "packetaddr",
   "transport": {"headers": {"Host": ["$argodomain"]}, "path": "/$uuid-vm", "type": "ws"},
@@ -5353,7 +5499,7 @@ done
 done
 }
 sbvmargopt1(){
-for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "\"${sxname}vmess-ws-argo-TLS-443-$hostname-$argo_suffix\","; echo "\"${sxname}vmess-ws-argo-HTTP-80-$hostname-$argo_suffix\","; done
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "\"$(routed_node_name "vmess-ws-argo-tls-443-ar$argo_suffix")\","; echo "\"$(routed_node_name "vmess-ws-argo-http-80-ar$argo_suffix")\","; done
 }
 clvmargopt(){
 for argo_entry in $argo_entries; do
@@ -5361,7 +5507,7 @@ argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
 for argo_mode in tls http; do
 if [ "$argo_mode" = tls ]; then argo_port=443; argo_tls=true; argo_label=TLS; else argo_port=80; argo_tls=false; argo_label=HTTP; fi
 cat <<EOF
-- name: ${sxname}vmess-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix
+- name: $(routed_node_name "vmess-ws-argo-$(printf '%s' "$argo_label" | tr '[:upper:]' '[:lower:]')-$argo_port-ar$argo_suffix")
   type: vmess
   server: "$argo_addr"
   port: $argo_port
@@ -5381,15 +5527,15 @@ done
 done
 }
 clvmargopt1(){
-for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- ${sxname}vmess-ws-argo-TLS-443-$hostname-$argo_suffix"; echo "- ${sxname}vmess-ws-argo-HTTP-80-$hostname-$argo_suffix"; done
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- $(routed_node_name "vmess-ws-argo-tls-443-ar$argo_suffix")"; echo "- $(routed_node_name "vmess-ws-argo-http-80-ar$argo_suffix")"; done
 }
 elif [ "$vlvm" = "Vless" ]; then
 for argo_entry in $argo_entries; do
 argo_addr=${argo_entry%%|*}
 argo_suffix=${argo_entry#*|}
 argo_uri=$(uri_host "$argo_addr")
-tls_link="vless://$uuid@$argo_uri:443?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#${sxname}vless-ws-argo-TLS-443-$hostname-$argo_suffix"
-http_link="vless://$uuid@$argo_uri:80?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=none#${sxname}vless-ws-argo-HTTP-80-$hostname-$argo_suffix"
+tls_link="vless://$uuid@$argo_uri:443?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#$(routed_node_name "vless-ws-argo-tls-443-ar$argo_suffix")"
+http_link="vless://$uuid@$argo_uri:80?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=none#$(routed_node_name "vless-ws-argo-http-80-ar$argo_suffix")"
 printf '%s\n%s\n' "$tls_link" "$http_link" >> "$HOME/lun/jhsub.txt"
 argo_links_display="$argo_links_display
 $tls_link
@@ -5404,7 +5550,7 @@ cat <<EOF
 {
   "server": "$argo_addr",
   "server_port": $argo_port,
-  "tag": "${sxname}vless-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix",
+  "tag": "$(routed_node_name "vless-ws-argo-$(printf '%s' "$argo_label" | tr '[:upper:]' '[:lower:]')-$argo_port-ar$argo_suffix")",
   "type": "vless",
   "uuid": "$uuid",
   "tls": {"enabled": $argo_tls, "server_name": "$argodomain", "insecure": false, "utls": {"enabled": true, "fingerprint": "chrome"}},
@@ -5415,7 +5561,7 @@ done
 done
 }
 sbvmargopt1(){
-for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "\"${sxname}vless-ws-argo-TLS-443-$hostname-$argo_suffix\","; echo "\"${sxname}vless-ws-argo-HTTP-80-$hostname-$argo_suffix\","; done
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "\"$(routed_node_name "vless-ws-argo-tls-443-ar$argo_suffix")\","; echo "\"$(routed_node_name "vless-ws-argo-http-80-ar$argo_suffix")\","; done
 }
 clvmargopt(){
 for argo_entry in $argo_entries; do
@@ -5423,7 +5569,7 @@ argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
 for argo_mode in tls http; do
 if [ "$argo_mode" = tls ]; then argo_port=443; argo_tls=true; argo_label=TLS; else argo_port=80; argo_tls=false; argo_label=HTTP; fi
 cat <<EOF
-- name: ${sxname}vless-ws-argo-$argo_label-$argo_port-$hostname-$argo_suffix
+- name: $(routed_node_name "vless-ws-argo-$(printf '%s' "$argo_label" | tr '[:upper:]' '[:lower:]')-$argo_port-ar$argo_suffix")
   type: vless
   server: "$argo_addr"
   port: $argo_port
@@ -5442,7 +5588,7 @@ done
 done
 }
 clvmargopt1(){
-for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- ${sxname}vless-ws-argo-TLS-443-$hostname-$argo_suffix"; echo "- ${sxname}vless-ws-argo-HTTP-80-$hostname-$argo_suffix"; done
+for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- $(routed_node_name "vless-ws-argo-tls-443-ar$argo_suffix")"; echo "- $(routed_node_name "vless-ws-argo-http-80-ar$argo_suffix")"; done
 }
 fi
 sbtk=$(cat "$HOME/lun/sbargotoken.log" 2>/dev/null)
@@ -5471,13 +5617,13 @@ entry_addr=${entry%%|*}
 entry_suffix=${entry#*|}
 client_addr=$(json_host "$entry_addr")
 client_addr_json=$client_addr
-node_name_suffix="-$entry_suffix"
+node_name_suffix=$(direct_node_suffix "$entry_suffix")
 out=$($f)
 [ -n "$out" ] && printf "%s\n" "$out"
 done
 client_addr=$(uri_host "$client_addr_raw")
 client_addr_json=$(json_host "$client_addr_raw")
-node_name_suffix="-$primary_name_suffix"
+node_name_suffix=$(direct_node_suffix "$primary_name_suffix")
 fi
 }
 sbxy="$(get_func sbvlpt; get_func sbsspt; get_func sbanpt; get_func sbarpt; get_func sbvmpt; get_func sbhypt; get_func sbtupt; get_func sbnvpt; get_func sbvmargopt; cat "$HOME/lun/.cdn_sbox_entries" 2>/dev/null)"
@@ -5751,7 +5897,7 @@ create_rebuild_snapshot(){
 rebuild_snapshot="$HOME/lun/.rebuild_snapshot"
 rm -rf "$rebuild_snapshot"
 mkdir -p "$rebuild_snapshot/lun" "$rebuild_snapshot/services" || return 1
-for rebuild_file in "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* "$HOME/lun"/name "$HOME/lun"/vlvm; do
+for rebuild_file in "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm; do
 [ -e "$rebuild_file" ] || continue
 cp -a "$rebuild_file" "$rebuild_snapshot/lun/" || return 1
 done
@@ -5992,7 +6138,7 @@ done
 printf "是否启用 Argo 隧道？输入 vmpt/vwpt，回车不启用："
 IFS= read -r menu_argo
 case "$menu_argo" in vmpt|vwpt) export argo="$menu_argo" ;; esac
-printf "节点名称前缀，回车不设置："
+printf "服务器管理备注（不加入节点名称），回车不设置："
 IFS= read -r menu_name
 [ -n "$menu_name" ] && export name="$menu_name"
 refresh_protocol_flags
@@ -6127,6 +6273,13 @@ LUN_BLUE=$(tput setaf 4 2>/dev/null)
 LUN_CYAN=$(tput setaf 6 2>/dev/null)
 LUN_WHITE=$(tput setaf 7 2>/dev/null)
 LUN_BOLD=$(tput bold 2>/dev/null)
+if [ "$(tput colors 2>/dev/null || printf 0)" -ge 256 ] 2>/dev/null; then
+LUN_ORANGE=$(tput setaf 208 2>/dev/null)
+LUN_LIME=$(tput setaf 226 2>/dev/null)
+else
+LUN_ORANGE=$LUN_RED
+LUN_LIME=$LUN_YELLOW
+fi
 LUN_RESET=$(tput sgr0 2>/dev/null)
 else
 LUN_RED=
@@ -6136,6 +6289,8 @@ LUN_BLUE=
 LUN_CYAN=
 LUN_WHITE=
 LUN_BOLD=
+LUN_ORANGE=
+LUN_LIME=
 LUN_RESET=
 fi
 green_line(){ printf '%s%s%s\n' "$LUN_GREEN" "$1" "$LUN_RESET"; }
@@ -6862,18 +7017,18 @@ cdn_raw=$(json_host "$cdn_ip")
 cdn_uri=$(uri_host "$cdn_ip")
 if [ "$mode" = "https" ]; then
 cdn_edge_label="HTTPS-$edge_port"
-cdn_name="${sxname}${base_name}-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_name=$(routed_node_name "${base_name}-cdn-https-${edge_port}-cf${cdn_no}")
 cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome#$cdn_name"
 cdn_tls=true
 else
 cdn_edge_label="HTTP-$edge_port"
-cdn_name="${sxname}${base_name}-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_name=$(routed_node_name "${base_name}-cdn-http-${edge_port}-cf${cdn_no}")
 cdn_link="vless://$uuid@$cdn_uri:$edge_port?${query}&host=$xvvmcdnym&security=none#$cdn_name"
 cdn_tls=false
 fi
 echo "$cdn_link" >> "$HOME/lun/jhsub.txt"
 echo "$cdn_link"
-if [ "$base_name" = "vl-xhttp-enc" ]; then
+if [ "$base_name" = "vless-xhttp" ]; then
 cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
 - name: "$cdn_name"
   type: vless
@@ -6892,7 +7047,7 @@ cat >> "$HOME/lun/.cdn_clash_entries" <<EOF
     host: $xvvmcdnym
     mode: auto
 EOF
-elif [ "$base_name" = "vl-ws-enc" ]; then
+elif [ "$base_name" = "vless-ws" ]; then
 cat >> "$HOME/lun/.cdn_sbox_entries" <<EOF
     {
       "type": "vless",
@@ -7027,7 +7182,7 @@ cdn_no=$(printf '%02d' "$cdn_index")
 cdn_kind=$(endpoint_kind "$cdn_ip")
 cdn_raw=$(json_host "$cdn_ip")
 cdn_uri=$(uri_host "$cdn_ip")
-cdn_tcp_name="${sxname}vless-xhttp-tls-CDN-TCP-HTTPS-${edge_port}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_tcp_name=$(routed_node_name "vless-xhttp-tls-tcp-cdn-tcp-${edge_port}-cf${cdn_no}")
 cdn_tcp_link="vless://$uuid@$cdn_uri:$edge_port?encryption=none&security=tls&sni=$xvvmcdnym&host=$xvvmcdnym&alpn=h2,http/1.1&fp=chrome&insecure=0&allowInsecure=0&type=xhttp&path=$uuid-xc&mode=auto#$cdn_tcp_name"
 printf '%s\n' "$cdn_tcp_link" >> "$HOME/lun/jhsub.txt"
 printf '%s\n' "$cdn_tcp_link"
@@ -7055,7 +7210,7 @@ printf -- '- "%s"\n' "$cdn_tcp_name" >> "$HOME/lun/.cdn_clash_names"
 
 if [ "$edge_port" = 443 ] && [ "$edge_h3" = yes ]; then
 cdn_udp_count=$((cdn_udp_count + 1))
-cdn_udp_name="${sxname}vless-xhttp-tls-CDN-UDP-EXP-443-${cdn_kind}-${cdn_no}-$hostname"
+cdn_udp_name=$(routed_node_name "vless-xhttp-tls-tcp-cdn-udp-exp-443-cf${cdn_no}")
 cdn_udp_link="vless://$uuid@$cdn_uri:443?encryption=none&security=tls&sni=$xvvmcdnym&host=$xvvmcdnym&alpn=h3&fp=chrome&insecure=0&allowInsecure=0&type=xhttp&path=$uuid-xc&mode=auto#$cdn_udp_name"
 printf '%s\n' "$cdn_udp_link" >> "$HOME/lun/jhsub.txt"
 printf '%s\n' "$cdn_udp_link"
@@ -7119,12 +7274,12 @@ cdn_kind=$(endpoint_kind "$cdn_ip")
 cdn_raw=$(json_host "$cdn_ip")
 if [ "$mode" = "https" ]; then
 cdn_edge_label="HTTPS-$edge_port"
-cdn_name="${sxname}vm-ws-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_name=$(routed_node_name "vmess-ws-cdn-https-${edge_port}-cf${cdn_no}")
 vm_cdn_json="{ \"v\": \"2\", \"ps\": \"$cdn_name\", \"add\": \"$cdn_raw\", \"port\": \"$edge_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"tls\", \"sni\": \"$xvvmcdnym\", \"fp\": \"chrome\"}"
 cdn_tls=true
 else
 cdn_edge_label="HTTP-$edge_port"
-cdn_name="${sxname}vm-ws-CDN-${cdn_edge_label}-${cdn_kind}-${cdn_no}-$hostname"
+cdn_name=$(routed_node_name "vmess-ws-cdn-http-${edge_port}-cf${cdn_no}")
 vm_cdn_json="{ \"v\": \"2\", \"ps\": \"$cdn_name\", \"add\": \"$cdn_raw\", \"port\": \"$edge_port\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$xvvmcdnym\", \"path\": \"/$uuid-vm\", \"tls\": \"\"}"
 cdn_tls=false
 fi
@@ -7197,19 +7352,28 @@ echo "CDN：未启用"
 fi
 }
 
+lun_banner(){
+banner_cols=$(tput cols 2>/dev/null || printf '80')
+case "$banner_cols" in ''|*[!0-9]*) banner_cols=80 ;; esac
+if [ "$banner_cols" -lt 92 ]; then
+printf '%s%s┌────────────────────────────────────────────────────────────────────┐%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
+printf '%s%s│  L U N  /  风火轮多协议交互面板                                  │%s\n' "$LUN_BOLD" "$LUN_YELLOW" "$LUN_RESET"
+printf '%s%s│  多协议支持  |  安全稳定  |  高速互联                              │%s\n' "$LUN_BOLD" "$LUN_ORANGE" "$LUN_RESET"
+printf '%s%s└────────────────────────────────────────────────────────────────────┘%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
+return
+fi
+printf '%s%s╔══════════════════════════════════════════════════════════════════════════════════════════╗%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
+printf '%s%s║  L       U   U  N   N       %s%s>> F I R E W H E E L // MULTI-PROTOCOL <<%s%s          [NET]  ║%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
+printf '%s%s║  L       U   U  NN  N             %s%s.---.        .---.~~~~>%s%s                   [VPS]  ║%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
+printf '%s%s║  L       U   U  N N N        %s%s---===(  O  )======---%s%s                         [CDN]  ║%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
+printf "%s%s║  LLLLLL   UUU   N  NN             %s%s'---'  > > >%s%s                            [LINK]  ║%s\n" "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
+printf '%s%s║  风火轮多协议交互面板       %s%s多协议支持  |  安全稳定  |  高速互联%s%s                        ║%s\n' "$LUN_BOLD" "$LUN_YELLOW" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
+printf '%s%s╚══════════════════════════════════════════════════════════════════════════════════════════╝%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
+}
+
 lun_dashboard(){
 clear 2>/dev/null || true
-ui_line
-printf '%s%s%s\n' "$LUN_YELLOW" "  _      _   _ _   _            ___        ___        ___        ___ " "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" " | |    | | | | \\ | |          /\\__\\      /\\  \\      /\\  \\      /\\  \\" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" " | |    | | | |  \\| |         /:/  /     /::\\  \\    /::\\  \\    /::\\  \\" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" " | |___ | |_| | |\\  |        /:/  /     /:/\\:\\  \\  /:/\\:\\  \\  /:/\\:\\  \\" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" " |_____| \\___/|_| \\_|       /:/  /  ___ \\:\\~\\ \\  \\/::\\~\\  \\/::\\~\\  \\" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" "                            \\/__/  /\\__\\ \\:\\ \\ \\__/\\:\\ \\ \\__/\\:\\ \\ \\__" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" "  风火轮多协议交互面板          \\/__/  \\:\\ \\ \\__\\/__\\:\\ \\/  \\:\\ \\/__/" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" "                                   \\:\\_\\       \\:\\_\\     \\:\\_\\    \\:\\_\\" "$LUN_RESET"
-printf '%s%s%s\n' "$LUN_YELLOW" "                                    \\/__/       \\/__/      \\/__/     \\/__/" "$LUN_RESET"
-ui_line
+lun_banner
 ui_dash
 printf "系统：%s  内核：%s  架构：%s  虚拟化：%s\n" "$op" "$(uname -r)" "$cpu" "${vi:-unknown}"
 printf "BBR算法：%s\n" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
@@ -7591,6 +7755,66 @@ show_subscription_links
 fi
 }
 
+refresh_identity_subscriptions(){
+cip || return 1
+if multiuser_enabled; then
+multiuser_cmd apply >/dev/null 2>&1 || return 1
+multiuser_service_restart >/dev/null 2>&1 || true
+fi
+if cluster_enabled; then
+case "$(cluster_role 2>/dev/null)" in
+child) cluster_cmd push >/dev/null 2>&1 || true ;;
+master) cluster_refresh_profiles >/dev/null 2>&1 || true ;;
+esac
+fi
+}
+
+server_identity_menu(){
+while :; do
+ensure_server_identity || return 1
+ui_title "Lun 服务器身份 / 节点命名"
+echo "当前地区：$server_place"
+echo "服务器编号：$server_number"
+echo "节点示例：$(routed_node_name vless-xhttp-tls-tcp)"
+[ -s "$HOME/lun/name" ] && echo "管理备注：$(cat "$HOME/lun/name" 2>/dev/null)"
+echo " 1. 自动重新识别地区"
+echo " 2. 手动设置地区"
+echo " 0. 返回"
+printf "请选择 [0-2]："
+IFS= read -r identity_choice
+case "$identity_choice" in
+1|2)
+if cluster_enabled && [ "$(cluster_role 2>/dev/null)" = child ]; then
+yellow_line "当前是已配对子 VPS；地区和编号由主 VPS 统一管理，请在主 VPS 的“地区设置”中修改。"
+ui_pause
+continue
+fi
+if [ "$identity_choice" = 1 ]; then
+v4v6
+identity_place=$(detect_server_place)
+[ "$identity_place" != "未设置地区" ] || { red_line "自动地区识别失败，请使用手动设置。"; ui_pause; continue; }
+else
+printf "地区（例如 德国-法兰克福，输入 0 返回）："
+IFS= read -r identity_place
+[ "$identity_place" = 0 ] && continue
+identity_place=$(sanitize_server_place "$identity_place") || { red_line "地区格式无效。"; ui_pause; continue; }
+fi
+if cluster_enabled && [ "$(cluster_role 2>/dev/null)" = master ]; then
+identity_node_id=$(cluster_config_value node_id)
+cluster_cmd set-location --node-id "$identity_node_id" --region "$identity_place" || { ui_pause; continue; }
+else
+save_server_identity "$identity_place" "$server_number" || { red_line "服务器身份保存失败。"; ui_pause; continue; }
+refresh_identity_subscriptions || { red_line "订阅重建失败，旧代理配置未改变。"; ui_pause; continue; }
+fi
+green_line "服务器身份已保存，个人、多用户和聚合订阅名称已刷新。"
+ui_pause
+;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
 subscription_menu(){
 while :; do
 ui_title "Lun 节点订阅分享"
@@ -7602,13 +7826,15 @@ else
 echo " 2. 设置订阅 token / 端口"
 fi
 echo " 3. 设置订阅 IPv4/IPv6 输出"
+echo " 4. 服务器身份 / 节点命名"
 echo " 0. 返回"
-printf "请选择 [0-3]："
+printf "请选择 [0-4]："
 IFS= read -r c
 case "$c" in
 1) LUN_MENU_ACTION=list; return ;;
 2) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 3 ] && { ui_pause; continue; }; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 3) prompt_subscription_ip_mode; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
+4) server_identity_menu ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -11446,7 +11672,14 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "cluster-prepare-multiuser" ]; then
+if [ "$1" = "cluster-refresh-identity" ]; then
+cip || exit $?
+if multiuser_enabled; then
+multiuser_cmd apply >/dev/null 2>&1 || exit $?
+multiuser_service_restart >/dev/null 2>&1 || true
+fi
+exit 0
+elif [ "$1" = "cluster-prepare-multiuser" ]; then
 if multiuser_enabled; then
 exit 0
 fi

@@ -36,6 +36,8 @@ cat > "$tmp/lun/modules/multiuser/config.json" <<'JSON'
 JSON
 
 collect_lun_firewall_ports "$tmp/lun" "$tmp/actual"
+tr -d '\r' < "$tmp/actual" > "$tmp/actual.normalized"
+mv "$tmp/actual.normalized" "$tmp/actual"
 cat > "$tmp/expected" <<'EOF'
 tcp:20001
 tcp:20002

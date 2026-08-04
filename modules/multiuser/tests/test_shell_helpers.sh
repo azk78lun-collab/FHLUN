@@ -7,6 +7,18 @@ SCRIPT="$ROOT/lun.sh"
 eval "$(sed -n '/^multiuser_quota_g(){/,/^}/p' "$SCRIPT")"
 for helper in \
   normalize_host \
+  host_is_ipv6 \
+  normalize_server_number \
+  sanitize_server_place \
+  address_variant_code \
+  direct_node_suffix \
+  direct_node_name \
+  routed_node_name \
+  uri_host \
+  json_host \
+  sed_escape \
+  sed_replacement_escape \
+  replace_link_addr \
   valid_port_value \
   valid_ipv4_value \
   valid_cdn_endpoint \
@@ -18,6 +30,35 @@ for helper in \
   lun_version_is_older; do
   eval "$(sed -n "/^${helper}(){/,/^}/p" "$SCRIPT")"
 done
+
+[[ $(normalize_server_number 1) == 01 ]]
+[[ $(normalize_server_number 07) == 07 ]]
+[[ $(normalize_server_number 100) == 100 ]]
+! normalize_server_number 0
+[[ $(sanitize_server_place ' 德国 法兰克福 ') == 德国-法兰克福 ]]
+server_number=01
+node_name_prefix='[德国-法兰克福]'
+direct_entry_count=1
+node_name_suffix=$(direct_node_suffix IPv4)
+[[ $(direct_node_name vless-xhttp-tls-tcp) == '[德国-法兰克福]vless-xhttp-tls-tcp-01' ]]
+direct_entry_count=3
+node_name_suffix=$(direct_node_suffix DOMAIN)
+[[ $(direct_node_name vless-xhttp-tls-tcp) == '[德国-法兰克福]vless-xhttp-tls-tcp-D4-01' ]]
+[[ $(routed_node_name 'vless-xhttp-tls-tcp-cdn-tcp-443-cf01') == '[德国-法兰克福]vless-xhttp-tls-tcp-cdn-tcp-443-cf01-01' ]]
+direct_entry_count=2
+client_addr_raw=direct.example.com
+primary_name_suffix=DOMAIN
+node_name_suffix=$(direct_node_suffix "$primary_name_suffix")
+direct_link="vless://uuid@direct.example.com:443#$(direct_node_name vless-xhttp-tls-tcp)"
+replaced_link=$(replace_link_addr "$direct_link" 192.0.2.10 IPv4)
+[[ $replaced_link == 'vless://uuid@192.0.2.10:443#[德国-法兰克福]vless-xhttp-tls-tcp-V4-01' ]]
+direct_entry_count=1
+node_name_suffix=$(direct_node_suffix IPv4)
+protocol_names=
+for protocol in vless-tcp-reality vless-xhttp-reality vless-xhttp vless-ws shadowsocks-2022 anytls any-reality vmess-ws hysteria2 tuic vless-xhttp-tls-udp vless-xhttp-tls-tcp naive-h2 naive-h3; do
+  protocol_names+="$(direct_node_name "$protocol")"$'\n'
+done
+[[ $(printf '%s' "$protocol_names" | sed '/^$/d' | sort | uniq -d | wc -l) -eq 0 ]]
 
 [[ $(multiuser_quota_g 6) == 6G ]]
 [[ $(multiuser_quota_g 6.5) == 6.5G ]]
@@ -71,7 +112,7 @@ grep -q '手动登记已设置的规则（无需 API' "$SCRIPT"
 grep -q '粘贴 Token（输入会显示，0 返回）' "$SCRIPT"
 grep -q '区域 → Origin Rules → 编辑' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.4.2' "$SCRIPT"
+grep -q '当前版本：V26.8.5.2' "$SCRIPT"
 grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"
@@ -83,6 +124,17 @@ grep -q 'set-subscription-port --port' "$SCRIPT"
 grep -q 'sync-subscription-state' "$SCRIPT"
 grep -q 'show-local-subscription' "$SCRIPT"
 grep -q 'token：按设备独立管理' "$SCRIPT"
+grep -q '服务器身份 / 节点命名' "$SCRIPT"
+grep -q '未能自动识别服务器地区' "$SCRIPT"
+grep -q 'vless-xhttp-tls-tcp-cdn-tcp-${edge_port}-cf${cdn_no}' "$SCRIPT"
+grep -q '^lun_banner(){' "$SCRIPT"
+grep -q 'F I R E W H E E L // MULTI-PROTOCOL' "$SCRIPT"
+grep -q 'banner_cols=$(tput cols' "$SCRIPT"
+! grep -q ' _      _   _ _   _            ___' "$SCRIPT"
+grep -q '主 VPS / 子 VPS 角色互换' "$SCRIPT"
+grep -q 'switch-master --node-id' "$SCRIPT"
+! grep -q 'sxname' "$SCRIPT"
+! grep -q '\$hostname\$node_name_suffix' "$SCRIPT"
 grep -q 'multiuser_clear_legacy_subscription_autostart' "$SCRIPT"
 ! grep -q 'ps -ef 2>/dev/null | grep "$showsubport"' "$SCRIPT"
 ! grep -q '输入 ENABLE 确认启用' "$SCRIPT"
@@ -109,7 +161,22 @@ extract_shell_function() {
   ' "$SCRIPT"
 }
 
+eval "$(extract_shell_function lun_banner)"
+LUN_BOLD= LUN_LIME= LUN_YELLOW= LUN_ORANGE= LUN_RESET=
+banner_test_cols=100
+tput() { [[ $1 == cols ]] && printf '%s\n' "$banner_test_cols"; }
+banner_output=$(lun_banner)
+[[ $banner_output == *'F I R E W H E E L // MULTI-PROTOCOL'* ]]
+[[ $banner_output == *'[NET]'* ]]
+banner_test_cols=80
+banner_output=$(lun_banner)
+[[ $banner_output == *'L U N  /  风火轮多协议交互面板'* ]]
+[[ $banner_output != *'[NET]'* ]]
+
 eval "$(extract_shell_function multiuser_prepare_service_port)"
+service_test_home=$(mktemp -d)
+HOME=$service_test_home
+mkdir -p "$HOME/lun"
 multiuser_enabled() { return 0; }
 multiuser_clear_legacy_subscription_autostart() { :; }
 multiuser_config_value() { printf '443\n'; }
@@ -137,6 +204,8 @@ multiuser_prepare_service_port
 
 select_subscription_port() { return 1; }
 ! multiuser_prepare_service_port
+rm -rf "$service_test_home"
+HOME=$original_home
 
 eval "$(extract_shell_function cluster_show_subscription_links)"
 cluster_refresh_profiles() { :; }

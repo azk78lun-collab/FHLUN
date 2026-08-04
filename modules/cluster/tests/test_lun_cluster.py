@@ -107,6 +107,7 @@ class ClusterTestCase(unittest.TestCase):
         rows = self.cluster.nodes()
         self.assertEqual([row["number"] for row in rows], [1, 2])
         self.assertEqual(self.cluster.node("1")["id"], first)
+        self.assertEqual(self.cluster.node("01")["id"], first)
         self.assertEqual(self.cluster.node("2")["id"], second)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -124,20 +125,144 @@ class ClusterTestCase(unittest.TestCase):
             "德国-法兰克福",
         )
 
-    def test_subscription_aggregation_prefixes_and_groups_regions(self) -> None:
+    def test_subscription_aggregation_keeps_canonical_names_and_groups_regions(self) -> None:
         de, hk = "a" * 32, "b" * 32
         self._record_sample(de, "DE", "Frankfurt", "德国")
         self._record_sample(hk, "HK", "Hong Kong", "香港")
         generated = self.cluster.aggregate("all")
-        self.assertIn("%5BDE-Frankfurt%5D%5B%E5%BE%B7%E5%9B%BD%5D", generated["jhsub.txt"])
-        self.assertIn("[HK-Hong Kong][香港]", generated["clmi.yaml"])
+        self.assertIn("[德国-法兰克福]vless-xhttp-tls-tcp-01", generated["jhsub.txt"])
+        self.assertIn("[中国香港-香港]vless-xhttp-tls-tcp-02", generated["clmi.yaml"])
+        self.assertNotIn("[DE-Frankfurt]", generated["jhsub.txt"])
+        self.assertNotIn("[德国]", generated["jhsub.txt"])
         self.assertIn("Lun DE", generated["clmi.yaml"])
         singbox = json.loads(generated["sbox.json"])
         tags = [item["tag"] for item in singbox["outbounds"]]
         self.assertIn("Lun HK", tags)
         region = self.cluster.aggregate("region:DE")
-        self.assertIn("DE-Frankfurt", region["clmi.yaml"])
+        self.assertIn("德国-法兰克福", region["clmi.yaml"])
         self.assertNotIn("Hong Kong", region["clmi.yaml"])
+
+    def test_server_numbers_are_stable_and_never_reused(self) -> None:
+        first, second, third = "a" * 32, "b" * 32, "c" * 32
+        self._add_node(first, "DE")
+        self._add_node(second, "JP")
+        self.cluster.save_config({
+            "enabled": True, "role": "master", "node_id": first, "public_host": "127.0.0.1",
+            "public_port": 20000, "internal_port": 20000,
+        })
+        self.cluster.remove_node(second)
+        self._add_node(third, "US")
+        self.assertEqual(self.cluster.node(first)["server_number"], 1)
+        self.assertEqual(self.cluster.node(third)["server_number"], 3)
+        self.assertEqual(
+            self.cluster.db.connection.execute(
+                "SELECT server_number FROM node_number_history WHERE node_id=?", (second,)
+            ).fetchone()[0],
+            2,
+        )
+
+    def test_local_identity_files_use_chinese_place_and_padded_number(self) -> None:
+        self.cluster.save_config({
+            "enabled": True, "role": "child", "node_id": "a" * 32,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+        })
+        identity = self.cluster.apply_local_identity(7, {
+            "country_code": "DE", "country": "Germany", "region": "Hesse", "city": "Frankfurt",
+        })
+        self.assertEqual(identity["place"], "德国-法兰克福")
+        self.assertEqual((self.root / "server_number").read_text(encoding="utf-8"), "07\n")
+        self.assertEqual((self.root / "server_place").read_text(encoding="utf-8"), "德国-法兰克福\n")
+
+    def test_identity_sync_marker_changes_only_with_number_or_location(self) -> None:
+        node_id = "a" * 32
+        self._add_node(node_id, "DE")
+        row = self.cluster.node(node_id)
+        self.assertTrue(self.cluster.identity_sync_pending(row))
+        self.cluster.mark_identity_synced(row)
+        self.assertFalse(self.cluster.identity_sync_pending(self.cluster.node(node_id)))
+        self.cluster.set_location(node_id, "DE", "德国", "德国-柏林")
+        self.assertTrue(self.cluster.identity_sync_pending(self.cluster.node(node_id)))
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_role_transfer_promotes_child_without_renumbering_and_can_rollback(self) -> None:
+        master_root = Path(self.temporary.name) / "role-master"
+        child_root = Path(self.temporary.name) / "role-child"
+        master_root.mkdir()
+        child_root.mkdir()
+        (master_root / "uuid").write_text("22222222-2222-4222-8222-222222222222", encoding="utf-8")
+        (child_root / "uuid").write_text("33333333-3333-4333-8333-333333333333", encoding="utf-8")
+        master = lun_cluster.Cluster(master_root)
+        child = lun_cluster.Cluster(child_root)
+        try:
+            master_config = master.init_master("127.0.0.1", free_port(), free_port(), "master")
+            child_config = child.init_child("127.0.0.1", free_port(), free_port(), "oracle")
+            certificate = master._sign_csr(
+                (child.pki / "node.csr").read_text(encoding="utf-8"), child_config["node_id"],
+                master.pki / f"issued-{child_config['node_id']}.crt",
+            )
+            (child.pki / "cluster-ca.crt").write_bytes((master.pki / "cluster-ca.crt").read_bytes())
+            (child.pki / "node.crt").write_text(certificate, encoding="utf-8")
+            child_config.update({
+                "cluster_id": master_config["cluster_id"], "controller_id": master_config["node_id"],
+                "controller_host": master_config["public_host"],
+                "controller_port": master_config["public_port"], "paired": True,
+            })
+            child.save_config(child_config)
+            master.upsert_node(child.local_status(), remark="oracle")
+            target = master.node(child_config["node_id"])
+            self.assertEqual(target["server_number"], 2)
+            data = master.build_role_transfer(str(target["id"]))
+            transfer_id = "f" * 32
+            digest = lun_cluster.hashlib.sha256(data).hexdigest()
+            total = (len(data) + lun_cluster.ROLE_TRANSFER_CHUNK - 1) // lun_cluster.ROLE_TRANSFER_CHUNK
+            for index in range(total):
+                chunk = data[index * lun_cluster.ROLE_TRANSFER_CHUNK:(index + 1) * lun_cluster.ROLE_TRANSFER_CHUNK]
+                child.stage_role_transfer({
+                    "transfer_id": transfer_id, "sha256": digest,
+                    "source_id": master_config["node_id"], "target_id": child_config["node_id"],
+                    "index": index, "total": total, "size": len(data),
+                    "data": base64.b64encode(chunk).decode(),
+                }, master_config["node_id"])
+            promoted = child.promote_from_role_transfer(transfer_id, master_config["node_id"])
+            self.assertEqual(promoted["role"], "master")
+            self.assertEqual(child.load_config()["role"], "master")
+            self.assertEqual(child.node(child_config["node_id"])["server_number"], 2)
+            self.assertEqual(child.node(master_config["node_id"])["role"], "child")
+            self.assertTrue((child.pki / "cluster-ca.key").is_file())
+            self.assertFalse((child.role_transfer_dir / transfer_id).exists())
+            child.rollback_role_promotion(master_config["node_id"])
+            self.assertEqual(child.load_config()["role"], "child")
+            self.assertEqual(child.load_config()["controller_id"], master_config["node_id"])
+            self.assertFalse((child.pki / "cluster-ca.key").exists())
+        finally:
+            master.close()
+            child.close()
+
+    def test_controller_transition_requires_current_then_pending_controller(self) -> None:
+        old_id, new_id = "a" * 32, "b" * 32
+        self.cluster.save_config({
+            "enabled": True, "role": "child", "node_id": "c" * 32,
+            "cluster_id": "d" * 32, "controller_id": old_id,
+            "controller_host": "192.0.2.1", "controller_port": 20000,
+            "public_host": "127.0.0.1", "public_port": 21000, "internal_port": 21000,
+            "paired": True,
+        })
+        prepared = lun_cluster.execute_action(self.cluster, {
+            "request_id": "1" * 32, "action": "controller.prepare",
+            "payload": {"controller": {"id": new_id, "host": "198.51.100.2", "port": 22000}},
+        }, old_id)
+        self.assertEqual(prepared["status"], "success")
+        with self.assertRaisesRegex(lun_cluster.ClusterError, "临时授权"):
+            lun_cluster.execute_action(self.cluster, {
+                "request_id": "2" * 32, "action": "controller.commit", "payload": {},
+            }, "e" * 32)
+        lun_cluster.execute_action(self.cluster, {
+            "request_id": "3" * 32, "action": "controller.commit", "payload": {},
+        }, new_id)
+        config = self.cluster.load_config()
+        self.assertEqual(config["controller_id"], new_id)
+        self.assertEqual(config["controller_host"], "198.51.100.2")
+        self.assertNotIn("pending_controller", config)
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_encrypted_backup_detects_wrong_password_and_restores(self) -> None:
@@ -232,14 +357,17 @@ class ClusterTestCase(unittest.TestCase):
         })
 
     def _record_sample(self, node_id: str, country: str, city: str, remark: str) -> None:
+        server_number = self.cluster.allocate_server_number(node_id)
+        place = lun_cluster.chinese_place({"country_code": country, "city": city})
+        name = f"[{place}]vless-xhttp-tls-tcp-{server_number:02d}"
         status = {
             "node_id": node_id, "public_host": "127.0.0.1", "public_port": 20000,
             "internal_port": 20000, "api_version": 1, "remark": remark,
             "location": {"country_code": country, "city": city},
         }
-        generic = "vless://11111111-1111-4111-8111-111111111111@127.0.0.1:443#VLESS\n"
-        clash = """proxies:
-- name: VLESS
+        generic = f"vless://11111111-1111-4111-8111-111111111111@127.0.0.1:443#{name}\n"
+        clash = f"""proxies:
+- name: {name}
   type: vless
   server: 127.0.0.1
   port: 443
@@ -248,12 +376,12 @@ proxy-groups:
 - name: select
   type: select
   proxies:
-    - VLESS
+    - {name}
 rules:
   - MATCH,select
 """
         singbox = json.dumps({
-            "inbounds": [], "outbounds": [{"type": "vless", "tag": "VLESS", "server": "127.0.0.1",
+            "inbounds": [], "outbounds": [{"type": "vless", "tag": name, "server": "127.0.0.1",
                                                "server_port": 443, "uuid": "11111111-1111-4111-8111-111111111111"}],
             "route": {"rules": []},
         })

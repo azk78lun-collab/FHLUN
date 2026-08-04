@@ -44,9 +44,12 @@ from typing import Any, Iterable
 
 
 VERSION = "0.1.0"
-API_VERSION = 1
+API_VERSION = 2
 JOIN_TTL = 15 * 60
 MAX_BODY = 4 * 1024 * 1024
+ROLE_TRANSFER_CHUNK = 512 * 1024
+ROLE_TRANSFER_MAX = 32 * 1024 * 1024
+ROLE_TRANSFER_TTL = 15 * 60
 BACKUP_MAGIC = b"LUNCLUSTER1\0"
 BACKUP_KDF_ITERATIONS = 300_000
 SUBSCRIPTION_FILES = ("jhsub.txt", "clmi.yaml", "sbox.json")
@@ -79,7 +82,10 @@ LUN_ENV_FIELDS = {
 ACTION_NAMES = {
     "status.refresh", "subscription.refresh", "protocol.apply", "service.restart",
     "core.update", "firewall.apply", "script.install", "snapshot.create",
-    "snapshot.restore", "user.sync", "lun.factory-reset", "lun.uninstall",
+    "snapshot.restore", "user.sync", "identity.apply", "lun.factory-reset", "lun.uninstall",
+    "role.stage", "role.discard", "role.promote", "role.rollback", "role.finalize",
+    "role.children-commit", "role.children-revert", "controller.prepare",
+    "controller.commit", "controller.abort", "controller.reassign",
 }
 
 
@@ -177,7 +183,7 @@ def chinese_place(row: dict[str, Any]) -> str:
         return detail
     if country and detail:
         return f"{country}-{detail}"
-    return country or detail or "未设置"
+    return country or detail or "未设置地区"
 
 
 def safe_label(value: str, limit: int = 80) -> str:
@@ -295,6 +301,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS nodes(
               id TEXT PRIMARY KEY,role TEXT NOT NULL DEFAULT 'child',endpoint_host TEXT NOT NULL,
               endpoint_port INTEGER NOT NULL,internal_port INTEGER NOT NULL,remark TEXT NOT NULL DEFAULT '',
+              server_number INTEGER NOT NULL DEFAULT 0,
               expected_uuid TEXT NOT NULL DEFAULT '',country_code TEXT NOT NULL DEFAULT 'ZZ',
               country TEXT NOT NULL DEFAULT '',region TEXT NOT NULL DEFAULT '',city TEXT NOT NULL DEFAULT '',
               provider TEXT NOT NULL DEFAULT '',location_manual INTEGER NOT NULL DEFAULT 0,
@@ -306,6 +313,9 @@ class Database:
             CREATE TABLE IF NOT EXISTS join_tokens(
               token_hash TEXT PRIMARY KEY,expires_at INTEGER NOT NULL,used_at INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS node_number_history(
+              node_id TEXT PRIMARY KEY,server_number INTEGER NOT NULL UNIQUE,allocated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS snapshots(
               node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,profile_key TEXT NOT NULL,
@@ -336,9 +346,37 @@ class Database:
               target TEXT NOT NULL,detail TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created_at DESC);
-            UPDATE schema_meta SET version=1;
+            UPDATE schema_meta SET version=2;
             """
         )
+        node_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(nodes)")}
+        if "server_number" not in node_columns:
+            self.connection.execute("ALTER TABLE nodes ADD COLUMN server_number INTEGER NOT NULL DEFAULT 0")
+        rows = self.connection.execute(
+            "SELECT id,role,server_number,created_at FROM nodes "
+            "ORDER BY CASE role WHEN 'master' THEN 0 ELSE 1 END,created_at,id"
+        ).fetchall()
+        used = {
+            int(row[0]) for row in self.connection.execute(
+                "SELECT server_number FROM node_number_history WHERE server_number>0"
+            )
+        }
+        for row in rows:
+            existing = self.connection.execute(
+                "SELECT server_number FROM node_number_history WHERE node_id=?", (row["id"],)
+            ).fetchone()
+            number = int(existing[0]) if existing else int(row["server_number"] or 0)
+            if number < 1 or (number in used and not existing):
+                number = 1
+                while number in used:
+                    number += 1
+            self.connection.execute(
+                "INSERT INTO node_number_history(node_id,server_number,allocated_at) VALUES(?,?,?) "
+                "ON CONFLICT(node_id) DO NOTHING",
+                (row["id"], number, int(row["created_at"] or utc_now())),
+            )
+            self.connection.execute("UPDATE nodes SET server_number=? WHERE id=?", (number, row["id"]))
+            used.add(number)
         profile_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(profiles)")}
         if "profile_key" not in profile_columns:
             self.connection.execute("ALTER TABLE profiles ADD COLUMN profile_key TEXT NOT NULL DEFAULT 'legacy'")
@@ -375,6 +413,7 @@ class Cluster:
         self.lock_path = self.module / ".lock"
         self.db = Database(self.data / "cluster.db")
         self.db.migrate()
+        self.reconcile_local_identity()
 
     def close(self) -> None:
         self.db.close()
@@ -405,6 +444,121 @@ class Cluster:
         for path in self.pki.glob("*"):
             with contextlib.suppress(OSError):
                 os.chmod(path, 0o600 if path.suffix in {".key", ".csr"} else 0o644)
+
+    def allocate_server_number(self, node_id: str, preferred: int = 0) -> int:
+        row = self.db.connection.execute(
+            "SELECT server_number FROM node_number_history WHERE node_id=?", (node_id,)
+        ).fetchone()
+        if row:
+            return int(row[0])
+        used = {
+            int(item[0]) for item in self.db.connection.execute(
+                "SELECT server_number FROM node_number_history WHERE server_number>0"
+            )
+        }
+        number = int(preferred or 0)
+        if number < 1 or number in used:
+            number = 1
+            while number in used:
+                number += 1
+        with self.db.connection:
+            self.db.connection.execute(
+                "INSERT INTO node_number_history(node_id,server_number,allocated_at) VALUES(?,?,?)",
+                (node_id, number, utc_now()),
+            )
+        return number
+
+    @staticmethod
+    def identity_signature(row: sqlite3.Row | dict[str, Any]) -> str:
+        payload = {
+            "server_number": int(row["server_number"]),
+            "location": {key: str(row[key] or "") for key in (
+                "country_code", "country", "region", "city", "provider"
+            )},
+        }
+        return hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest()
+
+    def mark_identity_synced(self, row: sqlite3.Row | dict[str, Any]) -> None:
+        self.db.set_setting(f"identity-synced:{row['id']}", self.identity_signature(row))
+
+    def identity_sync_pending(self, row: sqlite3.Row | dict[str, Any]) -> bool:
+        return self.db.setting(f"identity-synced:{row['id']}") != self.identity_signature(row)
+
+    @staticmethod
+    def normalize_identity_location(location: dict[str, Any] | None, place: str = "") -> dict[str, str]:
+        source = location if isinstance(location, dict) else {}
+        place = safe_label(place or str(source.get("region", "")))
+        country_code = normalize_country_code(str(source.get("country_code", "")))
+        if country_code == "ZZ":
+            country_code = infer_country_code(place)
+        return {
+            "country_code": country_code,
+            "country": safe_label(str(source.get("country", ""))) or COUNTRY_NAMES_ZH.get(country_code, ""),
+            "region": place or safe_label(str(source.get("region", ""))),
+            "city": safe_label(str(source.get("city", ""))),
+            "provider": safe_label(str(source.get("provider", ""))),
+        }
+
+    def apply_local_identity(self, server_number: int, location: dict[str, Any] | None) -> dict[str, Any]:
+        number = int(server_number)
+        if number < 1:
+            raise ClusterError("服务器编号必须大于 0")
+        normalized = self.normalize_identity_location(location)
+        place = chinese_place(normalized)
+        number_text = f"{number:02d}" if number < 100 else str(number)
+        atomic_write(self.root / "server_number", number_text + "\n")
+        atomic_write(self.root / "server_place", place + "\n")
+        config = self.load_config()
+        if config.get("enabled"):
+            config["server_number"] = number
+            config["location"] = normalized
+            self.save_config(config)
+        return {"server_number": number, "location": normalized, "place": place}
+
+    def rebuild_identity_subscriptions(self) -> None:
+        script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+        if not script.exists():
+            return
+        result = self._run(["bash", str(script), "cluster-refresh-identity"], timeout=300, check=False)
+        if result.returncode:
+            raise ClusterError((result.stderr or result.stdout or "节点名称订阅重建失败")[-2000:])
+
+    def apply_identity_transaction(self, server_number: int, location: dict[str, Any] | None) -> dict[str, Any]:
+        config = self.load_config()
+        old_number = int(config.get("server_number", 1))
+        old_location = config.get("location") if isinstance(config.get("location"), dict) else {}
+        try:
+            identity = self.apply_local_identity(server_number, location)
+            self.rebuild_identity_subscriptions()
+            return identity
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.apply_local_identity(old_number, old_location)
+                self.rebuild_identity_subscriptions()
+            raise
+
+    def reconcile_local_identity(self) -> None:
+        if not self.config_path.exists():
+            return
+        with contextlib.suppress(ClusterError, OSError, ValueError, sqlite3.Error):
+            number_path = self.root / "server_number"
+            place_path = self.root / "server_place"
+            previous_number = number_path.read_text(encoding="utf-8").strip() if number_path.exists() else ""
+            previous_place = place_path.read_text(encoding="utf-8").strip() if place_path.exists() else ""
+            config = self.load_config()
+            node_id = str(config.get("node_id", ""))
+            row = self.db.connection.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+            if row:
+                location = {key: row[key] for key in ("country_code", "country", "region", "city", "provider")}
+                identity = self.apply_local_identity(int(row["server_number"]), location)
+            else:
+                number_text = previous_number or str(config.get("server_number", 1))
+                identity = self.apply_local_identity(
+                    int(number_text or 1), self.normalize_identity_location(config.get("location"), previous_place)
+                )
+            number_text = f"{identity['server_number']:02d}" if identity["server_number"] < 100 else str(identity["server_number"])
+            if previous_number != number_text or previous_place != identity["place"]:
+                self.rebuild_identity_subscriptions()
 
     def _run(self, command: list[str], *, input_text: str | None = None, timeout: int = 60,
              env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -492,6 +646,10 @@ class Cluster:
         host = normalize_host(public_host)
         node_id = random_node_id()
         cluster_id = uuid.uuid4().hex
+        server_number = self.allocate_server_number(node_id, 1)
+        place = (self.root / "server_place").read_text(encoding="utf-8").strip() \
+            if (self.root / "server_place").exists() else ""
+        location = self.normalize_identity_location({}, place)
         self._create_ca(cluster_id)
         _, csr = self._create_key_and_csr("node", node_id)
         self._sign_csr(csr.read_text(encoding="utf-8"), node_id, self.pki / "node.crt")
@@ -499,9 +657,11 @@ class Cluster:
             "enabled": True, "role": "master", "cluster_id": cluster_id, "node_id": node_id,
             "bind": "0.0.0.0", "public_host": host, "internal_port": int(internal_port),
             "public_port": int(public_port or internal_port), "remark": safe_label(remark),
+            "server_number": server_number, "location": location,
             "paired": True, "created_at": utc_now(),
         }
         self.save_config(config)
+        self.apply_local_identity(server_number, location)
         self.upsert_node(self.local_snapshot()["status"], role="master")
         self.ensure_profile("全部节点", "all")
         self.record_local_snapshot()
@@ -514,14 +674,21 @@ class Cluster:
             raise ClusterError("通信端口必须在 1-65535")
         host = normalize_host(public_host)
         node_id = random_node_id()
+        number_path = self.root / "server_number"
+        place_path = self.root / "server_place"
+        number = int(number_path.read_text(encoding="utf-8").strip() or 1) if number_path.exists() else 1
+        place = place_path.read_text(encoding="utf-8").strip() if place_path.exists() else ""
+        location = self.normalize_identity_location({}, place)
         self._create_bootstrap_certificate(node_id)
         config = {
             "enabled": True, "role": "child", "cluster_id": "", "node_id": node_id,
             "bind": "0.0.0.0", "public_host": host, "internal_port": int(internal_port),
             "public_port": int(public_port or internal_port), "remark": safe_label(remark),
+            "server_number": number, "location": location,
             "paired": False, "created_at": utc_now(),
         }
         self.save_config(config)
+        self.apply_local_identity(number, location)
         self.db.audit("cluster.init-child", node_id, f"{host}:{config['public_port']}")
         return {**config, "join_uri": self.create_join_code()}
 
@@ -565,9 +732,10 @@ class Cluster:
             raise ClusterError("节点状态中的端口无效")
         now = utc_now()
         existing = self.db.connection.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        server_number = self.allocate_server_number(node_id, 1 if role == "master" else 0)
         location = status.get("location") if isinstance(status.get("location"), dict) else {}
         values = {
-            "remark": safe_label(remark if remark is not None else status.get("remark", existing["remark"] if existing else "")),
+            "remark": safe_label(remark if remark is not None else (existing["remark"] if existing else status.get("remark", ""))),
             "expected_uuid": safe_label(expected_uuid if expected_uuid is not None else (existing["expected_uuid"] if existing else ""), 64),
             "country_code": normalize_country_code(location.get("country_code", existing["country_code"] if existing else "ZZ")),
             "country": safe_label(location.get("country", existing["country"] if existing else "")),
@@ -578,12 +746,12 @@ class Cluster:
         with self.db.connection:
             self.db.connection.execute(
                 """INSERT INTO nodes(
-                id,role,endpoint_host,endpoint_port,internal_port,remark,expected_uuid,country_code,
+                id,role,endpoint_host,endpoint_port,internal_port,remark,server_number,expected_uuid,country_code,
                 country,region,city,provider,state,last_seen,last_success,snapshot_at,lun_version,
-                api_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                api_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET role=excluded.role,endpoint_host=excluded.endpoint_host,
                 endpoint_port=excluded.endpoint_port,internal_port=excluded.internal_port,
-                remark=excluded.remark,expected_uuid=excluded.expected_uuid,
+                remark=excluded.remark,server_number=excluded.server_number,expected_uuid=excluded.expected_uuid,
                 country_code=CASE WHEN nodes.location_manual=1 THEN nodes.country_code ELSE excluded.country_code END,
                 country=CASE WHEN nodes.location_manual=1 THEN nodes.country ELSE excluded.country END,
                 region=CASE WHEN nodes.location_manual=1 THEN nodes.region ELSE excluded.region END,
@@ -592,7 +760,7 @@ class Cluster:
                 state='online',last_seen=excluded.last_seen,last_success=excluded.last_success,
                 lun_version=excluded.lun_version,api_version=excluded.api_version,updated_at=excluded.updated_at""",
                 (
-                    node_id, role, host, port, internal, values["remark"], values["expected_uuid"],
+                    node_id, role, host, port, internal, values["remark"], server_number, values["expected_uuid"],
                     values["country_code"], values["country"], values["region"], values["city"],
                     values["provider"], "online", now, now, int(status.get("snapshot_at", 0)),
                     safe_label(status.get("lun_version", ""), 32), int(status.get("api_version", API_VERSION)),
@@ -646,9 +814,9 @@ class Cluster:
 
     def node(self, node_id: str) -> sqlite3.Row:
         node_id = node_id.strip().lower()
-        if re.fullmatch(r"[1-9][0-9]{0,3}", node_id):
+        if re.fullmatch(r"0*[1-9][0-9]{0,3}", node_id):
             row = self.db.connection.execute(
-                "SELECT * FROM nodes ORDER BY created_at,id LIMIT 1 OFFSET ?", (int(node_id) - 1,)
+                "SELECT * FROM nodes WHERE server_number=?", (int(node_id),)
             ).fetchone()
         elif re.fullmatch(r"[0-9a-f]{8,31}", node_id):
             rows = self.db.connection.execute(
@@ -664,8 +832,8 @@ class Cluster:
         return row
 
     def nodes(self) -> list[dict[str, Any]]:
-        rows = self.db.connection.execute("SELECT * FROM nodes ORDER BY created_at,id").fetchall()
-        return [{**dict(row), "number": number} for number, row in enumerate(rows, 1)]
+        rows = self.db.connection.execute("SELECT * FROM nodes ORDER BY server_number,id").fetchall()
+        return [{**dict(row), "number": int(row["server_number"])} for row in rows]
 
     def remove_node(self, node_id: str) -> None:
         config = self.load_config()
@@ -691,6 +859,13 @@ class Cluster:
     def local_status(self) -> dict[str, Any]:
         config = self.load_config()
         location = config.get("location", {}) if isinstance(config.get("location"), dict) else {}
+        number_path = self.root / "server_number"
+        server_number = int(number_path.read_text(encoding="utf-8").strip() or 1) \
+            if number_path.exists() else int(config.get("server_number", 1))
+        if not location and (self.root / "server_place").exists():
+            location = self.normalize_identity_location(
+                {}, (self.root / "server_place").read_text(encoding="utf-8").strip()
+            )
         return {
             "node_id": config.get("node_id", ""), "cluster_id": config.get("cluster_id", ""),
             "role": config.get("role", "disabled"), "public_host": config.get("public_host", ""),
@@ -698,6 +873,7 @@ class Cluster:
             "internal_port": int(config.get("internal_port", 0)), "remark": config.get("remark", ""),
             "paired": bool(config.get("paired")), "api_version": API_VERSION,
             "lun_version": self._lun_version(), "snapshot_at": utc_now(), "location": location,
+            "server_number": server_number,
             "uuid": (self.root / "uuid").read_text(encoding="utf-8").strip() if (self.root / "uuid").exists() else "",
         }
 
@@ -773,6 +949,20 @@ class Cluster:
         )]
 
     def refresh_profiles(self, profile_key: str = "legacy") -> list[dict[str, Any]]:
+        config = self.load_config()
+        if config.get("role") == "master":
+            self.record_local_snapshot(profile_key)
+            local = self.node(str(config.get("node_id", "")))
+            self.mark_identity_synced(local)
+            for node in list(self.db.connection.execute(
+                "SELECT * FROM nodes WHERE role='child' ORDER BY server_number,id"
+            )):
+                if not self.identity_sync_pending(node):
+                    continue
+                try:
+                    push_node_identity(self, str(node["id"]))
+                except ClusterError as exc:
+                    self.db.audit("identity.sync.pending", str(node["id"]), str(exc)[-2000:])
         self.ensure_profile("全部节点", "all")
         for row in self.db.connection.execute(
             "SELECT DISTINCT country_code FROM nodes WHERE country_code<>'ZZ' ORDER BY country_code"
@@ -956,25 +1146,12 @@ class Cluster:
 
     @staticmethod
     def node_prefix(node: sqlite3.Row) -> str:
-        place = "-".join(item for item in (node["country_code"], node["city"] or node["region"]) if item and item != "ZZ")
-        place = place or "未知地区"
-        remark = node["remark"] or short_id(node["id"])
-        return f"[{place}][{remark}]"
+        return f"[{chinese_place(dict(node))}]"
 
     @staticmethod
     def _prefix_generic_line(line: str, prefix: str) -> str:
         line = line.strip()
-        if not line:
-            return ""
-        if line.startswith("vmess://"):
-            with contextlib.suppress(ValueError, json.JSONDecodeError, UnicodeError):
-                encoded = line.split("://", 1)[1]
-                payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
-                payload["ps"] = f"{prefix} {payload.get('ps', 'VMess')}"
-                return "vmess://" + base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode()
-        base, marker, fragment = line.partition("#")
-        name = urllib.parse.unquote(fragment) if marker else base.split(":", 1)[0]
-        return base + "#" + urllib.parse.quote(f"{prefix} {name}", safe="")
+        return line
 
     @staticmethod
     def _extract_clash_blocks(text: str, prefix: str) -> list[tuple[str, list[str]]]:
@@ -999,7 +1176,7 @@ class Cluster:
             match = re.match(r"- name:\s*[\"']?(.+?)[\"']?\s*$", block[0])
             if not match:
                 continue
-            name = f"{prefix} {match.group(1)}"
+            name = match.group(1)
             updated = list(block)
             updated[0] = "- name: " + json.dumps(name, ensure_ascii=False)
             result.append((name, updated))
@@ -1043,8 +1220,7 @@ class Cluster:
                         if outbound.get("type") not in PROXY_OUTBOUND_TYPES:
                             continue
                         item = json.loads(json.dumps(outbound))
-                        original = item.get("tag") or item.get("type", "node")
-                        tag = f"{prefix} {original}"
+                        tag = item.get("tag") or item.get("type", "node")
                         if tag in seen_tags:
                             continue
                         item["tag"] = tag
@@ -1114,6 +1290,305 @@ class Cluster:
         for filename, content in generated.items():
             atomic_write(directory / filename, content, 0o644)
         return {name: str(directory / name) for name in generated}
+
+    @property
+    def role_transfer_dir(self) -> Path:
+        return self.module / "role-transfer"
+
+    def create_role_recovery(self, label: str) -> Path:
+        self.backups.mkdir(parents=True, exist_ok=True)
+        target = self.backups / f"role-{safe_slug(label)}-{utc_now()}-{secrets.token_hex(3)}.tar.gz"
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            database_copy = Path(temporary) / "cluster.db"
+            destination = sqlite3.connect(database_copy)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            with tarfile.open(target, "w:gz") as archive:
+                if self.config_path.exists():
+                    archive.add(self.config_path, arcname="config.json", recursive=False)
+                archive.add(database_copy, arcname="data/cluster.db", recursive=False)
+                for path in self.pki.glob("*"):
+                    if path.is_file():
+                        archive.add(path, arcname=f"pki/{path.name}", recursive=False)
+        os.chmod(target, 0o600)
+        return target
+
+    def restore_role_recovery(self, source: Path) -> None:
+        if source.parent.resolve() != self.backups.resolve() or not source.is_file():
+            raise ClusterError("角色切换恢复文件无效")
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            extract = Path(temporary) / "extract"
+            extract.mkdir()
+            with tarfile.open(source, "r:gz") as archive:
+                members = archive.getmembers()
+                allowed = {"config.json", "data/cluster.db"}
+                if not members or any(
+                    not member.isfile() or not (
+                        member.name in allowed
+                        or (member.name.startswith("pki/") and "/" not in member.name[len("pki/"):])
+                    )
+                    for member in members
+                ):
+                    raise ClusterError("角色切换恢复文件内容无效")
+                for member in members:
+                    destination = (extract / member.name).resolve()
+                    if extract.resolve() not in destination.parents:
+                        raise ClusterError("角色切换恢复文件包含不安全路径")
+                archive.extractall(extract)
+            if not (extract / "config.json").is_file() or not (extract / "data" / "cluster.db").is_file():
+                raise ClusterError("角色切换恢复文件不完整")
+            self.db.close()
+            shutil.copy2(extract / "config.json", self.config_path)
+            shutil.copy2(extract / "data" / "cluster.db", self.db.path)
+            if (extract / "pki").exists():
+                shutil.rmtree(self.pki, ignore_errors=True)
+                shutil.copytree(extract / "pki", self.pki)
+        self.db = Database(self.data / "cluster.db")
+        self.db.migrate()
+        self.secure_files()
+
+    def build_role_transfer(self, target_id: str) -> bytes:
+        config = self.load_config()
+        if config.get("role") != "master":
+            raise ClusterError("只有当前主 VPS 可以发起角色互换")
+        target = self.node(target_id)
+        if target["role"] != "child":
+            raise ClusterError("只能把子 VPS 提升为主 VPS")
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            archive_path = Path(temporary) / "role-transfer.tar.gz"
+            database_copy = Path(temporary) / "cluster.db"
+            destination = sqlite3.connect(database_copy)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            manifest = {
+                "format": 1, "api_version": API_VERSION, "created_at": utc_now(),
+                "cluster_id": config.get("cluster_id", ""), "source_id": config.get("node_id", ""),
+                "target_id": str(target["id"]),
+            }
+            manifest_path = Path(temporary) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            with tarfile.open(archive_path, "w:gz") as archive:
+                archive.add(manifest_path, arcname="manifest.json", recursive=False)
+                archive.add(database_copy, arcname="data/cluster.db", recursive=False)
+                for name in ("cluster-ca.crt", "cluster-ca.key"):
+                    path = self.pki / name
+                    if not path.is_file():
+                        raise ClusterError("主 VPS 集群 CA 不完整，无法切换角色")
+                    archive.add(path, arcname=f"pki/{name}", recursive=False)
+            payload = archive_path.read_bytes()
+        if len(payload) > ROLE_TRANSFER_MAX:
+            raise ClusterError("集群控制数据超过 32 MiB，请先清理旧快照或加载备份后再切换")
+        return payload
+
+    def stage_role_transfer(self, payload: dict[str, Any], peer_id: str) -> dict[str, Any]:
+        config = self.load_config()
+        if config.get("role") != "child" or config.get("controller_id") != peer_id:
+            raise ClusterError("只有当前主 VPS 可以向子 VPS 传送接管数据")
+        transfer_id = str(payload.get("transfer_id", ""))
+        digest = str(payload.get("sha256", ""))
+        source_id = str(payload.get("source_id", ""))
+        target_id = str(payload.get("target_id", ""))
+        try:
+            index = int(payload.get("index", -1))
+            total = int(payload.get("total", 0))
+            size = int(payload.get("size", 0))
+        except (TypeError, ValueError) as exc:
+            raise ClusterError("角色切换分片参数无效") from exc
+        if not re.fullmatch(r"[0-9a-f]{32}", transfer_id) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ClusterError("角色切换传输身份无效")
+        if source_id != peer_id or target_id != config.get("node_id"):
+            raise ClusterError("角色切换源或目标身份不匹配")
+        max_chunks = (ROLE_TRANSFER_MAX + ROLE_TRANSFER_CHUNK - 1) // ROLE_TRANSFER_CHUNK
+        if total < 1 or total > max_chunks or index < 0 or index >= total or size < 1 or size > ROLE_TRANSFER_MAX:
+            raise ClusterError("角色切换分片范围无效")
+        try:
+            chunk = base64.b64decode(str(payload.get("data", "")).encode(), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ClusterError("角色切换分片编码无效") from exc
+        if not chunk or len(chunk) > ROLE_TRANSFER_CHUNK:
+            raise ClusterError("角色切换分片大小无效")
+        self.role_transfer_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(self.role_transfer_dir, 0o700)
+        now = utc_now()
+        for directory in self.role_transfer_dir.iterdir():
+            with contextlib.suppress(OSError):
+                if directory.is_dir() and now - int(directory.stat().st_mtime) > ROLE_TRANSFER_TTL:
+                    shutil.rmtree(directory, ignore_errors=True)
+        directory = self.role_transfer_dir / transfer_id
+        directory.mkdir(mode=0o700, exist_ok=True)
+        metadata = {
+            "transfer_id": transfer_id, "sha256": digest, "source_id": source_id,
+            "target_id": target_id, "total": total, "size": size, "created_at": now,
+        }
+        metadata_path = directory / "metadata.json"
+        if metadata_path.exists():
+            try:
+                existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ClusterError("角色切换暂存数据损坏") from exc
+            comparable = {key: existing.get(key) for key in metadata if key != "created_at"}
+            expected = {key: metadata[key] for key in metadata if key != "created_at"}
+            if comparable != expected:
+                raise ClusterError("角色切换分片元数据不一致")
+        else:
+            atomic_write(metadata_path, json.dumps(metadata, ensure_ascii=False) + "\n")
+        atomic_write(directory / f"{index:04d}.part", chunk)
+        received = len(list(directory.glob("*.part")))
+        return {"transfer_id": transfer_id, "received": received, "total": total}
+
+    def _load_staged_role_transfer(self, transfer_id: str, peer_id: str) -> tuple[bytes, dict[str, Any]]:
+        if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+            raise ClusterError("角色切换传输身份无效")
+        directory = self.role_transfer_dir / transfer_id
+        try:
+            metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ClusterError("角色切换数据尚未传输完成") from exc
+        if metadata.get("source_id") != peer_id or metadata.get("target_id") != self.load_config().get("node_id"):
+            raise ClusterError("角色切换暂存身份不匹配")
+        if utc_now() - int(metadata.get("created_at", 0)) > ROLE_TRANSFER_TTL:
+            raise ClusterError("角色切换暂存数据已过期")
+        total = int(metadata.get("total", 0))
+        chunks: list[bytes] = []
+        for index in range(total):
+            path = directory / f"{index:04d}.part"
+            if not path.is_file():
+                raise ClusterError(f"角色切换缺少分片 {index + 1}/{total}")
+            chunks.append(path.read_bytes())
+        data = b"".join(chunks)
+        if len(data) != int(metadata.get("size", 0)) or len(data) > ROLE_TRANSFER_MAX:
+            raise ClusterError("角色切换数据大小不匹配")
+        if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), str(metadata.get("sha256", ""))):
+            raise ClusterError("角色切换数据校验失败")
+        return data, metadata
+
+    def discard_role_transfer(self, transfer_id: str, peer_id: str) -> dict[str, Any]:
+        config = self.load_config()
+        authorized = (
+            (config.get("role") == "child" and config.get("controller_id") == peer_id)
+            or (
+                config.get("role") == "master" and config.get("role_switch_pending")
+                and config.get("role_switch_source_id") == peer_id
+            )
+        )
+        if not authorized or not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+            raise ClusterError("无权清理该角色切换暂存数据")
+        shutil.rmtree(self.role_transfer_dir / transfer_id, ignore_errors=True)
+        return {"discarded": transfer_id}
+
+    def promote_from_role_transfer(self, transfer_id: str, peer_id: str) -> dict[str, Any]:
+        current = self.load_config()
+        if current.get("role") != "child" or current.get("controller_id") != peer_id:
+            raise ClusterError("当前服务器不是该主 VPS 的子 VPS")
+        data, metadata = self._load_staged_role_transfer(transfer_id, peer_id)
+        recovery = self.create_role_recovery("before-promote")
+        replaced = False
+        try:
+            with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+                archive_path = Path(temporary) / "role-transfer.tar.gz"
+                archive_path.write_bytes(data)
+                extract = Path(temporary) / "extract"
+                extract.mkdir()
+                with tarfile.open(archive_path, "r:gz") as archive:
+                    members = archive.getmembers()
+                    allowed = {"manifest.json", "data/cluster.db", "pki/cluster-ca.crt", "pki/cluster-ca.key"}
+                    if {member.name for member in members} != allowed or any(not member.isfile() for member in members):
+                        raise ClusterError("角色切换包内容无效")
+                    for member in members:
+                        destination = (extract / member.name).resolve()
+                        if extract.resolve() not in destination.parents:
+                            raise ClusterError("角色切换包包含不安全路径")
+                    archive.extractall(extract)
+                manifest = json.loads((extract / "manifest.json").read_text(encoding="utf-8"))
+                if (
+                    int(manifest.get("format", 0)) != 1
+                    or int(manifest.get("api_version", 0)) > API_VERSION
+                    or manifest.get("cluster_id") != current.get("cluster_id")
+                    or manifest.get("source_id") != peer_id
+                    or manifest.get("target_id") != current.get("node_id")
+                ):
+                    raise ClusterError("角色切换包与当前集群不匹配")
+                supplied_ca = (extract / "pki" / "cluster-ca.crt").read_bytes()
+                if not (self.pki / "cluster-ca.crt").is_file() or supplied_ca != (self.pki / "cluster-ca.crt").read_bytes():
+                    raise ClusterError("角色切换包的集群 CA 与本机不一致")
+                candidate = sqlite3.connect(extract / "data" / "cluster.db")
+                try:
+                    if candidate.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise ClusterError("角色切换数据库完整性检查失败")
+                    ids = {row[0] for row in candidate.execute("SELECT id FROM nodes")}
+                finally:
+                    candidate.close()
+                if peer_id not in ids or current["node_id"] not in ids:
+                    raise ClusterError("角色切换数据库缺少主机或目标子机")
+                self.db.close()
+                shutil.copy2(extract / "data" / "cluster.db", self.db.path)
+                shutil.copy2(extract / "pki" / "cluster-ca.crt", self.pki / "cluster-ca.crt")
+                shutil.copy2(extract / "pki" / "cluster-ca.key", self.pki / "cluster-ca.key")
+                os.chmod(self.pki / "cluster-ca.crt", 0o644)
+                os.chmod(self.pki / "cluster-ca.key", 0o600)
+                self.db = Database(self.data / "cluster.db")
+                self.db.migrate()
+                replaced = True
+            with self.db.connection:
+                self.db.connection.execute("UPDATE nodes SET role='child' WHERE id=?", (peer_id,))
+                self.db.connection.execute("UPDATE nodes SET role='master' WHERE id=?", (current["node_id"],))
+                self.db.connection.execute(
+                    "UPDATE nodes SET endpoint_host=?,endpoint_port=?,internal_port=?,remark=?,updated_at=? WHERE id=?",
+                    (current["public_host"], int(current["public_port"]), int(current["internal_port"]),
+                     safe_label(str(current.get("remark", ""))), utc_now(), current["node_id"]),
+                )
+            target = self.node(str(current["node_id"]))
+            location = {key: target[key] for key in ("country_code", "country", "region", "city", "provider")}
+            for key in ("controller_id", "controller_host", "controller_port", "pending_controller"):
+                current.pop(key, None)
+            current.update({
+                "role": "master", "paired": True, "server_number": int(target["server_number"]),
+                "location": self.normalize_identity_location(location),
+                "role_switch_pending": True, "role_switch_source_id": peer_id,
+                "role_switch_transfer_id": transfer_id, "role_switch_recovery": str(recovery),
+            })
+            self.save_config(current)
+            self.apply_local_identity(int(target["server_number"]), location)
+            self.db.audit("role.promote", current["node_id"], f"from={short_id(peer_id)}")
+            shutil.rmtree(self.role_transfer_dir / transfer_id, ignore_errors=True)
+            return {"role": "master", "node_id": current["node_id"], "restart_required": True}
+        except Exception:
+            if replaced:
+                with contextlib.suppress(Exception):
+                    self.restore_role_recovery(recovery)
+            raise
+
+    def rollback_role_promotion(self, peer_id: str) -> dict[str, Any]:
+        config = self.load_config()
+        if config.get("role") != "master" or not config.get("role_switch_pending"):
+            raise ClusterError("当前没有待确认的主 VPS 提升")
+        if config.get("role_switch_source_id") != peer_id:
+            raise ClusterError("只有原主 VPS 可以撤销本次提升")
+        recovery = Path(str(config.get("role_switch_recovery", "")))
+        self.restore_role_recovery(recovery)
+        self.db.audit("role.rollback", self.load_config().get("node_id", ""), f"to={short_id(peer_id)}")
+        return {"role": self.load_config().get("role"), "restart_required": True}
+
+    def finalize_role_promotion(self, peer_id: str) -> dict[str, Any]:
+        config = self.load_config()
+        if config.get("role") != "master" or not config.get("role_switch_pending"):
+            raise ClusterError("当前没有待确认的主 VPS 提升")
+        if config.get("role_switch_source_id") != peer_id:
+            raise ClusterError("只有原主 VPS 可以完成本次切换")
+        previous = str(config.pop("role_switch_source_id", ""))
+        recovery = str(config.pop("role_switch_recovery", ""))
+        config.pop("role_switch_transfer_id", None)
+        config.pop("role_switch_pending", None)
+        config["previous_master_id"] = previous
+        self.save_config(config)
+        self.refresh_profiles()
+        self.db.audit("role.finalize", config["node_id"], f"previous={short_id(previous)}")
+        return {"role": "master", "node_id": config["node_id"], "recovery": recovery}
 
     def create_snapshot(self, label: str = "manual") -> Path:
         self.backups.mkdir(parents=True, exist_ok=True)
@@ -1291,7 +1766,7 @@ def print_nodes(rows: list[dict[str, Any]]) -> None:
     values: list[tuple[str, ...]] = []
     for row in rows:
         values.append((
-            str(row.get("number", len(values) + 1)), STATE_NAMES_ZH.get(row["state"], "异常"),
+            f"{int(row.get('number', len(values) + 1)):02d}", STATE_NAMES_ZH.get(row["state"], "异常"),
             "主机" if row["role"] == "master" else "子机", chinese_place(row),
             f"{uri_host(row['endpoint_host'])}:{row['endpoint_port']}", row["remark"] or "-",
             iso_time(row["snapshot_at"]),
@@ -1352,7 +1827,12 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
             raise ClusterError("需要有效的集群客户端证书")
         config = self.cluster.load_config()
         if config.get("role") == "child":
-            if common_name != config.get("controller_id"):
+            pending = config.get("pending_controller") if isinstance(config.get("pending_controller"), dict) else {}
+            pending_valid = (
+                common_name == pending.get("id")
+                and int(pending.get("expires_at", 0)) >= utc_now()
+            )
+            if common_name != config.get("controller_id") and not pending_valid:
                 raise ClusterError("该证书不是当前主 VPS")
         elif config.get("role") == "master":
             row = self.cluster.node(common_name)
@@ -1382,6 +1862,8 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             sys.stderr.write(f"cluster GET failed: {exc}\n")
             self._reply(500, {"ok": False, "error": "internal error"})
+        finally:
+            self.cluster.close()
 
     def do_POST(self) -> None:  # noqa: N802
         try:
@@ -1418,6 +1900,9 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
             elif parsed.path == "/v1/action":
                 result = execute_action(self.cluster, body, peer)
                 self._reply(200, {"ok": True, "result": result})
+                action_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+                if action_result.get("restart_required"):
+                    self.server.restart_requested = True  # type: ignore[attr-defined]
             else:
                 self._reply(404, {"ok": False, "error": "not found"})
         except ClusterError as exc:
@@ -1425,6 +1910,8 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             sys.stderr.write(f"cluster POST failed: {exc}\n")
             self._reply(500, {"ok": False, "error": "internal error"})
+        finally:
+            self.cluster.close()
 
     def _bootstrap_csr(self, parsed: urllib.parse.SplitResult) -> None:
         config = self.cluster.load_config()
@@ -1453,6 +1940,11 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         ca = str(body.get("ca_certificate", ""))
         certificate = str(body.get("node_certificate", ""))
         controller = body.get("controller") if isinstance(body.get("controller"), dict) else {}
+        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        server_number = int(identity.get("server_number", config.get("server_number", 1)))
+        location = identity.get("location") if isinstance(identity.get("location"), dict) else config.get("location", {})
+        if server_number < 1:
+            raise ClusterError("主 VPS 下发的服务器编号无效")
         host = normalize_host(str(controller.get("host", "")))
         port = int(controller.get("port", 0))
         if not valid_port(port) or "BEGIN CERTIFICATE" not in ca or "BEGIN CERTIFICATE" not in certificate:
@@ -1463,10 +1955,19 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         config.update({
             "cluster_id": cluster_id, "controller_id": controller_id,
             "controller_host": host, "controller_port": port, "paired": True,
+            "server_number": server_number,
+            "location": self.cluster.normalize_identity_location(location),
         })
         self.cluster.save_config(config)
+        self.cluster.apply_local_identity(server_number, config["location"])
+        rebuild_error = ""
+        try:
+            self.cluster.rebuild_identity_subscriptions()
+        except ClusterError as exc:
+            rebuild_error = str(exc)
         self.cluster.db.audit("cluster.paired", controller_id, f"{host}:{port}")
-        self._reply(200, {"ok": True, "snapshot": self.cluster.local_snapshot(), "restart_required": True})
+        self._reply(200, {"ok": True, "snapshot": self.cluster.local_snapshot(),
+                          "identity_rebuild_error": rebuild_error, "restart_required": True})
         self.server.restart_requested = True  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -1601,19 +2102,28 @@ def add_node(cluster: Cluster, join_uri: str, remark: str = "", expected_uuid: s
     status = result.get("status") if isinstance(result.get("status"), dict) else {}
     if expected_uuid and status.get("uuid") != expected_uuid:
         raise ClusterError("目标 UUID 与子 VPS 当前 UUID 不一致，已拒绝加入")
+    cluster.upsert_node(status, remark=remark, expected_uuid=expected_uuid)
+    with contextlib.suppress(ClusterError):
+        cluster.geolocate(join["node_id"])
+    pending = cluster.node(join["node_id"])
+    server_number = int(pending["server_number"])
+    location = {key: pending[key] for key in ("country_code", "country", "region", "city", "provider")}
     node_certificate = cluster._sign_csr(str(result.get("csr", "")), join["node_id"], cluster.pki / f"issued-{join['node_id']}.crt")
     completion = bootstrap_request(join, "POST", "/v1/bootstrap/complete", {
         "token": join["token"], "cluster_id": config["cluster_id"], "controller_id": config["node_id"],
         "controller": {"host": config["public_host"], "port": config["public_port"]},
         "ca_certificate": (cluster.pki / "cluster-ca.crt").read_text(encoding="utf-8"),
         "node_certificate": node_certificate,
+        "identity": {"server_number": server_number, "location": location},
     })
     snapshot = completion.get("snapshot") if isinstance(completion.get("snapshot"), dict) else {}
-    cluster.upsert_node(snapshot.get("status", status), remark=remark, expected_uuid=expected_uuid)
     if snapshot:
         cluster.record_snapshot(snapshot)
-    with contextlib.suppress(ClusterError):
-        cluster.geolocate(join["node_id"])
+    rebuild_error = str(completion.get("identity_rebuild_error") or "").strip()
+    if rebuild_error:
+        cluster.db.audit("identity.rebuild.pending", join["node_id"], rebuild_error[-2000:])
+    else:
+        cluster.mark_identity_synced(cluster.node(join["node_id"]))
     cluster.db.audit("node.add", join["node_id"], remark)
     return dict(cluster.node(join["node_id"]))
 
@@ -1622,6 +2132,7 @@ def sync_node(cluster: Cluster, node_id: str, profile: str = "legacy") -> dict[s
     node = cluster.node(node_id)
     resolved_id = str(node["id"])
     try:
+        push_node_identity(cluster, resolved_id)
         result = mutual_request(cluster, node["endpoint_host"], node["endpoint_port"], "GET",
                                 "/v1/snapshot?profile=" + urllib.parse.quote(profile))
         snapshot = result["snapshot"]
@@ -1638,6 +2149,25 @@ def sync_node(cluster: Cluster, node_id: str, profile: str = "legacy") -> dict[s
         raise
 
 
+def push_node_identity(cluster: Cluster, node_id: str) -> dict[str, Any]:
+    row = cluster.node(node_id)
+    location = {key: row[key] for key in ("country_code", "country", "region", "city", "provider")}
+    if row["role"] == "master":
+        identity = cluster.apply_identity_transaction(int(row["server_number"]), location)
+        cluster.record_local_snapshot()
+        cluster.mark_identity_synced(cluster.node(str(row["id"])))
+        return {"identity": identity, "snapshot": cluster.local_snapshot()}
+    result = send_action(cluster, row["id"], "identity.apply", {
+        "server_number": int(row["server_number"]), "location": location,
+    })
+    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else None
+    if snapshot:
+        cluster.record_snapshot(snapshot)
+    cluster.mark_identity_synced(cluster.node(str(row["id"])))
+    return result
+
+
 def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
     config = cluster.load_config()
     if config.get("role") != "child" or not config.get("paired"):
@@ -1646,6 +2176,162 @@ def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
         cluster, config["controller_host"], int(config["controller_port"]), "POST",
         "/v1/events/snapshot", {"snapshot": cluster.local_snapshot(profile)},
     )
+
+
+def send_role_transfer(cluster: Cluster, target_id: str, data: bytes) -> str:
+    target = cluster.node(target_id)
+    config = cluster.load_config()
+    transfer_id = uuid.uuid4().hex
+    digest = hashlib.sha256(data).hexdigest()
+    total = (len(data) + ROLE_TRANSFER_CHUNK - 1) // ROLE_TRANSFER_CHUNK
+    try:
+        for index in range(total):
+            chunk = data[index * ROLE_TRANSFER_CHUNK:(index + 1) * ROLE_TRANSFER_CHUNK]
+            send_action(cluster, str(target["id"]), "role.stage", {
+                "transfer_id": transfer_id, "sha256": digest, "source_id": config["node_id"],
+                "target_id": str(target["id"]), "index": index, "total": total, "size": len(data),
+                "data": base64.b64encode(chunk).decode(),
+            })
+    except Exception:
+        with contextlib.suppress(Exception):
+            send_action(cluster, str(target["id"]), "role.discard", {"transfer_id": transfer_id})
+        raise
+    return transfer_id
+
+
+def wait_for_remote_role(cluster: Cluster, node: sqlite3.Row, role: str, timeout: int = 45) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            result = mutual_request(
+                cluster, node["endpoint_host"], int(node["endpoint_port"]), "GET", "/v1/status", timeout=8
+            )
+            status = result.get("status") if isinstance(result.get("status"), dict) else {}
+            if status.get("node_id") == node["id"] and status.get("role") == role:
+                return status
+            last_error = f"远端角色仍为 {status.get('role', 'unknown')}"
+        except ClusterError as exc:
+            last_error = str(exc)
+        time.sleep(1)
+    raise ClusterError(f"等待新主 VPS 启动超时：{last_error or '无响应'}")
+
+
+def demote_local_master(cluster: Cluster, target_id: str) -> dict[str, Any]:
+    config = cluster.load_config()
+    if config.get("role") != "master":
+        raise ClusterError("当前服务器已经不是主 VPS")
+    target = cluster.node(target_id)
+    if target["role"] != "child":
+        raise ClusterError("目标服务器不是子 VPS")
+    local = cluster.node(str(config.get("node_id", "")))
+    recovery = cluster.create_role_recovery("before-demote")
+    try:
+        with cluster.db.connection:
+            cluster.db.connection.execute("UPDATE nodes SET role='child' WHERE id=?", (local["id"],))
+            cluster.db.connection.execute("UPDATE nodes SET role='master' WHERE id=?", (target["id"],))
+        for key in (
+            "role_switch_pending", "role_switch_source_id", "role_switch_transfer_id",
+            "role_switch_recovery", "previous_master_id", "pending_controller",
+        ):
+            config.pop(key, None)
+        config.update({
+            "role": "child", "paired": True, "controller_id": str(target["id"]),
+            "controller_host": str(target["endpoint_host"]),
+            "controller_port": int(target["endpoint_port"]),
+            "server_number": int(local["server_number"]),
+        })
+        cluster.save_config(config)
+        location = {key: local[key] for key in ("country_code", "country", "region", "city", "provider")}
+        cluster.apply_local_identity(int(local["server_number"]), location)
+        cluster.db.audit("role.demote", str(local["id"]), f"controller={short_id(str(target['id']))}")
+        (cluster.pki / "cluster-ca.key").unlink(missing_ok=True)
+        cluster.secure_files()
+        return {"role": "child", "controller_id": str(target["id"]), "recovery": str(recovery)}
+    except Exception:
+        with contextlib.suppress(Exception):
+            cluster.restore_role_recovery(recovery)
+        raise
+
+
+def switch_master(cluster: Cluster, target_id: str) -> dict[str, Any]:
+    config = cluster.load_config()
+    if config.get("role") != "master":
+        raise ClusterError("只有当前主 VPS 可以发起角色互换")
+    target = cluster.node(target_id)
+    if target["role"] != "child":
+        raise ClusterError("目标必须是当前集群中的子 VPS")
+    target_id = str(target["id"])
+    sync_node(cluster, target_id)
+    target = cluster.node(target_id)
+    controller = {"id": target_id, "host": str(target["endpoint_host"]), "port": int(target["endpoint_port"])}
+    others = [
+        str(row["id"]) for row in cluster.db.connection.execute(
+            "SELECT id FROM nodes WHERE role='child' AND id<>? ORDER BY server_number,id", (target_id,)
+        )
+    ]
+    for node_id in others:
+        sync_node(cluster, node_id)
+    outdated: list[str] = []
+    for node_id in [target_id, *others]:
+        row = cluster.node(node_id)
+        if int(row["api_version"] or 0) < 2:
+            outdated.append(f"{int(row['server_number']):02d}")
+    if outdated:
+        raise ClusterError(
+            "以下服务器的联动程序不支持安全角色互换，请先分别更新：" + ", ".join(outdated)
+        )
+    prepared: list[str] = []
+    promoted = False
+    committed = False
+    transfer_id = ""
+    try:
+        transfer = cluster.build_role_transfer(target_id)
+        transfer_id = send_role_transfer(cluster, target_id, transfer)
+        for node_id in others:
+            send_action(cluster, node_id, "controller.prepare", {"controller": controller})
+            prepared.append(node_id)
+        promoted = True
+        send_action(cluster, target_id, "role.promote", {"transfer_id": transfer_id})
+        time.sleep(5)
+        wait_for_remote_role(cluster, target, "master")
+        if others:
+            send_action(cluster, target_id, "role.children-commit", {"node_ids": others})
+            committed = True
+        demotion = demote_local_master(cluster, target_id)
+    except Exception as exc:
+        rollback_errors: dict[str, str] = {}
+        if promoted and committed:
+            try:
+                send_action(cluster, target_id, "role.children-revert", {"node_ids": others})
+            except Exception as rollback_exc:
+                rollback_errors["children"] = str(rollback_exc)
+        for node_id in prepared:
+            try:
+                send_action(cluster, node_id, "controller.abort", {})
+            except Exception as rollback_exc:
+                rollback_errors[f"abort:{short_id(node_id)}"] = str(rollback_exc)
+        if promoted:
+            try:
+                send_action(cluster, target_id, "role.rollback", {})
+            except Exception as rollback_exc:
+                rollback_errors["target"] = str(rollback_exc)
+        if transfer_id:
+            with contextlib.suppress(Exception):
+                send_action(cluster, target_id, "role.discard", {"transfer_id": transfer_id})
+        detail = {"error": str(exc), "rollback_errors": rollback_errors}
+        raise ClusterError("主 VPS 角色互换失败：" + json_dumps(detail)) from exc
+    finalize_warning = ""
+    try:
+        send_action(cluster, target_id, "role.finalize", {})
+    except ClusterError as exc:
+        finalize_warning = str(exc)
+    return {
+        "old_master": config["node_id"], "new_master": target_id,
+        "new_master_host": str(target["endpoint_host"]),
+        "new_master_port": int(target["endpoint_port"]), "server_number": int(target["server_number"]),
+        "demotion_recovery": demotion["recovery"], "finalize_warning": finalize_warning,
+    }
 
 
 def validate_lun_environment(payload: dict[str, Any]) -> dict[str, str]:
@@ -1701,7 +2387,7 @@ def execute_action(cluster: Cluster, request: dict[str, Any], peer_id: str = "lo
         )
     try:
         with FileLock(cluster.lock_path, timeout=5):
-            result = _execute_action_locked(cluster, action, payload, request)
+            result = _execute_action_locked(cluster, action, payload, request, peer_id)
         status = "success"
         detail = json_dumps(result)[:2000]
     except Exception as exc:
@@ -1725,8 +2411,132 @@ def execute_action(cluster: Cluster, request: dict[str, Any], peer_id: str = "lo
     return {"request_id": request_id, "status": status, "result": result}
 
 
-def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any], request: dict[str, Any],
+                           peer_id: str = "local") -> dict[str, Any]:
     script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+    if action == "role.stage":
+        return cluster.stage_role_transfer(payload, peer_id)
+    if action == "role.discard":
+        return cluster.discard_role_transfer(str(payload.get("transfer_id", "")), peer_id)
+    if action == "role.promote":
+        return cluster.promote_from_role_transfer(str(payload.get("transfer_id", "")), peer_id)
+    if action == "role.rollback":
+        return cluster.rollback_role_promotion(peer_id)
+    if action == "role.finalize":
+        return cluster.finalize_role_promotion(peer_id)
+    if action in {"controller.prepare", "controller.reassign"}:
+        config = cluster.load_config()
+        if config.get("role") != "child" or config.get("controller_id") != peer_id:
+            raise ClusterError("只有当前主 VPS 可以修改子 VPS 的控制器")
+        controller = payload.get("controller") if isinstance(payload.get("controller"), dict) else {}
+        controller_id = str(controller.get("id", ""))
+        if not re.fullmatch(r"[0-9a-f]{32}", controller_id) or controller_id == config.get("node_id"):
+            raise ClusterError("新主 VPS 身份无效")
+        host = normalize_host(str(controller.get("host", "")))
+        try:
+            port = int(controller.get("port", 0))
+        except (TypeError, ValueError) as exc:
+            raise ClusterError("新主 VPS 通信端口无效") from exc
+        if not valid_port(port):
+            raise ClusterError("新主 VPS 通信端口无效")
+        if action == "controller.prepare":
+            config["pending_controller"] = {
+                "id": controller_id, "host": host, "port": port,
+                "expires_at": utc_now() + ROLE_TRANSFER_TTL,
+            }
+            cluster.save_config(config)
+            cluster.db.audit("controller.prepare", config.get("node_id", ""), short_id(controller_id))
+            return {"pending_controller": controller_id, "expires_at": config["pending_controller"]["expires_at"]}
+        config.update({"controller_id": controller_id, "controller_host": host, "controller_port": port})
+        config.pop("pending_controller", None)
+        cluster.save_config(config)
+        cluster.db.audit("controller.reassign", config.get("node_id", ""), short_id(controller_id))
+        return {"controller_id": controller_id}
+    if action == "controller.abort":
+        config = cluster.load_config()
+        if config.get("role") != "child" or config.get("controller_id") != peer_id:
+            raise ClusterError("只有当前主 VPS 可以取消控制器切换")
+        config.pop("pending_controller", None)
+        cluster.save_config(config)
+        cluster.db.audit("controller.abort", config.get("node_id", ""), short_id(peer_id))
+        return {"pending": False}
+    if action == "controller.commit":
+        config = cluster.load_config()
+        pending = config.get("pending_controller") if isinstance(config.get("pending_controller"), dict) else {}
+        if (
+            config.get("role") != "child" or pending.get("id") != peer_id
+            or int(pending.get("expires_at", 0)) < utc_now()
+        ):
+            raise ClusterError("新主 VPS 的临时授权无效或已过期")
+        config.update({
+            "controller_id": peer_id, "controller_host": normalize_host(str(pending.get("host", ""))),
+            "controller_port": int(pending.get("port", 0)),
+        })
+        config.pop("pending_controller", None)
+        cluster.save_config(config)
+        cluster.db.audit("controller.commit", config.get("node_id", ""), short_id(peer_id))
+        return {"controller_id": peer_id}
+    if action in {"role.children-commit", "role.children-revert"}:
+        config = cluster.load_config()
+        if (
+            config.get("role") != "master" or not config.get("role_switch_pending")
+            or config.get("role_switch_source_id") != peer_id
+        ):
+            raise ClusterError("当前不处于该原主 VPS 发起的角色切换中")
+        raw_ids = payload.get("node_ids") if isinstance(payload.get("node_ids"), list) else []
+        node_ids: list[str] = []
+        for value in raw_ids:
+            row = cluster.node(str(value))
+            if row["role"] != "child" or row["id"] in {peer_id, config.get("node_id")}:
+                raise ClusterError("角色切换子机列表包含无效节点")
+            if row["id"] not in node_ids:
+                node_ids.append(str(row["id"]))
+        old = cluster.node(peer_id)
+        old_controller = {
+            "id": peer_id, "host": str(old["endpoint_host"]), "port": int(old["endpoint_port"]),
+        }
+        if action == "role.children-revert":
+            failures: dict[str, str] = {}
+            for node_id in node_ids:
+                try:
+                    send_action(cluster, node_id, "controller.reassign", {"controller": old_controller})
+                except ClusterError as exc:
+                    failures[node_id] = str(exc)
+            if failures:
+                raise ClusterError("部分子 VPS 未能恢复原主控：" + json_dumps(failures))
+            return {"reverted": node_ids}
+        for node_id in node_ids:
+            node = cluster.node(node_id)
+            result = mutual_request(
+                cluster, node["endpoint_host"], node["endpoint_port"], "GET", "/v1/status", timeout=20
+            )
+            if result.get("status", {}).get("node_id") != node_id:
+                raise ClusterError(f"子 VPS {short_id(node_id)} 临时授权验证失败")
+        committed: list[str] = []
+        try:
+            for node_id in node_ids:
+                send_action(cluster, node_id, "controller.commit", {})
+                committed.append(node_id)
+        except ClusterError as exc:
+            rollback_failures: dict[str, str] = {}
+            for node_id in committed:
+                try:
+                    send_action(cluster, node_id, "controller.reassign", {"controller": old_controller})
+                except ClusterError as rollback_exc:
+                    rollback_failures[node_id] = str(rollback_exc)
+            detail = {"error": str(exc), "rollback_failures": rollback_failures}
+            raise ClusterError("子 VPS 控制器提交失败：" + json_dumps(detail)) from exc
+        return {"committed": committed}
+    if action == "identity.apply":
+        try:
+            server_number = int(payload.get("server_number", 0))
+        except (TypeError, ValueError) as exc:
+            raise ClusterError("服务器编号无效") from exc
+        location = payload.get("location") if isinstance(payload.get("location"), dict) else None
+        if server_number < 1 or location is None:
+            raise ClusterError("服务器身份数据无效")
+        identity = cluster.apply_identity_transaction(server_number, location)
+        return {"identity": identity, "snapshot": cluster.local_snapshot()}
     if action == "status.refresh":
         return cluster.local_status()
     if action == "subscription.refresh":
@@ -2035,6 +2845,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove = sub.add_parser("remove-node")
     remove.add_argument("--node-id", required=True)
     remove.add_argument("--confirm", required=True)
+    switch = sub.add_parser("switch-master")
+    switch.add_argument("--node-id", required=True)
+    switch.add_argument("--confirm", required=True)
     sub.add_parser("nodes")
     sync = sub.add_parser("sync")
     sync.add_argument("--node-id", required=True)
@@ -2113,6 +2926,19 @@ def main(argv: list[str] | None = None) -> int:
             cluster.remove_node(row["id"])
             result = {"removed": row["id"]}
             print("子 VPS 已从主 VPS 移除，其旧证书已无法访问控制器。")
+        elif args.command == "switch-master":
+            row = cluster.node(args.node_id)
+            number = f"{int(row['server_number']):02d}" if int(row["server_number"]) < 100 else str(row["server_number"])
+            if args.confirm != f"SWITCH-{number}":
+                raise ClusterError(f"确认文字不匹配，请输入 SWITCH-{number}")
+            result = switch_master(cluster, str(row["id"]))
+            print(
+                f"主 VPS 已切换到服务器 {number}："
+                f"{result['new_master_host']}:{result['new_master_port']}"
+            )
+            print("服务器编号和节点名称保持不变；聚合订阅请改用新主 VPS 地址。")
+            if result.get("finalize_warning"):
+                print("警告：新主 VPS 订阅收尾需要手动刷新：" + result["finalize_warning"])
         elif args.command == "nodes":
             result = cluster.nodes()
             if not args.json:
@@ -2159,10 +2985,12 @@ def main(argv: list[str] | None = None) -> int:
             country = args.country or COUNTRY_NAMES_ZH.get(country_code, row["country"])
             provider = args.provider or row["provider"]
             cluster.set_location(row["id"], country_code, country, args.region, args.city, provider)
+            push_node_identity(cluster, row["id"])
             result = dict(cluster.node(row["id"]))
             print("节点地区已更新。")
         elif args.command == "locate":
             result = cluster.geolocate(args.node_id)
+            push_node_identity(cluster, cluster.node(args.node_id)["id"])
             print("自动地区识别完成。")
         elif args.command == "assign-user":
             node_ids = [item for item in args.nodes.split(",") if item]
