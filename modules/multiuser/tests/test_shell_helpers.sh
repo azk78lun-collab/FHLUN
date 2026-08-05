@@ -36,6 +36,8 @@ done
 [[ $(normalize_server_number 100) == 100 ]]
 ! normalize_server_number 0
 [[ $(sanitize_server_place ' 德国 法兰克福 ') == 德国-法兰克福 ]]
+[[ $(sanitize_server_place '日本-箕面') == 日本-大阪 ]]
+[[ $(sanitize_server_place '日本-大阪1') == 日本-大阪1 ]]
 server_number=01
 node_name_prefix='[德国-法兰克福]'
 direct_entry_count=1
@@ -112,7 +114,7 @@ grep -q '手动登记已设置的规则（无需 API' "$SCRIPT"
 grep -q '粘贴 Token（输入会显示，0 返回）' "$SCRIPT"
 grep -q '区域 → Origin Rules → 编辑' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.5.3' "$SCRIPT"
+grep -q '当前版本：V26.8.5.11' "$SCRIPT"
 grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"
@@ -132,10 +134,21 @@ grep -q 'token：按设备独立管理' "$SCRIPT"
 grep -q '服务器身份 / 节点命名' "$SCRIPT"
 grep -q '未能自动识别服务器地区' "$SCRIPT"
 grep -q 'vless-xhttp-tls-tcp-cdn-tcp-${edge_port}-cf${cdn_no}' "$SCRIPT"
-grep -q '^lun_banner(){' "$SCRIPT"
-grep -q 'F I R E W H E E L // MULTI-PROTOCOL' "$SCRIPT"
-grep -q 'banner_cols=$(tput cols' "$SCRIPT"
+grep -q '^lun_splash(){' "$SCRIPT"
+grep -q '^lun_panel_header(){' "$SCRIPT"
+grep -q '^lun_banner_render_ascii(){' "$SCRIPT"
+grep -q '多协议统一接入 · 多 VPS 集群联动 · 多用户精细管理' "$SCRIPT"
+grep -q '正在准备主面板，完成后自动进入' "$SCRIPT"
+grep -q '^lun_menu_prepare(){' "$SCRIPT"
+grep -q '^lun_menu_screen(){' "$SCRIPT"
+! grep -q '^lun_banner_send_kitty(){' "$SCRIPT"
+! grep -q '^lun_banner_send_wezterm(){' "$SCRIPT"
+! grep -q 'download_lun_banner_asset' "$SCRIPT"
+! grep -q '欢迎界面模式' "$SCRIPT"
+! grep -q '^lun_banner_mode_menu(){' "$SCRIPT"
+grep -q 'banner_cols=${LUN_BANNER_TEST_COLS:-$(tput cols' "$SCRIPT"
 ! grep -q ' _      _   _ _   _            ___' "$SCRIPT"
+! grep -q 'F I R E W H E E L // MULTI-PROTOCOL' "$SCRIPT"
 grep -q '主 VPS / 子 VPS 角色互换' "$SCRIPT"
 grep -q 'switch-master --node-id' "$SCRIPT"
 ! grep -q 'sxname' "$SCRIPT"
@@ -165,18 +178,6 @@ extract_shell_function() {
     }
   ' "$SCRIPT"
 }
-
-eval "$(extract_shell_function lun_banner)"
-LUN_BOLD= LUN_LIME= LUN_YELLOW= LUN_ORANGE= LUN_RESET=
-banner_test_cols=100
-tput() { [[ $1 == cols ]] && printf '%s\n' "$banner_test_cols"; }
-banner_output=$(lun_banner)
-[[ $banner_output == *'F I R E W H E E L // MULTI-PROTOCOL'* ]]
-[[ $banner_output == *'[NET]'* ]]
-banner_test_cols=80
-banner_output=$(lun_banner)
-[[ $banner_output == *'L U N  /  风火轮多协议交互面板'* ]]
-[[ $banner_output != *'[NET]'* ]]
 
 eval "$(extract_shell_function multiuser_prepare_service_port)"
 service_test_home=$(mktemp -d)

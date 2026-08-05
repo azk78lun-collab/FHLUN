@@ -61,9 +61,10 @@ COUNTRY_NAMES_ZH = {
 }
 CITY_NAMES_ZH = {
     "frankfurt": "法兰克福", "hong kong": "香港", "los angeles": "洛杉矶",
-    "minoh": "箕面", "osaka": "大阪", "seoul": "首尔", "singapore": "新加坡",
+    "minoh": "大阪", "osaka": "大阪", "seoul": "首尔", "singapore": "新加坡",
     "tokyo": "东京",
 }
+PLACE_LABEL_ALIASES_ZH = {"日本-箕面": "日本-大阪", "箕面": "大阪"}
 STATE_NAMES_ZH = {"online": "在线", "unreachable": "离线", "unknown": "未连接"}
 PROXY_OUTBOUND_TYPES = {
     "vless", "vmess", "shadowsocks", "anytls", "tuic", "hysteria2", "socks", "naive"
@@ -176,9 +177,10 @@ def infer_country_code(value: str) -> str:
 def chinese_place(row: dict[str, Any]) -> str:
     code = normalize_country_code(str(row.get("country_code", "")))
     country = COUNTRY_NAMES_ZH.get(code, "")
-    detail = safe_label(str(row.get("city") or row.get("region") or ""))
+    detail = canonical_place_label(str(row.get("city") or row.get("region") or ""))
     if detail:
         detail = CITY_NAMES_ZH.get(detail.lower(), detail if re.search(r"[\u3400-\u9fff]", detail) else "")
+        detail = canonical_place_label(detail)
     if country and detail and (detail == country or detail.startswith(country + "-") or detail.startswith(country + " ")):
         return detail
     if country and detail:
@@ -186,9 +188,41 @@ def chinese_place(row: dict[str, Any]) -> str:
     return country or detail or "未设置地区"
 
 
+def numbered_place_labels(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> dict[str, str]:
+    items = [dict(row) for row in rows]
+    items.sort(key=lambda row: (int(row.get("server_number") or row.get("number") or 0), str(row.get("id", ""))))
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in items:
+        groups.setdefault(chinese_place(row), []).append(row)
+    labels: dict[str, str] = {}
+    for place, members in groups.items():
+        for index, row in enumerate(members, 1):
+            labels[str(row.get("id", ""))] = place if len(members) == 1 else f"{place}{index}"
+    return labels
+
+
 def safe_label(value: str, limit: int = 80) -> str:
     value = " ".join(value.replace("\x00", "").split())
     return value[:limit]
+
+
+def canonical_place_label(value: str) -> str:
+    label = safe_label(value)
+    return PLACE_LABEL_ALIASES_ZH.get(label, label)
+
+
+def canonical_subscription_names(value: str) -> str:
+    return value.replace("[日本-箕面]", "[日本-大阪]")
+
+
+def canonicalize_subscription_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return canonical_subscription_names(value)
+    if isinstance(value, list):
+        return [canonicalize_subscription_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: canonicalize_subscription_value(item) for key, item in value.items()}
+    return value
 
 
 def safe_slug(value: str) -> str:
@@ -489,10 +523,20 @@ class Cluster:
             )
         return number
 
-    @staticmethod
-    def identity_signature(row: sqlite3.Row | dict[str, Any]) -> str:
+    def place_labels(self) -> dict[str, str]:
+        rows = self.db.connection.execute(
+            "SELECT * FROM nodes ORDER BY server_number,id"
+        ).fetchall()
+        return numbered_place_labels(rows)
+
+    def identity_place(self, row: sqlite3.Row | dict[str, Any]) -> str:
+        base = chinese_place(dict(row))
+        return self.place_labels().get(str(row.get("id", "") if isinstance(row, dict) else row["id"]), base)
+
+    def identity_signature(self, row: sqlite3.Row | dict[str, Any]) -> str:
         payload = {
             "server_number": int(row["server_number"]),
+            "place": self.identity_place(row),
             "location": {key: str(row[key] or "") for key in (
                 "country_code", "country", "region", "city", "provider"
             )},
@@ -520,12 +564,13 @@ class Cluster:
             "provider": safe_label(str(source.get("provider", ""))),
         }
 
-    def apply_local_identity(self, server_number: int, location: dict[str, Any] | None) -> dict[str, Any]:
+    def apply_local_identity(self, server_number: int, location: dict[str, Any] | None,
+                             place_override: str = "") -> dict[str, Any]:
         number = int(server_number)
         if number < 1:
             raise ClusterError("服务器编号必须大于 0")
         normalized = self.normalize_identity_location(location)
-        place = chinese_place(normalized)
+        place = canonical_place_label(safe_label(place_override, 48)) or chinese_place(normalized)
         number_text = f"{number:02d}" if number < 100 else str(number)
         atomic_write(self.root / "server_number", number_text + "\n")
         atomic_write(self.root / "server_place", place + "\n")
@@ -533,6 +578,7 @@ class Cluster:
         if config.get("enabled"):
             config["server_number"] = number
             config["location"] = normalized
+            config["place"] = place
             self.save_config(config)
         return {"server_number": number, "location": normalized, "place": place}
 
@@ -544,17 +590,19 @@ class Cluster:
         if result.returncode:
             raise ClusterError((result.stderr or result.stdout or "节点名称订阅重建失败")[-2000:])
 
-    def apply_identity_transaction(self, server_number: int, location: dict[str, Any] | None) -> dict[str, Any]:
+    def apply_identity_transaction(self, server_number: int, location: dict[str, Any] | None,
+                                   place_override: str = "") -> dict[str, Any]:
         config = self.load_config()
         old_number = int(config.get("server_number", 1))
         old_location = config.get("location") if isinstance(config.get("location"), dict) else {}
+        old_place = safe_label(str(config.get("place", "")), 48)
         try:
-            identity = self.apply_local_identity(server_number, location)
+            identity = self.apply_local_identity(server_number, location, place_override)
             self.rebuild_identity_subscriptions()
             return identity
         except Exception:
             with contextlib.suppress(Exception):
-                self.apply_local_identity(old_number, old_location)
+                self.apply_local_identity(old_number, old_location, old_place)
                 self.rebuild_identity_subscriptions()
             raise
 
@@ -571,11 +619,14 @@ class Cluster:
             row = self.db.connection.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
             if row:
                 location = {key: row[key] for key in ("country_code", "country", "region", "city", "provider")}
-                identity = self.apply_local_identity(int(row["server_number"]), location)
+                identity = self.apply_local_identity(
+                    int(row["server_number"]), location, self.identity_place(row)
+                )
             else:
                 number_text = previous_number or str(config.get("server_number", 1))
                 identity = self.apply_local_identity(
-                    int(number_text or 1), self.normalize_identity_location(config.get("location"), previous_place)
+                    int(number_text or 1), self.normalize_identity_location(config.get("location"), previous_place),
+                    safe_label(str(config.get("place", "")), 48) or previous_place,
                 )
             number_text = f"{identity['server_number']:02d}" if identity["server_number"] < 100 else str(identity["server_number"])
             if previous_number != number_text or previous_place != identity["place"]:
@@ -1172,6 +1223,21 @@ class Cluster:
     def node_prefix(node: sqlite3.Row) -> str:
         return f"[{chinese_place(dict(node))}]"
 
+    def node_subscription_names(self, value: str, node: sqlite3.Row) -> str:
+        value = canonical_subscription_names(value)
+        base = chinese_place(dict(node))
+        display = self.identity_place(node)
+        return re.sub(r"\[" + re.escape(base) + r"\d*\]", f"[{display}]", value)
+
+    def node_subscription_value(self, value: Any, node: sqlite3.Row) -> Any:
+        if isinstance(value, str):
+            return self.node_subscription_names(value, node)
+        if isinstance(value, list):
+            return [self.node_subscription_value(item, node) for item in value]
+        if isinstance(value, dict):
+            return {key: self.node_subscription_value(item, node) for key, item in value.items()}
+        return value
+
     @staticmethod
     def _prefix_generic_line(line: str, prefix: str) -> str:
         line = line.strip()
@@ -1224,20 +1290,28 @@ class Cluster:
                 (node["id"], profile_key),
             )}
             if "jhsub.txt" in rows:
-                for raw in rows["jhsub.txt"].decode("utf-8", errors="replace").splitlines():
+                generic_text = self.node_subscription_names(
+                    rows["jhsub.txt"].decode("utf-8", errors="replace"), node
+                )
+                for raw in generic_text.splitlines():
                     line = self._prefix_generic_line(raw, prefix)
                     if line and line not in seen_generic:
                         generic.append(line)
                         seen_generic.add(line)
             if "clmi.yaml" in rows:
-                for name, block in self._extract_clash_blocks(rows["clmi.yaml"].decode("utf-8", errors="replace"), prefix):
+                clash_text = self.node_subscription_names(
+                    rows["clmi.yaml"].decode("utf-8", errors="replace"), node
+                )
+                for name, block in self._extract_clash_blocks(clash_text, prefix):
                     if name not in clash_names:
                         clash_names.append(name)
                         clash_blocks.append(block)
                         region_names.setdefault(node["country_code"], []).append(name)
             if "sbox.json" in rows:
                 with contextlib.suppress(json.JSONDecodeError):
-                    data = json.loads(rows["sbox.json"].decode("utf-8"))
+                    data = self.node_subscription_value(
+                        canonicalize_subscription_value(json.loads(rows["sbox.json"].decode("utf-8"))), node
+                    )
                     if singbox_base is None:
                         singbox_base = data
                     for outbound in data.get("outbounds", []):
@@ -1571,7 +1645,9 @@ class Cluster:
                 "role_switch_transfer_id": transfer_id, "role_switch_recovery": str(recovery),
             })
             self.save_config(current)
-            self.apply_local_identity(int(target["server_number"]), location)
+            self.apply_local_identity(
+                int(target["server_number"]), location, self.identity_place(target)
+            )
             self.db.audit("role.promote", current["node_id"], f"from={short_id(peer_id)}")
             shutil.rmtree(self.role_transfer_dir / transfer_id, ignore_errors=True)
             return {"role": "master", "node_id": current["node_id"], "restart_required": True}
@@ -1779,10 +1855,12 @@ class Cluster:
 def print_nodes(rows: list[dict[str, Any]]) -> None:
     headers = ("编号", "状态", "类型", "地区", "地址", "备注", "快照")
     values: list[tuple[str, ...]] = []
+    place_labels = numbered_place_labels(rows)
     for row in rows:
         values.append((
             f"{int(row.get('number', len(values) + 1)):02d}", STATE_NAMES_ZH.get(row["state"], "异常"),
-            "主机" if row["role"] == "master" else "子机", chinese_place(row),
+            "主机" if row["role"] == "master" else "子机",
+            place_labels.get(str(row.get("id", "")), chinese_place(row)),
             f"{uri_host(row['endpoint_host'])}:{row['endpoint_port']}", row["remark"] or "-",
             iso_time(row["snapshot_at"]),
         ))
@@ -1958,6 +2036,7 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
         server_number = int(identity.get("server_number", config.get("server_number", 1)))
         location = identity.get("location") if isinstance(identity.get("location"), dict) else config.get("location", {})
+        place = safe_label(str(identity.get("place", "")), 48)
         if server_number < 1:
             raise ClusterError("主 VPS 下发的服务器编号无效")
         host = normalize_host(str(controller.get("host", "")))
@@ -1972,9 +2051,10 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
             "controller_host": host, "controller_port": port, "paired": True,
             "server_number": server_number,
             "location": self.cluster.normalize_identity_location(location),
+            "place": place,
         })
         self.cluster.save_config(config)
-        self.cluster.apply_local_identity(server_number, config["location"])
+        self.cluster.apply_local_identity(server_number, config["location"], place)
         rebuild_error = ""
         try:
             self.cluster.rebuild_identity_subscriptions()
@@ -2123,13 +2203,14 @@ def add_node(cluster: Cluster, join_uri: str, remark: str = "", expected_uuid: s
     pending = cluster.node(join["node_id"])
     server_number = int(pending["server_number"])
     location = {key: pending[key] for key in ("country_code", "country", "region", "city", "provider")}
+    place = cluster.identity_place(pending)
     node_certificate = cluster._sign_csr(str(result.get("csr", "")), join["node_id"], cluster.pki / f"issued-{join['node_id']}.crt")
     completion = bootstrap_request(join, "POST", "/v1/bootstrap/complete", {
         "token": join["token"], "cluster_id": config["cluster_id"], "controller_id": config["node_id"],
         "controller": {"host": config["public_host"], "port": config["public_port"]},
         "ca_certificate": (cluster.pki / "cluster-ca.crt").read_text(encoding="utf-8"),
         "node_certificate": node_certificate,
-        "identity": {"server_number": server_number, "location": location},
+        "identity": {"server_number": server_number, "location": location, "place": place},
     })
     snapshot = completion.get("snapshot") if isinstance(completion.get("snapshot"), dict) else {}
     if snapshot:
@@ -2167,15 +2248,19 @@ def sync_node(cluster: Cluster, node_id: str, profile: str = "legacy") -> dict[s
 def push_node_identity(cluster: Cluster, node_id: str) -> dict[str, Any]:
     row = cluster.node(node_id)
     location = {key: row[key] for key in ("country_code", "country", "region", "city", "provider")}
+    place = cluster.identity_place(row)
     if row["role"] == "master":
-        identity = cluster.apply_identity_transaction(int(row["server_number"]), location)
+        identity = cluster.apply_identity_transaction(int(row["server_number"]), location, place)
         cluster.record_local_snapshot()
         cluster.mark_identity_synced(cluster.node(str(row["id"])))
         return {"identity": identity, "snapshot": cluster.local_snapshot()}
     result = send_action(cluster, row["id"], "identity.apply", {
-        "server_number": int(row["server_number"]), "location": location,
+        "server_number": int(row["server_number"]), "location": location, "place": place,
     })
     payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    remote_identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    if safe_label(str(remote_identity.get("place", "")), 48) != place:
+        raise ClusterError("子 VPS 未应用同地区编号，请先更新该节点的 Lun 联动模块")
     snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else None
     if snapshot:
         cluster.record_snapshot(snapshot)
@@ -2258,7 +2343,9 @@ def demote_local_master(cluster: Cluster, target_id: str) -> dict[str, Any]:
         })
         cluster.save_config(config)
         location = {key: local[key] for key in ("country_code", "country", "region", "city", "provider")}
-        cluster.apply_local_identity(int(local["server_number"]), location)
+        cluster.apply_local_identity(
+            int(local["server_number"]), location, cluster.identity_place(local)
+        )
         cluster.db.audit("role.demote", str(local["id"]), f"controller={short_id(str(target['id']))}")
         (cluster.pki / "cluster-ca.key").unlink(missing_ok=True)
         cluster.secure_files()
@@ -2548,9 +2635,10 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         except (TypeError, ValueError) as exc:
             raise ClusterError("服务器编号无效") from exc
         location = payload.get("location") if isinstance(payload.get("location"), dict) else None
+        place = safe_label(str(payload.get("place", "")), 48)
         if server_number < 1 or location is None:
             raise ClusterError("服务器身份数据无效")
-        identity = cluster.apply_identity_transaction(server_number, location)
+        identity = cluster.apply_identity_transaction(server_number, location, place)
         return {"identity": identity, "snapshot": cluster.local_snapshot()}
     if action == "status.refresh":
         return cluster.local_status()

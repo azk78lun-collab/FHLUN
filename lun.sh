@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.5.3"
+echo "当前版本：V26.8.5.11"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -185,6 +185,7 @@ sanitize_server_place(){
 place=$(printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/\[//g; s/\]//g; s#[/#?@]#-#g; s/[[:space:]][[:space:]]*/-/g; s/--*/-/g; s/^-//; s/-$//')
 [ -n "$place" ] || return 1
 [ "${#place}" -le 48 ] || return 1
+case "$place" in 日本-箕面) place=日本-大阪 ;; esac
 printf '%s\n' "$place"
 }
 
@@ -202,7 +203,7 @@ server_city_zh(){
 city=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 case "$city" in
 frankfurt) printf '法兰克福\n' ;; "hong kong") printf '香港\n' ;;
-"los angeles") printf '洛杉矶\n' ;; minoh) printf '箕面\n' ;;
+"los angeles") printf '洛杉矶\n' ;; minoh) printf '大阪\n' ;;
 osaka) printf '大阪\n' ;; seoul) printf '首尔\n' ;;
 singapore) printf '新加坡\n' ;; tokyo) printf '东京\n' ;;
 *) return 1 ;;
@@ -6488,12 +6489,17 @@ LUN_BLUE=$(tput setaf 4 2>/dev/null)
 LUN_CYAN=$(tput setaf 6 2>/dev/null)
 LUN_WHITE=$(tput setaf 7 2>/dev/null)
 LUN_BOLD=$(tput bold 2>/dev/null)
-if [ "$(tput colors 2>/dev/null || printf 0)" -ge 256 ] 2>/dev/null; then
+LUN_COLOR_COUNT=$(tput colors 2>/dev/null || printf 0)
+if [ "$LUN_COLOR_COUNT" -ge 256 ] 2>/dev/null; then
 LUN_ORANGE=$(tput setaf 208 2>/dev/null)
 LUN_LIME=$(tput setaf 226 2>/dev/null)
+LUN_BANNER_CYAN=$(tput setaf 51 2>/dev/null)
+LUN_BANNER_WHITE=$(tput setaf 230 2>/dev/null)
 else
-LUN_ORANGE=$LUN_RED
+LUN_ORANGE=$LUN_YELLOW
 LUN_LIME=$LUN_YELLOW
+LUN_BANNER_CYAN=$LUN_CYAN
+LUN_BANNER_WHITE=$LUN_WHITE
 fi
 LUN_RESET=$(tput sgr0 2>/dev/null)
 else
@@ -6506,6 +6512,9 @@ LUN_WHITE=
 LUN_BOLD=
 LUN_ORANGE=
 LUN_LIME=
+LUN_BANNER_CYAN=
+LUN_BANNER_WHITE=
+LUN_COLOR_COUNT=0
 LUN_RESET=
 fi
 green_line(){ printf '%s%s%s\n' "$LUN_GREEN" "$1" "$LUN_RESET"; }
@@ -7567,28 +7576,132 @@ echo "CDN：未启用"
 fi
 }
 
-lun_banner(){
-banner_cols=$(tput cols 2>/dev/null || printf '80')
+# BEGIN Lun banner UI
+lun_banner_dimensions(){
+banner_cols=${LUN_BANNER_TEST_COLS:-$(tput cols 2>/dev/null || printf '80')}
+banner_lines=${LUN_BANNER_TEST_LINES:-$(tput lines 2>/dev/null || printf '32')}
 case "$banner_cols" in ''|*[!0-9]*) banner_cols=80 ;; esac
-if [ "$banner_cols" -lt 92 ]; then
-printf '%s%s┌────────────────────────────────────────────────────────────────────┐%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
-printf '%s%s│  L U N  /  风火轮多协议交互面板                                  │%s\n' "$LUN_BOLD" "$LUN_YELLOW" "$LUN_RESET"
-printf '%s%s│  多协议支持  |  安全稳定  |  高速互联                              │%s\n' "$LUN_BOLD" "$LUN_ORANGE" "$LUN_RESET"
-printf '%s%s└────────────────────────────────────────────────────────────────────┘%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
-return
-fi
-printf '%s%s╔══════════════════════════════════════════════════════════════════════════════════════════╗%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
-printf '%s%s║  L       U   U  N   N       %s%s>> F I R E W H E E L // MULTI-PROTOCOL <<%s%s          [NET]  ║%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
-printf '%s%s║  L       U   U  NN  N             %s%s.---.        .---.~~~~>%s%s                   [VPS]  ║%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
-printf '%s%s║  L       U   U  N N N        %s%s---===(  O  )======---%s%s                         [CDN]  ║%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
-printf "%s%s║  LLLLLL   UUU   N  NN             %s%s'---'  > > >%s%s                            [LINK]  ║%s\n" "$LUN_BOLD" "$LUN_LIME" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
-printf '%s%s║  风火轮多协议交互面板       %s%s多协议支持  |  安全稳定  |  高速互联%s%s                        ║%s\n' "$LUN_BOLD" "$LUN_YELLOW" "$LUN_ORANGE" "$LUN_BOLD" "$LUN_RESET" "$LUN_LIME" "$LUN_RESET"
-printf '%s%s╚══════════════════════════════════════════════════════════════════════════════════════════╝%s\n' "$LUN_BOLD" "$LUN_LIME" "$LUN_RESET"
+case "$banner_lines" in ''|*[!0-9]*) banner_lines=32 ;; esac
+[ "$banner_cols" -gt 0 ] 2>/dev/null || banner_cols=80
+[ "$banner_lines" -gt 0 ] 2>/dev/null || banner_lines=32
 }
 
-lun_dashboard(){
+lun_banner_ascii_size(){
+lun_banner_dimensions
+if [ "$banner_cols" -ge 120 ] 2>/dev/null && [ "$banner_lines" -ge 37 ] 2>/dev/null; then
+printf 'large\n'
+elif [ "$banner_cols" -ge 96 ] 2>/dev/null && [ "$banner_lines" -ge 31 ] 2>/dev/null; then
+printf 'medium\n'
+elif [ "$banner_cols" -ge 72 ] 2>/dev/null && [ "$banner_lines" -ge 25 ] 2>/dev/null; then
+printf 'small\n'
+else
+printf 'compact\n'
+fi
+}
+
+lun_banner_ascii_data(){
+case "$1" in
+small)
+cat <<'LUN_ASCII_SMALL'
+          @C@...-+#####@W@#######**@O@+-...... ..
+       @C@..+*##@#**@W@++*##@O@*++@W@+*###@#@O@+---++--....... ....... ..   ..
+     @C@.-+#@@**+@W@-..@O@..@W@.#*@O@*...@W@.+@O@+++@W@#@#@O@#*****++-..  ........ .. ....... .....
+   @C@..+#@@**#.. .   @W@#*@O@*#      .@W@##@O@-@W@#@#@O@##**++-.-++--..  . ......  ..
+ @C@..-+*@#*####@W@##**+*#@O@-@W@+@O@++@W@-+**#####@O@-#@W@@@#@O@##**+-++-+++*+++-..  .  .......
+ @C@.-+*#@**-..@W@+***+-++++-+**@O@+@W@#*+.@O@.+*-@W@#@##@O@#**+-+--....... ....-......    ..
+@C@..-+*#@**-..   @W@.#-.*.-+++**   @O@..@W@*#@O@-#@W@@@O@##*++-.--+.-........ ...    ..
+ @C@..-*#@#+*-.. .@W@##+**++*#**#. @O@..@W@-#+@O@+@W@@@#@O@##**+-++++++----....-......
+ @C@...-+#@#+**+##*@W@**+.  .+*#*#*@O@-@W@*#@O@++@W@@#@O@#***++---+--........... .....  ..
+   @C@...+*##**#*@W@**-@C@.@W@.@C@.@W@....@O@.@W@.##@O@*@W@#*@O@+@W@#@@O@**+--................. ... ..  .    .
+      @C@...+*#**+++@W@********#**@O@*@W@##@O@#+-+++--+---..... .... ...    ..
+          @C@...-+++-++-@W@+-++-+*+@O@-............        .   .
+LUN_ASCII_SMALL
+;;
+medium)
+cat <<'LUN_ASCII_MEDIUM'
+                @C@....+-**###@W@#*#*##+*---@O@--....  ..  . .
+            @C@...++##@@#@*#+@W@**+*+***@#@@##@O@++.-....+-+....-.....   ...
+          @C@.--*#@W@@@C@@@*+++@W@+.--#@##+@O@++-+-@W@++#@#@@O@**+-+--.-...      .-.   ....... ...     ..
+        @C@.-+*#@W@@@C@##+*@W@+-- @O@....@W@*#+# @O@....@W@.+@O@+*--@W@##@@O@#*#+***+*+-*-...   .  ..       ... ......
+      @C@..**#@##-++.. .     @W@#*+@O@#.      ..*@W@+@O@--@W@#@#@O@#*#++++-.-...   ..--.-.....           .... ... ..
+    @C@..--#@@W@@@C@#**##.        @W@.@++@O@#+        .+@W@@*@O@-+@W@@@##@O@*@W@#@O@***++----++++--..   .  .......   ..
+   @C@..-**@@***@*#@W@###*-@C@.  .@W@##@O@-@W@-@O@-*-   @W@.-*######@O@-+@W@@@@@O@*@W@#@O@***+*++--+.--++-*++--+..    .   .-......
+ @C@...-+*#@****++**@W@#@C@*@W@*###*#.@O@.@W@+*.@O@.@W@+**#*#*+#@O@***@W@#@O@--*@W@@@@O@##***+*-++-+----+-+--......       .          ..
+ @C@..+-**#@*+#.. . @W@.+**+--*+++-+*-#+*@O@+@W@*@O@+@W@+@O@.   *@W@#@O@.+@W@#@###@O@**+*+++-+.----.-...  ....+-+-.-.....
+@C@...+-**#@*+*.-..    .@W@#+..*.   *.+**@O@.     . *@W@#@O@.+@W@#@@O@##***-+--+-+-+--+.-.-....-. ...
+@C@...++**#@*+*-+.-     @W@##.***+-**##+#      @O@..@W@##@O@-+@W@@@##@O@***-+.---+-++-+-+---....  ....      ...
+   @C@..+**@#*+*+...  .@W@##*+*-**+***+-##.  @O@...@W@*@@O@-.@W@#@@@O@##***+*-+--+-----...-.--....+---......
+  @C@...-+-#@#*-*-+..*#*+@W@#**-.  .-*#**+#* @O@..@W@##+@O@-*@W@@@O@##**++*+*----+.....   .... .. .  .......  -..
+   @C@...-.**##+*+*#@*+@W@#*+          +##+@O@*@W@####@O@--@W@#@@O@#+*++---.-..-----....+.-....   ..               .
+     @C@...+-+*##+*-**@W@#@C@+@W@-@C@-.@W@........@O@..@W@-*@@O@*+*-+*@W@@#@O@**++-+-.-........       ....   .-.  ..    .
+        @C@...--*##*+-+*-@W@**#*******#*#*#@O@+-*@W@#@@O@#+++*+*-+---.+.--.....     .. ....      .@C@.
+            @C@...++**++---*@W@+**+*+*+.+@O@-*@W@*##@O@++..........--....       . ..   .
+               @C@.....--+-+.--.@W@-.-+-+--.@O@...........
+LUN_ASCII_MEDIUM
+;;
+large)
+cat <<'LUN_ASCII_LARGE'
+                         @C@......--.--.@W@........@O@..
+                  @C@.---+*#@@@##@W@@@@######@#@######@O@**+--... ....  . .
+               @C@...-**#@@@##*+@W@+--....@O@...-+@W@*+++##@@#+@O@+----.. .-++-------.......    ...
+            @C@..-++*@@W@@@@C@##+*+*@W@+---+*@@##@O@#@W@+@O@+++@W@+@O@+---@W@*##@@#@O@#*+--+-----....        .+.    ........  ...       ..
+           @C@.+++##@W@@@C@##*+.@W@+*+.@O@..... @W@##+** @O@... .@W@.+*@O@+--+@W@##@#@O@#**********++*++-...    .   ..         .-.  ..-....
+        @C@..++*##@W@@@C@#**+++@W@+@C@..@O@.@W@.      @+*@O@+#        .-@W@**@O@.--@W@*@@#@O@#*+***+-+---....     ..------...-..   .          .... .. . . .
+       @C@..-+*#@W@@@C@@**-**...  .      @W@+@+*@O@+@W@#          @O@..*@W@#@O@.-+@W@#@#@O@#####*++-++--....--+-.         .    ..
+     @C@...-+*#@#**.*#@W@#@C@.           @W@##@O@-@W@+@O@-*+          .+@W@#@+@O@.-@W@#@##*#@O@#*+*@W@+@O@+++-...-++++-+--..       ..........    ..
+   @C@..--+**#@W@@@C@@#++@##@W@@####+@C@.     @W@+@+@O@-@W@+@O@.-@W@#@O@.      @W@-###@##@#@O@++@W@#@@@@#@O@#*##*#**+--++-+.-+++**+++++++.      .    .+........
+  @C@....-++*@@*+.#**@W@#@C@#++@W@+@C@*@W@####**##.@O@.@W@-*.@O@..*@W@***#*###*+@O@+@W@*@O@*@W@##@O@.-.@W@#@##@O@**+*++++---.--++---+++++----... .         .
+  @C@.++****@@##+#... .@W@*#*##*#+...@O@.@W@.****-@O@.@W@.+**++**#***  @O@.*@W@#@O@.-+@W@@@@@####@O@###**++++++--+----....  .....--++++--.....        ..
+  @C@...--++#@**.*.. .     @W@+#*..+***.   .#+#*+@O@.-@W@**@O@.     .*@W@#@O@.--@W@#@#@O@#*+++---........  .                ...
+ @C@..-++***@@##.#-- -       @W@#*--.*+     #--#-#@O@-       . #@W@#-@O@--@W@#@@@O@###*****+++++++*--++++---..-.---.  ...
+ @C@....--+*#@**.*.- ..      .@W@#@C@.@W@-.+*+-++*+-*#@O@-@W@#       @O@...@W@##@O@.-.@W@#@#@O@#*++--.. .  ............  .         ...       ....
+  @C@...++**#@W@@@C@##++*--.-     .@W@#@+@C@.@W@###.-. .###*@O@+@W@#      @O@.- +@W@@#@O@---@W@@@@####@O@###***+++***++-+++++----.-....-+++--......
+    @C@....++#@W@@@C@#*.*+--..   .@W@@#++++-**+*+**+-*@O@.*@W@#+   @O@.. @W@-#@@O@.--@W@#@@O@##*++++-+---..---+-.---.....---....
+   @C@.----++*@@*+-+*++ ..#@W@@@C@*+@W@*@C@+@W@*#*.    .*##*++@O@+@W@##  @O@. +@W@#@-@O@--@W@#@#@O@###*******++-----....      --..  .. .   .........  .-..
+   @C@.......+*@@++--***#@#++@W@*#*.          -##*-+*@***##.@O@--@W@#@@O@#****+++--+-.....--+---...--......    ...
+     @C@.....-+*#@*++-*##+.*@W@#+ @C@..           @O@.@W@.*#*@O@.+@W@###-@O@.-+@W@@@@O@*+++--......   .....-...  .........    ...                  .
+       @C@....+***##***-**#@W@#@C@+@W@*-@C@..@W@..@C@.@W@.......@O@..@W@.-#@#@O@**-@W@-@O@+-@W@#@@@O@**++++++--.--... ....         ......    --   ...    .
+          @C@.....--###---.-+*@W@*******++-++**###**+@O@-@W@+@O@-+@W@*##@O@+++---+++-----++------..        ..    . .
+            @C@....--*##**++++.-@W@*+***##***#***--@O@+@W@+@O@*@W@###@O@*+++--.--.-....---...   . ...  . ..    ..          ..@C@.
+                  @C@....++***-..+++-@W@----+++-.-***#@O@*++-.---...--.. .....               .     .
+                      @C@.....---+++@W@-@C@.@W@-.--+++-@O@.....
+LUN_ASCII_LARGE
+;;
+*) return 1 ;;
+esac
+}
+
+lun_banner_render_ascii(){
+banner_ascii_size=$1
+lun_banner_ascii_data "$banner_ascii_size" | awk -v c="$LUN_BANNER_CYAN" -v w="$LUN_BANNER_WHITE" -v o="$LUN_ORANGE" -v r="$LUN_RESET" '{gsub(/@C@/,c); gsub(/@W@/,w); gsub(/@O@/,o); print $0 r}'
+}
+
+lun_banner_caption(){
+printf '%s%sLun%s %s· 风火轮多协议交互面板%s\n' "$LUN_BOLD" "$LUN_BANNER_CYAN" "$LUN_RESET" "$LUN_BANNER_WHITE" "$LUN_RESET"
+printf '%s多协议统一接入 · 多 VPS 集群联动 · 多用户精细管理%s\n' "$LUN_ORANGE" "$LUN_RESET"
+}
+
+lun_panel_header(){
+printf '%s%sLun%s %s· 风火轮多协议交互面板%s\n' "$LUN_BOLD" "$LUN_BANNER_CYAN" "$LUN_RESET" "$LUN_BANNER_WHITE" "$LUN_RESET"
+printf '%s多协议统一接入 · 多 VPS 集群联动 · 多用户精细管理%s\n' "$LUN_ORANGE" "$LUN_RESET"
+}
+
+lun_splash(){
+if { [ ! -t 0 ] || [ ! -t 1 ]; } && [ "${LUN_BANNER_ALLOW_NONTTY:-}" != 1 ]; then
+return
+fi
+[ "${TERM:-}" != dumb ] || return 0
+banner_ascii_size=$(lun_banner_ascii_size)
+[ "$banner_ascii_size" != compact ] || return 0
 clear 2>/dev/null || true
-lun_banner
+lun_banner_render_ascii "$banner_ascii_size"
+lun_banner_caption
+printf '\n%s正在准备主面板，完成后自动进入…%s' "$LUN_BANNER_WHITE" "$LUN_RESET"
+}
+# END Lun banner UI
+
+lun_dashboard_render(){
+lun_panel_header
 ui_dash
 printf "系统：%s  内核：%s  架构：%s  虚拟化：%s\n" "$op" "$(uname -r)" "$cpu" "${vi:-unknown}"
 printf "BBR算法：%s\n" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
@@ -7627,6 +7740,44 @@ ui_dash
 echo "协议概览："
 show_protocol_summary
 ui_dash
+}
+
+lun_menu_options(){
+echo " 1. 安装 / 协议管理"
+printf " 2. %s节点订阅分享%s\n" "$LUN_GREEN" "$LUN_RESET"
+echo " 3. 入口网络管理"
+echo " 4. 服务与更新"
+echo " 5. 高级设置"
+printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 7. %s网站访问监控%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 8. %s服务器联动 / 节点集群%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 9. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
+echo " 0. 退出"
+}
+
+lun_menu_prepare(){
+LUN_MENU_PREFILL_FILE=
+menu_prefill=$(mktemp "${TMPDIR:-/tmp}/lun-menu.XXXXXX" 2>/dev/null) || return 0
+chmod 600 "$menu_prefill" 2>/dev/null || true
+if { lun_dashboard_render; lun_menu_options; } > "$menu_prefill"; then
+LUN_MENU_PREFILL_FILE=$menu_prefill
+else
+rm -f "$menu_prefill"
+fi
+}
+
+lun_menu_screen(){
+clear 2>/dev/null || true
+if [ -n "${LUN_MENU_PREFILL_FILE:-}" ] && [ -s "$LUN_MENU_PREFILL_FILE" ]; then
+cat "$LUN_MENU_PREFILL_FILE"
+rm -f "$LUN_MENU_PREFILL_FILE"
+LUN_MENU_PREFILL_FILE=
+else
+[ -z "${LUN_MENU_PREFILL_FILE:-}" ] || rm -f "$LUN_MENU_PREFILL_FILE"
+LUN_MENU_PREFILL_FILE=
+lun_dashboard_render
+lun_menu_options
+fi
 }
 
 prompt_service_domain(){
@@ -11843,17 +11994,7 @@ done
 
 lun_menu(){
 while :; do
-lun_dashboard
-echo " 1. 安装 / 协议管理"
-printf " 2. %s节点订阅分享%s\n" "$LUN_GREEN" "$LUN_RESET"
-echo " 3. 入口网络管理"
-echo " 4. 服务与更新"
-echo " 5. 高级设置"
-printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 7. %s网站访问监控%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 8. %s服务器联动 / 节点集群%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 9. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
-echo " 0. 退出"
+lun_menu_screen
 ui_line
 printf "请输入数字【0-9】："
 IFS= read -r menu_choice
@@ -11874,6 +12015,8 @@ done
 }
 
 if [ "$LUN_MENU_REQUEST" = yes ]; then
+lun_splash
+lun_menu_prepare
 lun_menu
 case "$LUN_MENU_ACTION" in
 install) set -- ;;

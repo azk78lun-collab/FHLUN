@@ -117,7 +117,8 @@ class ClusterTestCase(unittest.TestCase):
         self.assertIn("编号", text)
         self.assertIn("在线", text)
         self.assertIn("离线", text)
-        self.assertIn("日本-箕面", text)
+        self.assertIn("日本-大阪", text)
+        self.assertNotIn("日本-箕面", text)
         self.assertIn("美国-洛杉矶", text)
         self.assertNotIn(first[:8], text)
         self.assertEqual(lun_cluster.infer_country_code("美国-洛杉矶"), "US")
@@ -157,6 +158,62 @@ class ClusterTestCase(unittest.TestCase):
         self.assertIn("德国-法兰克福", region["clmi.yaml"])
         self.assertNotIn("Hong Kong", region["clmi.yaml"])
 
+    def test_minoh_names_are_canonicalized_to_osaka_in_all_subscriptions(self) -> None:
+        node_id = "c" * 32
+        server_number = self.cluster.allocate_server_number(node_id)
+        old_name = f"[日本-箕面]naive-h3-{server_number:02d}"
+        status = {
+            "node_id": node_id, "public_host": "127.0.0.1", "public_port": 20000,
+            "internal_port": 20000, "api_version": 1,
+            "location": {"country_code": "JP", "region": "Osaka", "city": "Minoh"},
+        }
+        generic = f"naive+quic://uuid:uuid@127.0.0.1:443#{old_name}\n"
+        clash = f"proxies:\n- name: {old_name}\n  type: vless\nproxy-groups:\n"
+        singbox = json.dumps({
+            "inbounds": [], "outbounds": [{"type": "naive", "tag": old_name}],
+            "route": {"rules": []},
+        })
+        self.cluster.record_snapshot({
+            "status": status, "profile_key": "legacy", "files": {
+                "jhsub.txt": base64.b64encode(generic.encode()).decode(),
+                "clmi.yaml": base64.b64encode(clash.encode()).decode(),
+                "sbox.json": base64.b64encode(singbox.encode()).decode(),
+            },
+        })
+        generated = self.cluster.aggregate("all")
+        for content in generated.values():
+            self.assertNotIn("日本-箕面", content)
+        self.assertIn("[日本-大阪]naive-h3", generated["jhsub.txt"])
+        self.assertIn("[日本-大阪]naive-h3", generated["clmi.yaml"])
+        self.assertIn("[日本-大阪]naive-h3", generated["sbox.json"])
+
+    def test_duplicate_places_are_numbered_in_all_subscription_formats(self) -> None:
+        first, second = "d" * 32, "e" * 32
+        self._record_sample(first, "JP", "Osaka", "Osaka-A")
+        self._record_sample(second, "JP", "Minoh", "Osaka-B")
+        labels = self.cluster.place_labels()
+        self.assertEqual(labels[first], "日本-大阪1")
+        self.assertEqual(labels[second], "日本-大阪2")
+        generated = self.cluster.aggregate("all")
+        for content in generated.values():
+            self.assertIn("[日本-大阪1]vless-xhttp-tls-tcp-01", content)
+            self.assertIn("[日本-大阪2]vless-xhttp-tls-tcp-02", content)
+            self.assertNotIn("[日本-大阪]vless-xhttp", content)
+
+    def test_duplicate_place_changes_identity_signature_and_node_view(self) -> None:
+        first, second = "d" * 32, "e" * 32
+        self._add_node(first, "JP")
+        self.cluster.set_location(first, "JP", "日本", "Osaka", "Minoh")
+        self.cluster.mark_identity_synced(self.cluster.node(first))
+        self._add_node(second, "JP")
+        self.cluster.set_location(second, "JP", "日本", "Osaka", "Osaka")
+        self.assertTrue(self.cluster.identity_sync_pending(self.cluster.node(first)))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            lun_cluster.print_nodes(self.cluster.nodes())
+        self.assertIn("日本-大阪1", output.getvalue())
+        self.assertIn("日本-大阪2", output.getvalue())
+
     def test_server_numbers_are_stable_and_never_reused(self) -> None:
         first, second, third = "a" * 32, "b" * 32, "c" * 32
         self._add_node(first, "DE")
@@ -187,6 +244,18 @@ class ClusterTestCase(unittest.TestCase):
         self.assertEqual(identity["place"], "德国-法兰克福")
         self.assertEqual((self.root / "server_number").read_text(encoding="utf-8"), "07\n")
         self.assertEqual((self.root / "server_place").read_text(encoding="utf-8"), "德国-法兰克福\n")
+
+    def test_local_identity_accepts_cluster_duplicate_place_label(self) -> None:
+        self.cluster.save_config({
+            "enabled": True, "role": "child", "node_id": "a" * 32,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+        })
+        identity = self.cluster.apply_local_identity(
+            2, {"country_code": "JP", "region": "Osaka", "city": "Minoh"}, "日本-大阪2"
+        )
+        self.assertEqual(identity["place"], "日本-大阪2")
+        self.assertEqual((self.root / "server_place").read_text(encoding="utf-8"), "日本-大阪2\n")
+        self.assertEqual(self.cluster.load_config()["place"], "日本-大阪2")
 
     def test_identity_sync_marker_changes_only_with_number_or_location(self) -> None:
         node_id = "a" * 32
