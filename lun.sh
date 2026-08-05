@@ -91,13 +91,15 @@ echo
 showmode(){
 showmode_short
 }
+if [ "$1" != "cluster-service-control" ]; then
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.5.2"
+echo "当前版本：V26.8.5.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
 [ -z "$(systemd-detect-virt 2>/dev/null)" ] && vi=$(virt-what 2>/dev/null) || vi=$(systemd-detect-virt 2>/dev/null)
 case $(uname -m) in
@@ -4022,6 +4024,213 @@ print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 PY
 }
 
+cluster_service_is_active(){
+cluster_systemd_name=$1
+cluster_openrc_name=$2
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-active --quiet "$cluster_systemd_name" 2>/dev/null
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service "$cluster_openrc_name" status >/dev/null 2>&1
+else
+return 1
+fi
+}
+
+cluster_stop_core_process(){
+cluster_core_name=$1
+for cluster_proc in /proc/[0-9]*; do
+[ -L "$cluster_proc/exe" ] || continue
+cluster_exe=$(readlink -f "$cluster_proc/exe" 2>/dev/null) || continue
+case "$cluster_exe" in
+*"/lun/$cluster_core_name") kill "$(basename "$cluster_proc")" 2>/dev/null || true ;;
+esac
+done
+}
+
+cluster_argo_start(){
+[ -x "$HOME/lun/cloudflared" ] || { echo "Argo/Cloudflared 未安装。" >&2; return 1; }
+if pidof systemd >/dev/null 2>&1 && [ -s /etc/systemd/system/argo.service ]; then
+systemctl start argo
+elif command -v rc-service >/dev/null 2>&1 && [ -x /etc/init.d/argo ]; then
+rc-service argo start
+elif [ -s "$HOME/lun/sbargotoken.log" ]; then
+nohup "$HOME/lun/cloudflared" tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run \
+--token "$(cat "$HOME/lun/sbargotoken.log")" >/dev/null 2>&1 &
+elif [ -s "$HOME/lun/argoport.log" ] && valid_port_value "$(cat "$HOME/lun/argoport.log")"; then
+nohup "$HOME/lun/cloudflared" tunnel --url "http://localhost:$(cat "$HOME/lun/argoport.log")" \
+--edge-ip-version auto --no-autoupdate --protocol http2 > "$HOME/lun/argo.log" 2>&1 &
+else
+echo "Argo 未配置 Token 或本地入口端口。" >&2
+return 1
+fi
+}
+
+cluster_argo_stop(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl stop argo >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service argo stop >/dev/null 2>&1 || true
+fi
+cluster_stop_core_process cloudflared
+}
+
+cluster_service_status(){
+cluster_component=$1
+case "$cluster_component" in
+xray) lunstatus | sed -n '/^Xray/p' ;;
+singbox) lunstatus | sed -n '/^Sing-box/p' ;;
+argo) argo_status_line ;;
+subscription)
+if multiuser_enabled; then
+cluster_service_is_active lun-agent lun-agent && echo "订阅服务：由多用户服务承载 / 运行中" || echo "订阅服务：由多用户服务承载 / 未运行"
+elif pgrep -f "httpd.*-h $HOME/weblun" >/dev/null 2>&1; then
+echo "订阅服务：运行中"
+else
+echo "订阅服务：未运行"
+fi
+;;
+multiuser)
+cluster_service_is_active lun-agent lun-agent && echo "多用户服务：运行中" || echo "多用户服务：未运行"
+;;
+visit)
+cluster_service_is_active lun-visit-monitor lun-visit-monitor && echo "网站访问监控：运行中" || echo "网站访问监控：未运行"
+;;
+esac
+return 0
+}
+
+cluster_service_control_local(){
+cluster_component=$1
+cluster_operation=$2
+case "$cluster_component" in xray|singbox|argo|subscription|multiuser|visit) ;; *) echo "服务名称无效。" >&2; return 1 ;; esac
+case "$cluster_operation" in status|start|stop|restart) ;; *) echo "服务操作无效。" >&2; return 1 ;; esac
+[ "$cluster_operation" = status ] && { cluster_service_status "$cluster_component"; return; }
+if [ "$cluster_operation" = stop ] || [ "$cluster_operation" = restart ]; then
+case "$cluster_component" in
+xray)
+if pidof systemd >/dev/null 2>&1; then systemctl stop xr >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then rc-service xray stop >/dev/null 2>&1 || true; fi
+cluster_stop_core_process xray
+;;
+singbox)
+if pidof systemd >/dev/null 2>&1; then systemctl stop sb >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then rc-service sing-box stop >/dev/null 2>&1 || true; fi
+cluster_stop_core_process sing-box
+;;
+argo) cluster_argo_stop ;;
+subscription)
+if multiuser_enabled; then
+echo "当前订阅由多用户服务承载，请直接控制“多用户服务”。" >&2
+return 1
+fi
+stop_subscription_service
+;;
+multiuser) multiuser_service_stop ;;
+visit) visit_monitor_service_stop ;;
+esac
+[ "$cluster_operation" = stop ] && { cluster_service_status "$cluster_component"; return; }
+fi
+case "$cluster_component" in
+xray) [ -x "$HOME/lun/xray" ] && [ -s "$HOME/lun/xr.json" ] || { echo "Xray 内核或配置不存在。" >&2; return 1; }; xrestart ;;
+singbox) [ -x "$HOME/lun/sing-box" ] && [ -s "$HOME/lun/sb.json" ] || { echo "Sing-box 内核或配置不存在。" >&2; return 1; }; sbrestart ;;
+argo) cluster_argo_start ;;
+subscription) restart_subscription_service ;;
+multiuser) multiuser_installed || { echo "多用户模块未安装。" >&2; return 1; }; multiuser_service_start ;;
+visit) visit_monitor_enabled || { echo "网站访问监控未启用。" >&2; return 1; }; visit_monitor_service_start ;;
+esac
+cluster_service_status "$cluster_component"
+}
+
+cluster_write_install_payload(){
+cluster_source_file=$1
+cluster_payload_file=$2
+[ -s "$cluster_source_file" ] || { echo "本机源文件不存在：$cluster_source_file" >&2; return 1; }
+python3 - "$cluster_source_file" "$cluster_payload_file" <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+content = pathlib.Path(sys.argv[1]).read_bytes()
+payload = {"content": base64.b64encode(content).decode(), "sha256": hashlib.sha256(content).hexdigest()}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+PY
+chmod 600 "$cluster_payload_file"
+}
+
+cluster_remote_update_ui(){
+cluster_update_node=$1
+cluster_update_kind=$2
+case "$cluster_update_kind" in
+lun)
+cluster_update_source=$(command -v lun 2>/dev/null)
+[ -s "$cluster_update_source" ] || cluster_update_source=/usr/bin/lun
+cluster_update_action=script.install
+cluster_update_label="Lun 主脚本"
+;;
+agent) cluster_update_source="$(cluster_module_dir)/lun_cluster.py"; cluster_update_action=agent.install; cluster_update_label="服务器联动程序" ;;
+*) return 1 ;;
+esac
+cluster_update_payload=$(mktemp "$HOME/lun/.cluster-update.XXXXXX") || return 1
+if cluster_write_install_payload "$cluster_update_source" "$cluster_update_payload" \
+&& cluster_cmd action --node-id "$cluster_update_node" --action "$cluster_update_action" --payload-file "$cluster_update_payload"; then
+rm -f "$cluster_update_payload"
+green_line "$cluster_update_label 已通过 mTLS 校验下发。"
+return 0
+fi
+rm -f "$cluster_update_payload"
+return 1
+}
+
+cluster_node_service_ui(){
+cluster_target_node=$1
+while :; do
+ui_title "Lun 远程进程 / 服务控制"
+echo " 1. Xray"
+echo " 2. Sing-box"
+echo " 3. Argo / Cloudflared"
+echo " 4. 订阅服务"
+echo " 5. 多用户服务"
+echo " 6. 网站访问监控"
+echo " 7. 服务器联动服务（可查看/重启）"
+echo " 0. 返回"
+printf "请选择 [0-7]："
+IFS= read -r cluster_service_choice
+case "$cluster_service_choice" in
+1) cluster_component=xray ;;
+2) cluster_component=singbox ;;
+3) cluster_component=argo ;;
+4) cluster_component=subscription ;;
+5) cluster_component=multiuser ;;
+6) cluster_component=visit ;;
+7) cluster_component=cluster ;;
+0|"") return ;;
+*) red_line "输入错误。"; continue ;;
+esac
+echo " 1. 查看状态"
+if [ "$cluster_component" = cluster ]; then
+echo " 2. 重启联动服务"
+echo " 0. 返回"
+printf "请选择 [0-2]："
+else
+echo " 2. 启动"
+echo " 3. 停止"
+echo " 4. 重启"
+echo " 0. 返回"
+printf "请选择 [0-4]："
+fi
+IFS= read -r cluster_operation_choice
+if [ "$cluster_component" = cluster ]; then
+case "$cluster_operation_choice" in 1) cluster_operation=status ;; 2) cluster_operation=restart ;; 0|"") continue ;; *) red_line "输入错误。"; continue ;; esac
+else
+case "$cluster_operation_choice" in 1) cluster_operation=status ;; 2) cluster_operation=start ;; 3) cluster_operation=stop ;; 4) cluster_operation=restart ;; 0|"") continue ;; *) red_line "输入错误。"; continue ;; esac
+fi
+cluster_cmd action --node-id "$cluster_target_node" --action service.control \
+--payload "{\"component\":\"$cluster_component\",\"operation\":\"$cluster_operation\"}"
+ui_pause
+done
+}
+
 cluster_node_action_ui(){
 printf "子 VPS 节点编号（输入 0 返回）："
 IFS= read -r cluster_node_id
@@ -4030,24 +4239,30 @@ while :; do
 ui_title "Lun 远程配置子 VPS"
 echo "目标节点：$cluster_node_id"
 echo " 1. 刷新状态"
-echo " 2. 重启代理服务"
-echo " 3. 更新 Xray 内核"
-echo " 4. 更新 Sing-box 内核"
-echo " 5. 同步防火墙"
-echo " 6. 应用协议变量组"
-echo " 7. 创建远程快照"
-echo " 8. 清空配置（危险）"
-echo " 9. 卸载 Lun（危险）"
+echo " 2. 进程 / 服务控制"
+echo " 3. 重启全部代理服务"
+echo " 4. 下发当前 Lun 主脚本"
+echo " 5. 下发当前服务器联动程序"
+echo " 6. 更新 Xray 内核"
+echo " 7. 更新 Sing-box 内核"
+echo " 8. 同步防火墙"
+echo " 9. 应用协议变量组"
+echo "10. 创建远程快照"
+echo "11. 清空配置（危险）"
+echo "12. 卸载 Lun（危险）"
 echo " 0. 返回"
-printf "请选择 [0-9]："
+printf "请选择 [0-12]："
 IFS= read -r cluster_choice
 case "$cluster_choice" in
 1) cluster_cmd sync --node-id "$cluster_node_id" ;;
-2) cluster_cmd action --node-id "$cluster_node_id" --action service.restart ;;
-3) cluster_cmd action --node-id "$cluster_node_id" --action core.update --payload '{"core":"xray"}' ;;
-4) cluster_cmd action --node-id "$cluster_node_id" --action core.update --payload '{"core":"singbox"}' ;;
-5) cluster_cmd action --node-id "$cluster_node_id" --action firewall.apply ;;
-6)
+2) cluster_node_service_ui "$cluster_node_id" ;;
+3) cluster_cmd action --node-id "$cluster_node_id" --action service.restart ;;
+4) cluster_remote_update_ui "$cluster_node_id" lun ;;
+5) cluster_remote_update_ui "$cluster_node_id" agent ;;
+6) cluster_cmd action --node-id "$cluster_node_id" --action core.update --payload '{"core":"xray"}' ;;
+7) cluster_cmd action --node-id "$cluster_node_id" --action core.update --payload '{"core":"singbox"}' ;;
+8) cluster_cmd action --node-id "$cluster_node_id" --action firewall.apply ;;
+9)
 yellow_line "格式示例：vlpt=443 vxpt=8080 vpsmode=nat ptmap='52581-443 56567-8080'"
 yellow_line "只接受 Lun 公开变量，不执行命令文本；敏感 Token 仅当次加密转交。"
 printf "变量组（输入 0 返回）："
@@ -4056,9 +4271,9 @@ IFS= read -r cluster_pairs
 cluster_payload=$(cluster_parse_action_payload "$cluster_pairs") || { red_line "变量组格式错误。"; ui_pause; continue; }
 cluster_cmd action --node-id "$cluster_node_id" --action protocol.apply --payload "$cluster_payload"
 ;;
-7) cluster_cmd action --node-id "$cluster_node_id" --action snapshot.create --payload '{"label":"manual-remote"}' ;;
-8|9)
-cluster_action=$([ "$cluster_choice" = 8 ] && echo lun.factory-reset || echo lun.uninstall)
+10) cluster_cmd action --node-id "$cluster_node_id" --action snapshot.create --payload '{"label":"manual-remote"}' ;;
+11|12)
+cluster_action=$([ "$cluster_choice" = 11 ] && echo lun.factory-reset || echo lun.uninstall)
 red_line "危险操作只能单机执行；子机将先创建快照。"
 printf "再次输入目标节点编号确认（输入 0 返回）："
 IFS= read -r cluster_confirm
@@ -4184,7 +4399,7 @@ echo " 2. 添加子 VPS"
 echo " 3. 配置单台子 VPS"
 echo " 4. 批量配置（金丝雀 + 失败回滚）"
 echo " 5. 立即同步子 VPS"
-echo " 6. 刷新并查看聚合订阅"
+printf " 6. %s刷新并查看聚合订阅%s\n" "$LUN_GREEN" "$LUN_RESET"
 echo " 7. 用户与服务器授权"
 echo " 8. 地区设置"
 echo " 9. 集群备份 / 加载备份"
@@ -11550,50 +11765,50 @@ done
 
 show_protocol_help(){
 ui_title "Lun 协议特点"
-yellow_line "能力标签：CDN优选=Cloudflare HTTP(S)；端口回源=Origin Rules；CF隧道=当前 Lun 的 WS/Argo。"
-yellow_line "端口回源只改写 Cloudflare HTTP(S) 的目标端口，不能把 Reality、任意 TCP/UDP 或 H3-only 转换成 CDN 协议。"
-echo " 1. VLESS TCP Reality：Xray / TCP Reality；Cloudflare 会终止普通 TLS，不能作为标准 CDN 回源。｜$(protocol_route_capabilities 1)"
-echo " 2. VLESS XHTTP Reality：Xray / XHTTP Reality；鉴权不匹配会落到伪装站，不能作为 Cloudflare HTTP 回源。｜$(protocol_route_capabilities 2)"
-echo " 3. VLESS XHTTP：Xray / XHTTP 路径（非 Reality）；支持 CDN 优选与 Host+Path 端口回源。｜$(protocol_route_capabilities 3)"
-echo " 4. VLESS WS：Xray / WebSocket；CDN 与 Argo 是两条独立入口。｜$(protocol_route_capabilities 4)"
-echo " 5. Shadowsocks-2022：Sing-box / TCP+UDP；Cloudflare 普通代理不转发任意 TCP/UDP。｜$(protocol_route_capabilities 5)"
-echo " 6. AnyTLS：Sing-box / TLS over TCP；不是 Cloudflare HTTP 回源协议。｜$(protocol_route_capabilities 6)"
-echo " 7. Any-Reality：Sing-box / Reality；只用于直连，不套普通 CDN。｜$(protocol_route_capabilities 7)"
-echo " 8. VMess WS：Sing-box / WebSocket；CDN 与 Argo 是两条独立入口。｜$(protocol_route_capabilities 8)"
-echo " 9. Socks5：Sing-box / TCP+UDP；Cloudflare 普通代理不提供公网 Socks5 转发。｜$(protocol_route_capabilities 9)"
-echo "10. Hysteria2：Sing-box / QUIC+UDP；需放行 UDP，普通 CDN 与 Origin Rules 不转发该协议。｜$(protocol_route_capabilities 10)"
-echo "11. TUIC：Sing-box / QUIC+UDP；需放行 UDP，普通 CDN 与 Origin Rules 不转发该协议。｜$(protocol_route_capabilities 11)"
-echo "12. VLESS XHTTP TLS UDP：Xray / H3-only 直连；Cloudflare HTTP/3 不以 H3 回源，tcping 失败正常。｜$(protocol_route_capabilities 12)"
-echo "13. VLESS XHTTP TLS TCP/UDP：Xray / H2、HTTP/1.1 源站；支持 CDN-TCP，实验 UDP443 仍以 TCP/TLS 回源。｜$(protocol_route_capabilities 13)"
-echo "14. NaiveProxy H2/H3：Sing-box / HTTP CONNECT；当前 Lun 不生成 CDN/Argo 节点，且只接受匹配域名的公开可信证书。｜$(protocol_route_capabilities 14)"
-yellow_line "UDP/QUIC 协议必须同时放行服务商公网 UDP、系统防火墙和 NAT 映射。"
-red_line "NaiveProxy 不能使用自签证书或 Cloudflare Origin CA。"
+green_line "新手优先：1 VLESS TCP Reality；需 CDN/隧道优先：3 VLESS XHTTP 或 4 VLESS WS；弱网高速优先：10 Hysteria2。"
+yellow_line "“隐蔽性”只表示流量特征更接近常见 TLS/HTTP/QUIC，不代表无法识别，也不代表匿名。"
+echo " 1. VLESS TCP Reality  【首选】直连稳定，无需证书；适合大多数 VPS 和日常主节点。隐蔽：高（Reality TLS 伪装）。要求：TCP。｜$(protocol_route_capabilities 1)"
+echo " 2. VLESS XHTTP Reality【进阶】直连 XHTTP+Reality；适合想测试 HTTP 形态且客户端支持较新的场景。隐蔽：高。要求：TCP。｜$(protocol_route_capabilities 2)"
+echo " 3. VLESS XHTTP         【CDN首选】适合橙云、优选 IP 和端口回源。隐蔽：较高（HTTP Host+Path）。要求：域名、路径正确。｜$(protocol_route_capabilities 3)"
+echo " 4. VLESS WS            【兼容首选】客户端覆盖广，适合 CDN 或 CF 隧道。隐蔽：中等（WebSocket 特征较明显）。｜$(protocol_route_capabilities 4)"
+echo " 5. Shadowsocks-2022   【简单高效】TCP/UDP 直连，适合私用、游戏和小型设备。隐蔽：中等，不是 HTTP 伪装。｜$(protocol_route_capabilities 5)"
+echo " 6. AnyTLS              【移动端备选】TLS over TCP 直连，适合 Sing-box 生态。隐蔽：较高。要求：客户端支持 AnyTLS。｜$(protocol_route_capabilities 6)"
+echo " 7. Any-Reality         【Sing-box 进阶】Reality 直连，适合不用 Xray 客户端的场景。隐蔽：高。兼容性不如 VLESS Reality 广。｜$(protocol_route_capabilities 7)"
+echo " 8. VMess WS            【旧客户端兼容】适合必须使用 VMess 的 CDN/隧道环境；新建节点更推荐 VLESS WS。｜$(protocol_route_capabilities 8)"
+echo " 9. Socks5              【调试/信任网络】适合本人临时使用或内网转发。隐蔽：低，不建议裸露给不可信用户。｜$(protocol_route_capabilities 9)"
+echo "10. Hysteria2           【弱网高速】适合高延迟、丢包和移动网络。速度：高。特征：QUIC/UDP；必须放行 UDP。｜$(protocol_route_capabilities 10)"
+echo "11. TUIC                【低延迟 UDP】适合移动网络、游戏和频繁切网。特征：QUIC/UDP；客户端兼容性略窄。｜$(protocol_route_capabilities 11)"
+echo "12. VLESS XHTTP TLS UDP 【实验】H3-only 直连，适合测试 XHTTP/QUIC。某些手机客户端不显延迟或重置，不建议做唯一主节点。｜$(protocol_route_capabilities 12)"
+echo "13. VLESS XHTTP TLS TCP/UDP【进阶】直连兼顾 TCP/UDP，并可生成 CDN-TCP。隐蔽：较高。实验 UDP443 不宜作主力。｜$(protocol_route_capabilities 13)"
+echo "14. NaiveProxy H2/H3   【公开证书场景】HTTP CONNECT 特征接近普通 Web TLS，适合有正式域名证书的直连节点。｜$(protocol_route_capabilities 14)"
+yellow_line "UDP/QUIC 协议需同时放行服务商 UDP、云安全组、系统防火墙；NAT 还需 UDP 映射。"
+red_line "NaiveProxy 必须使用与域名匹配的公开可信证书，不接受自签或 Cloudflare Origin CA。"
 }
 
 show_nat_help(){
 ui_title "Lun NAT / 端口池说明"
-echo "NAT 映射格式：公网端口-内网监听端口，多个映射用空格分隔。"
-echo "脚本只改变客户端节点和订阅端口，不创建服务商端口转发，也不写 NAT iptables。"
-green_line "协议和订阅的内网监听端口会自动同步到 UFW、Firewalld 或限制型 iptables。"
-yellow_line "云安全组与服务商公网端口映射无法由 VPS 内脚本代办，仍需手动配置。"
-echo "内网端口池是协议实际监听端口；外网端口池是公网入口，两组按位置自动对应。"
-yellow_line "同一内网端口出现多个公网映射时保留首项，后续项会被提示并忽略。"
-red_line "同一公网端口不能指向多个内网端口；此类冲突会拒绝整次输入。"
-echo "Cloudflare CDN：先完成服务商公网→内网映射；已有云端规则选手动登记，否则使用 API 自动部署。"
+echo "Lun 统一使用：公网端口-内网端口。示例：4444-80。"
+echo "含义：客户端连接公网 4444，服务商把流量转到 VPS 内网 80，Lun 协议实际监听 80。"
+echo "多组映射用空格分隔：4444-80 5555-443 6666-8080。"
+echo "端口池也是按位置对应：第 1 个公网端口对第 1 个内网端口。"
+yellow_line "同一内网端口配了多个公网端口时，Lun 只保留第一组；完全重复的映射自动去重。"
+red_line "同一公网端口不能指向两个内网端口；此类冲突会被拒绝。"
+green_line "Lun 会放行协议和订阅的内网监听端口。"
+yellow_line "Lun 不能代替服务商创建 4444→80；请先在服务商面板建好，再把同样的映射填入 Lun。"
 }
 
 show_cdn_help(){
-ui_title "Lun Cloudflare / Origin Rules 说明"
-echo "HTTP 端口：80、8080、8880、2052、2082、2086、2095。"
-echo "HTTPS 端口：443、8443、2053、2083、2087、2096。"
-echo "支持 CDN 的协议随机端口会优先选择对应 CF 端口，并默认排除热门的 443。"
-yellow_line "源站端口不在 CF 端口组时，必须用精确 Host + Path 的 Origin Rule 改写回源端口。"
-green_line "已经在控制台建好规则：选择“手动登记”，输入边缘端口和 Destination port，不需要 API Token。"
-echo "自动部署使用“我的个人资料”中的用户 API 令牌；权限为 区域/区域/读取、区域/Origin Rules/编辑、区域/DNS/编辑、区域/区域设置/编辑。"
-echo "脚本只要令牌正文，不需要 Token ID、用户 ID、账户 ID 或邮箱。"
-green_line "API 自动部署会开启橙云、部署精确规则、调整 SSL/HTTP3、验证并刷新订阅。"
-yellow_line "实验 CDN-UDP 要求 Cloudflare HTTP/3 和边缘 UDP 443；手动优选 IP 不能替灰云 Host 创建边缘路由，官方稳定用法仍是橙云并通过连通诊断。"
-red_line "手动使用本机 443 前必须检查占用；Lun 不会自动 kill 未知进程。"
+ui_title "Lun Cloudflare 端口回源操作"
+echo "1. 在 Lun 选择支持 CDN 的协议：VLESS XHTTP、VLESS WS、VMess WS，或 XHTTP TLS TCP/UDP 的 TCP 节点。"
+echo "2. 记下 Lun 显示的服务域名、Path、Cloudflare 边缘端口和源站端口。"
+echo "3. 在 Cloudflare DNS 中让该域名指向 VPS 公网 IP，并开启橙云；灰云不会经过 Cloudflare，Origin Rule 不会执行。"
+echo "4. 进入 Cloudflare 网站 → 规则 → Origin Rules（源站规则）→ 创建规则。"
+echo "5. 匹配条件使用：主机名等于服务域名；多协议共用域名时，再加 URI Path 匹配对应 UUID 路径。"
+echo "6. 操作选择“重写目标端口”，填入源站端口：普通 VPS 填 Lun 监听端口；NAT 机填服务商的公网映射端口。"
+echo "7. NAT 示例：服务商已配 56567-8080，Cloudflare 边缘用 443，则 Origin Rule 目标端口填 56567，Lun 仍监听 8080。"
+echo "8. 回到 Lun 选择“手动登记已有规则”，填边缘端口和目标端口，然后刷新订阅并运行连通检测。"
+green_line "通过标准：订阅中出现 CDN 节点，且 Host + Path 诊断能回源到 Lun 协议。"
+red_line "Reality、Shadowsocks、AnyTLS、Socks5、Hysteria2、TUIC 和 H3-only 不能靠 Origin Rules 变成 Cloudflare CDN 节点。"
 }
 
 show_certificate_help(){
@@ -11679,6 +11894,9 @@ multiuser_cmd apply >/dev/null 2>&1 || exit $?
 multiuser_service_restart >/dev/null 2>&1 || true
 fi
 exit 0
+elif [ "$1" = "cluster-service-control" ]; then
+cluster_service_control_local "$2" "$3"
+exit $?
 elif [ "$1" = "cluster-prepare-multiuser" ]; then
 if multiuser_enabled; then
 exit 0

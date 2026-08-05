@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "lun_cluster.py"
@@ -124,6 +125,20 @@ class ClusterTestCase(unittest.TestCase):
             lun_cluster.chinese_place({"country_code": "DE", "region": "德国-法兰克福"}),
             "德国-法兰克福",
         )
+
+    def test_master_nodes_view_refreshes_its_own_runtime_version(self) -> None:
+        node_id = "a" * 32
+        self.cluster.save_config({
+            "enabled": True, "role": "master", "node_id": node_id, "cluster_id": "b" * 32,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+            "paired": True, "location": {"country_code": "JP"},
+        })
+        status = self.cluster.local_status()
+        status["lun_version"] = "Vold"
+        self.cluster.upsert_node(status, role="master")
+        with mock.patch.object(self.cluster, "_lun_version", return_value="Vnew"):
+            rows = self.cluster.nodes()
+        self.assertEqual(rows[0]["lun_version"], "Vnew")
 
     def test_subscription_aggregation_keeps_canonical_names_and_groups_regions(self) -> None:
         de, hk = "a" * 32, "b" * 32
@@ -279,6 +294,8 @@ class ClusterTestCase(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_bootstrap_pairing_pins_certificate_and_rejects_replay(self) -> None:
+        old_script = lun_cluster.os.environ.get("LUN_SCRIPT")
+        lun_cluster.os.environ["LUN_SCRIPT"] = str(Path(self.temporary.name) / "no-real-lun-script")
         master_root = Path(self.temporary.name) / "master"
         child_root = Path(self.temporary.name) / "child"
         master_root.mkdir()
@@ -319,6 +336,10 @@ class ClusterTestCase(unittest.TestCase):
             thread.join(timeout=5)
             master.close()
             child.close()
+            if old_script is None:
+                lun_cluster.os.environ.pop("LUN_SCRIPT", None)
+            else:
+                lun_cluster.os.environ["LUN_SCRIPT"] = old_script
 
     def test_action_is_idempotent_and_unknown_action_is_rejected(self) -> None:
         config = {
@@ -335,6 +356,64 @@ class ClusterTestCase(unittest.TestCase):
             lun_cluster.execute_action(
                 self.cluster, {"request_id": "2" * 32, "action": "shell.run", "payload": {}}
             )
+
+    def test_service_control_is_fixed_and_cluster_cannot_be_stopped(self) -> None:
+        script = Path(self.temporary.name) / "bin-lun"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        old_script = lun_cluster.os.environ.get("LUN_SCRIPT")
+        lun_cluster.os.environ["LUN_SCRIPT"] = str(script)
+        try:
+            completed = lun_cluster.subprocess.CompletedProcess([], 0, "Xray：运行中\n", "")
+            with mock.patch.object(self.cluster, "_run", return_value=completed) as run:
+                result = lun_cluster.execute_action(self.cluster, {
+                    "request_id": "3" * 32, "action": "service.control",
+                    "payload": {"component": "xray", "operation": "restart"},
+                })
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(
+                run.call_args.args[0],
+                ["bash", str(script), "cluster-service-control", "xray", "restart"],
+            )
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "仅允许"):
+                lun_cluster.execute_action(self.cluster, {
+                    "request_id": "4" * 32, "action": "service.control",
+                    "payload": {"component": "cluster", "operation": "stop"},
+                })
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "参数无效"):
+                lun_cluster.execute_action(self.cluster, {
+                    "request_id": "5" * 32, "action": "service.control",
+                    "payload": {"component": "shell", "operation": "restart"},
+                })
+        finally:
+            if old_script is None:
+                lun_cluster.os.environ.pop("LUN_SCRIPT", None)
+            else:
+                lun_cluster.os.environ["LUN_SCRIPT"] = old_script
+
+    def test_database_replace_keeps_live_wal_connections_consistent(self) -> None:
+        candidate_root = Path(self.temporary.name) / "candidate"
+        candidate_root.mkdir()
+        candidate = lun_cluster.Cluster(candidate_root)
+        observer = lun_cluster.sqlite3.connect(self.cluster.db.path)
+        try:
+            candidate.db.set_setting("database-owner", "candidate")
+            observer.execute("PRAGMA journal_mode=WAL")
+            observer.execute("SELECT COUNT(*) FROM settings").fetchone()
+            self.cluster.db.set_setting("database-owner", "old")
+            self.cluster.replace_database(candidate.db.path)
+            self.assertEqual(self.cluster.db.setting("database-owner"), "candidate")
+            self.assertEqual(
+                observer.execute("SELECT value FROM settings WHERE key='database-owner'").fetchone()[0],
+                "candidate",
+            )
+            checker = lun_cluster.sqlite3.connect(self.cluster.db.path)
+            try:
+                self.assertEqual(checker.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            finally:
+                checker.close()
+        finally:
+            observer.close()
+            candidate.close()
 
     def test_snapshot_restore_replaces_protocol_state(self) -> None:
         (self.root / "xr.json").write_text('{"old":true}\n', encoding="utf-8")

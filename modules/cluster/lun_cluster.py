@@ -80,8 +80,8 @@ LUN_ENV_FIELDS = {
     "certmode", "acme_email", "acme_dns", "coremirror",
 }
 ACTION_NAMES = {
-    "status.refresh", "subscription.refresh", "protocol.apply", "service.restart",
-    "core.update", "firewall.apply", "script.install", "snapshot.create",
+    "status.refresh", "subscription.refresh", "protocol.apply", "service.restart", "service.control",
+    "core.update", "firewall.apply", "script.install", "agent.install", "snapshot.create",
     "snapshot.restore", "user.sync", "identity.apply", "lun.factory-reset", "lun.uninstall",
     "role.stage", "role.discard", "role.promote", "role.rollback", "role.finalize",
     "role.children-commit", "role.children-revert", "controller.prepare",
@@ -417,6 +417,27 @@ class Cluster:
 
     def close(self) -> None:
         self.db.close()
+
+    def replace_database(self, source: Path) -> None:
+        """Replace database contents through SQLite's online backup API.
+
+        The cluster server is threaded. Replacing cluster.db with shutil.copy2
+        leaves other threads holding connections to the old inode and can make
+        their WAL writes corrupt the new file. SQLite backup coordinates all
+        active connections and keeps the destination inode stable.
+        """
+        if not source.is_file():
+            raise ClusterError("集群数据库恢复文件不存在")
+        candidate = sqlite3.connect(f"file:{source.resolve().as_posix()}?mode=ro", uri=True)
+        try:
+            if candidate.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ClusterError("集群数据库恢复文件完整性检查失败")
+            candidate.backup(self.db.connection)
+        finally:
+            candidate.close()
+        if self.db.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ClusterError("集群数据库替换后完整性检查失败")
+        self.db.migrate()
 
     def load_config(self) -> dict[str, Any]:
         if not self.config_path.exists():
@@ -832,6 +853,9 @@ class Cluster:
         return row
 
     def nodes(self) -> list[dict[str, Any]]:
+        config = self.load_config()
+        if config.get("role") == "master" and re.fullmatch(r"[0-9a-f]{32}", str(config.get("node_id", ""))):
+            self.upsert_node(self.local_status(), role="master")
         rows = self.db.connection.execute("SELECT * FROM nodes ORDER BY server_number,id").fetchall()
         return [{**dict(row), "number": int(row["server_number"])} for row in rows]
 
@@ -1339,14 +1363,11 @@ class Cluster:
                 archive.extractall(extract)
             if not (extract / "config.json").is_file() or not (extract / "data" / "cluster.db").is_file():
                 raise ClusterError("角色切换恢复文件不完整")
-            self.db.close()
             shutil.copy2(extract / "config.json", self.config_path)
-            shutil.copy2(extract / "data" / "cluster.db", self.db.path)
+            self.replace_database(extract / "data" / "cluster.db")
             if (extract / "pki").exists():
                 shutil.rmtree(self.pki, ignore_errors=True)
                 shutil.copytree(extract / "pki", self.pki)
-        self.db = Database(self.data / "cluster.db")
-        self.db.migrate()
         self.secure_files()
 
     def build_role_transfer(self, target_id: str) -> bytes:
@@ -1525,14 +1546,11 @@ class Cluster:
                     candidate.close()
                 if peer_id not in ids or current["node_id"] not in ids:
                     raise ClusterError("角色切换数据库缺少主机或目标子机")
-                self.db.close()
-                shutil.copy2(extract / "data" / "cluster.db", self.db.path)
+                self.replace_database(extract / "data" / "cluster.db")
                 shutil.copy2(extract / "pki" / "cluster-ca.crt", self.pki / "cluster-ca.crt")
                 shutil.copy2(extract / "pki" / "cluster-ca.key", self.pki / "cluster-ca.key")
                 os.chmod(self.pki / "cluster-ca.crt", 0o644)
                 os.chmod(self.pki / "cluster-ca.key", 0o600)
-                self.db = Database(self.data / "cluster.db")
-                self.db.migrate()
                 replaced = True
             with self.db.connection:
                 self.db.connection.execute("UPDATE nodes SET role='child' WHERE id=?", (peer_id,))
@@ -1744,17 +1762,14 @@ class Cluster:
             manifest = json.loads((extract / "manifest.json").read_text(encoding="utf-8"))
             if int(manifest.get("api_version", 0)) > API_VERSION:
                 raise ClusterError("备份来自更高版本，请先更新 Lun")
-            self.db.close()
             shutil.copy2(extract / "config.json", self.config_path)
-            shutil.copy2(extract / "data" / "cluster.db", self.db.path)
+            self.replace_database(extract / "data" / "cluster.db")
             if (extract / "pki").exists():
                 shutil.rmtree(self.pki, ignore_errors=True)
                 shutil.copytree(extract / "pki", self.pki)
             if (extract / "generated").exists():
                 shutil.rmtree(self.cache, ignore_errors=True)
                 shutil.copytree(extract / "generated", self.cache)
-        self.db = Database(self.data / "cluster.db")
-        self.db.migrate()
         self.secure_files()
         self.db.audit("backup.restore", self.load_config().get("node_id", ""), source.name)
         return {"manifest": manifest, "pre_restore_snapshot": str(current),
@@ -2631,6 +2646,34 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         finally:
             temporary.unlink(missing_ok=True)
         return {"sha256": expected, "path": str(script)}
+    if action == "agent.install":
+        encoded = str(payload.get("content", ""))
+        expected = str(payload.get("sha256", ""))
+        try:
+            content = b64decode(encoded)
+            source = content.decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+            raise ClusterError("联动程序内容编码无效") from exc
+        if hashlib.sha256(content).hexdigest() != expected:
+            raise ClusterError("联动程序 SHA-256 不匹配")
+        if len(content) > 2 * 1024 * 1024 or not content.startswith(b"#!/usr/bin/env python3"):
+            raise ClusterError("联动程序内容无效")
+        try:
+            compile(source, "lun_cluster.py", "exec")
+        except SyntaxError as exc:
+            raise ClusterError("新联动程序语法检查失败") from exc
+        destination = Path(__file__).resolve()
+        with tempfile.NamedTemporaryFile(dir=str(destination.parent), delete=False) as handle:
+            handle.write(content)
+            temporary = Path(handle.name)
+        try:
+            os.chmod(temporary, 0o755)
+            backup = destination.with_name(destination.name + ".cluster-backup")
+            shutil.copy2(destination, backup)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"sha256": expected, "path": str(destination), "restart_required": True}
     if not script.exists():
         raise ClusterError("没有找到可执行的 Lun 主脚本")
     if action == "protocol.apply":
@@ -2641,6 +2684,22 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         result = cluster._run(["bash", str(script), "rep"], timeout=900, env=environment, check=False)
     elif action == "service.restart":
         result = cluster._run(["bash", str(script), "res"], timeout=300, check=False)
+    elif action == "service.control":
+        component = str(payload.get("component", ""))
+        operation = str(payload.get("operation", ""))
+        components = {"xray", "singbox", "argo", "subscription", "multiuser", "visit", "cluster"}
+        if component not in components or operation not in {"status", "start", "stop", "restart"}:
+            raise ClusterError("服务控制参数无效")
+        if component == "cluster":
+            if operation == "status":
+                return {"component": component, "operation": operation, "running": True}
+            if operation != "restart":
+                raise ClusterError("联动服务仅允许远程查看或重启，避免主 VPS 失去控制通道")
+            return {"component": component, "operation": operation, "restart_required": True}
+        result = cluster._run(
+            ["bash", str(script), "cluster-service-control", component, operation],
+            timeout=180, check=False,
+        )
     elif action == "core.update":
         core = payload.get("core")
         if core not in {"xray", "singbox"}:
@@ -2863,11 +2922,15 @@ def build_parser() -> argparse.ArgumentParser:
     action = sub.add_parser("action")
     action.add_argument("--node-id", required=True)
     action.add_argument("--action", choices=sorted(ACTION_NAMES), required=True)
-    action.add_argument("--payload", default="{}")
+    action_payload = action.add_mutually_exclusive_group()
+    action_payload.add_argument("--payload", default="{}")
+    action_payload.add_argument("--payload-file")
     batch = sub.add_parser("batch-action")
     batch.add_argument("--nodes", required=True)
     batch.add_argument("--action", choices=sorted(ACTION_NAMES), required=True)
-    batch.add_argument("--payload", default="{}")
+    batch_payload = batch.add_mutually_exclusive_group()
+    batch_payload.add_argument("--payload", default="{}")
+    batch_payload.add_argument("--payload-file")
     location = sub.add_parser("set-location")
     location.add_argument("--node-id", required=True)
     location.add_argument("--country-code", default="")
@@ -2964,13 +3027,15 @@ def main(argv: list[str] | None = None) -> int:
                 for item in result:
                     print(f"{item['id']}. {item['name']}  selector={item['selector']}  token={item['token']}")
         elif args.command == "action":
-            payload = json.loads(args.payload)
+            payload_text = Path(args.payload_file).read_text(encoding="utf-8") if args.payload_file else args.payload
+            payload = json.loads(payload_text)
             if not isinstance(payload, dict):
                 raise ClusterError("payload 必须是 JSON 对象")
             result = send_action(cluster, args.node_id, args.action, payload)
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "batch-action":
-            payload = json.loads(args.payload)
+            payload_text = Path(args.payload_file).read_text(encoding="utf-8") if args.payload_file else args.payload
+            payload = json.loads(payload_text)
             if not isinstance(payload, dict):
                 raise ClusterError("payload 必须是 JSON 对象")
             result = batch_action(cluster, re.split(r"[,\s]+", args.nodes), args.action, payload)
