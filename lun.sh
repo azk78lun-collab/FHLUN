@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.5.11"
+echo "当前版本：V26.8.5.12"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -865,12 +865,71 @@ case "$ippz" in 4) printf 'ipv4\n' ;; 6) printf 'ipv6\n' ;; 46) printf 'dual\n' 
 fi
 }
 
+direct_mode_uses_domain(){
+case "${1:-$(effective_address_mode)}" in
+domain|all|legacy-domain4|legacy-domain6|legacy-domain-auto|auto) return 0 ;;
+*) return 1 ;;
+esac
+}
+
+direct_domain_matches_rewrite_host(){
+cdn_rewrite_active || return 1
+direct_host=$(normalize_host "${addym:-$domain}")
+rewrite_host=$(normalize_host "${cdnym:-$(cat "$HOME/lun/cdnym" 2>/dev/null)}")
+[ -n "$direct_host" ] && [ -n "$rewrite_host" ] || return 1
+[ "$(endpoint_kind "$direct_host")" = DOMAIN ] || return 1
+[ "$(endpoint_kind "$rewrite_host")" = DOMAIN ] || return 1
+direct_host_key=$(printf '%s' "$direct_host" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+rewrite_host_key=$(printf '%s' "$rewrite_host" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+[ "$direct_host_key" = "$rewrite_host_key" ]
+}
+
+direct_domain_ip_guard_active(){
+direct_mode_uses_domain "${1:-}" && direct_domain_matches_rewrite_host
+}
+
+direct_origin_ip_entries(){
+origin_preference=${1:-auto}
+origin_v4=$(normalize_host "${v4:-}")
+origin_v6=$(normalize_host "${v6:-}")
+[ "$(endpoint_kind "$origin_v4")" = V4 ] || origin_v4=
+[ "$(endpoint_kind "$origin_v6")" = V6 ] || origin_v6=
+if [ -z "$origin_v4" ] || [ -z "$origin_v6" ]; then
+origin_logged=$(normalize_host "$(cat "$HOME/lun/server_ip.log" 2>/dev/null)")
+case "$(endpoint_kind "$origin_logged")" in
+V4) [ -n "$origin_v4" ] || origin_v4=$origin_logged ;;
+V6) [ -n "$origin_v6" ] || origin_v6=$origin_logged ;;
+esac
+fi
+case "$origin_preference" in
+dual)
+[ -n "$origin_v4" ] && printf '%s|IPv4\n' "$origin_v4"
+[ -n "$origin_v6" ] && printf '%s|IPv6\n' "$origin_v6"
+;;
+ipv4)
+if [ -n "$origin_v4" ]; then printf '%s|IPv4\n' "$origin_v4"; elif [ -n "$origin_v6" ]; then printf '%s|IPv6\n' "$origin_v6"; fi
+;;
+ipv6)
+if [ -n "$origin_v6" ]; then printf '%s|IPv6\n' "$origin_v6"; elif [ -n "$origin_v4" ]; then printf '%s|IPv4\n' "$origin_v4"; fi
+;;
+*)
+if [ -n "$origin_v4" ]; then printf '%s|IPv4\n' "$origin_v4"; elif [ -n "$origin_v6" ]; then printf '%s|IPv6\n' "$origin_v6"; fi
+;;
+esac
+}
+
 direct_address_entries(){
 mode=$(effective_address_mode)
 domain_addr=$(normalize_host "${addym:-$domain}")
+direct_guard=no
+direct_domain_ip_guard_active "$mode" && direct_guard=yes
 case "$mode" in
 domain)
+if [ "$direct_guard" = yes ]; then
+direct_origin_ip_entries auto
+else
 [ -n "$domain_addr" ] && printf '%s|DOMAIN\n' "$domain_addr"
+fi
 ;;
 ipv4)
 [ -n "$v4" ] && printf '%s|IPv4\n' "$v4"
@@ -883,24 +942,42 @@ dual)
 [ -n "$v6" ] && printf '%s|IPv6\n' "$v6"
 ;;
 all)
+if [ "$direct_guard" = yes ]; then
+direct_origin_ip_entries dual
+else
 [ -n "$domain_addr" ] && printf '%s|DOMAIN\n' "$domain_addr"
 [ -n "$v4" ] && [ "$v4" != "$domain_addr" ] && printf '%s|IPv4\n' "$v4"
 [ -n "$v6" ] && [ "$v6" != "$domain_addr" ] && printf '%s|IPv6\n' "$v6"
+fi
 ;;
 legacy-domain4)
+if [ "$direct_guard" = yes ]; then
+direct_origin_ip_entries ipv4
+else
 [ -n "$v4" ] && printf '%s|IPv4\n' "$v4"
 [ -n "$domain_addr" ] && [ "$domain_addr" != "$v4" ] && printf '%s|DOMAIN\n' "$domain_addr"
+fi
 ;;
 legacy-domain6)
+if [ "$direct_guard" = yes ]; then
+direct_origin_ip_entries ipv6
+else
 [ -n "$v6" ] && printf '%s|IPv6\n' "$v6"
 [ -n "$domain_addr" ] && [ "$domain_addr" != "$v6" ] && printf '%s|DOMAIN\n' "$domain_addr"
+fi
 ;;
 legacy-domain-auto)
+if [ "$direct_guard" = yes ]; then
+direct_origin_ip_entries auto
+else
 if [ -n "$v4" ]; then printf '%s|IPv4\n' "$v4"; elif [ -n "$v6" ]; then printf '%s|IPv6\n' "$v6"; fi
 [ -n "$domain_addr" ] && [ "$domain_addr" != "$v4" ] && [ "$domain_addr" != "$v6" ] && printf '%s|DOMAIN\n' "$domain_addr"
+fi
 ;;
 *)
-if [ -n "$v4" ]; then
+if [ "$direct_guard" = yes ]; then
+direct_origin_ip_entries auto
+elif [ -n "$v4" ]; then
 printf '%s|IPv4\n' "$v4"
 elif [ -n "$v6" ]; then
 printf '%s|IPv6\n' "$v6"
@@ -912,6 +989,10 @@ esac
 }
 
 address_mode_label(){
+if direct_domain_ip_guard_active "$(effective_address_mode)"; then
+printf '源站 IP（端口回源自动保护）\n'
+return
+fi
 case "$(effective_address_mode)" in
 domain) printf '仅域名\n' ;;
 ipv4) printf '仅 IPv4\n' ;;
@@ -5004,8 +5085,14 @@ argoip_cfg=$(cat "$HOME/lun/argoip" 2>/dev/null)
 [ -z "$argoip_cfg" ] && argoip_cfg="162.159.192.1 162.159.192.2"
 direct_entries=$(direct_address_entries)
 if [ -z "$direct_entries" ]; then
+if direct_domain_ip_guard_active "$(effective_address_mode)"; then
+red_line "Origin Rules 使用的橙云域名不能作为直连入口，且当前未检测到可用源站 IP；已停止生成订阅，避免输出必然失败的节点。"
+fi
 echo "当前地址输出模式 $(address_mode_label) 没有可用地址，请在高级设置中重新选择。"
 return 1
+fi
+if direct_domain_ip_guard_active "$(effective_address_mode)"; then
+yellow_line "已识别端口回源 Host ${cdnym:-$(cat "$HOME/lun/cdnym" 2>/dev/null)}：直连节点自动使用源站 IP；CDN/回源节点继续使用该域名与 CF 优选入口。"
 fi
 direct_entry_count=$(printf '%s\n' "$direct_entries" | sed '/^$/d' | wc -l | tr -d ' ')
 primary_entry=$(printf '%s\n' "$direct_entries" | sed -n '1p')
@@ -9666,6 +9753,9 @@ addrmode=$new_addrmode
 printf '%s\n' "$addrmode" > "$HOME/lun/address_mode"
 export addrmode ippz addym addout
 echo "节点地址输出已设置为：$(address_mode_label)"
+if direct_domain_ip_guard_active "$new_addrmode"; then
+yellow_line "该域名同时用于 Cloudflare Origin Rules；直连节点将自动使用源站 IP，TLS SNI/Host 仍保留域名。需要域名直连时，请另设一个 DNS-only 域名。"
+fi
 return 0
 }
 

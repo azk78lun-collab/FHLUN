@@ -8,6 +8,7 @@ eval "$(sed -n '/^multiuser_quota_g(){/,/^}/p' "$SCRIPT")"
 for helper in \
   normalize_host \
   host_is_ipv6 \
+  endpoint_kind \
   normalize_server_number \
   sanitize_server_place \
   address_variant_code \
@@ -27,6 +28,14 @@ for helper in \
   cloudflare_manual_rule_file \
   cloudflare_manual_rule_matches \
   cdn_first_endpoint \
+  cdn_rewrite_active \
+  effective_address_mode \
+  direct_mode_uses_domain \
+  direct_domain_matches_rewrite_host \
+  direct_domain_ip_guard_active \
+  direct_origin_ip_entries \
+  direct_address_entries \
+  address_mode_label \
   lun_version_is_older; do
   eval "$(sed -n "/^${helper}(){/,/^}/p" "$SCRIPT")"
 done
@@ -100,6 +109,55 @@ cloudflare_manual_rule_matches 3 8080 56567 test-uuid-vx
 HOME=$original_home
 rm -rf "$test_home"
 
+address_test_home=$(mktemp -d)
+HOME=$address_test_home
+mkdir -p "$HOME/lun"
+addrmode=domain
+addym=proxy.example.com
+domain=proxy.example.com
+addout=replace
+ippz=
+cdnmode=rewrite
+cdnym=proxy.example.com
+v4=77.90.28.162
+v6=
+vpsmode=nat
+ptmap='45126-12343 45201-12340'
+[[ $(direct_address_entries) == '77.90.28.162|IPv4' ]]
+[[ $(address_mode_label) == '源站 IP（端口回源自动保护）' ]]
+
+# 普通 VPS 复用橙云回源 Host 时受到同样影响，也必须使用源站 IP。
+vpsmode=normal
+ptmap=
+[[ $(direct_address_entries) == '77.90.28.162|IPv4' ]]
+
+# 单独准备的 DNS-only 直连域名与回源 Host 不同，应继续保留域名输出。
+addym=direct.example.com
+[[ $(direct_address_entries) == 'direct.example.com|DOMAIN' ]]
+
+# 未启用端口改写时保持原有域名模式兼容。
+addym=proxy.example.com
+cdnmode=standard
+[[ $(direct_address_entries) == 'proxy.example.com|DOMAIN' ]]
+
+# all 模式在端口回源保护下只保留源站 IP，不再混入橙云域名。
+cdnmode=rewrite
+addrmode=all
+v6=2001:db8::10
+expected_direct_addresses=$'77.90.28.162|IPv4\n2001:db8::10|IPv6'
+[[ $(direct_address_entries) == "$expected_direct_addresses" ]]
+
+# 临时公网探测失败时可复用已记录的源站 IP；完全没有 IP 时拒绝生成错误域名节点。
+addrmode=domain
+v4=
+v6=
+printf '%s\n' '77.90.28.162' > "$HOME/lun/server_ip.log"
+[[ $(direct_address_entries) == '77.90.28.162|IPv4' ]]
+rm -f "$HOME/lun/server_ip.log"
+[[ -z $(direct_address_entries) ]]
+rm -rf "$address_test_home"
+HOME=$original_home
+
 grep -q '输入协议代码（输入 0 返回）' "$SCRIPT"
 grep -q '设备 ID（输入 0 返回）' "$SCRIPT"
 grep -q '输入用户 ID（输入 0 返回）' "$SCRIPT"
@@ -114,7 +172,7 @@ grep -q '手动登记已设置的规则（无需 API' "$SCRIPT"
 grep -q '粘贴 Token（输入会显示，0 返回）' "$SCRIPT"
 grep -q '区域 → Origin Rules → 编辑' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.5.11' "$SCRIPT"
+grep -q '当前版本：V26.8.5.12' "$SCRIPT"
 grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"

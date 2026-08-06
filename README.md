@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.8.5.11`。
+当前脚本版本：`V26.8.5.12`。
 
 ## 致谢与上游
 
@@ -192,7 +192,7 @@ Reality、Argo 和 CDN 仍然独立：
 
 CDN 优选 IP 的工作原理：客户端连接 Cloudflare 优选地址（节点里的 `add/cfip`），Cloudflare 通过回源域名（`host/cdnym`）回源到你的 VPS。服务器访问外网默认仍直连 VPS；只有启用 WARP 出站时，目标网站才可能显示 WARP/Cloudflare IP。
 
-启用 CDN Host 不会强制把普通节点地址改回服务器 IP；如果你设置了 `domain/addym`，订阅里的直连节点仍可继续使用域名。CDN 节点会额外使用 `cfip` 作为 Cloudflare 入口地址。
+启用 Origin Rules 端口回源后，如果普通节点地址与 `cdnym` 使用同一个域名，Lun 会自动让直连节点改用源站 IP；CDN/回源节点仍使用 `cdnym` 和 `cfip`。这样可避免橙云域名把 Reality、直连 TLS 等连接送到 Cloudflare 边缘。该保护同时适用于 NAT VPS 和普通 VPS，不改变 UUID、端口、证书、TLS SNI 或 HTTP Host。若确实需要域名直连，请单独准备一个 DNS-only（灰云）域名作为 `addym`。
 
 **使用条件：**
 1. 设置 `cdnym`：Cloudflare 接收请求时使用的 Host 域名。
@@ -279,6 +279,8 @@ HTTP 端口组节点会显式写入 `security=none`，HTTPS 端口组节点写�
 | `all` | 域名、IPv4 和 IPv6 |
 
 只输出一种地址时，节点名不显示地址类型；同一协议同时输出多个地址时，使用紧凑的 `D4`、`V4`、`V6` 区分域名、IPv4 和 IPv6。CDN 节点继续只使用 `cfip`，Argo 节点继续只使用 `argoip`，并分别使用 `cf01`、`ar01` 这类候选编号区分入口。
+
+当 `cdnmode=rewrite` 且所选直连域名与 Origin Rules 的 `cdnym` 相同时，橙云域名不会写入直连节点：`domain` 自动切换为可用源站 IPv4（无 IPv4 时用 IPv6），`all` 只保留源站 IPv4/IPv6。NAT VPS 使用映射后的公网端口，普通 VPS 使用协议监听端口；两者都使用源站 IP 作为直连地址。CDN 和端口回源节点不受此切换影响。
 
 ### 兼容 addym/addout
 
