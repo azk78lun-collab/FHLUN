@@ -26,6 +26,7 @@ printf '20003\n' > "$tmp/lun/port_hy2"
 printf '20004\n' > "$tmp/lun/port_xc"
 printf '20005\n' > "$tmp/lun/port_nv"
 printf '21000\n' > "$tmp/lun/subport.log"
+printf '21001\n' > "$tmp/lun/cdnopt_port"
 printf 'invalid\n' > "$tmp/lun/port_tu"
 cat > "$tmp/lun/modules/multiuser/config.json" <<'JSON'
 {
@@ -44,6 +45,7 @@ tcp:20002
 tcp:20004
 tcp:20005
 tcp:21000
+tcp:21001
 tcp:22000
 tcp:22001
 tcp:22002

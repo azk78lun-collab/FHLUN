@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.8.5.12`。
+当前脚本版本：`V26.8.7.1`。
 
 ## 致谢与上游
 
@@ -42,7 +42,11 @@ lun
 0. 退出
 ```
 
-引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。协议选择和增删改界面共用带边框的对齐表格，分别显示选择状态、监听/公网端口以及直连、CDN 优选、端口回源、CF 隧道能力，支持项使用绿色 `✓`；表格由脚本按终端显示宽度排版，不依赖系统 `column` 命令。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 14 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、Cloudflare Origin Rules（手动登记或 API 自动部署）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。协议选择和增删改界面共用带边框的对齐表格，分别显示选择状态、监听/公网端口以及直连、CDN 优选、端口回源、CF 隧道能力，支持项使用绿色 `✓`；表格由脚本按终端显示宽度排版，不依赖系统 `column` 命令。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 14 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、一键优选 CDN 节点、Cloudflare Origin Rules（手动登记或 API 自动部署）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
+
+“一键优选 CDN 节点”是独立按需模块：只有用户进入该菜单时才下载轻量 Python 程序，平时没有常驻进程。模块从 [CM IP 节点包](https://github.com/cmliu/cmliu/blob/main/CF-CIDR.txt) 生成候选列表，然后在 VPS 上启动一个带随机 token、默认 15 分钟过期的临时页面。请用需要实际优化的电脑或手机网络打开该页，它会测量“客户端 → Cloudflare 边缘”延迟与下载带宽，默认剔除延迟超过 `150 ms` 或带宽低于 `80 Mbps` 的 IP，返回综合最快 5 个（可在启动时改数量）。点击网页的“应用到 Lun”后，结果直接写入现有 `cfip`/`~/lun/cdnip`，订阅重建后立即生效；原有手工输入优选 IP 仍完整保留。
+
+VPS 只用来托管临时页面、下载候选数据和校验回传结果。`VPS → Cloudflare` 的 ping/带宽不能代表家庭宽带、手机网络或特定运营商的真实线路，因此本模块不会用 VPS 测速替代客户端结果。在线探测方案参考 [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel) 与 BestCF，并在页面中保留 HiDNS、@ktff、@Lfreea 贡献致谢。
 
 “安装 / 协议管理”中的增删改操作会停止旧协议进程并重写 Xray/Sing-box 配置，这是让新增、删除和端口修改生效的必要步骤；已有内核、证书、UUID 与订阅设置会保留，只有所选协议需要的内核文件确实缺失时才下载。重建前会创建事务快照，SSH 断线、命令中断或新配置校验失败时自动恢复旧配置和服务，成功后保留 `~/lun/.last_good_rebuild`。状态区会区分“运行中”“已安装但未运行”“内核已安装但当前协议未使用”和“未安装”。
 
@@ -122,7 +126,7 @@ SQLite 记录仅包含时间、用户、设备、目标域名/端口、内核和
 | Hysteria2 | `hypt` | 否 | 否 | 否 |
 | TUIC | `tupt` | 否 | 否 | 否 |
 | VLESS XHTTP TLS UDP（H3-only） | `xupt` | 否 | 否 | 否 |
-| VLESS XHTTP TLS TCP/UDP | `xcpt` | 是（TCP；实验 UDP 443） | 是 | 否 |
+| VLESS XHTTP TLS TCP/UDP | `xcpt` | 是（TCP；UDP需本机公网443） | 是 | 否 |
 | NaiveProxy H2/H3 | `nvpt` | 否 | 否 | 否 |
 
 这里的“CF 隧道 / Argo”指当前 Lun 已实现的普通 Public Hostname 节点，只绑定 VLESS WS 或 VMess WS。Cloudflare Tunnel 理论上还能发布其它 HTTP/TCP 服务，但那些模式不属于本项目现有节点输出。Origin Rules 只作用于 Cloudflare HTTP(S) 请求，因此 Reality、任意 TCP/UDP、QUIC/H3-only 和 Naive CONNECT 不能因为改写了端口就自动变成可用 CDN 协议。

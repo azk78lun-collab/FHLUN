@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.5.12"
+echo "当前版本：V26.8.7.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4666,6 +4666,7 @@ firewall_append_file "$fw_proto" "$fw_root/$fw_file" "$fw_output"
 done
 firewall_append_file tcp "$fw_root/subport.log" "$fw_output"
 firewall_append_file tcp "$fw_root/subport_legacy.log" "$fw_output"
+firewall_append_file tcp "$fw_root/cdnopt_port" "$fw_output"
 
 fw_config="$fw_root/modules/multiuser/config.json"
 if [ -s "$fw_config" ]; then
@@ -9276,6 +9277,183 @@ done
 is_nat_mode && yellow_line "NAT VPS 在服务器自身发起 CF 回环测试时可能误判；客户端外部测试结果优先。"
 }
 
+cdnopt_module_dir(){
+printf '%s\n' "$HOME/lun/modules/cdnopt"
+}
+
+cdnopt_agent(){
+printf '%s/lun_cdn_optimizer.py\n' "$(cdnopt_module_dir)"
+}
+
+cdnopt_install_python(){
+command -v python3 >/dev/null 2>&1 && return 0
+yellow_line "一键优选 CDN 模块需要 Python 3（仅在测速时运行），正在安装……"
+if command -v apk >/dev/null 2>&1; then
+apk add --no-cache python3 >/dev/null 2>&1
+elif command -v apt-get >/dev/null 2>&1; then
+apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1
+elif command -v dnf >/dev/null 2>&1; then
+dnf install -y python3 >/dev/null 2>&1
+elif command -v yum >/dev/null 2>&1; then
+yum install -y python3 >/dev/null 2>&1
+else
+red_line "当前系统无法自动安装 Python 3，请先手动安装。"
+return 1
+fi
+command -v python3 >/dev/null 2>&1
+}
+
+cdnopt_download_agent(){
+cdnopt_dir=$(cdnopt_module_dir)
+cdnopt_target=$(cdnopt_agent)
+cdnopt_tmp="$cdnopt_target.tmp.$$"
+mkdir -p "$cdnopt_dir" || return 1
+rm -f "$cdnopt_tmp"
+if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
+cp "$LUN_CDNOPT_SOURCE" "$cdnopt_tmp" || return 1
+else
+if [ -n "${LUN_CDNOPT_URL:-}" ]; then
+cdnopt_url=$LUN_CDNOPT_URL
+cdnopt_fallback=
+else
+cdnopt_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/modules/cdnopt/lun_cdn_optimizer.py?ref=main&fhlun_nocache=$(date +%s)"
+cdnopt_fallback="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/modules/cdnopt/lun_cdn_optimizer.py?fhlun_nocache=$(date +%s)"
+fi
+if command -v curl >/dev/null 2>&1 && curl -fL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' \
+--connect-timeout 10 --max-time 120 --retry 2 -o "$cdnopt_tmp" "$cdnopt_url"; then
+:
+elif command -v wget >/dev/null 2>&1 && wget -O "$cdnopt_tmp" --header='Accept: application/vnd.github.raw+json' \
+--header='Cache-Control: no-cache' --tries=2 --timeout=60 "$cdnopt_url"; then
+:
+elif [ -n "$cdnopt_fallback" ] && command -v curl >/dev/null 2>&1 && curl -fL -H 'Cache-Control: no-cache' \
+--connect-timeout 10 --max-time 120 --retry 2 -o "$cdnopt_tmp" "$cdnopt_fallback"; then
+:
+elif [ -n "$cdnopt_fallback" ] && command -v wget >/dev/null 2>&1 && wget -O "$cdnopt_tmp" \
+--header='Cache-Control: no-cache' --tries=2 --timeout=60 "$cdnopt_fallback"; then
+:
+else
+rm -f "$cdnopt_tmp"
+return 1
+fi
+fi
+python3 - "$cdnopt_tmp" >/dev/null 2>&1 <<'PY' || {
+import sys
+import tokenize
+
+path = sys.argv[1]
+with tokenize.open(path) as source:
+    compile(source.read(), path, "exec")
+PY
+rm -f "$cdnopt_tmp"
+red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
+return 1
+}
+cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
+[ "$cdnopt_version" = 1.0.0 ] || {
+rm -f "$cdnopt_tmp"
+red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
+return 1
+}
+mv -f "$cdnopt_tmp" "$cdnopt_target"
+chmod 700 "$cdnopt_target"
+}
+
+cdnopt_public_host(){
+cdnopt_host=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
+[ -n "$cdnopt_host" ] || cdnopt_host=${v4:-${v6:-}}
+[ -n "$cdnopt_host" ] || cdnopt_host=$(local_public_ips | sed -n '1p')
+cdnopt_host=${cdnopt_host#\[}
+cdnopt_host=${cdnopt_host%\]}
+[ -n "$cdnopt_host" ] || return 1
+printf '%s\n' "$cdnopt_host"
+}
+
+cdnopt_prompt_count(){
+while :; do
+printf "返回综合最快节点数量 [默认 5，1-20，输入 0 返回]："
+IFS= read -r cdnopt_count
+[ "$cdnopt_count" = 0 ] && return 2
+[ -n "$cdnopt_count" ] || cdnopt_count=5
+case "$cdnopt_count" in *[!0-9]*|'') echo "请输入 1-20。"; continue ;; esac
+if [ "$cdnopt_count" -ge 1 ] 2>/dev/null && [ "$cdnopt_count" -le 20 ] 2>/dev/null; then
+CDNOPT_TOP_COUNT=$cdnopt_count
+return 0
+fi
+echo "请输入 1-20。"
+done
+}
+
+cdnopt_cleanup_session(){
+rm -f "$HOME/lun/cdnopt_port"
+apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
+}
+
+cdnopt_run(){
+ui_title "Lun 一键优选 CDN 节点"
+echo "CM IP 提供候选库；真实测速由您打开的电脑/手机浏览器执行。"
+echo "默认剔除延迟 >150 ms 或带宽 <80 Mbps 的 IP，速度为主、延迟辅助排名。"
+yellow_line "VPS 到优选 IP 的 ping 不代表您本地线路，因此 VPS 不伪装成最终带宽测试。"
+cdnopt_prompt_count || return $?
+cdnopt_top=$CDNOPT_TOP_COUNT
+cdnopt_install_python || return 1
+yellow_line "正在按需下载独立 CDN 优选模块……"
+cdnopt_download_agent || { red_line "CDN 优选模块下载失败，未修改现有优选 IP。"; return 1; }
+cdnopt_internal=$(random_subscription_port) || {
+red_line "没有可用于临时测速页的空闲端口。"
+is_nat_mode && yellow_line "NAT VPS 需要至少一组尚未被协议占用的“公网端口-内网端口”映射。"
+return 1
+}
+cdnopt_public=$(client_port "$cdnopt_internal")
+cdnopt_host=$(cdnopt_public_host) || { red_line "无法识别 VPS 公网 IP，未启动测速页。"; return 1; }
+cdnopt_result_dir=$(cdnopt_module_dir)
+cdnopt_result="$cdnopt_result_dir/result.$$.json"
+rm -f "$cdnopt_result"
+printf '%s\n' "$cdnopt_internal" > "$HOME/lun/cdnopt_port"
+apply_lun_firewall_rules quiet >/dev/null 2>&1 || yellow_line "系统防火墙未能自动放行临时 TCP $cdnopt_internal，如页面打不开请检查防火墙/安全组。"
+if is_nat_mode; then
+green_line "临时页面使用 NAT 映射：公网 $cdnopt_public → 内网 $cdnopt_internal。"
+else
+yellow_line "如页面无法打开，请在云安全组临时放行 TCP $cdnopt_public；测速结束后 Lun 会删除自己的系统防火墙规则。"
+fi
+if [ -n "${LUN_CDNOPT_CANDIDATE_FILE:-}" ]; then
+python3 "$(cdnopt_agent)" serve \
+--port "$cdnopt_internal" --public-host "$cdnopt_host" --public-port "$cdnopt_public" \
+--result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
+--source-file "$LUN_CDNOPT_CANDIDATE_FILE"
+else
+python3 "$(cdnopt_agent)" serve \
+--port "$cdnopt_internal" --public-host "$cdnopt_host" --public-port "$cdnopt_public" \
+--result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80
+fi
+cdnopt_rc=$?
+cdnopt_cleanup_session
+case "$cdnopt_rc" in
+0) ;;
+2) yellow_line "已取消优选，未修改现有节点。"; rm -f "$cdnopt_result"; return 2 ;;
+*) red_line "CDN 优选未完成，现有节点保持不变。"; rm -f "$cdnopt_result"; return 1 ;;
+esac
+python3 "$(cdnopt_agent)" extract --result-file "$cdnopt_result" --format table || {
+red_line "测速结果校验失败，现有节点保持不变。"
+rm -f "$cdnopt_result"
+return 1
+}
+cdnopt_ips=$(python3 "$(cdnopt_agent)" extract --result-file "$cdnopt_result" --format ips | tr '\n' ' ')
+[ -n "$cdnopt_ips" ] && save_cdn_ip_list "$cdnopt_ips" || {
+red_line "结果中没有可应用的 IP，现有节点保持不变。"
+rm -f "$cdnopt_result"
+return 1
+}
+rm -f "$cdnopt_result"
+export cfip
+green_line "已应用到 Lun CDN 优选入口：$cfip"
+if [ -s "$HOME/lun/cdnym" ]; then
+green_line "订阅将立即重建，已启用的 CDN 协议节点会直接使用新 IP。"
+else
+yellow_line "尚未设置 CDN Host；结果已保存，以后启用 CDN 协议时会直接复用。"
+fi
+return 0
+}
+
 prompt_cdn_host(){
 cur_host=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 while :; do
@@ -9782,7 +9960,7 @@ protocol_route_capabilities(){
 case "$1" in
 3) echo "直连 / CDN优选 / 端口回源" ;;
 4|8) echo "直连 / CDN优选 / 端口回源 / CF隧道" ;;
-13) echo "直连 / CDN优选(TCP、实验UDP443) / 端口回源" ;;
+13) echo "直连 / CDN优选(TCP、UDP需公网443) / 端口回源" ;;
 10|11|12) echo "仅直连UDP/QUIC（无CDN、回源、隧道）" ;;
 *) echo "仅直连（无CDN、回源、隧道）" ;;
 esac
@@ -9916,7 +10094,7 @@ echo "当前协议选择："
 render_protocol_table
 yellow_line "绿色 ✓ 表示已选择或支持；— 表示未选择或不支持。"
 yellow_line "能力：CDN优选=Cloudflare HTTP(S)；端口回源=Origin Rules；CF隧道=当前 Lun 的 WS/Argo。"
-yellow_line "* 13 的 CDN 优选包含 TCP 与实验性 UDP 443；10/11/12 的直连使用 UDP/QUIC。"
+yellow_line "* 编号13 的 CDN 优选包含 TCP 与 UDP；UDP 必须献祭本机公网443端口，否则只输出 TCP 节点。"
 }
 
 prompt_protocol_by_id(){
@@ -10861,11 +11039,12 @@ show_cdn_summary
 [ -s "$HOME/lun/argoip" ] && echo "Argo优选：$(cat "$HOME/lun/argoip")" || echo "Argo优选：中性默认"
 echo " 1. VPS 类型 / 端口池 / 快速改端口"
 echo " 2. CDN / CF 优选（入口地址与 Host）"
-echo " 3. Cloudflare Origin Rules（手动登记 / API 自动部署）"
-echo " 4. CF 隧道 / Argo（独立链路，不使用 2/3 的设置）"
-echo " 5. CDN 连通诊断"
+echo " 3. 一键优选 CDN 节点（按需下载，浏览器实测）"
+echo " 4. Cloudflare Origin Rules（手动登记 / API 自动部署）"
+echo " 5. CF 隧道 / Argo（独立链路，不使用 2/4 的设置）"
+echo " 6. CDN 连通诊断"
 echo " 0. 返回"
-printf "请选择 [0-5]："
+printf "请选择 [0-6]："
 IFS= read -r c
 case "$c" in
 1)
@@ -10879,6 +11058,11 @@ if [ "$CDN_REBUILD_REQUIRED" = yes ]; then load_installed_protocol_flags; LUN_ME
 return
 ;;
 3)
+cdnopt_run; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || { ui_pause; continue; }
+LUN_MENU_ACTION=list
+return
+;;
+4)
 prompt_origin_rules; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || { ui_pause; continue; }
 if [ "$CDN_REBUILD_REQUIRED" = yes ]; then
 [ "$CLOUDFLARE_PROTOCOL_PORT_CHANGED" = yes ] || load_installed_protocol_flags
@@ -10888,11 +11072,11 @@ LUN_MENU_ACTION=list
 fi
 return
 ;;
-4)
+5)
 argo_network_menu; rc=$?; [ "$rc" = 2 ] && continue
 return
 ;;
-5) diagnose_cdn_endpoints; ui_pause ;;
+6) diagnose_cdn_endpoints; ui_pause ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -12020,7 +12204,7 @@ echo " 9. Socks5              【调试/信任网络】适合本人临时使用�
 echo "10. Hysteria2           【弱网高速】适合高延迟、丢包和移动网络。速度：高。特征：QUIC/UDP；必须放行 UDP。｜$(protocol_route_capabilities 10)"
 echo "11. TUIC                【低延迟 UDP】适合移动网络、游戏和频繁切网。特征：QUIC/UDP；客户端兼容性略窄。｜$(protocol_route_capabilities 11)"
 echo "12. VLESS XHTTP TLS UDP 【实验】H3-only 直连，适合测试 XHTTP/QUIC。某些手机客户端不显延迟或重置，不建议做唯一主节点。｜$(protocol_route_capabilities 12)"
-echo "13. VLESS XHTTP TLS TCP/UDP【进阶】直连兼顾 TCP/UDP，并可生成 CDN-TCP。隐蔽：较高。实验 UDP443 不宜作主力。｜$(protocol_route_capabilities 13)"
+echo "13. VLESS XHTTP TLS TCP/UDP【进阶】直连兼顾 TCP/UDP，并可生成 CDN-TCP。UDP 必须献祭本机公网443端口，否则只输出 TCP 节点。隐蔽：较高。｜$(protocol_route_capabilities 13)"
 echo "14. NaiveProxy H2/H3   【公开证书场景】HTTP CONNECT 特征接近普通 Web TLS，适合有正式域名证书的直连节点。｜$(protocol_route_capabilities 14)"
 yellow_line "UDP/QUIC 协议需同时放行服务商 UDP、云安全组、系统防火墙；NAT 还需 UDP 映射。"
 red_line "NaiveProxy 必须使用与域名匹配的公开可信证书，不接受自签或 Cloudflare Origin CA。"
@@ -12040,6 +12224,7 @@ yellow_line "Lun 不能代替服务商创建 4444→80；请先在服务商面�
 
 show_cdn_help(){
 ui_title "Lun Cloudflare 端口回源操作"
+green_line "优选 IP：进入“入口网络管理 → 一键优选 CDN 节点”，用本地浏览器实测后可直接应用；原有手工输入仍保留。"
 echo "1. 在 Lun 选择支持 CDN 的协议：VLESS XHTTP、VLESS WS、VMess WS，或 XHTTP TLS TCP/UDP 的 TCP 节点。"
 echo "2. 记下 Lun 显示的服务域名、Path、Cloudflare 边缘端口和源站端口。"
 echo "3. 在 Cloudflare DNS 中让该域名指向 VPS 公网 IP，并开启橙云；灰云不会经过 Cloudflare，Origin Rule 不会执行。"
