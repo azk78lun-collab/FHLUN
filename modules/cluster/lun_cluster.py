@@ -1023,9 +1023,10 @@ class Cluster:
             "SELECT * FROM profiles WHERE enabled=1 ORDER BY id"
         )]
 
-    def refresh_profiles(self, profile_key: str = "legacy") -> list[dict[str, Any]]:
+    def refresh_profiles(self, profile_key: str = "legacy",
+                         sync_master_state: bool = True) -> list[dict[str, Any]]:
         config = self.load_config()
-        if config.get("role") == "master":
+        if config.get("role") == "master" and sync_master_state:
             self.record_local_snapshot(profile_key)
             local = self.node(str(config.get("node_id", "")))
             self.mark_identity_synced(local)
@@ -1974,6 +1975,9 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
                 if status.get("node_id") != peer:
                     raise ClusterError("订阅快照节点身份不匹配")
                 self.cluster.record_snapshot(snapshot)
+                self.cluster.refresh_profiles(
+                    str(snapshot.get("profile_key", "legacy")), sync_master_state=False
+                )
                 self._reply(200, {"ok": True})
             elif parsed.path == "/v1/events/usage":
                 if self.cluster.load_config().get("role") != "master":

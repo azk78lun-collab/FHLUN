@@ -21,6 +21,8 @@ for helper in \
   sed_replacement_escape \
   replace_link_addr \
   valid_port_value \
+  valid_ptmap_pair \
+  normalize_ptmap \
   valid_ipv4_value \
   valid_cdn_endpoint \
   clean_cdn_endpoint_token \
@@ -28,7 +30,11 @@ for helper in \
   cloudflare_manual_rule_file \
   cloudflare_manual_rule_matches \
   cdn_first_endpoint \
+  cdn_protocol_state_port \
+  cdn_protocol_enabled \
   cdn_rewrite_active \
+  is_cf_https_port \
+  cdn_origin_tls_for_port \
   effective_address_mode \
   direct_mode_uses_domain \
   direct_domain_matches_rewrite_host \
@@ -76,6 +82,22 @@ done
 [[ $(multiuser_quota_g 500M) == 500M ]]
 [[ $(multiuser_quota_g 2T) == 2T ]]
 [[ $(multiuser_quota_g 0) == 0 ]]
+
+# XHTTP TLS 可使用 HTTPS 回源，但未纳入 CDN 的 WS 必须保持明文供 Tunnel 使用。
+test_home=$(mktemp -d)
+original_home=$HOME
+HOME=$test_home
+mkdir -p "$HOME/lun"
+cdnym=proxy.example.com
+cdnmode=rewrite
+cdnproto=xhttp
+port_xc=8443
+port_vw=8080
+cdn_client_port() { printf '443\n'; }
+cdn_origin_tls_for_port 8443
+! cdn_origin_tls_for_port 8080
+HOME=$original_home
+rm -rf "$test_home"
 
 cdn_sample=$(cat <<'EOF'
 **108.162.198.211:2083#JP 电信优选[64ms 160.85Mbps]**
@@ -170,9 +192,22 @@ grep -q 'mu_ss_port=$(random_nat_port' "$SCRIPT"
 ! grep -q '输入 HTTP 才继续' "$SCRIPT"
 grep -q '手动登记已设置的规则（无需 API' "$SCRIPT"
 grep -q '粘贴 Token（输入会显示，0 返回）' "$SCRIPT"
-grep -q '区域 → Origin Rules → 编辑' "$SCRIPT"
+grep -q '最大可用编辑权限' "$SCRIPT"
+grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
+grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.7.1' "$SCRIPT"
+grep -q '当前版本：V26.8.8.1' "$SCRIPT"
+grep -q '一键全配置（CDN / 域名证书 / 隧道 / 端口回源）' "$SCRIPT"
+grep -q '^oneclick_full_setup(){' "$SCRIPT"
+grep -q '^oneclick_full_finalize(){' "$SCRIPT"
+grep -q '^oneclick_full_complete(){' "$SCRIPT"
+grep -q 'SUBSCRIPTION_HTTP=verified' "$SCRIPT"
+grep -q 'CERT_TRUST=public' "$SCRIPT"
+grep -q '\${ONECLICK_FORCE_CERT:-no}' "$SCRIPT"
+grep -q 'export .* ONECLICK_FORCE_CERT' "$SCRIPT"
+grep -q 'if \[ "\${ONECLICK_FORCE_CERT:-no}" = yes \]; then' "$SCRIPT"
+grep -q '! cert_publicly_trusted_for_domain "\$HOME/lun/cert.crt" "\$host"' "$SCRIPT"
+grep -q 'python3 .* tunnel-deploy' "$SCRIPT"
 grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"
@@ -222,6 +257,13 @@ grep -q 'visit-recent --days 1 --limit 100 --view smart --noise auto' "$SCRIPT"
 grep -q 'visit-filter --mode standard' "$SCRIPT"
 ! grep -q '今日最近访问' "$SCRIPT"
 
+# 子机必须在最终订阅生成和 Cloudflare 待处理刷新之后再推送快照。
+final_cip_line=$(grep -n '^cip$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
+final_cf_line=$(grep -n '^cloudflare_origin_finalize_pending || true$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
+final_oneclick_line=$(grep -n '^if ! oneclick_full_complete; then$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
+final_push_line=$(grep -n '^cluster_push_event >/dev/null 2>&1 || true$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
+[[ $final_cip_line -lt $final_cf_line && $final_cf_line -lt $final_oneclick_line && $final_oneclick_line -lt $final_push_line ]]
+
 extract_shell_function() {
   awk -v target="$1" '
     $0 ~ "^" target "\\(\\)\\{" { capture=1 }
@@ -236,6 +278,69 @@ extract_shell_function() {
     }
   ' "$SCRIPT"
 }
+
+# 证书来源标签不能掩盖实际证书类型：Origin CA 即使状态文件写着 dns，也必须纠正为 origin。
+eval "$(extract_shell_function sync_cert_metadata)"
+cert_meta_home=$(mktemp -d)
+HOME=$cert_meta_home
+mkdir -p "$HOME/lun"
+touch "$HOME/lun/cert.crt" "$HOME/lun/private.key"
+printf '%s\n' dns > "$HOME/lun/cert_mode"
+cert_key_matches() { return 0; }
+cert_detect_mode() { printf '%s\n' origin; }
+cert_subject_from_file() { printf '%s\n' proxy.example.com; }
+cert_hash_update() { :; }
+domain=proxy.example.com
+sync_cert_metadata
+[[ $(cat "$HOME/lun/cert_mode") == origin ]]
+cert_detect_mode() { printf '%s\n' ca; }
+printf '%s\n' dns > "$HOME/lun/cert_mode"
+sync_cert_metadata
+[[ $(cat "$HOME/lun/cert_mode") == dns ]]
+unset -f cert_key_matches cert_detect_mode cert_subject_from_file cert_hash_update
+rm -rf "$cert_meta_home"
+HOME=$original_home
+
+eval "$(extract_shell_function oneclick_collect_ports)"
+oneclick_port_safe() { return 0; }
+yellow_line() { :; }
+red_line() { :; }
+green_line() { :; }
+ONECLICK_MODE=normal
+oneclick_collect_ports <<< '21001 21002 21003 21004'
+[[ $ONECLICK_PROFILE == full && $ONECLICK_CDN_PORT == 21001 && $ONECLICK_WS_PORT == 21002 && $ONECLICK_REALITY_PORT == 21003 && $ONECLICK_SUB_PORT == 21004 ]]
+ONECLICK_MODE=nat
+ptmap=
+oneclick_collect_ports <<< '41001-22001 41002-22002'
+[[ $ONECLICK_PROFILE == shared-ws && $ONECLICK_CDN_PORT == 22001 && $ONECLICK_WS_PORT == 22001 && $ONECLICK_SUB_PORT == 22002 ]]
+
+eval "$(extract_shell_function oneclick_full_complete)"
+oneclick_test_home=$(mktemp -d)
+HOME=$oneclick_test_home
+mkdir -p "$HOME/lun"
+cat > "$HOME/lun/oneclick_full_pending" <<'EOF'
+PROFILE=full
+HOST=cdn.example.com
+TUNNEL_HOST=argo.example.com
+EOF
+touch "$HOME/lun/oneclick_cloud_verified" "$HOME/lun/oneclick_origin_deployed"
+printf '%s\n' dns > "$HOME/lun/cert_mode"
+printf '%s\n' cdn.example.com > "$HOME/lun/cert_subject"
+printf '%s\n' 12347 > "$HOME/lun/subport.log"
+printf '%s\n' test-token > "$HOME/lun/subtoken.log"
+curl() { printf '%s\n' 'vless://cdn.example.com/node' 'vless://argo.example.com/node'; }
+pidof() { [[ $1 == systemd ]]; }
+systemctl() { return 0; }
+cert_key_matches() { return 0; }
+cert_publicly_trusted_for_domain() { return 0; }
+oneclick_full_complete
+grep -q '^SUBSCRIPTION_HTTP=verified$' "$HOME/lun/oneclick_full_report.txt"
+grep -q '^CERT_TRUST=public$' "$HOME/lun/oneclick_full_report.txt"
+grep -q '^RESULT=PASS$' "$HOME/lun/oneclick_full_report.txt"
+[[ ! -e $HOME/lun/oneclick_full_pending ]]
+unset -f curl pidof systemctl cert_key_matches cert_publicly_trusted_for_domain
+rm -rf "$oneclick_test_home"
+HOME=$original_home
 
 eval "$(extract_shell_function multiuser_prepare_service_port)"
 service_test_home=$(mktemp -d)

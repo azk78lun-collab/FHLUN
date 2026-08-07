@@ -158,6 +158,56 @@ class ClusterTestCase(unittest.TestCase):
         self.assertIn("德国-法兰克福", region["clmi.yaml"])
         self.assertNotIn("Hong Kong", region["clmi.yaml"])
 
+    def test_child_snapshot_event_refreshes_public_aggregate(self) -> None:
+        master_id, child_id = "a" * 32, "b" * 32
+        self.cluster.save_config({
+            "enabled": True, "role": "master", "node_id": master_id,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+        })
+        self.cluster.upsert_node({
+            "node_id": master_id, "public_host": "127.0.0.1", "public_port": 20000,
+            "internal_port": 20000, "api_version": 1,
+            "location": {"country_code": "JP", "city": "Osaka"},
+        }, role="master")
+        self.cluster.upsert_node({
+            "node_id": child_id, "public_host": "198.51.100.2", "public_port": 21000,
+            "internal_port": 21000, "api_version": 1,
+            "location": {"country_code": "DE", "city": "Frankfurt"},
+        }, role="child")
+        node_name = "[德国-法兰克福]vless-xhttp-tls-tcp-02"
+        snapshot = {
+            "status": {
+                "node_id": child_id, "public_host": "198.51.100.2", "public_port": 21000,
+                "internal_port": 21000, "api_version": 1,
+                "location": {"country_code": "DE", "city": "Frankfurt"},
+            },
+            "profile_key": "legacy",
+            "files": {
+                "jhsub.txt": base64.b64encode(
+                    f"vless://11111111-1111-4111-8111-111111111111@198.51.100.2:443#{node_name}\n".encode()
+                ).decode(),
+                "clmi.yaml": base64.b64encode(b"proxies: []\nproxy-groups: []\nrules: []\n").decode(),
+                "sbox.json": base64.b64encode(b'{"inbounds":[],"outbounds":[],"route":{"rules":[]}}').decode(),
+            },
+        }
+        handler = object.__new__(lun_cluster.ClusterHandler)
+        handler.server = type("Server", (), {"cluster": self.cluster})()
+        handler.path = "/v1/events/snapshot"
+        handler._body = mock.Mock(return_value={"snapshot": snapshot})
+        handler._require_peer = mock.Mock(return_value=child_id)
+        handler._reply = mock.Mock()
+
+        with mock.patch.object(
+            lun_cluster, "push_node_identity", side_effect=AssertionError("unexpected identity sync")
+        ):
+            handler.do_POST()
+
+        handler._reply.assert_called_once_with(200, {"ok": True})
+        generated = list((self.root / "modules" / "cluster" / "generated").glob("*/jhsub.txt"))
+        self.assertTrue(generated)
+        self.assertTrue(any(node_name in path.read_text(encoding="utf-8") for path in generated))
+        self.cluster = lun_cluster.Cluster(self.root)
+
     def test_minoh_names_are_canonicalized_to_osaka_in_all_subscriptions(self) -> None:
         node_id = "c" * 32
         server_number = self.cluster.allocate_server_number(node_id)

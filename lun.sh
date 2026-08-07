@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.7.1"
+echo "当前版本：V26.8.8.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -835,10 +835,19 @@ fi
 
 cdn_origin_tls_for_port(){
 [ -n "$cdnym" ] || [ -s "$HOME/lun/cdnym" ] || return 1
+origin_inner=$1
+origin_enabled=no
+if cdn_protocol_enabled xhttp; then
+[ "$origin_inner" = "$(cdn_protocol_state_port "${port_xc:-}" "$HOME/lun/port_xc")" ] && origin_enabled=yes
+[ "$origin_inner" = "$(cdn_protocol_state_port "${port_vx:-}" "$HOME/lun/port_vx")" ] && origin_enabled=yes
+fi
+if cdn_protocol_enabled ws && [ "$origin_inner" = "$(cdn_protocol_state_port "${port_vw:-}" "$HOME/lun/port_vw")" ]; then origin_enabled=yes; fi
+if cdn_protocol_enabled vmess && [ "$origin_inner" = "$(cdn_protocol_state_port "${port_vm_ws:-}" "$HOME/lun/port_vm_ws")" ]; then origin_enabled=yes; fi
+[ "$origin_enabled" = yes ] || return 1
 if cdn_rewrite_active; then
-is_cf_https_port "$(cdn_client_port "$1")"
+is_cf_https_port "$(cdn_client_port "$origin_inner")"
 else
-is_cf_https_port "$(client_port "$1")"
+is_cf_https_port "$(client_port "$origin_inner")"
 fi
 }
 
@@ -1831,7 +1840,12 @@ key_file="$HOME/lun/private.key"
 cert_key_matches "$cert_file" "$key_file" || return 1
 detected_mode=$(cert_detect_mode "$cert_file")
 stored_mode=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
-case "$stored_mode" in domain|dns|ip) effective_mode=$stored_mode ;; *) effective_mode=$detected_mode ;; esac
+case "$detected_mode" in
+ca)
+case "$stored_mode" in domain|dns|ip) effective_mode=$stored_mode ;; *) effective_mode=ca ;; esac
+;;
+*) effective_mode=$detected_mode ;;
+esac
 preferred_name=${domain:-$(cat "$HOME/lun/cdnym" 2>/dev/null)}
 subject=$(cert_subject_from_file "$cert_file" "$preferred_name")
 printf '%s\n' "$effective_mode" > "$HOME/lun/cert_mode"
@@ -1839,6 +1853,41 @@ printf '%s\n' "$subject" > "$HOME/lun/cert_subject"
 certmode=$effective_mode
 cert_hash_update
 }
+
+cert_publicly_trusted_for_domain(){ (
+cert_file=$1
+host=$2
+[ -s "$cert_file" ] && [ -n "$host" ] || return 1
+[ "$(cert_detect_mode "$cert_file")" = ca ] || return 1
+cert_covers_domain "$cert_file" "$host" || return 1
+openssl x509 -in "$cert_file" -noout -checkend 0 >/dev/null 2>&1 || return 1
+leaf="/tmp/lun-public-leaf.$$"
+chain="/tmp/lun-public-chain.$$"
+awk '
+/-----BEGIN CERTIFICATE-----/ { block++ }
+block == 1 { print }
+' "$cert_file" > "$leaf"
+awk '
+/-----BEGIN CERTIFICATE-----/ { block++ }
+block >= 2 { print }
+' "$cert_file" > "$chain"
+ca_file=
+for candidate in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+[ -s "$candidate" ] && { ca_file=$candidate; break; }
+done
+if [ -n "$ca_file" ]; then
+if [ -s "$chain" ]; then
+openssl verify -purpose sslserver -CAfile "$ca_file" -untrusted "$chain" "$leaf" >/dev/null 2>&1
+else
+openssl verify -purpose sslserver -CAfile "$ca_file" "$leaf" >/dev/null 2>&1
+fi
+verify_rc=$?
+else
+verify_rc=1
+fi
+rm -f "$leaf" "$chain"
+[ "$verify_rc" = 0 ]
+) }
 
 import_local_certificate(){
 cert_file=$1
@@ -2072,7 +2121,7 @@ install_acme_cert "$subject" "$mode"
 
 prepare_runtime_cert(){
 load_domain_cert_config
-if reuse_local_cert_interactive; then return 0; fi
+if [ "${ONECLICK_FORCE_CERT:-no}" != yes ] && reuse_local_cert_interactive; then return 0; fi
 subject=$(cert_subject_default)
 case "$certmode" in
 domain|dns)
@@ -2304,7 +2353,9 @@ dekey=$(cat "$HOME/lun/xrk/dekey")
 enkey=$(cat "$HOME/lun/xrk/enkey")
 fi
 if [ -n "$xup" ] || [ -n "$xcp" ]; then
-if cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key"; then
+if [ "${ONECLICK_FORCE_CERT:-no}" = yes ]; then
+prepare_runtime_cert || { echo "XHTTP TLS 证书准备失败。"; return 1; }
+elif cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key"; then
 sync_cert_metadata || { echo "XHTTP TLS 证书元数据同步失败。"; return 1; }
 else
 prepare_runtime_cert || { echo "XHTTP TLS 证书准备失败。"; return 1; }
@@ -6199,10 +6250,17 @@ showmode_short
 }
 create_rebuild_snapshot(){
 rebuild_snapshot="$HOME/lun/.rebuild_snapshot"
+[ -s "$HOME/lun/oneclick_full_pending" ] && [ -f "$rebuild_snapshot/oneclick_prepared" ] && return 0
 rm -rf "$rebuild_snapshot"
 mkdir -p "$rebuild_snapshot/lun" "$rebuild_snapshot/services" || return 1
-for rebuild_file in "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm; do
-[ -e "$rebuild_file" ] || continue
+for rebuild_file in \
+"$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* \
+"$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_* "$HOME/lun"/cert.crt "$HOME/lun"/private.key "$HOME/lun"/SHA256.txt \
+"$HOME/lun"/acme_* "$HOME/lun"/cert.env "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool \
+"$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
+"$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
+"$HOME/lun"/warp* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm; do
+[ -f "$rebuild_file" ] || continue
 cp -a "$rebuild_file" "$rebuild_snapshot/lun/" || return 1
 done
 [ -f "$HOME/.bashrc" ] && cp -a "$HOME/.bashrc" "$rebuild_snapshot/bashrc"
@@ -6220,7 +6278,16 @@ trap - HUP INT TERM EXIT
 [ -n "$rebuild_snapshot" ] && [ -d "$rebuild_snapshot" ] || return 1
 echo
 echo "协议重建未完成，正在自动恢复上一次可用配置……"
-rm -f "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* "$HOME/lun"/name "$HOME/lun"/vlvm
+if [ -s "$HOME/lun/oneclick_full_pending" ]; then
+oneclick_cloud_rollback >/dev/null 2>&1 || true
+fi
+rm -f "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* \
+"$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_* "$HOME/lun"/cert.crt "$HOME/lun"/private.key "$HOME/lun"/SHA256.txt \
+"$HOME/lun"/acme_* "$HOME/lun"/cert.env "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool \
+"$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
+"$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
+"$HOME/lun"/warp* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm \
+"$HOME/lun"/oneclick_*
 cp -a "$rebuild_snapshot/lun/." "$HOME/lun/" 2>/dev/null || true
 [ -f "$rebuild_snapshot/bashrc" ] && cp -a "$rebuild_snapshot/bashrc" "$HOME/.bashrc"
 [ -s "$rebuild_snapshot/crontab" ] && crontab "$rebuild_snapshot/crontab" >/dev/null 2>&1 || true
@@ -8382,8 +8449,14 @@ except (AttributeError, OSError):
 BASE = os.environ.get("CF_LUN_API_BASE", "https://api.cloudflare.com/client/v4").rstrip("/")
 TOKEN = os.environ.get("CF_LUN_TOKEN", "").strip()
 HOST = os.environ.get("CF_LUN_HOST", "").strip().lower().rstrip(".")
+ZONE_NAME = os.environ.get("CF_LUN_ZONE", "").strip().lower().rstrip(".")
+ORIGIN_IPS = os.environ.get("CF_LUN_ORIGIN_IPS", "").split()
 BACKUP = os.environ.get("CF_LUN_BACKUP", "")
 STATE = os.environ.get("CF_LUN_STATE", "")
+TUNNEL_HOST = os.environ.get("CF_LUN_TUNNEL_HOST", "").strip().lower().rstrip(".")
+TUNNEL_NAME = os.environ.get("CF_LUN_TUNNEL_NAME", "").strip()
+TUNNEL_PORT = os.environ.get("CF_LUN_TUNNEL_PORT", "").strip()
+TUNNEL_STATE = os.environ.get("CF_LUN_TUNNEL_STATE", "")
 
 
 class ApiError(RuntimeError):
@@ -8711,6 +8784,15 @@ def deploy():
         "host": HOST,
         "ruleset_id": ruleset_result.get("id"),
         "rule_refs": [rule["ref"] for rule in desired],
+        "dns_created_ids": created_dns,
+        "dns_changed": [
+            {"id": record_id, "proxied": old_proxied}
+            for record_id, old_proxied in changed_dns
+        ],
+        "settings_changed": [
+            {"id": setting_id, "value": old_value}
+            for setting_id, old_value in changed_settings
+        ],
         "targets": [
             {"edge": item["edge"], "origin": item["origin"], "path": item["path"]}
             for item in specs
@@ -8758,6 +8840,235 @@ def remove():
     print("REMOVED=" + str(removed))
 
 
+def all_zones():
+    zones = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode({"per_page": 50, "page": page, "status": "active"})
+        result, doc = api("GET", "/zones?" + query)
+        zones.extend(result or [])
+        pages = int((doc.get("result_info") or {}).get("total_pages") or 1)
+        if page >= pages:
+            return zones
+        page += 1
+
+
+def find_zone_name(name):
+    matches = [zone for zone in all_zones() if str(zone.get("name", "")).lower() == name]
+    if not matches:
+        raise ApiError("Token 看不到区域 %s" % name)
+    return matches[0]
+
+
+def list_zones_action():
+    zones = all_zones()
+    if not zones:
+        raise ApiError("Token 没有可用区域")
+    for zone in sorted(zones, key=lambda item: str(item.get("name", ""))):
+        account = zone.get("account") or {}
+        account_name = str(account.get("name", "")).replace("|", " ")
+        print("ZONE=%s|%s|%s|%s" % (
+            zone.get("name", ""), zone.get("id", ""), account.get("id", ""), account_name,
+        ))
+
+
+def discover_hosts_action():
+    if not ZONE_NAME:
+        raise ApiError("未指定区域")
+    zone = find_zone_name(ZONE_NAME)
+    records, _ = api("GET", "/zones/%s/dns_records?%s" % (
+        zone["id"], urllib.parse.urlencode({"per_page": 500}),
+    ))
+    local = {value.strip().strip("[]") for value in ORIGIN_IPS if value.strip()}
+    seen = set()
+    for record in records or []:
+        if record.get("type") not in {"A", "AAAA"}:
+            continue
+        content = str(record.get("content", "")).strip().strip("[]")
+        if content not in local:
+            continue
+        name = str(record.get("name", "")).lower().rstrip(".")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        print("HOST=%s|%s|%s" % (name, record.get("type", ""), "yes" if record.get("proxied") else "no"))
+
+
+def preflight_action():
+    if not HOST:
+        raise ApiError("未提供服务域名")
+    zone = find_zone()
+    zone_id = zone["id"]
+    account_id = str((zone.get("account") or {}).get("id", ""))
+    api("GET", "/zones/%s/dns_records?%s" % (zone_id, urllib.parse.urlencode({"name": HOST, "per_page": 10})))
+    api("GET", "/zones/%s/rulesets" % zone_id)
+    api("GET", "/zones/%s/settings/ssl" % zone_id)
+    if not account_id:
+        raise ApiError("区域没有返回账户 ID")
+    api("GET", "/accounts/%s/cfd_tunnel?%s" % (
+        account_id, urllib.parse.urlencode({"is_deleted": "false", "per_page": 1}),
+    ))
+    print("PREFLIGHT=ok")
+    print("ZONE=" + str(zone.get("name", "")))
+    print("ACCOUNT=" + account_id)
+
+
+def dns_payload(record):
+    allowed = ("type", "name", "content", "ttl", "proxied", "comment", "tags", "settings")
+    return {key: record[key] for key in allowed if key in record}
+
+
+def tunnel_paths(account_id, tunnel_id=""):
+    base = "/accounts/%s/cfd_tunnel" % account_id
+    return base + (("/" + tunnel_id) if tunnel_id else "")
+
+
+def tunnel_rollback_payload(payload):
+    account_id = str(payload.get("account_id", ""))
+    tunnel_id = str(payload.get("tunnel_id", ""))
+    zone_id = str(payload.get("zone_id", ""))
+    errors = []
+    old_dns = payload.get("old_dns")
+    created_dns_id = str(payload.get("created_dns_id", ""))
+    try:
+        if created_dns_id:
+            api("DELETE", "/zones/%s/dns_records/%s" % (zone_id, created_dns_id))
+        elif isinstance(old_dns, dict) and old_dns.get("id"):
+            api("PUT", "/zones/%s/dns_records/%s" % (zone_id, old_dns["id"]), dns_payload(old_dns))
+    except Exception as exc:
+        errors.append("Tunnel DNS 回滚失败: %s" % exc)
+    try:
+        if payload.get("created_tunnel") and tunnel_id:
+            api("DELETE", tunnel_paths(account_id, tunnel_id))
+        elif tunnel_id and isinstance(payload.get("old_config"), dict):
+            api("PUT", tunnel_paths(account_id, tunnel_id) + "/configurations", payload["old_config"])
+    except Exception as exc:
+        errors.append("Tunnel 配置回滚失败: %s" % exc)
+    return errors
+
+
+def tunnel_deploy_action():
+    if not HOST or not TUNNEL_HOST or not TUNNEL_STATE:
+        raise ApiError("Tunnel 参数不完整")
+    try:
+        tunnel_port = int(TUNNEL_PORT)
+    except ValueError:
+        raise ApiError("Tunnel 本机端口无效")
+    if not 1 <= tunnel_port <= 65535:
+        raise ApiError("Tunnel 本机端口超出范围")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", TUNNEL_HOST):
+        raise ApiError("Tunnel 域名格式无效")
+    zone = find_zone()
+    zone_id = zone["id"]
+    account_id = str((zone.get("account") or {}).get("id", ""))
+    if not account_id:
+        raise ApiError("区域没有返回账户 ID")
+    name = TUNNEL_NAME or ("fhlun-" + hashlib.sha256((HOST + "|" + TUNNEL_HOST).encode()).hexdigest()[:12])
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise ApiError("Tunnel 名称格式无效")
+    query = urllib.parse.urlencode({"is_deleted": "false", "name": name, "per_page": 100})
+    tunnels, _ = api("GET", tunnel_paths(account_id) + "?" + query)
+    matches = [item for item in (tunnels or []) if str(item.get("name", "")) == name]
+    if len(matches) > 1:
+        raise ApiError("检测到多个同名 Tunnel，已停止以免覆盖")
+    tunnel = matches[0] if matches else None
+    created_tunnel = False
+    old_config = None
+    if tunnel:
+        tunnel_id = str(tunnel["id"])
+        old_config, _ = api("GET", tunnel_paths(account_id, tunnel_id) + "/configurations")
+    else:
+        tunnel, _ = api("POST", tunnel_paths(account_id), {"name": name, "config_src": "cloudflare"})
+        tunnel_id = str(tunnel["id"])
+        created_tunnel = True
+    target = tunnel_id + ".cfargotunnel.com"
+    dns_query = urllib.parse.urlencode({"name": TUNNEL_HOST, "per_page": 100})
+    dns_records, _ = api("GET", "/zones/%s/dns_records?%s" % (zone_id, dns_query))
+    dns_records = dns_records or []
+    if len(dns_records) > 1:
+        if created_tunnel:
+            api("DELETE", tunnel_paths(account_id, tunnel_id))
+        raise ApiError("Tunnel 域名存在多条 DNS 记录，已停止以免覆盖")
+    old_dns = dns_records[0] if dns_records else None
+    if old_dns and not (
+        old_dns.get("type") == "CNAME" and str(old_dns.get("content", "")).lower().rstrip(".") == target
+    ):
+        if created_tunnel:
+            api("DELETE", tunnel_paths(account_id, tunnel_id))
+        raise ApiError("Tunnel 域名已被非本 Tunnel 的 DNS 记录占用")
+    rollback_data = {
+        "account_id": account_id, "zone_id": zone_id, "tunnel_id": tunnel_id,
+        "created_tunnel": created_tunnel, "old_config": old_config,
+        "old_dns": old_dns, "created_dns_id": "",
+    }
+    try:
+        desired_config = {"config": {"ingress": [
+            {"hostname": TUNNEL_HOST, "service": "http://localhost:%d" % tunnel_port},
+            {"service": "http_status:404"},
+        ]}}
+        api("PUT", tunnel_paths(account_id, tunnel_id) + "/configurations", desired_config)
+        record_payload = {"type": "CNAME", "name": TUNNEL_HOST, "content": target, "ttl": 1, "proxied": True}
+        if old_dns:
+            api("PUT", "/zones/%s/dns_records/%s" % (zone_id, old_dns["id"]), record_payload)
+        else:
+            created_dns, _ = api("POST", "/zones/%s/dns_records" % zone_id, record_payload)
+            rollback_data["created_dns_id"] = str(created_dns["id"])
+        token, _ = api("GET", tunnel_paths(account_id, tunnel_id) + "/token")
+        if not isinstance(token, str) or not token.strip():
+            raise ApiError("Cloudflare 未返回 Tunnel token")
+    except Exception as exc:
+        rollback_errors = tunnel_rollback_payload(rollback_data)
+        suffix = ("；" + "；".join(rollback_errors)) if rollback_errors else "；已自动回滚"
+        raise ApiError(str(exc) + suffix)
+    rollback_data.update({
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "host": HOST, "tunnel_host": TUNNEL_HOST, "tunnel_name": name,
+    })
+    atomic_json(TUNNEL_STATE, rollback_data)
+    print("TUNNEL_ID=" + tunnel_id)
+    print("TUNNEL_HOST=" + TUNNEL_HOST)
+    print("TUNNEL_TOKEN=" + token.strip())
+    print("TUNNEL_SERVICE=http://localhost:%d" % tunnel_port)
+
+
+def tunnel_rollback_action():
+    if not TUNNEL_STATE or not os.path.isfile(TUNNEL_STATE):
+        print("TUNNEL_ROLLBACK=none")
+        return
+    with open(TUNNEL_STATE, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    errors = tunnel_rollback_payload(payload)
+    if errors:
+        raise ApiError("；".join(errors))
+    print("TUNNEL_ROLLBACK=ok")
+
+
+def restore_origin_action():
+    if not BACKUP or not STATE or not os.path.isfile(BACKUP):
+        print("RESTORE=none")
+        return
+    with open(BACKUP, "r", encoding="utf-8") as handle:
+        backup = json.load(handle)
+    with open(STATE, "r", encoding="utf-8") as handle:
+        state = json.load(handle)
+    zone_id = str((backup.get("zone") or {}).get("id") or state.get("zone_id") or "")
+    original_ruleset = backup.get("ruleset")
+    if original_ruleset:
+        api("PUT", "/zones/%s/rulesets/%s" % (zone_id, original_ruleset["id"]), {
+            "description": original_ruleset.get("description", "Zone-level origin rules"),
+            "rules": [clean_rule(rule) for rule in original_ruleset.get("rules", [])],
+        })
+    elif state.get("ruleset_id"):
+        api("DELETE", "/zones/%s/rulesets/%s" % (zone_id, state["ruleset_id"]))
+    for item in state.get("settings_changed", []):
+        api("PATCH", "/zones/%s/settings/%s" % (zone_id, item["id"]), {"value": item["value"]})
+    for item in state.get("dns_changed", []):
+        api("PATCH", "/zones/%s/dns_records/%s" % (zone_id, item["id"]), {"proxied": item["proxied"]})
+    for record_id in state.get("dns_created_ids", []):
+        api("DELETE", "/zones/%s/dns_records/%s" % (zone_id, record_id))
+    print("RESTORE=ok")
+
+
 def main():
     if not TOKEN:
         raise ApiError("未提供 Cloudflare API Token")
@@ -8767,10 +9078,22 @@ def main():
         if str((result or {}).get("status", "")).lower() not in {"active", ""}:
             raise ApiError("Token 状态不是 active")
         print("TOKEN=valid")
+    elif action == "zones":
+        list_zones_action()
+    elif action == "hosts":
+        discover_hosts_action()
+    elif action == "preflight":
+        preflight_action()
     elif action == "deploy":
         if not HOST:
             raise ApiError("未提供 CDN Host")
         deploy()
+    elif action == "restore":
+        restore_origin_action()
+    elif action == "tunnel-deploy":
+        tunnel_deploy_action()
+    elif action == "tunnel-rollback":
+        tunnel_rollback_action()
     elif action == "remove":
         if not HOST:
             raise ApiError("未提供 CDN Host")
@@ -8797,12 +9120,8 @@ ensure_cloudflare_origin_helper || return 1
 token_file=$(cloudflare_token_file)
 echo "首次自动配置需要 Cloudflare API Token，之后不再重复询问。"
 echo "创建位置：我的个人资料 → API 令牌 → 创建自定义令牌（不要使用“账户 API 令牌”）。"
-echo "添加 4 行权限："
-echo "  区域 → 区域 → 读取"
-echo "  区域 → Origin Rules → 编辑"
-echo "  区域 → DNS → 编辑"
-echo "  区域 → 区域设置 → 编辑"
-echo "区域资源只选择当前域名。这里只需要令牌正文，不需要 Token ID、用户 ID、账户 ID 或邮箱。"
+echo "傻瓜式全配置建议：直接给该用户令牌全部账户、全部区域的最大可用编辑权限，避免逐项补权限。"
+echo "这里只需要令牌正文；Token ID、用户 ID、账户 ID 和邮箱都不用填写。Lun 会先自检，再事务化修改。"
 printf "粘贴 Token（输入会显示，0 返回）："
 IFS= read -r cf_token
 [ "$cf_token" = 0 ] && return 2
@@ -9116,6 +9435,470 @@ api_error=$(sed -n 's/^ERROR=//p' "$result_file" | sed -n 1p)
 rm -f "$result_file"
 red_line "Cloudflare 规则删除失败：$api_error"
 return 1
+}
+
+oneclick_snapshot_restore_files(){
+snapshot_dir="$HOME/lun/.rebuild_snapshot"
+[ -d "$snapshot_dir/lun" ] || return 0
+rm -f "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo* \
+"$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_* "$HOME/lun"/cert.crt "$HOME/lun"/private.key "$HOME/lun"/SHA256.txt \
+"$HOME/lun"/acme_* "$HOME/lun"/cert.env "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool \
+"$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
+"$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
+"$HOME/lun"/warp* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm \
+"$HOME/lun"/oneclick_*
+cp -a "$snapshot_dir/lun/." "$HOME/lun/" 2>/dev/null || true
+rm -rf "$snapshot_dir"
+}
+
+oneclick_reload_state(){
+clear_all_protocol_picks
+refresh_protocol_flags
+load_installed_protocol_flags
+ptmap=$(cat "$HOME/lun/port_map" 2>/dev/null)
+vpsmode=$(cat "$HOME/lun/vps_mode" 2>/dev/null); [ -n "$vpsmode" ] || vpsmode=normal
+domain=$(cat "$HOME/lun/domain" 2>/dev/null)
+cdnym=$(cat "$HOME/lun/cdnym" 2>/dev/null)
+cfip=$(cdn_ip_list | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+cdnmode=$(cat "$HOME/lun/cdn_mode" 2>/dev/null); [ -n "$cdnmode" ] || cdnmode=standard
+cdnpt=$(cat "$HOME/lun/cdn_edge_port" 2>/dev/null)
+cdnproto=$(cat "$HOME/lun/cdn_protocol" 2>/dev/null); [ -n "$cdnproto" ] || cdnproto=xhttp
+certmode=$(cat "$HOME/lun/cert_mode" 2>/dev/null); [ -n "$certmode" ] || certmode=self
+acme_email=$(cat "$HOME/lun/acme_email" 2>/dev/null)
+acme_dns=$(cat "$HOME/lun/acme_dns" 2>/dev/null)
+addym=$(cat "$HOME/lun/addym" 2>/dev/null)
+addout=$(cat "$HOME/lun/addout" 2>/dev/null)
+addrmode=$(cat "$HOME/lun/address_mode" 2>/dev/null)
+if [ -s "$HOME/lun/subport.log" ]; then sub=y; subpt=$(cat "$HOME/lun/subport.log"); else sub=; subpt=; fi
+subid=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
+ARGO_DOMAIN=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
+ARGO_AUTH=$(cat "$HOME/lun/sbargotoken.log" 2>/dev/null)
+case "$(cat "$HOME/lun/vlvm" 2>/dev/null)" in Vless) argo=vwpt ;; Vmess) argo=vmpt ;; *) argo= ;; esac
+export ptmap vpsmode domain cdnym cfip cdnmode cdnpt cdnproto certmode acme_email acme_dns
+export addym addout addrmode sub subpt subid ARGO_DOMAIN ARGO_AUTH argo
+}
+
+oneclick_cancel_restore(){
+oneclick_snapshot_restore_files
+oneclick_reload_state
+}
+
+cloudflare_origin_api_restore(){
+[ -f "$HOME/lun/oneclick_origin_deployed" ] || return 0
+token_file=$(cloudflare_token_file)
+[ -s "$token_file" ] || return 1
+host=$(sed -n 's/^HOST=//p' "$HOME/lun/oneclick_full_pending" | sed -n 1p)
+CF_LUN_TOKEN="$(cat "$token_file")" CF_LUN_HOST="$host" \
+CF_LUN_BACKUP="$HOME/lun/cdn_cloudflare_backup.json" CF_LUN_STATE="$HOME/lun/cdn_cloudflare_state.json" \
+python3 "$HOME/lun/cdn_cloudflare_api.py" restore >/dev/null 2>&1
+}
+
+cloudflare_tunnel_rollback(){
+token_file=$(cloudflare_token_file)
+[ -s "$token_file" ] && [ -s "$HOME/lun/oneclick_tunnel_state.json" ] || return 0
+CF_LUN_TOKEN="$(cat "$token_file")" CF_LUN_TUNNEL_STATE="$HOME/lun/oneclick_tunnel_state.json" \
+python3 "$HOME/lun/cdn_cloudflare_api.py" tunnel-rollback >/dev/null 2>&1
+}
+
+oneclick_cloud_rollback(){
+cloudflare_origin_api_restore || true
+cloudflare_tunnel_rollback || true
+rm -f "$HOME/lun/oneclick_origin_deployed" "$HOME/lun/oneclick_cloud_verified" "$HOME/lun/oneclick_full_pending"
+}
+
+oneclick_cloudflare_zones(){
+ensure_cloudflare_origin_helper || return 1
+cloudflare_require_token || return $?
+zone_file="/tmp/lun-oneclick-zones.$$"
+if ! CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" python3 "$HOME/lun/cdn_cloudflare_api.py" zones > "$zone_file" 2>&1; then
+red_line "Cloudflare 区域读取失败：$(sed -n 's/^ERROR=//p' "$zone_file" | sed -n 1p)"
+rm -f "$zone_file"
+return 1
+fi
+zone_count=$(grep -c '^ZONE=' "$zone_file" 2>/dev/null)
+[ "$zone_count" -gt 0 ] 2>/dev/null || { red_line "Token 没有返回可用区域。"; rm -f "$zone_file"; return 1; }
+if [ "$zone_count" -eq 1 ]; then
+ONECLICK_ZONE=$(sed -n 's/^ZONE=//p' "$zone_file" | sed -n 1p | cut -d'|' -f1)
+green_line "已识别 Cloudflare 区域：$ONECLICK_ZONE"
+rm -f "$zone_file"
+return 0
+fi
+echo "Token 可用区域："
+grep '^ZONE=' "$zone_file" | sed 's/^ZONE=//' | awk -F'|' '{printf " %2d. %s（%s）\n", NR, $1, $4}'
+printf "请选择区域编号（输入 0 返回）："
+IFS= read -r zone_choice
+[ "$zone_choice" = 0 ] && { rm -f "$zone_file"; return 2; }
+case "$zone_choice" in ''|*[!0-9]*) rm -f "$zone_file"; red_line "区域编号无效。"; return 1 ;; esac
+ONECLICK_ZONE=$(sed -n 's/^ZONE=//p' "$zone_file" | sed -n "${zone_choice}p" | cut -d'|' -f1)
+rm -f "$zone_file"
+[ -n "$ONECLICK_ZONE" ] || { red_line "区域编号不存在。"; return 1; }
+}
+
+oneclick_cloudflare_host(){
+host_file="/tmp/lun-oneclick-hosts.$$"
+CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" CF_LUN_ZONE="$ONECLICK_ZONE" \
+CF_LUN_ORIGIN_IPS="$(local_public_ips)" python3 "$HOME/lun/cdn_cloudflare_api.py" hosts > "$host_file" 2>&1 || {
+red_line "Cloudflare 域名识别失败：$(sed -n 's/^ERROR=//p' "$host_file" | sed -n 1p)"
+rm -f "$host_file"
+return 1
+}
+ONECLICK_HOST=$(sed -n 's/^HOST=//p' "$host_file" | sed -n 1p | cut -d'|' -f1)
+rm -f "$host_file"
+if [ -n "$ONECLICK_HOST" ]; then
+green_line "已识别绑定本机公网 IP 的域名：$ONECLICK_HOST"
+else
+ensure_server_identity >/dev/null 2>&1 || true
+oneclick_number=${server_number:-01}
+ONECLICK_HOST="lun-${oneclick_number}.${ONECLICK_ZONE}"
+yellow_line "该区域没有绑定本机公网 IP 的记录；将自动创建橙云域名 $ONECLICK_HOST。"
+fi
+}
+
+oneclick_cloudflare_preflight(){
+preflight_file="/tmp/lun-oneclick-preflight.$$"
+if CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" CF_LUN_HOST="$ONECLICK_HOST" \
+python3 "$HOME/lun/cdn_cloudflare_api.py" preflight > "$preflight_file" 2>&1; then
+rm -f "$preflight_file"
+green_line "Cloudflare 区域、DNS、Origin Rules、区域设置和 Tunnel 读取自检通过。"
+yellow_line "Cloudflare 不提供无副作用的写权限预检；实际写入会在确认后事务化验证，失败自动回滚。"
+return 0
+fi
+red_line "Cloudflare 权限自检失败：$(sed -n 's/^ERROR=//p' "$preflight_file" | sed -n 1p)"
+yellow_line "请换用覆盖全部账户和全部区域、具有最大可用编辑权限的用户 API Token。"
+rm -f "$preflight_file"
+return 1
+}
+
+oneclick_lun_owned_port(){
+needle=$1
+for file in "$HOME/lun"/port_*; do
+[ -s "$file" ] || continue
+[ "$(cat "$file" 2>/dev/null)" = "$needle" ] && return 0
+done
+[ "$(cat "$HOME/lun/subport.log" 2>/dev/null)" = "$needle" ] && return 0
+return 1
+}
+
+oneclick_port_safe(){
+candidate=$1
+port_valid "$candidate" || return 1
+[ "$candidate" = 22 ] && return 1
+cluster_port=$(cluster_config_value internal_port 2>/dev/null)
+[ -n "$cluster_port" ] && [ "$candidate" = "$cluster_port" ] && return 1
+if port_in_use "$candidate" && ! oneclick_lun_owned_port "$candidate"; then return 1; fi
+return 0
+}
+
+oneclick_collect_ports(){
+ONECLICK_MAP=
+ONECLICK_PORTS=
+echo "端口按自动套餐顺序使用：CDN回源、CF隧道、Reality直连、订阅；只有 2/3 个端口时自动精简。"
+if [ "$ONECLICK_MODE" = nat ]; then
+yellow_line "NAT 格式为 公网端口-内网端口，例如 56567-8080；至少 2 组，脚本最多取前 4 组。"
+printf "粘贴 NAT 映射（回车复用当前映射，输入 0 返回）："
+IFS= read -r port_input
+[ "$port_input" = 0 ] && return 2
+[ -n "$port_input" ] || port_input="$ptmap"
+ONECLICK_MAP=$(normalize_ptmap "$port_input") || return 1
+[ -n "$ONECLICK_MAP" ] || { red_line "NAT 一键全配置至少需要 2 组映射。"; return 1; }
+for pair in $ONECLICK_MAP; do
+inner=${pair#*-}
+oneclick_port_safe "$inner" || { yellow_line "映射 $pair 的内网端口不可用，已跳过。"; continue; }
+ONECLICK_PORTS="${ONECLICK_PORTS:+$ONECLICK_PORTS }$inner"
+current_count=$(printf '%s\n' $ONECLICK_PORTS | awk 'NF{n++} END{print n+0}')
+[ "$current_count" -ge 4 ] && break
+done
+else
+printf "输入 2-4 个本机端口（空格分隔；回车自动分配 4 个；输入 0 返回）："
+IFS= read -r port_input
+[ "$port_input" = 0 ] && return 2
+if [ -n "$port_input" ]; then
+for candidate in $port_input; do
+case " $ONECLICK_PORTS " in *" $candidate "*) red_line "端口 $candidate 重复。"; return 1 ;; esac
+oneclick_port_safe "$candidate" || { red_line "端口 $candidate 无效、被集群占用或被非 Lun 进程监听。"; return 1; }
+ONECLICK_PORTS="${ONECLICK_PORTS:+$ONECLICK_PORTS }$candidate"
+done
+else
+for _oneclick_n in 1 2 3 4; do
+candidate=$(random_port 2>/dev/null) || return 1
+while case " $ONECLICK_PORTS " in *" $candidate "*) true ;; *) false ;; esac; do
+candidate=$(random_port 2>/dev/null) || return 1
+done
+ONECLICK_PORTS="${ONECLICK_PORTS:+$ONECLICK_PORTS }$candidate"
+done
+green_line "已自动分配端口：$ONECLICK_PORTS"
+fi
+fi
+ONECLICK_PORT_COUNT=$(printf '%s\n' $ONECLICK_PORTS | awk 'NF{n++} END{print n+0}')
+[ "$ONECLICK_PORT_COUNT" -ge 2 ] && [ "$ONECLICK_PORT_COUNT" -le 4 ] || {
+red_line "一键全配置需要 2-4 个可用端口；当前只有 $ONECLICK_PORT_COUNT 个。"
+return 1
+}
+set -- $ONECLICK_PORTS
+case "$ONECLICK_PORT_COUNT" in
+4) ONECLICK_PROFILE=full; ONECLICK_CDN_PORT=$1; ONECLICK_WS_PORT=$2; ONECLICK_REALITY_PORT=$3; ONECLICK_SUB_PORT=$4 ;;
+3) ONECLICK_PROFILE=cdn-tunnel; ONECLICK_CDN_PORT=$1; ONECLICK_WS_PORT=$2; ONECLICK_REALITY_PORT=; ONECLICK_SUB_PORT=$3 ;;
+2) ONECLICK_PROFILE=shared-ws; ONECLICK_CDN_PORT=$1; ONECLICK_WS_PORT=$1; ONECLICK_REALITY_PORT=; ONECLICK_SUB_PORT=$2 ;;
+esac
+}
+
+oneclick_prompt_cdn_ips(){
+printf "粘贴 CDN 优选 IP/域名（支持 IP:端口#备注；回车直接使用服务域名；输入 0 返回）："
+IFS= read -r cdn_input
+[ "$cdn_input" = 0 ] && return 2
+case "$cdn_input" in
+*#*|*"Mbps"*|*"ms]"*)
+yellow_line "可继续粘贴剩余行，最后输入空行结束。"
+while IFS= read -r extra_line; do
+[ -n "$extra_line" ] || break
+cdn_input="$cdn_input
+$extra_line"
+done
+;;
+esac
+[ -n "$cdn_input" ] || cdn_input="$ONECLICK_HOST"
+ONECLICK_CDN_IPS=$(normalize_cdn_ip_input "$cdn_input")
+[ -n "$ONECLICK_CDN_IPS" ] || { red_line "没有识别到有效 CDN 入口。"; return 1; }
+}
+
+oneclick_profile_label(){
+case "$1" in
+full) printf '四端口完整套餐' ;;
+cdn-tunnel) printf '三端口 CDN + 隧道套餐' ;;
+shared-ws) printf '双端口 WS 共享套餐' ;;
+esac
+}
+
+oneclick_apply_local_state(){
+clear_all_protocol_picks
+ONECLICK_FORCE_CERT=yes
+case "$ONECLICK_PROFILE" in
+full) xcpt=$ONECLICK_CDN_PORT; vwpt=$ONECLICK_WS_PORT; vlpt=$ONECLICK_REALITY_PORT; cdnproto=xhttp; cdnpt=443 ;;
+cdn-tunnel) xcpt=$ONECLICK_CDN_PORT; vwpt=$ONECLICK_WS_PORT; cdnproto=xhttp; cdnpt=443 ;;
+shared-ws) vwpt=$ONECLICK_WS_PORT; cdnproto=all; cdnpt=8080 ;;
+esac
+refresh_protocol_flags
+vpsmode=$ONECLICK_MODE
+[ "$vpsmode" = nat ] && ptmap=$ONECLICK_MAP
+domain=$ONECLICK_HOST
+cdnym=$ONECLICK_HOST
+cdnmode=rewrite
+certmode=dns
+acme_dns=dns_cf
+[ -n "$acme_email" ] || acme_email=$(gen_random_gmail)
+sub=y
+subid=
+subpt=$ONECLICK_SUB_PORT
+subipmode=ipv4
+addym=$ONECLICK_HOST
+addout=replace
+addrmode=domain
+mkdir -p "$HOME/lun"
+printf '%s\n' "$vpsmode" > "$HOME/lun/vps_mode"
+[ "$vpsmode" = nat ] && printf '%s\n' "$ptmap" > "$HOME/lun/port_map"
+printf '%s\n' "$domain" > "$HOME/lun/domain"
+printf '%s\n' "$cdnym" > "$HOME/lun/cdnym"
+printf '%s\n' "$cdnmode" > "$HOME/lun/cdn_mode"
+printf '%s\n' "$cdnpt" > "$HOME/lun/cdn_edge_port"
+printf '%s\n' "$cdnproto" > "$HOME/lun/cdn_protocol"
+printf '%s\n' "$certmode" > "$HOME/lun/cert_mode"
+printf '%s\n' "$acme_dns" > "$HOME/lun/acme_dns"
+printf '%s\n' "$acme_email" > "$HOME/lun/acme_email"
+printf 'export CF_Token=%s\n' "$(cat "$(cloudflare_token_file)")" > "$HOME/lun/cert.env"
+printf '%s\n' "$subipmode" > "$HOME/lun/subip_mode"
+printf '%s\n' "$addym" > "$HOME/lun/addym"
+printf '%s\n' "$addout" > "$HOME/lun/addout"
+printf '%s\n' "$addrmode" > "$HOME/lun/address_mode"
+chmod 600 "$HOME/lun/cert.env" "$HOME/lun/acme_dns" "$(cloudflare_token_file)" 2>/dev/null
+save_cdn_ip_list "$ONECLICK_CDN_IPS" || return 1
+export vpsmode ptmap domain cdnym cdnmode cdnpt cdnproto certmode acme_dns acme_email
+export sub subid subpt subipmode addym addout addrmode vlpt vwpt xcpt ONECLICK_FORCE_CERT
+}
+
+oneclick_deploy_tunnel(){
+ensure_server_identity >/dev/null 2>&1 || true
+oneclick_number=${server_number:-01}
+ONECLICK_TUNNEL_HOST="argo-${oneclick_number}.${ONECLICK_ZONE}"
+tunnel_result="/tmp/lun-oneclick-tunnel.$$"
+if ! CF_LUN_TOKEN="$(cat "$(cloudflare_token_file)")" CF_LUN_HOST="$ONECLICK_HOST" \
+CF_LUN_TUNNEL_HOST="$ONECLICK_TUNNEL_HOST" CF_LUN_TUNNEL_PORT="$ONECLICK_WS_PORT" \
+CF_LUN_TUNNEL_STATE="$HOME/lun/oneclick_tunnel_state.json" \
+python3 "$HOME/lun/cdn_cloudflare_api.py" tunnel-deploy > "$tunnel_result" 2>&1; then
+tunnel_error=$(sed -n 's/^ERROR=//p' "$tunnel_result" | sed -n 1p)
+case "$tunnel_error" in
+*"HTTP 403"*|*"Authentication error"*)
+red_line "Cloudflare Tunnel 自动配置失败：当前 Token 缺少账户级 Cloudflare Tunnel 编辑权限。"
+yellow_line "请换用覆盖全部账户与区域、具有最大可用编辑权限的用户 API Token；无需填写任何 ID。"
+;;
+*) red_line "Cloudflare Tunnel 自动配置失败：$tunnel_error" ;;
+esac
+rm -f "$tunnel_result"
+return 1
+fi
+ARGO_DOMAIN=$(sed -n 's/^TUNNEL_HOST=//p' "$tunnel_result" | sed -n 1p)
+ARGO_AUTH=$(sed -n 's/^TUNNEL_TOKEN=//p' "$tunnel_result" | sed -n 1p)
+rm -f "$tunnel_result"
+[ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ] || return 1
+argo=vwpt
+umask 077
+printf '%s\n' "$ARGO_DOMAIN" > "$HOME/lun/sbargoym.log"
+printf '%s\n' "$ARGO_AUTH" > "$HOME/lun/sbargotoken.log"
+printf '%s\n' Vless > "$HOME/lun/vlvm"
+chmod 600 "$HOME/lun/sbargoym.log" "$HOME/lun/sbargotoken.log" "$HOME/lun/oneclick_tunnel_state.json"
+export argo ARGO_DOMAIN ARGO_AUTH
+green_line "Cloudflare Tunnel 已创建/修复：$ARGO_DOMAIN → http://localhost:$ONECLICK_WS_PORT"
+}
+
+oneclick_full_setup(){
+ui_title "Lun 一键全配置"
+yellow_line "保留 UUID 与内核，协议组合切换为自动精选套餐；任一步失败都会恢复操作前快照。"
+create_rebuild_snapshot || { red_line "无法创建一键配置前快照。"; return 1; }
+touch "$HOME/lun/.rebuild_snapshot/oneclick_prepared"
+echo "VPS 类型：1. 普通 VPS  2. NAT VPS"
+printf "请选择 [回车沿用当前 %s，输入 0 返回]：" "${vpsmode:-normal}"
+IFS= read -r mode_choice
+case "$mode_choice" in
+0) oneclick_cancel_restore; return 2 ;;
+1) ONECLICK_MODE=normal ;;
+2) ONECLICK_MODE=nat ;;
+"") ONECLICK_MODE=${vpsmode:-normal} ;;
+*) red_line "VPS 类型输入无效。"; oneclick_cancel_restore; return 1 ;;
+esac
+oneclick_collect_ports
+rc=$?
+[ "$rc" = 0 ] || { oneclick_cancel_restore; return "$rc"; }
+cloudflare_require_token
+rc=$?
+[ "$rc" = 0 ] || { oneclick_cancel_restore; return "$rc"; }
+oneclick_cloudflare_zones
+rc=$?
+[ "$rc" = 0 ] || { oneclick_cancel_restore; return "$rc"; }
+oneclick_cloudflare_host || { oneclick_cancel_restore; return 1; }
+oneclick_cloudflare_preflight || { oneclick_cancel_restore; return 1; }
+oneclick_prompt_cdn_ips
+rc=$?
+[ "$rc" = 0 ] || { oneclick_cancel_restore; return "$rc"; }
+echo
+ui_title "一键全配置确认"
+echo "套餐：$(oneclick_profile_label "$ONECLICK_PROFILE")"
+echo "VPS：$ONECLICK_MODE${ONECLICK_MAP:+  映射=$ONECLICK_MAP}"
+echo "协议端口：CDN回源=$ONECLICK_CDN_PORT  CF隧道=$ONECLICK_WS_PORT${ONECLICK_REALITY_PORT:+  Reality=$ONECLICK_REALITY_PORT}  订阅=$ONECLICK_SUB_PORT"
+echo "服务域名：$ONECLICK_HOST"
+echo "CDN入口：$ONECLICK_CDN_IPS"
+echo "证书：Let's Encrypt DNS-01（Cloudflare）"
+if [ "$ONECLICK_PROFILE" = shared-ws ]; then oneclick_edge=8080; else oneclick_edge=443; fi
+oneclick_origin_public=$ONECLICK_CDN_PORT
+if [ "$ONECLICK_MODE" = nat ]; then
+for oneclick_pair in $ONECLICK_MAP; do
+[ "${oneclick_pair#*-}" = "$ONECLICK_CDN_PORT" ] && { oneclick_origin_public=${oneclick_pair%%-*}; break; }
+done
+fi
+echo "Origin Rules：边缘 $oneclick_edge → 源站 $oneclick_origin_public"
+echo "Tunnel：自动创建独立域名并回源 http://localhost:$ONECLICK_WS_PORT"
+printf "确认执行？输入 YES（输入 0 返回）："
+IFS= read -r confirm
+[ "$confirm" = YES ] || { oneclick_cancel_restore; return 2; }
+oneclick_apply_local_state || { oneclick_cancel_restore; return 1; }
+oneclick_deploy_tunnel || { cloudflare_tunnel_rollback || true; oneclick_cancel_restore; return 1; }
+if ! cat > "$HOME/lun/oneclick_full_pending" <<EOF
+PROFILE=$ONECLICK_PROFILE
+ZONE=$ONECLICK_ZONE
+HOST=$ONECLICK_HOST
+CDN_PORT=$ONECLICK_CDN_PORT
+WS_PORT=$ONECLICK_WS_PORT
+REALITY_PORT=$ONECLICK_REALITY_PORT
+SUB_PORT=$ONECLICK_SUB_PORT
+TUNNEL_HOST=$ARGO_DOMAIN
+EDGE_PORT=$cdnpt
+EOF
+then
+cloudflare_tunnel_rollback || true
+oneclick_cancel_restore
+return 1
+fi
+chmod 600 "$HOME/lun/oneclick_full_pending"
+green_line "云端隧道准备完成；现在开始事务化安装/重建、申请证书并部署 Origin Rules。"
+return 0
+}
+
+oneclick_full_finalize(){
+[ -s "$HOME/lun/oneclick_full_pending" ] || return 0
+host=$(sed -n 's/^HOST=//p' "$HOME/lun/oneclick_full_pending" | sed -n 1p)
+cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+cert_subject_now=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+if [ "$cert_subject_now" != "$host" ] || [ "$cert_mode_now" != dns ] || \
+! cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key" || \
+! cert_publicly_trusted_for_domain "$HOME/lun/cert.crt" "$host"; then
+red_line "DNS-01 公开证书未成功生成，已拒绝继续云端回源配置。"
+return 1
+fi
+cloudflare_origin_api_deploy "" "" || return 1
+touch "$HOME/lun/oneclick_origin_deployed"
+echo "正在验证 Cloudflare 精确端口回源……"
+if ! cloudflare_origin_wait_verify; then
+red_line "Cloudflare 端口回源未通过快速验证，一键全配置将自动回滚。"
+return 1
+fi
+touch "$HOME/lun/oneclick_cloud_verified" || return 1
+green_line "Cloudflare 证书、端口回源和 Tunnel 云端配置已验证；继续检查本地订阅。"
+return 0
+}
+
+oneclick_full_complete(){
+[ -s "$HOME/lun/oneclick_full_pending" ] || return 0
+[ -f "$HOME/lun/oneclick_cloud_verified" ] || { red_line "Cloudflare 云端验证状态缺失。"; return 1; }
+host=$(sed -n 's/^HOST=//p' "$HOME/lun/oneclick_full_pending" | sed -n 1p)
+tunnel_host=$(sed -n 's/^TUNNEL_HOST=//p' "$HOME/lun/oneclick_full_pending" | sed -n 1p)
+cert_mode_now=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+cert_subject_now=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+if [ "$cert_subject_now" != "$host" ] || [ "$cert_mode_now" != dns ] || \
+! cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key" || \
+! cert_publicly_trusted_for_domain "$HOME/lun/cert.crt" "$host"; then
+red_line "DNS-01 公开证书最终校验失败，已拒绝生成成功报告。"
+return 1
+fi
+sub_port=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+sub_token=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
+[ -n "$sub_port" ] && [ -n "$sub_token" ] || { red_line "订阅端口或订阅令牌未生成。"; return 1; }
+subscription_check="/tmp/lun-oneclick-subscription.$$"
+if ! curl -fsS --connect-timeout 3 --max-time 8 \
+"http://127.0.0.1:$sub_port/$sub_token/jhsub.txt" > "$subscription_check" 2>/dev/null; then
+rm -f "$subscription_check"
+red_line "本地订阅服务未通过 HTTP 验证。"
+return 1
+fi
+if ! grep -Fq "$host" "$subscription_check" || ! grep -Fq "$tunnel_host" "$subscription_check"; then
+rm -f "$subscription_check"
+red_line "订阅文件缺少 CDN 或 Tunnel 节点。"
+return 1
+fi
+rm -f "$subscription_check"
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-active --quiet argo || { red_line "Cloudflare Tunnel 服务未运行。"; return 1; }
+else
+pgrep -f "$HOME/lun/cloudflared.*tunnel" >/dev/null 2>&1 || { red_line "Cloudflare Tunnel 进程未运行。"; return 1; }
+fi
+report="$HOME/lun/oneclick_full_report.txt"
+{
+echo "Lun 一键全配置测试报告"
+echo "完成时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+cat "$HOME/lun/oneclick_full_pending"
+echo "CERT_MODE=$cert_mode_now"
+echo "CERT_SUBJECT=$cert_subject_now"
+echo "CERT_TRUST=public"
+echo "XRAY_CONFIG=$([ -s "$HOME/lun/xr.json" ] && echo ok || echo unused)"
+echo "SINGBOX_CONFIG=$([ -s "$HOME/lun/sb.json" ] && echo ok || echo unused)"
+echo "ORIGIN_RULES=verified"
+echo "TUNNEL=configured"
+echo "SUBSCRIPTION_HTTP=verified"
+echo "SUBSCRIPTION_CONTENT=verified"
+echo "RESULT=PASS"
+} > "$report"
+chmod 600 "$report"
+rm -f "$HOME/lun/oneclick_origin_deployed" "$HOME/lun/oneclick_cloud_verified" "$HOME/lun/oneclick_full_pending"
+green_line "一键全配置已通过：证书、CDN 优选、端口回源和 Tunnel 均已生效。"
+green_line "测试报告：$report"
+return 0
 }
 
 show_cdn_origin_rules(){
@@ -10094,7 +10877,7 @@ echo "当前协议选择："
 render_protocol_table
 yellow_line "绿色 ✓ 表示已选择或支持；— 表示未选择或不支持。"
 yellow_line "能力：CDN优选=Cloudflare HTTP(S)；端口回源=Origin Rules；CF隧道=当前 Lun 的 WS/Argo。"
-yellow_line "* 编号13 的 CDN 优选包含 TCP 与 UDP；UDP 必须献祭本机公网443端口，否则只输出 TCP 节点。"
+yellow_line "* 编号13 的 CDN 优选包含 TCP 与UDP。但是UDP必需献祭本机公网443端口，否则单输出TCP节点。"
 }
 
 prompt_protocol_by_id(){
@@ -10900,12 +11683,14 @@ while :; do
 ui_title "Lun 安装 / 协议管理"
 echo " 1. 引导式安装 / 新建协议"
 echo " 2. 增删改协议（保留内核，仅重建配置）"
+printf " 3. %s一键全配置（CDN / 域名证书 / 隧道 / 端口回源）%s\n" "$LUN_GREEN" "$LUN_RESET"
 echo " 0. 返回"
-printf "请选择 [0-2]："
+printf "请选择 [0-3]："
 IFS= read -r c
 case "$c" in
 1) guided_install; rc=$?; [ "$rc" = 0 ] && { { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; } && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
 2) pick_protocols; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
+3) oneclick_full_setup; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -12465,7 +13250,13 @@ if ! validate_rebuild; then
 rollback_rebuild
 exit 1
 fi
-commit_rebuild_snapshot
+_oneclick_rebuild_active=no
+[ -s "$HOME/lun/oneclick_full_pending" ] && _oneclick_rebuild_active=yes
+if ! oneclick_full_finalize; then
+rollback_rebuild
+exit 1
+fi
+[ "$_oneclick_rebuild_active" = yes ] || commit_rebuild_snapshot
 if multiuser_enabled; then
 [ -s "$HOME/lun/xr.json" ] && xrestart
 [ -s "$HOME/lun/sb.json" ] && sbrestart
@@ -12546,14 +13337,31 @@ rc-service iptables save >/dev/null 2>&1
 rc-service ip6tables save >/dev/null 2>&1
 fi
 fi
-apply_lun_firewall_rules || true
+if ! apply_lun_firewall_rules; then
+if [ "$_oneclick_rebuild_active" = yes ]; then
+rollback_rebuild
+exit 1
+fi
+fi
+if ! cip; then
+if [ "$_oneclick_rebuild_active" = yes ]; then
+rollback_rebuild
+exit 1
+fi
+fi
+cloudflare_origin_finalize_pending || true
+if [ "$_oneclick_rebuild_active" = yes ]; then
+if ! oneclick_full_complete; then
+rollback_rebuild
+exit 1
+fi
+commit_rebuild_snapshot
+fi
 if cluster_enabled; then
 cluster_service_start || yellow_line "服务器联动服务未能自动启动。"
 cluster_push_event >/dev/null 2>&1 || true
 [ "$(cluster_role 2>/dev/null)" = master ] && cluster_refresh_profiles >/dev/null 2>&1 || true
 fi
-cip
-cloudflare_origin_finalize_pending || true
 echo
 else
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
