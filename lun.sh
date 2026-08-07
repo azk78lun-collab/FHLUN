@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.8.1"
+echo "当前版本：V26.8.8.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1409,7 +1409,12 @@ fi
 
 download_lun_script(){
 target=$1
+source_mode=${2:-configured}
 tmp="${target}.tmp.$$"
+if [ "$source_mode" = official ]; then
+download_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/lun.sh?ref=main"
+fallback_url="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh"
+else
 download_url=$lunurl
 fallback_url=
 case "$download_url" in
@@ -1418,6 +1423,7 @@ fallback_url=$download_url
 download_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/lun.sh?ref=main"
 ;;
 esac
+fi
 case "$download_url" in
 https://raw.githubusercontent.com/*|https://github.com/*/raw/*|https://api.github.com/*)
 case "$download_url" in
@@ -4315,6 +4321,64 @@ rm -f "$cluster_update_payload"
 return 1
 }
 
+cluster_update_all_ui(){
+ui_title "Lun 一键更新全部集群服务器"
+cluster_cmd nodes || return 1
+yellow_line "本机先从官方 main 检查一次更新；随后复用本机脚本，通过 mTLS 推送给主 VPS 与全部子 VPS。"
+yellow_line "远端服务器不再分别访问 GitHub；脚本和联动程序均执行语法、SHA-256 与原子替换校验。"
+printf "排除的服务器编号（多个用空格或逗号分隔；回车不排除；输入 0 返回）："
+IFS= read -r cluster_update_exclude
+[ "$cluster_update_exclude" = 0 ] && return 2
+
+if ! update_lun_script; then
+red_line "本机主脚本未能更新，已停止集群推送。"
+return 1
+fi
+cluster_update_source=$(lun_update_target)
+[ -s "$cluster_update_source" ] && bash -n "$cluster_update_source" 2>/dev/null || {
+red_line "本机生效入口不是有效的 Lun 脚本：$cluster_update_source"
+return 1
+}
+cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
+if [ -s "$cluster_agent_source" ] \
+&& python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 \
+&& grep -q 'update-all' "$cluster_agent_source"; then
+green_line "已复用本机通过校验的服务器联动程序。"
+elif ! cluster_download_agent; then
+red_line "服务器联动程序下载失败，且本机缓存不支持集群更新。"
+return 1
+else
+cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
+[ -s "$cluster_agent_source" ] && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 && grep -q 'update-all' "$cluster_agent_source" || {
+red_line "下载的服务器联动程序不支持集群更新，已停止推送。"
+return 1
+}
+fi
+cluster_install_service || return 1
+cluster_service_restart || { red_line "本机服务器联动服务重启失败。"; return 1; }
+
+cluster_script_payload=$(mktemp "$HOME/lun/.cluster-script.XXXXXX") || return 1
+cluster_agent_payload=$(mktemp "$HOME/lun/.cluster-agent.XXXXXX") || { rm -f "$cluster_script_payload"; return 1; }
+if cluster_write_install_payload "$cluster_update_source" "$cluster_script_payload" \
+&& cluster_write_install_payload "$(cluster_module_dir)/lun_cluster.py" "$cluster_agent_payload" \
+&& cluster_cmd update-all --script-payload "$cluster_script_payload" \
+    --agent-payload "$cluster_agent_payload" --exclude "$cluster_update_exclude"; then
+cluster_update_rc=0
+else
+cluster_update_rc=1
+fi
+rm -f "$cluster_script_payload" "$cluster_agent_payload"
+if [ "$cluster_update_rc" = 0 ]; then
+green_line "集群一键更新完成；主 VPS 与全部未排除子 VPS 已使用同一份本机脚本。"
+cluster_role_now=$(cluster_role 2>/dev/null)
+[ "$cluster_role_now" = child ] && cluster_cmd push >/dev/null 2>&1 || true
+[ "$cluster_role_now" = master ] && cluster_refresh_profiles >/dev/null 2>&1 || true
+return 0
+fi
+red_line "至少一台服务器更新失败；已成功的服务器保持新版本，请按上方编号重试。"
+return 1
+}
+
 cluster_node_service_ui(){
 cluster_target_node=$1
 while :; do
@@ -4537,12 +4601,13 @@ echo " 7. 用户与服务器授权"
 echo " 8. 地区设置"
 echo " 9. 集群备份 / 加载备份"
 echo "10. 通信状态 / 修复服务"
-echo "11. 更新服务器联动程序"
-echo "12. 移除子 VPS / 撤销访问"
-echo "13. 停用并卸载服务器联动模块"
-printf "14. %s主 VPS / 子 VPS 角色互换%s\n" "$LUN_RED" "$LUN_RESET"
+echo "11. 一键更新全部集群服务器"
+echo "12. 更新本机服务器联动程序"
+echo "13. 移除子 VPS / 撤销访问"
+echo "14. 停用并卸载服务器联动模块"
+printf "15. %s主 VPS / 子 VPS 角色互换%s\n" "$LUN_RED" "$LUN_RESET"
 echo " 0. 返回"
-printf "请选择 [0-14]："
+printf "请选择 [0-15]："
 IFS= read -r cluster_choice
 case "$cluster_choice" in
 1) cluster_cmd nodes; ui_pause ;;
@@ -4577,8 +4642,9 @@ ui_pause
 ;;
 9) cluster_backup_ui ;;
 10) cluster_cmd status; cluster_install_service; cluster_service_restart; apply_lun_firewall_rules; ui_pause ;;
-11) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
-12)
+11) cluster_update_all_ui; ui_pause ;;
+12) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
+13)
 cluster_cmd nodes
 printf "要移除的子 VPS 节点编号（输入 0 返回）："; IFS= read -r cluster_node_id
 [ "$cluster_node_id" = 0 ] && continue
@@ -4590,7 +4656,7 @@ cluster_refresh_profiles >/dev/null 2>&1 || true
 fi
 ui_pause
 ;;
-13)
+14)
 red_line "卸载只移除本机集群控制面；不会卸载代理协议或远端子 VPS。"
 printf "输入 REMOVE 确认（输入 0 返回）："; IFS= read -r cluster_confirm
 [ "$cluster_confirm" = REMOVE ] || continue
@@ -4600,7 +4666,7 @@ apply_lun_firewall_rules quiet || true
 green_line "服务器联动模块已卸载。"
 return
 ;;
-14)
+15)
 if cluster_switch_master_ui; then
 ui_pause
 return
@@ -4622,18 +4688,20 @@ echo " 1. 生成新的一次性加入地址"
 echo " 2. 立即向主 VPS 推送配置与订阅"
 echo " 3. 修复 / 重启联动服务"
 echo " 4. 集群备份 / 加载备份"
-echo " 5. 更新服务器联动程序"
-echo " 6. 解除并卸载本机联动模块"
+echo " 5. 一键更新全部集群服务器"
+echo " 6. 更新本机服务器联动程序"
+echo " 7. 解除并卸载本机联动模块"
 echo " 0. 返回"
-printf "请选择 [0-6]："
+printf "请选择 [0-7]："
 IFS= read -r cluster_choice
 case "$cluster_choice" in
 1) cluster_cmd join-code; ui_pause ;;
 2) cluster_cmd push; ui_pause ;;
 3) cluster_install_service; cluster_service_restart; apply_lun_firewall_rules; ui_pause ;;
 4) cluster_backup_ui ;;
-5) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
-6)
+5) cluster_update_all_ui; ui_pause ;;
+6) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
+7)
 red_line "解除后主 VPS 不能再管理本机；代理协议不会删除。"
 printf "输入 REMOVE 确认（输入 0 返回）："; IFS= read -r cluster_confirm
 [ "$cluster_confirm" = REMOVE ] || continue
@@ -6561,24 +6629,85 @@ awk -v candidate="$1" -v current="$2" 'BEGIN {
  }'
 }
 
-update_lun_script(){
-if [ "$(id -u 2>/dev/null)" = "0" ]; then
-target="/usr/bin/lun"
-else
-target="$HOME/bin/lun"
-mkdir -p "$HOME/bin"
+lun_script_version(){
+grep -Eo 'V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$1" 2>/dev/null | head -n 1
+}
+
+lun_update_target(){
+resolved=$(command -v lun 2>/dev/null || true)
+case "$resolved" in
+/*)
+if command -v readlink >/dev/null 2>&1; then
+resolved_real=$(readlink -f "$resolved" 2>/dev/null || true)
+[ -n "$resolved_real" ] && resolved=$resolved_real
 fi
+printf '%s\n' "$resolved"
+return 0
+;;
+esac
+if [ "$(id -u 2>/dev/null)" = "0" ]; then
+printf '/usr/bin/lun\n'
+else
+printf '%s/bin/lun\n' "$HOME"
+fi
+}
+
+lun_install_update_stage(){
+stage=$1
+target=$2
+target_dir=$(dirname "$target")
+target_tmp="${target}.replace.$$"
+target_backup="${target}.update-backup"
+if { [ -e "$target" ] && [ -w "$target" ] && [ -w "$target_dir" ]; } || { [ ! -e "$target" ] && [ -w "$target_dir" ]; }; then
+[ ! -e "$target" ] || cp -p "$target" "$target_backup" 2>/dev/null || return 1
+cp "$stage" "$target_tmp" || return 1
+chmod 755 "$target_tmp" || { rm -f "$target_tmp"; return 1; }
+mv -f "$target_tmp" "$target" || { rm -f "$target_tmp"; return 1; }
+elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+sudo mkdir -p "$target_dir" || return 1
+if sudo test -e "$target"; then sudo cp -p "$target" "$target_backup" || return 1; fi
+sudo cp "$stage" "$target_tmp" || return 1
+sudo chmod 755 "$target_tmp" || { sudo rm -f "$target_tmp"; return 1; }
+sudo mv -f "$target_tmp" "$target" || { sudo rm -f "$target_tmp"; return 1; }
+else
+return 1
+fi
+expected_hash=$(sha256sum "$stage" 2>/dev/null | awk '{print $1}')
+actual_hash=$(sha256sum "$target" 2>/dev/null | awk '{print $1}')
+[ -n "$expected_hash" ] && [ "$expected_hash" = "$actual_hash" ]
+}
+
+lun_sync_secondary_entry(){
+source=$1
+primary=$2
+secondary="$HOME/bin/lun"
+[ -f "$secondary" ] || return 0
+[ "$secondary" != "$primary" ] || return 0
+mkdir -p "$HOME/bin" 2>/dev/null || return 0
+secondary_tmp="${secondary}.replace.$$"
+cp "$source" "$secondary_tmp" 2>/dev/null || return 0
+chmod 755 "$secondary_tmp" 2>/dev/null || { rm -f "$secondary_tmp"; return 0; }
+mv -f "$secondary_tmp" "$secondary" 2>/dev/null || rm -f "$secondary_tmp"
+}
+
+update_lun_script(){
+target=$(lun_update_target)
+mkdir -p "$HOME/bin" 2>/dev/null || true
+if [ -w "$(dirname "$target")" ]; then
 update_stage="${target}.update.$$"
+else
+update_stage="${TMPDIR:-/tmp}/lun.update.$$"
+fi
 rm -f "$update_stage"
-current_lun_version=$(sed -n 's/.*当前版本：\(V[^"]*\)".*/\1/p' "$target" 2>/dev/null | head -n 1)
+current_lun_version=$(lun_script_version "$target")
 yellow_line "正在检查 Lun 更新，请稍候……"
-if ! download_lun_script "$update_stage"; then
+if ! download_lun_script "$update_stage" official; then
 rm -f "$update_stage"
 red_line "Lun 脚本更新失败：无法下载远端脚本，请检查网络后重试。"
 return 1
 fi
-new_lun_version=$(sed -n 's/.*当前版本：\(V[^"]*\)".*/\1/p' "$update_stage" 2>/dev/null | head -n 1)
-if [ -z "$new_lun_version" ] || ! grep -q 'Lun 项目地址' "$update_stage" 2>/dev/null || ! sh -n "$update_stage" 2>/dev/null; then
+new_lun_version=$(lun_script_version "$update_stage")
+if [ -z "$new_lun_version" ] || ! grep -q 'Lun 项目地址' "$update_stage" 2>/dev/null || ! bash -n "$update_stage" 2>/dev/null; then
 rm -f "$update_stage"
 red_line "远端文件不是有效的 Lun 脚本，已拒绝覆盖当前版本。"
 return 1
@@ -6589,13 +6718,20 @@ yellow_line "远端版本 $new_lun_version 低于当前 $current_lun_version，�
 return 0
 fi
 if [ -s "$target" ] && cmp -s "$target" "$update_stage" 2>/dev/null; then
+lun_sync_secondary_entry "$update_stage" "$target"
 rm -f "$update_stage"
 green_line "当前已是最新版：${current_lun_version:-$new_lun_version}"
 return 0
 fi
-mv "$update_stage" "$target" || { rm -f "$update_stage"; red_line "Lun 脚本替换失败：$target"; return 1; }
-chmod +x "$target"
+if ! lun_install_update_stage "$update_stage" "$target"; then
+rm -f "$update_stage"
+red_line "Lun 脚本替换失败：$target。请使用 root 或为当前用户配置免密 sudo 后重试。"
+return 1
+fi
+lun_sync_secondary_entry "$update_stage" "$target"
+rm -f "$update_stage"
 green_line "Lun 脚本更新完成：${current_lun_version:-未知} → $new_lun_version"
+green_line "生效入口：$target"
 yellow_line "新版本将在下次运行 lun 时完全生效。"
 }
 
@@ -6611,7 +6747,7 @@ cyan_line " 4. 设置自定义节点地址 addym/addout"
 cyan_line " 5. 重启 Lun 进程"
 cyan_line " 6. 更新 Xray 内核"
 cyan_line " 7. 更新 Sing-box 内核"
-cyan_line " 8. 更新 Lun 脚本"
+cyan_line " 8. 更新本机 Lun 脚本"
 cyan_line " 9. 卸载 Lun"
 cyan_line " 0. 退出"
 printf "请输入数字【0-9】（%s回车退出%s）：" "$LUN_YELLOW" "$LUN_RESET"
@@ -7542,9 +7678,17 @@ if [ -z "$edge_result" ] || [ "$edge_through_cf" != yes ] || [ "$edge_signature"
 if [ "$edge_route" = reality-apple ]; then
 reality_public=
 [ -s "$HOME/lun/port_xh" ] && reality_public=$(client_port "$(cat "$HOME/lun/port_xh" 2>/dev/null)")
+if cdn_rewrite_active; then
 cdn_skip "首个入口 $probe_ip:$edge_port 已进入 Cloudflare，但回源落到了 Reality/Apple 伪装${reality_public:+（公网端口 $reality_public）}，不是 XHTTP TLS。已停止检测其余入口；请删除旧 tls/nottls 宽泛规则，并把 UUID-xc 精确规则指向 $origin_public_port。"
 else
+cdn_skip "首个入口 $probe_ip:$edge_port 已进入 Cloudflare，但没有到达同端口 XHTTP TLS 入站，反而落到 Reality/Apple 伪装。当前是同端口 CDN，不需要 Origin Rule；请开启 Host 橙云并停用旧的端口改写/宽泛规则。"
+fi
+else
+if cdn_rewrite_active; then
 cdn_skip "首个入口 $probe_ip:$edge_port 未按 Host + UUID-xc Path 回源到 $origin_public_port，已停止检测其余入口。可在 Origin Rules 菜单手动登记现有规则，或使用 API 自动部署。"
+else
+cdn_skip "首个入口 $probe_ip:$edge_port 未到达同端口 XHTTP TLS 入站，已停止检测其余入口。当前是同端口 CDN，不需要 Origin Rule；请确认 Host 已开启橙云，并检查源站 $origin_public_port、TLS、系统防火墙及旧规则。"
+fi
 fi
 return 0
 fi
@@ -11874,7 +12018,7 @@ ui_title "Lun 服务与更新"
 echo " 1. 重启服务"
 echo " 2. 停止服务"
 echo " 3. 查看运行日志"
-echo " 4. 更新 Lun 脚本"
+echo " 4. 更新本机 Lun 脚本"
 echo " 5. 更新 Xray 内核"
 echo " 6. 更新 Sing-box 内核"
 echo " 0. 返回"
@@ -13090,7 +13234,10 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "cluster-refresh-identity" ]; then
+if [ "$1" = "self-update" ]; then
+update_lun_script
+exit $?
+elif [ "$1" = "cluster-refresh-identity" ]; then
 cip || exit $?
 if multiuser_enabled; then
 multiuser_cmd apply >/dev/null 2>&1 || exit $?

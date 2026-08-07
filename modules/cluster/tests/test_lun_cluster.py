@@ -509,6 +509,115 @@ class ClusterTestCase(unittest.TestCase):
             else:
                 lun_cluster.os.environ["LUN_SCRIPT"] = old_script
 
+    def test_cluster_update_distribution_skips_source_and_excluded_nodes(self) -> None:
+        master_id, source_id, target_id, excluded_id = "a" * 32, "b" * 32, "c" * 32, "d" * 32
+        self.cluster.save_config({
+            "enabled": True, "role": "master", "node_id": master_id,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+        })
+        self.cluster.upsert_node({
+            "node_id": master_id, "public_host": "127.0.0.1", "public_port": 20000,
+            "internal_port": 20000, "api_version": 1, "location": {"country_code": "JP"},
+        }, role="master")
+        for node_id, port in ((source_id, 21000), (target_id, 22000), (excluded_id, 23000)):
+            self.cluster.upsert_node({
+                "node_id": node_id, "public_host": "127.0.0.1", "public_port": port,
+                "internal_port": port, "api_version": 1, "location": {"country_code": "DE"},
+            }, role="child")
+        script_payload, agent_payload = self._update_payloads()
+        calls: list[tuple[str, str]] = []
+
+        def fake_send(_cluster, node_id, action, payload, timeout=900):
+            calls.append((node_id, action))
+            if action == "status.refresh":
+                return {"result": {
+                    "node_id": node_id, "public_host": "127.0.0.1", "public_port": 22000,
+                    "internal_port": 22000, "api_version": 1, "location": {"country_code": "DE"},
+                }}
+            return {"result": {"sha256": payload["sha256"]}}
+
+        with mock.patch.object(lun_cluster, "send_action", side_effect=fake_send):
+            result = lun_cluster.distribute_cluster_update(
+                self.cluster,
+                {"script": script_payload, "agent": agent_payload, "exclude": "4"},
+                source_peer=source_id,
+            )
+        self.assertEqual(calls, [
+            (target_id, "status.refresh"),
+            (target_id, "script.install"),
+            (target_id, "agent.install"),
+        ])
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["version"], "V26.8.8.2")
+        self.assertEqual(result["nodes"]["2"]["status"], "source-current")
+        self.assertEqual(result["nodes"]["3"]["script_sha256"], script_payload["sha256"])
+        self.assertEqual(result["nodes"]["4"]["status"], "excluded")
+
+    def test_cluster_update_child_requests_master(self) -> None:
+        self.cluster.save_config({
+            "enabled": True, "role": "child", "node_id": "b" * 32,
+            "cluster_id": "e" * 32, "controller_id": "a" * 32,
+            "controller_host": "192.0.2.10", "controller_port": 20000,
+            "public_host": "127.0.0.1", "public_port": 21000,
+            "internal_port": 21000, "paired": True,
+        })
+        payload = {"script": {}, "agent": {}, "exclude": "4"}
+        response = {
+            "result": {"status": "success", "result": {"complete": True, "version": "V26.8.8.2"}}
+        }
+        with mock.patch.object(lun_cluster, "mutual_request", return_value=response) as request:
+            result = lun_cluster.request_cluster_update(self.cluster, payload)
+        self.assertTrue(result["complete"])
+        self.assertEqual(request.call_args.args[2:5], (20000, "POST", "/v1/action"))
+        self.assertEqual(request.call_args.args[5]["action"], "cluster.update-all")
+
+    def test_cluster_update_marks_unresponsive_child_and_continues(self) -> None:
+        master_id, child_id = "a" * 32, "b" * 32
+        self.cluster.save_config({
+            "enabled": True, "role": "master", "node_id": master_id,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+        })
+        self.cluster.upsert_node({
+            "node_id": master_id, "public_host": "127.0.0.1", "public_port": 20000,
+            "internal_port": 20000, "api_version": 1, "location": {"country_code": "JP"},
+        }, role="master")
+        self.cluster.upsert_node({
+            "node_id": child_id, "public_host": "127.0.0.1", "public_port": 21000,
+            "internal_port": 21000, "api_version": 1, "location": {"country_code": "US"},
+        }, role="child")
+        script_payload, agent_payload = self._update_payloads()
+        with mock.patch.object(lun_cluster, "send_action", side_effect=TimeoutError("handshake timeout")):
+            result = lun_cluster.distribute_cluster_update(
+                self.cluster, {"script": script_payload, "agent": agent_payload}
+            )
+        self.assertFalse(result["complete"])
+        self.assertIn("handshake timeout", result["failures"]["2"])
+        self.assertEqual(self.cluster.node(child_id)["state"], "unreachable")
+
+    def test_cluster_update_installs_master_last_when_requested(self) -> None:
+        master_id = "a" * 32
+        self.cluster.save_config({
+            "enabled": True, "role": "master", "node_id": master_id,
+            "public_host": "127.0.0.1", "public_port": 20000, "internal_port": 20000,
+        })
+        self.cluster.upsert_node({
+            "node_id": master_id, "public_host": "127.0.0.1", "public_port": 20000,
+            "internal_port": 20000, "api_version": 1, "location": {"country_code": "JP"},
+        }, role="master")
+        script_payload, agent_payload = self._update_payloads()
+        order: list[str] = []
+        with mock.patch.object(
+            lun_cluster, "install_script_payload", side_effect=lambda *_: order.append("script") or {}
+        ), mock.patch.object(
+            lun_cluster, "install_agent_payload", side_effect=lambda *_: order.append("agent") or {}
+        ):
+            result = lun_cluster.distribute_cluster_update(
+                self.cluster, {"script": script_payload, "agent": agent_payload}, install_local=True
+            )
+        self.assertEqual(order, ["script", "agent"])
+        self.assertTrue(result["restart_required"])
+        self.assertEqual(result["local"]["status"], "updated")
+
     def test_database_replace_keeps_live_wal_connections_consistent(self) -> None:
         candidate_root = Path(self.temporary.name) / "candidate"
         candidate_root.mkdir()
@@ -553,6 +662,19 @@ class ClusterTestCase(unittest.TestCase):
             "internal_port": 20000, "api_version": 1,
             "location": {"country_code": country},
         })
+
+    @staticmethod
+    def _update_payloads() -> tuple[dict[str, str], dict[str, str]]:
+        script = b"#!/usr/bin/env bash\n# V26.8.8.2\nexit 0\n"
+        agent = b"#!/usr/bin/env python3\nVALUE = 1\n"
+
+        def payload(content: bytes) -> dict[str, str]:
+            return {
+                "content": base64.b64encode(content).decode(),
+                "sha256": lun_cluster.hashlib.sha256(content).hexdigest(),
+            }
+
+        return payload(script), payload(agent)
 
     def _record_sample(self, node_id: str, country: str, city: str, remark: str) -> None:
         server_number = self.cluster.allocate_server_number(node_id)

@@ -42,7 +42,10 @@ for helper in \
   direct_origin_ip_entries \
   direct_address_entries \
   address_mode_label \
-  lun_version_is_older; do
+  lun_version_is_older \
+  lun_script_version \
+  lun_update_target \
+  lun_install_update_stage; do
   eval "$(sed -n "/^${helper}(){/,/^}/p" "$SCRIPT")"
 done
 
@@ -118,6 +121,26 @@ expected_cdn='108.162.198.211 162.159.38.68 108.162.198.42 162.159.39.156 162.15
 lun_version_is_older V26.7.29.1 V26.7.29.2
 ! lun_version_is_older V26.7.29.2 V26.7.29.2
 ! lun_version_is_older V26.7.30.1 V26.7.29.2
+
+update_test=$(mktemp -d)
+update_original_home=$HOME
+update_original_path=$PATH
+HOME="$update_test/home"
+mkdir -p "$HOME/bin" "$update_test/path" "$update_test/system"
+printf '#!/usr/bin/env bash\n# V26.8.5.10\n' > "$HOME/bin/lun"
+printf '#!/usr/bin/env bash\n# V26.8.5.10\n' > "$update_test/system/lun"
+chmod +x "$HOME/bin/lun" "$update_test/system/lun"
+ln -s "$update_test/system/lun" "$update_test/path/lun"
+PATH="$update_test/path:$update_original_path"
+[[ $(lun_update_target) == "$update_test/system/lun" ]]
+printf '#!/usr/bin/env bash\n# V26.8.8.2\nexit 0\n' > "$update_test/new-lun"
+lun_install_update_stage "$update_test/new-lun" "$update_test/system/lun"
+[[ $(lun_script_version "$update_test/system/lun") == V26.8.8.2 ]]
+[[ $(lun_script_version "$update_test/system/lun.update-backup") == V26.8.5.10 ]]
+[[ $(sha256sum "$update_test/new-lun" | awk '{print $1}') == $(sha256sum "$update_test/system/lun" | awk '{print $1}') ]]
+PATH=$update_original_path
+HOME=$update_original_home
+rm -rf "$update_test"
 
 test_home=$(mktemp -d)
 original_home=$HOME
@@ -196,7 +219,12 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.8.1' "$SCRIPT"
+grep -q '当前版本：V26.8.8.2' "$SCRIPT"
+grep -q '^lun_update_target(){' "$SCRIPT"
+grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
+grep -q '一键更新全部集群服务器' "$SCRIPT"
+grep -q 'cluster_cmd update-all --script-payload' "$SCRIPT"
+grep -q '当前是同端口 CDN，不需要 Origin Rule' "$SCRIPT"
 grep -q '一键全配置（CDN / 域名证书 / 隧道 / 端口回源）' "$SCRIPT"
 grep -q '^oneclick_full_setup(){' "$SCRIPT"
 grep -q '^oneclick_full_finalize(){' "$SCRIPT"

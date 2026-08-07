@@ -84,6 +84,7 @@ ACTION_NAMES = {
     "status.refresh", "subscription.refresh", "protocol.apply", "service.restart", "service.control",
     "core.update", "firewall.apply", "script.install", "agent.install", "snapshot.create",
     "snapshot.restore", "user.sync", "identity.apply", "lun.factory-reset", "lun.uninstall",
+    "cluster.update-all",
     "role.stage", "role.discard", "role.promote", "role.rollback", "role.finalize",
     "role.children-commit", "role.children-revert", "controller.prepare",
     "controller.commit", "controller.abort", "controller.reassign",
@@ -2517,6 +2518,78 @@ def execute_action(cluster: Cluster, request: dict[str, Any], peer_id: str = "lo
     return {"request_id": request_id, "status": status, "result": result}
 
 
+def validate_script_install_payload(payload: dict[str, Any]) -> bytes:
+    encoded = str(payload.get("content", ""))
+    expected = str(payload.get("sha256", ""))
+    try:
+        content = b64decode(encoded)
+    except (ValueError, binascii.Error) as exc:
+        raise ClusterError("脚本内容编码无效") from exc
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise ClusterError("脚本 SHA-256 不匹配")
+    if len(content) > 2 * 1024 * 1024 or not content.startswith(b"#!/"):
+        raise ClusterError("脚本内容无效")
+    return content
+
+
+def validate_agent_install_payload(payload: dict[str, Any]) -> tuple[bytes, str]:
+    encoded = str(payload.get("content", ""))
+    expected = str(payload.get("sha256", ""))
+    try:
+        content = b64decode(encoded)
+        source = content.decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ClusterError("联动程序内容编码无效") from exc
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise ClusterError("联动程序 SHA-256 不匹配")
+    if len(content) > 2 * 1024 * 1024 or not content.startswith(b"#!/usr/bin/env python3"):
+        raise ClusterError("联动程序内容无效")
+    try:
+        compile(source, "lun_cluster.py", "exec")
+    except SyntaxError as exc:
+        raise ClusterError("新联动程序语法检查失败") from exc
+    return content, source
+
+
+def install_script_payload(cluster: Cluster, script: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    content = validate_script_install_payload(payload)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=str(script.parent), delete=False) as handle:
+        handle.write(content)
+        temporary = Path(handle.name)
+    try:
+        if cluster._run(["bash", "-n", str(temporary)], check=False).returncode:
+            raise ClusterError("新 Lun 脚本语法检查失败")
+        os.chmod(temporary, 0o755)
+        backup = script.with_name(script.name + ".cluster-backup")
+        if script.exists():
+            shutil.copy2(script, backup)
+        os.replace(temporary, script)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"sha256": hashlib.sha256(content).hexdigest(), "path": str(script)}
+
+
+def install_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    content, _ = validate_agent_install_payload(payload)
+    destination = Path(__file__).resolve()
+    with tempfile.NamedTemporaryFile(dir=str(destination.parent), delete=False) as handle:
+        handle.write(content)
+        temporary = Path(handle.name)
+    try:
+        os.chmod(temporary, 0o755)
+        backup = destination.with_name(destination.name + ".cluster-backup")
+        if destination.exists():
+            shutil.copy2(destination, backup)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "sha256": hashlib.sha256(content).hexdigest(), "path": str(destination),
+        "restart_required": True,
+    }
+
+
 def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any], request: dict[str, Any],
                            peer_id: str = "local") -> dict[str, Any]:
     script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
@@ -2713,59 +2786,14 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
         return {"snapshot": str(recovery), "scheduled": True}
+    if action == "cluster.update-all":
+        if cluster.load_config().get("role") != "master":
+            raise ClusterError("只有主 VPS 可以向全部服务器分发更新")
+        return distribute_cluster_update(cluster, payload, source_peer=peer_id, install_local=True)
     if action == "script.install":
-        encoded = str(payload.get("content", ""))
-        expected = str(payload.get("sha256", ""))
-        try:
-            content = b64decode(encoded)
-        except (ValueError, binascii.Error) as exc:
-            raise ClusterError("脚本内容编码无效") from exc
-        if hashlib.sha256(content).hexdigest() != expected:
-            raise ClusterError("脚本 SHA-256 不匹配")
-        if len(content) > 2 * 1024 * 1024 or not content.startswith(b"#!/"):
-            raise ClusterError("脚本内容无效")
-        with tempfile.NamedTemporaryFile(dir=str(script.parent), delete=False) as handle:
-            handle.write(content)
-            temporary = Path(handle.name)
-        try:
-            if cluster._run(["bash", "-n", str(temporary)], check=False).returncode:
-                raise ClusterError("新 Lun 脚本语法检查失败")
-            os.chmod(temporary, 0o755)
-            backup = script.with_name(script.name + ".cluster-backup")
-            if script.exists():
-                shutil.copy2(script, backup)
-            os.replace(temporary, script)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return {"sha256": expected, "path": str(script)}
+        return install_script_payload(cluster, script, payload)
     if action == "agent.install":
-        encoded = str(payload.get("content", ""))
-        expected = str(payload.get("sha256", ""))
-        try:
-            content = b64decode(encoded)
-            source = content.decode("utf-8")
-        except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
-            raise ClusterError("联动程序内容编码无效") from exc
-        if hashlib.sha256(content).hexdigest() != expected:
-            raise ClusterError("联动程序 SHA-256 不匹配")
-        if len(content) > 2 * 1024 * 1024 or not content.startswith(b"#!/usr/bin/env python3"):
-            raise ClusterError("联动程序内容无效")
-        try:
-            compile(source, "lun_cluster.py", "exec")
-        except SyntaxError as exc:
-            raise ClusterError("新联动程序语法检查失败") from exc
-        destination = Path(__file__).resolve()
-        with tempfile.NamedTemporaryFile(dir=str(destination.parent), delete=False) as handle:
-            handle.write(content)
-            temporary = Path(handle.name)
-        try:
-            os.chmod(temporary, 0o755)
-            backup = destination.with_name(destination.name + ".cluster-backup")
-            shutil.copy2(destination, backup)
-            os.replace(temporary, destination)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return {"sha256": expected, "path": str(destination), "restart_required": True}
+        return install_agent_payload(payload)
     if not script.exists():
         raise ClusterError("没有找到可执行的 Lun 主脚本")
     if action == "protocol.apply":
@@ -2809,13 +2837,112 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
     return {"returncode": result.returncode, "output": output}
 
 
-def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, Any],
+                timeout: int = 900) -> dict[str, Any]:
     node = cluster.node(node_id)
     if action in {"lun.factory-reset", "lun.uninstall"} and str(payload.get("confirm", "")) == node_id:
         payload = {**payload, "confirm": short_id(node["id"])}
     request = {"schema_version": API_VERSION, "request_id": uuid.uuid4().hex, "action": action, "payload": payload}
-    result = mutual_request(cluster, node["endpoint_host"], node["endpoint_port"], "POST", "/v1/action", request, timeout=900)
+    result = mutual_request(
+        cluster, node["endpoint_host"], node["endpoint_port"],
+        "POST", "/v1/action", request, timeout=timeout,
+    )
     return result["result"]
+
+
+def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_peer: str = "local",
+                              install_local: bool = False) -> dict[str, Any]:
+    config = cluster.load_config()
+    if config.get("role") != "master":
+        raise ClusterError("只有主 VPS 可以向全部服务器分发更新")
+    script_payload = payload.get("script") if isinstance(payload.get("script"), dict) else {}
+    agent_payload = payload.get("agent") if isinstance(payload.get("agent"), dict) else {}
+    script_content = validate_script_install_payload(script_payload)
+    validate_agent_install_payload(agent_payload)
+    version_match = re.search(rb"V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", script_content)
+    lun_version = version_match.group().decode() if version_match else ""
+
+    excluded: set[str] = set()
+    raw_exclude = payload.get("exclude", "")
+    exclude_values = raw_exclude if isinstance(raw_exclude, list) else re.split(r"[,\s]+", str(raw_exclude))
+    for value in exclude_values:
+        if not str(value).strip():
+            continue
+        excluded.add(str(cluster.node(str(value).strip())["id"]))
+    if re.fullmatch(r"[0-9a-f]{32}", source_peer or ""):
+        excluded.add(source_peer)
+
+    results: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    for node in cluster.nodes():
+        node_id = str(node["id"])
+        if node["role"] != "child":
+            continue
+        number = str(int(node["server_number"] or 0))
+        if node_id in excluded:
+            results[number] = {"status": "excluded" if node_id != source_peer else "source-current"}
+            continue
+        try:
+            status = _action_result_payload(
+                send_action(cluster, node_id, "status.refresh", {}, timeout=20)
+            )
+            if status:
+                cluster.upsert_node(status, role="child")
+            script_result = _action_result_payload(
+                send_action(cluster, node_id, "script.install", script_payload, timeout=180)
+            )
+            agent_result = _action_result_payload(
+                send_action(cluster, node_id, "agent.install", agent_payload, timeout=180)
+            )
+            results[number] = {
+                "status": "updated", "version": lun_version,
+                "script_sha256": script_result.get("sha256", ""),
+                "agent_sha256": agent_result.get("sha256", ""),
+            }
+            with cluster.db.connection:
+                cluster.db.connection.execute(
+                    "UPDATE nodes SET lun_version=?,updated_at=? WHERE id=?",
+                    (lun_version, utc_now(), node_id),
+                )
+        except Exception as exc:
+            failures[number] = str(exc)[-1000:]
+            with cluster.db.connection:
+                cluster.db.connection.execute(
+                    "UPDATE nodes SET state='unreachable',last_failure=?,updated_at=? WHERE id=?",
+                    (utc_now(), utc_now(), node_id),
+                )
+
+    local_result: dict[str, Any] = {"status": "current", "version": lun_version}
+    if install_local:
+        script_path = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+        install_script_payload(cluster, script_path, script_payload)
+        install_agent_payload(agent_payload)
+        local_result = {"status": "updated", "version": lun_version}
+    with contextlib.suppress(Exception):
+        cluster.upsert_node(cluster.local_status(), role="master")
+    return {
+        "complete": not failures, "version": lun_version, "local": local_result,
+        "nodes": results, "failures": failures, "restart_required": install_local,
+    }
+
+
+def request_cluster_update(cluster: Cluster, payload: dict[str, Any]) -> dict[str, Any]:
+    config = cluster.load_config()
+    if config.get("role") != "child" or not config.get("paired"):
+        raise ClusterError("当前服务器不是已配对子 VPS")
+    request = {
+        "schema_version": API_VERSION, "request_id": uuid.uuid4().hex,
+        "action": "cluster.update-all", "payload": payload,
+    }
+    response = mutual_request(
+        cluster, config["controller_host"], int(config["controller_port"]),
+        "POST", "/v1/action", request, timeout=1800,
+    )
+    wrapper = response.get("result") if isinstance(response.get("result"), dict) else {}
+    result = wrapper.get("result") if isinstance(wrapper.get("result"), dict) else {}
+    if not result:
+        raise ClusterError("主 VPS 未返回集群更新结果")
+    return result
 
 
 def _multiuser_agent_path(cluster: Cluster) -> Path:
@@ -3023,6 +3150,10 @@ def build_parser() -> argparse.ArgumentParser:
     batch_payload = batch.add_mutually_exclusive_group()
     batch_payload.add_argument("--payload", default="{}")
     batch_payload.add_argument("--payload-file")
+    update_all = sub.add_parser("update-all")
+    update_all.add_argument("--script-payload", required=True)
+    update_all.add_argument("--agent-payload", required=True)
+    update_all.add_argument("--exclude", default="")
     location = sub.add_parser("set-location")
     location.add_argument("--node-id", required=True)
     location.add_argument("--country-code", default="")
@@ -3132,6 +3263,22 @@ def main(argv: list[str] | None = None) -> int:
                 raise ClusterError("payload 必须是 JSON 对象")
             result = batch_action(cluster, re.split(r"[,\s]+", args.nodes), args.action, payload)
             print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.command == "update-all":
+            script_payload = json.loads(Path(args.script_payload).read_text(encoding="utf-8"))
+            agent_payload = json.loads(Path(args.agent_payload).read_text(encoding="utf-8"))
+            if not isinstance(script_payload, dict) or not isinstance(agent_payload, dict):
+                raise ClusterError("更新载荷必须是 JSON 对象")
+            payload = {"script": script_payload, "agent": agent_payload, "exclude": args.exclude}
+            if cluster.load_config().get("role") == "master":
+                result = distribute_cluster_update(cluster, payload)
+            else:
+                result = request_cluster_update(cluster, payload)
+            print(f"集群更新目标版本：{result.get('version') or '未知'}")
+            for number, item in sorted(result.get("nodes", {}).items(), key=lambda pair: int(pair[0])):
+                print(f"服务器 {int(number):02d}：{item.get('status', 'unknown')}")
+            if not result.get("complete"):
+                raise ClusterError("部分服务器更新失败：" + json_dumps(result.get("failures", {})))
+            print("全部可用服务器已完成 Lun 主脚本与联动程序更新。")
         elif args.command == "set-location":
             row = cluster.node(args.node_id)
             country_code = normalize_country_code(args.country_code)
