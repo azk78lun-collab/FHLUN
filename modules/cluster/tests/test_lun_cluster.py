@@ -7,7 +7,9 @@ import io
 import json
 import shutil
 import socket
+import sqlite3
 import ssl
+import tarfile
 import tempfile
 import threading
 import time
@@ -660,6 +662,969 @@ class ClusterTestCase(unittest.TestCase):
         self.assertEqual((self.root / "xr.json").read_text(encoding="utf-8"), '{"old":true}\n')
         self.assertEqual((self.root / "port_vl_re").read_text(encoding="utf-8"), "12345\n")
         self.assertFalse((self.root / "port_xh").exists())
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_federation_three_nodes_sync_events_and_rejects_tamper_replay(self) -> None:
+        roots = [Path(self.temporary.name) / f"fed-{name}" for name in ("a", "b", "c")]
+        clusters = []
+        try:
+            for number, root in enumerate(roots, 1):
+                root.mkdir()
+                (root / "uuid").write_text("11111111-1111-4111-8111-111111111111\n", encoding="utf-8")
+                item = lun_cluster.Cluster(root)
+                item.federation_init("127.0.0.1", 24000 + number, remark=f"node-{number}")
+                clusters.append(item)
+            first, second, third = clusters
+            first.federation_register_peer(second.federation_public_bundle())
+            first.federation_register_peer(third.federation_public_bundle())
+            baseline = first.federation_public_bundle()
+            second.import_federation_bundle(baseline, allow_cluster_adopt=True)
+            third.import_federation_bundle(baseline, allow_cluster_adopt=True)
+            first.create_event("node.metadata", "node:shared", {"value": "first"})
+            second.create_event("node.metadata", "node:shared", {"value": "second"})
+            all_events = [event for item in clusters for event in item.federation_events_since({})]
+            for receiver in clusters:
+                receiver.federation_import_events(all_events)
+            states = [json.loads(item.db.connection.execute("SELECT payload FROM federation_entities WHERE entity_key='node:shared'").fetchone()[0]) for item in clusters]
+            self.assertEqual(states[0], states[1])
+            self.assertEqual(states[1], states[2])
+            event = first.create_event("node.metadata", "node:tamper", {"value": "safe"})
+            bad = dict(event)
+            bad["payload"] = json.dumps({"value": "changed"})
+            with self.assertRaises(lun_cluster.ClusterError):
+                second.ingest_event(bad)
+            self.assertTrue(second.ingest_event(event))
+            self.assertFalse(second.ingest_event(event))  # replay is idempotent
+        finally:
+            for item in clusters:
+                item.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_federation_numbers_usage_revoke_and_private_free_backup(self) -> None:
+        self.cluster.federation_init("127.0.0.1", 25001)
+        local = self.cluster.load_config()["node_id"]
+        second_root = Path(self.temporary.name) / "federation-second"
+        second_root.mkdir()
+        (second_root / "uuid").write_text("11111111-1111-4111-8111-111111111111\n", encoding="utf-8")
+        second = lun_cluster.Cluster(second_root)
+        try:
+            second.federation_init("127.0.0.1", 25002)
+            bundle = second.federation_public_bundle()
+            self.cluster.federation_register_peer(bundle)
+            self.assertEqual(self.cluster.node(local)["server_number"], 1)
+            self.assertEqual(self.cluster.node(bundle["node_id"])["server_number"], 2)
+            event = self.cluster.create_event("usage.absolute", "usage:device:2026-08", {
+                "node_id": local, "device_uuid": "device", "epoch": "2026-08", "uplink": 10,
+                "downlink": 20, "month_uplink": 5, "month_downlink": 6, "sequence": 2,
+            })
+            self.assertFalse(self.cluster.ingest_event(event))
+            self.assertEqual(self.cluster.global_usage("device", "2026-08")["downlink"], 20)
+            now = lun_cluster.utc_now()
+            status = self.cluster.record_transport_failure(bundle["node_id"], when=now - 40)
+            self.cluster.record_transport_failure(bundle["node_id"], when=now - 20)
+            status = self.cluster.record_transport_failure(bundle["node_id"], when=now)
+            self.assertTrue(status["needs_probe"])
+            for offset in (40, 20, 0):
+                vote = self.cluster.create_probe_vote(bundle["node_id"], False, observed_at=now - offset)
+                verdict = self.cluster.record_probe_vote(vote)
+            self.assertTrue(verdict["revocable"])
+            forged = self.cluster.create_probe_vote(bundle["node_id"], False)
+            forged["signature"] = base64.b64encode(b"forged").decode()
+            with self.assertRaises(lun_cluster.ClusterError):
+                self.cluster.record_probe_vote(forged)
+            self.cluster.finalize_suspect(bundle["node_id"])
+            self.assertTrue(self.cluster.federation_cleanup_plan(bundle["node_id"])["revoked"])
+            backup = Path(self.temporary.name) / "federation.backup"
+            self.cluster.export_federation_backup(backup, "correct-password")
+            second_config = second.load_config().copy()
+            second_key = (second.pki / "federation-root.key").read_bytes()
+            second.import_federation_bundle(self.cluster.federation_public_bundle(), allow_cluster_adopt=True)
+            second.restore_federation_backup(backup, "correct-password")
+            self.assertEqual(second.load_config()["node_id"], second_config["node_id"])
+            self.assertEqual((second.pki / "federation-root.key").read_bytes(), second_key)
+        finally:
+            second.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_old_master_configuration_requires_and_supports_explicit_migration(self) -> None:
+        self.cluster.init_master("127.0.0.1", 26001)
+        with self.assertRaises(lun_cluster.ClusterError):
+            self.cluster.federation_init("127.0.0.1", 26001)
+        migrated = self.cluster.migrate_to_federation()
+        self.assertEqual(migrated["mode"], "federation")
+        self.assertEqual(migrated["role"], "federation")
+        self.assertNotIn("controller_id", migrated)
+        self.assertTrue((self.cluster.pki / "federation-root.key").exists())
+        self.assertFalse((self.cluster.pki / "cluster-ca.key").exists())
+        recovery = Path(migrated["legacy_rollback_archive"])
+        self.assertTrue(recovery.is_file())
+        with tarfile.open(recovery, "r:gz") as archive:
+            self.assertIn("pki/cluster-ca.key", archive.getnames())
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_third_node_dependency_join_root_immutability_and_failed_pairing(self) -> None:
+        first = self._federation_cluster("join-first", 27001)
+        second = self._federation_cluster("join-second", 27002)
+        third = self._federation_cluster("join-third", 27003)
+        replacement = self._federation_cluster("join-replacement", 27004)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            bundle = first.federation_public_bundle()
+            bundle["events"] = list(reversed(bundle["events"]))
+            unsigned = {key: value for key, value in bundle.items() if key != "signature"}
+            bundle["signature"] = first._sign_federation(lun_cluster.json_dumps(unsigned).encode())
+            third.import_federation_bundle(bundle, allow_cluster_adopt=True)
+            self.assertIsNotNone(third.db.connection.execute(
+                "SELECT 1 FROM federation_keys WHERE node_id=?", (second.load_config()["node_id"],)
+            ).fetchone())
+            with self.assertRaises(lun_cluster.ClusterError):
+                first.register_federation_key(
+                    second.load_config()["node_id"], replacement.federation_root_certificate(),
+                    replacement.federation_identity_certificate(),
+                )
+            target_id = replacement.load_config()["node_id"]
+            uri = lun_cluster.make_join_uri(
+                "127.0.0.1", 27004, target_id, "x" * 43,
+                replacement.certificate_fingerprint(), lun_cluster.utc_now() + 60,
+            )
+            with mock.patch.object(lun_cluster, "bootstrap_request", side_effect=[
+                {"ok": True, "bundle": replacement.federation_public_bundle()},
+                lun_cluster.ClusterError("remote transaction failed"),
+                lun_cluster.ClusterError("transaction status unavailable"),
+            ]):
+                with self.assertRaises(lun_cluster.ClusterError):
+                    lun_cluster.federation_add_peer(first, uri)
+            self.assertIsNone(first.db.connection.execute(
+                "SELECT 1 FROM federation_keys WHERE node_id=?", (target_id,)
+            ).fetchone())
+            pending = first.db.connection.execute(
+                "SELECT status FROM federation_join_transactions WHERE direction='outgoing'"
+            ).fetchone()
+            self.assertEqual(pending["status"], "remote-committed-local-pending")
+        finally:
+            for item in (first, second, third, replacement):
+                item.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_member_number_conflicts_converge_in_forward_and_reverse_order(self) -> None:
+        source = self._federation_cluster("number-source", 27101)
+        second = self._federation_cluster("number-second", 27102)
+        third = self._federation_cluster("number-third", 27103)
+        identity_backup = Path(self.temporary.name) / "number-identity.backup"
+        source.export_identity_backup(identity_backup, "correct-password")
+        receivers = [self._blank_cluster("number-forward"), self._blank_cluster("number-reverse")]
+        try:
+            for receiver in receivers:
+                receiver.restore_federation_backup(identity_backup, "correct-password")
+            source.federation_register_peer(second.federation_public_bundle())
+            source.federation_register_peer(third.federation_public_bundle())
+            forward = source.federation_public_bundle()
+            reverse = dict(forward)
+            reverse["events"] = list(reversed(forward["events"]))
+            reverse["signature"] = source._sign_federation(lun_cluster.json_dumps({
+                key: value for key, value in reverse.items() if key != "signature"
+            }).encode())
+            receivers[0].import_federation_bundle(forward)
+            receivers[1].import_federation_bundle(reverse)
+            ids = [source.load_config()["node_id"], second.load_config()["node_id"], third.load_config()["node_id"]]
+            mappings = [{node_id: int(receiver.node(node_id)["server_number"]) for node_id in ids} for receiver in receivers]
+            self.assertEqual(mappings[0], mappings[1])
+            self.assertEqual(len(set(mappings[0].values())), 3)
+        finally:
+            for item in (source, second, third, *receivers):
+                item.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_revocation_boundary_and_membership_proof_nonce(self) -> None:
+        first = self._federation_cluster("revoke-first", 27201)
+        second = self._federation_cluster("revoke-second", 27202)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            second.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            before_one = second.create_event("node.metadata", "node:before-one", {"value": 1})
+            before_two = second.create_event("node.metadata", "node:before-two", {"value": 2})
+            first.create_event("member.revoke", f"member:{second.load_config()['node_id']}", {
+                "node_id": second.load_config()["node_id"], "reason": "test", "revoked_after_seq": 3,
+            })
+            self.assertEqual(first.federation_import_events([before_two, before_one]), 2)
+            after = second.create_event("node.metadata", "node:after", {"value": 3})
+            with self.assertRaises(lun_cluster.ClusterError):
+                first.federation_import_events([after])
+            nonce = "proof_nonce_1234567890"
+            proof = first.membership_status_proof(second.load_config()["node_id"], nonce)
+            self.assertTrue(first.verify_membership_status_proof(
+                proof, second.load_config()["node_id"], nonce
+            ))
+            with self.assertRaises(lun_cluster.ClusterError):
+                first.verify_membership_status_proof(proof, second.load_config()["node_id"], "wrong_nonce_123456")
+        finally:
+            first.close()
+            second.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_data_backup_rejects_traversal_and_preserves_target_identity(self) -> None:
+        source = self._federation_cluster("backup-source", 27301)
+        target = self._federation_cluster("backup-target", 27302)
+        try:
+            join = target.create_join_code()
+            token = lun_cluster.parse_join_uri(join)["token"]
+            source_bundle = source.federation_public_bundle()
+            transaction = source.create_join_transaction(source_bundle, target.load_config()["node_id"])
+            target.accept_federation_join(token, source_bundle, transaction)
+            backup = Path(self.temporary.name) / "data-only.backup"
+            source.export_federation_backup(backup, "correct-password")
+            old_config = target.config_path.read_bytes()
+            old_key = (target.pki / "federation-root.key").read_bytes()
+            target.restore_federation_backup(backup, "correct-password")
+            self.assertEqual(target.config_path.read_bytes(), old_config)
+            self.assertEqual((target.pki / "federation-root.key").read_bytes(), old_key)
+
+            archive_bytes = io.BytesIO()
+            with tarfile.open(fileobj=archive_bytes, mode="w:gz") as archive:
+                info = tarfile.TarInfo("../escape")
+                content = b"malicious"
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+            malicious = Path(self.temporary.name) / "malicious.backup"
+            source._encrypt_backup_payload(archive_bytes.getvalue(), malicious, "correct-password")
+            with self.assertRaises(lun_cluster.ClusterError):
+                target.restore_federation_backup(malicious, "correct-password")
+        finally:
+            source.close()
+            target.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_legacy_five_node_migration_is_local_only_and_candidates_are_inactive(self) -> None:
+        self.cluster.init_master("127.0.0.1", 27401)
+        local_id = self.cluster.load_config()["node_id"]
+        (self.root / "jhsub.txt").write_text("vless://local\n", encoding="utf-8")
+        legacy = [
+            ("2" * 32, "192.0.2.2"), ("3" * 32, "198.51.100.3"),
+            ("4" * 32, "203.0.113.4"), ("5" * 32, "192.0.2.5"),
+        ]
+        for index, (node_id, host) in enumerate(legacy, 2):
+            self.cluster.upsert_node({"node_id": node_id, "public_host": host, "public_port": 20000 + index,
+                                      "internal_port": 20000 + index, "api_version": 2,
+                                      "location": {"country_code": "ZZ"}}, role="child")
+        with mock.patch.object(lun_cluster, "mutual_request") as request, \
+                mock.patch.object(lun_cluster, "bootstrap_request") as bootstrap, \
+                mock.patch.object(lun_cluster.urllib.request, "urlopen") as urlopen:
+            migrated = self.cluster.migrate_to_federation()
+        request.assert_not_called()
+        bootstrap.assert_not_called()
+        urlopen.assert_not_called()
+        self.assertEqual(self.cluster.node(local_id)["server_number"], 1)
+        for index, (node_id, _) in enumerate(legacy, 2):
+            row = self.cluster.node(node_id)
+            self.assertEqual(row["server_number"], index)
+            self.assertEqual(row["state"], "legacy-unverified")
+            self.assertIsNone(self.cluster.db.connection.execute(
+                "SELECT 1 FROM federation_keys WHERE node_id=?", (node_id,)
+            ).fetchone())
+            with mock.patch.object(lun_cluster, "mutual_request") as transport:
+                with self.assertRaises(lun_cluster.ClusterError):
+                    lun_cluster.federation_sync(self.cluster, node_id)
+                with self.assertRaises(lun_cluster.ClusterError):
+                    lun_cluster.send_action(self.cluster, node_id, "status.refresh", {})
+                transport.assert_not_called()
+        selected = self.cluster._selected_nodes("all", "legacy")
+        self.assertEqual({row["id"] for row in selected}, {local_id})
+        trust = {row["id"]: row["trusted"] for row in self.cluster.nodes()}
+        self.assertTrue(trust[local_id])
+        self.assertTrue(all(not trust[node_id] for node_id, _ in legacy))
+        self.assertEqual(migrated["mode"], "federation")
+
+    def test_cdn_pool_validation_preview_apply_and_rollback(self) -> None:
+        (self.root / "cdnip").write_text("2.2.2.2 old.example.com\n", encoding="utf-8")
+        (self.root / "cdnip1").write_text("stale.example.com\n", encoding="utf-8")
+        (self.root / "cdnip9").write_text("stale-nine.example.com\n", encoding="utf-8")
+        (self.root / "cdnym").write_text("host.example.com\n", encoding="utf-8")
+        script = self.root / "lun.sh"
+        script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+        preview = self.cluster.preview_cdn_pool(
+            "merge", "1.1.1.1 2001:0db8::1 CDN.Example.COM. 1.1.1.1"
+        )
+        self.assertEqual(preview["current"], ["2.2.2.2", "old.example.com"])
+        self.assertEqual(preview["source"], ["1.1.1.1", "2001:db8::1", "cdn.example.com"])
+        self.assertEqual(preview["result"], [
+            "1.1.1.1", "2001:db8::1", "cdn.example.com", "2.2.2.2", "old.example.com",
+        ])
+        replaced = self.cluster.preview_cdn_pool("replace", "1.1.1.1")
+        self.assertEqual(replaced["remove"], ["2.2.2.2", "old.example.com"])
+        for invalid in ("", "https://1.1.1.1", "1.1.1.1:443", "host.example/path", "$(id)"):
+            with self.subTest(invalid=invalid), self.assertRaises(lun_cluster.ClusterError):
+                self.cluster.normalize_cdn_pool(invalid)
+
+        success = mock.Mock(returncode=0, stdout="ok", stderr="")
+        with mock.patch.object(self.cluster, "_run", return_value=success) as runner, \
+                mock.patch.object(self.cluster, "record_local_snapshot"):
+            applied = self.cluster.apply_cdn_pool("replace", "1.1.1.1 edge.example.com", script)
+        self.assertTrue(applied["applied"])
+        runner.assert_called_once_with(
+            ["bash", str(script), "subscription-refresh"], timeout=300, check=False
+        )
+        self.assertEqual((self.root / "cdnip").read_text(encoding="utf-8"), "1.1.1.1 edge.example.com\n")
+        self.assertEqual((self.root / "cdnip2").read_text(encoding="utf-8"), "edge.example.com\n")
+        self.assertFalse((self.root / "cdnip9").exists())
+        self.assertEqual((self.root / "cdnym").read_text(encoding="utf-8"), "host.example.com\n")
+
+        original = (self.root / "cdnip").read_bytes()
+        failed = mock.Mock(returncode=1, stdout="", stderr="refresh failed")
+        restored = mock.Mock(returncode=0, stdout="restored", stderr="")
+        with mock.patch.object(self.cluster, "_run", side_effect=[failed, restored]) as runner:
+            rollback = self.cluster.apply_cdn_pool("replace", "9.9.9.9", script)
+        self.assertFalse(rollback["applied"])
+        self.assertEqual(rollback["rollback"], {"restored": True, "refresh_returncode": 0})
+        self.assertEqual((self.root / "cdnip").read_bytes(), original)
+        self.assertEqual(runner.call_count, 2)
+
+        with self.assertRaises(lun_cluster.ClusterError):
+            lun_cluster.execute_action(self.cluster, {
+                "request_id": "a" * 32, "action": "cdn.pool.preview",
+                "payload": {"mode": "merge", "cfip": "1.1.1.1", "cdnym": "forbidden.example"},
+            })
+
+    def test_cdn_pool_remote_command_uses_structured_send_action(self) -> None:
+        local_id, remote_id = "a" * 32, "b" * 32
+        self.cluster.save_config({"enabled": True, "mode": "federation", "role": "federation",
+                                  "node_id": local_id, "cluster_id": "c" * 32})
+        self._add_node(local_id, "DE")
+        self._add_node(remote_id, "JP")
+        with mock.patch.object(lun_cluster, "send_action", return_value={"mode": "merge"}) as sender:
+            result = lun_cluster.cdn_pool_command(
+                self.cluster, remote_id, "merge", "1.1.1.1 edge.example.com", apply=False
+            )
+        self.assertEqual(result["mode"], "merge")
+        sender.assert_called_once_with(
+            self.cluster, remote_id, "cdn.pool.preview",
+            {"mode": "merge", "cfip": "1.1.1.1 edge.example.com"},
+        )
+
+    def test_new_cli_contracts_and_cdn_json_output(self) -> None:
+        parser = lun_cluster.build_parser()
+        self.assertEqual(parser.parse_args([
+            "identity-restore", "--path", "identity.backup", "--password-file", "password.txt",
+        ]).command, "identity-restore")
+        self.assertEqual(parser.parse_args([
+            "subscription-access", "--token", "a" * 16,
+        ]).command, "subscription-access")
+        local_id = "a" * 32
+        self.cluster.save_config({"enabled": True, "mode": "federation", "role": "federation",
+                                  "node_id": local_id, "cluster_id": "b" * 32})
+        self._add_node(local_id, "DE")
+        (self.root / "cdnip").write_text("2.2.2.2\n", encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = lun_cluster.main([
+                "--root", str(self.root), "--json", "cdn-pool-preview", "--node-id", local_id,
+                "--mode", "merge", "--cfip", "1.1.1.1",
+            ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["result"], ["1.1.1.1", "2.2.2.2"])
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_identity_restore_rejects_data_backup_and_restores_identity(self) -> None:
+        source = self._federation_cluster("identity-source", 27501)
+        target = self._federation_cluster("identity-target", 27502)
+        data_backup = Path(self.temporary.name) / "federation-data.backup"
+        identity_backup = Path(self.temporary.name) / "identity.backup"
+        try:
+            source.export_federation_backup(data_backup, "correct-password")
+            source.export_identity_backup(identity_backup, "correct-password")
+            target_config = target.config_path.read_bytes()
+            target_key = (target.pki / "federation-root.key").read_bytes()
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "只接受完整身份备份"):
+                target.restore_identity_backup(data_backup, "correct-password")
+            self.assertEqual(target.config_path.read_bytes(), target_config)
+            self.assertEqual((target.pki / "federation-root.key").read_bytes(), target_key)
+
+            restored = target.restore_identity_backup(identity_backup, "correct-password")
+            self.assertTrue(restored["identity_restored"])
+            self.assertEqual(target.load_config()["node_id"], source.load_config()["node_id"])
+            self.assertEqual(
+                (target.pki / "federation-root.key").read_bytes(),
+                (source.pki / "federation-root.key").read_bytes(),
+            )
+        finally:
+            source.close()
+            target.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_subscription_access_debounce_failures_and_untrusted_exclusion(self) -> None:
+        first = self._federation_cluster("access-first", 27601)
+        second = self._federation_cluster("access-second", 27602)
+        third = self._federation_cluster("access-third", 27603)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            first.federation_register_peer(third.federation_public_bundle())
+            legacy_id = "d" * 32
+            first.upsert_node({"node_id": legacy_id, "public_host": "192.0.2.44", "public_port": 24444,
+                               "internal_port": 24444, "api_version": 2,
+                               "location": {"country_code": "ZZ"}}, role="legacy-candidate")
+            with first.db.connection:
+                first.db.connection.execute(
+                    "UPDATE nodes SET state='legacy-unverified' WHERE id=?", (legacy_id,)
+                )
+            token = first.profiles()[0]["token"]
+            calls: list[str] = []
+
+            def fake_sync(_cluster, node_id):
+                calls.append(node_id)
+                if node_id == second.load_config()["node_id"]:
+                    raise lun_cluster.ClusterError("offline")
+                return {"received": 4}
+
+            with mock.patch.object(lun_cluster, "federation_sync", side_effect=fake_sync), \
+                    mock.patch.object(first, "refresh_profiles", return_value=[{"id": 1}]) as refresh:
+                result = first.subscription_access(token, now=1000)
+                debounced = first.subscription_access(token, now=1020)
+            self.assertFalse(result["debounced"])
+            self.assertEqual(len(result["failures"]), 1)
+            self.assertEqual(sum(result["received"].values()), 4)
+            self.assertTrue(debounced["debounced"])
+            self.assertNotIn(legacy_id, calls)
+            self.assertEqual(set(calls), {
+                second.load_config()["node_id"], third.load_config()["node_id"],
+            })
+            refresh.assert_called_once_with()
+            settings = [tuple(row) for row in first.db.connection.execute(
+                "SELECT key,value FROM settings WHERE key LIKE 'subscription.access.%'"
+            )]
+            self.assertEqual(settings, [("subscription.access." + lun_cluster.hashlib.sha256(token.encode()).hexdigest(), "1000")])
+            self.assertNotIn(token, json.dumps(settings))
+            with first.db.connection:
+                first.db.connection.execute("UPDATE profiles SET enabled=0 WHERE token=?", (token,))
+            with self.assertRaises(lun_cluster.ClusterError):
+                first.subscription_access(token, now=1040)
+        finally:
+            first.close()
+            second.close()
+            third.close()
+
+    def test_serve_starts_subscription_catchup_only_once(self) -> None:
+        self.cluster.save_config({"enabled": True, "role": "master", "node_id": "a" * 32,
+                                  "cluster_id": "b" * 32, "bind": "127.0.0.1",
+                                  "internal_port": 27701, "public_port": 27701})
+        started: list[str] = []
+
+        class FakeServer:
+            def __init__(self, *_args):
+                self.socket = object()
+                self.restart_requested = False
+
+            def serve_forever(self, **_kwargs):
+                return None
+
+            def server_close(self):
+                return None
+
+        class FakeThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                started.append(self.target.__name__)
+                if self.target.__name__ == "initial_subscription_catchup":
+                    self.target()
+
+        context = mock.Mock()
+        context.wrap_socket.return_value = object()
+        with mock.patch.object(lun_cluster, "ThreadingClusterServer", FakeServer), \
+                mock.patch.object(lun_cluster, "server_context", return_value=context), \
+                mock.patch.object(lun_cluster.threading, "Thread", FakeThread), \
+                mock.patch.object(lun_cluster.signal, "signal"), \
+                mock.patch.object(self.cluster, "subscription_catchup", return_value={}) as catchup:
+            lun_cluster.serve(self.cluster)
+        catchup.assert_called_once_with()
+        self.assertEqual(started.count("initial_subscription_catchup"), 1)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_pairing_invalid_final_bundle_keeps_signed_recoverable_transaction(self) -> None:
+        first = self._federation_cluster("transaction-first", 27801)
+        remote = self._federation_cluster("transaction-remote", 27802)
+        join_uri = remote.create_join_code()
+        join = lun_cluster.parse_join_uri(join_uri)
+        committed: dict[str, object] = {}
+        try:
+            def first_attempt(_join, method, path, body=None):
+                if method == "GET":
+                    return {"ok": True, "bundle": remote.federation_public_bundle()}
+                if path == "/v1/federation/join":
+                    accepted = remote.accept_federation_join(body["token"], body["bundle"], body["transaction"])
+                    committed.update(accepted)
+                    bad = dict(accepted["bundle"])
+                    bad["signature"] = base64.b64encode(b"bad").decode()
+                    return {"ok": True, "transaction_id": accepted["transaction_id"], "bundle": bad}
+                raise lun_cluster.ClusterError("temporary status outage")
+
+            with mock.patch.object(lun_cluster, "bootstrap_request", side_effect=first_attempt):
+                with self.assertRaisesRegex(lun_cluster.ClusterError, "可恢复事务"):
+                    lun_cluster.federation_add_peer(first, join_uri)
+            remote_id = remote.load_config()["node_id"]
+            self.assertIsNone(first.db.connection.execute(
+                "SELECT 1 FROM federation_keys WHERE node_id=?", (remote_id,)
+            ).fetchone())
+            pending = first.db.connection.execute(
+                "SELECT * FROM federation_join_transactions WHERE direction='outgoing'"
+            ).fetchone()
+            self.assertEqual(pending["status"], "remote-committed-local-pending")
+            transaction = json.loads(pending["transaction_payload"])
+            self.assertTrue(first._verify_federation_signature(
+                first.federation_root_certificate(), first.canonical_join_transaction(transaction),
+                transaction["signature"],
+            ))
+
+            def recovered(_join, method, path, body=None):
+                self.assertEqual(path, "/v1/federation/join-status")
+                return {"ok": True, **remote.federation_join_status(body["token"], body["transaction"])}
+
+            with mock.patch.object(lun_cluster, "bootstrap_request", side_effect=recovered):
+                result = lun_cluster.federation_add_peer(first, join_uri)
+            self.assertTrue(result["recovered"])
+            self.assertIsNotNone(first.db.connection.execute(
+                "SELECT 1 FROM federation_keys WHERE node_id=?", (remote_id,)
+            ).fetchone())
+            self.assertEqual(first.db.connection.execute(
+                "SELECT status FROM federation_join_transactions WHERE transaction_id=?",
+                (result["transaction_id"],),
+            ).fetchone()[0], "committed")
+        finally:
+            first.close()
+            remote.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_federation_user_events_converge_delete_and_keep_stable_device_key(self) -> None:
+        first = self._federation_cluster("users-first", 27901)
+        second = self._federation_cluster("users-second", 27902)
+        third = self._federation_cluster("users-third", 27903)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            first.federation_register_peer(third.federation_public_bundle())
+            baseline = first.federation_public_bundle()
+            second.import_federation_bundle(baseline, allow_cluster_adopt=True)
+            third.import_federation_bundle(baseline, allow_cluster_adopt=True)
+            node_ids = [item.load_config()["node_id"] for item in (first, second, third)]
+            first.assign_user_nodes(7, node_ids)
+            database = first.root / "modules" / "multiuser" / "data" / "lun.db"
+            database.parent.mkdir(parents=True)
+            sqlite3.connect(database).close()
+            bundle = self._sample_federation_user_bundle()
+            with mock.patch.object(lun_cluster, "export_master_users", return_value=bundle):
+                published = first.publish_local_user_events()
+            self.assertEqual(published["events"], 6)
+            for receiver in (second, third):
+                events = first.federation_events_since(receiver.federation_manifest())
+                self.assertEqual(receiver.federation_import_events(reversed(events)), 6)
+                self.assertEqual(receiver.federation_import_events(events), 0)
+
+            captured: list[dict[str, object]] = []
+            with mock.patch.object(second, "_apply_federation_user_bundle",
+                                   side_effect=lambda value: captured.append(value) or {"users": 1}), \
+                    mock.patch.object(second, "refresh_profiles", return_value=[]):
+                applied = second.apply_federation_users()
+            self.assertEqual(applied["users"], 1)
+            imported_user = captured[-1]["users"][0]
+            self.assertEqual(imported_user["monthly_quota"], 98765432)
+            self.assertEqual(imported_user["permissions"], {"vl": True, "ss": False})
+            self.assertEqual([item["key"] for item in imported_user["devices"]], [
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000002",
+            ])
+            self.assertEqual(imported_user["devices"][1]["token"], "token_02_abcdefghijklmnop")
+
+            one_device = self._sample_federation_user_bundle()
+            one_device["users"][0]["devices"] = [one_device["users"][0]["devices"][1]]
+            with mock.patch.object(lun_cluster, "export_master_users", return_value=one_device):
+                self.assertGreater(first.publish_local_user_events()["events"], 0)
+            delta = first.federation_events_since(second.federation_manifest())
+            second.federation_import_events(reversed(delta))
+            captured.clear()
+            with mock.patch.object(second, "_apply_federation_user_bundle",
+                                   side_effect=lambda value: captured.append(value) or {"users": 1}), \
+                    mock.patch.object(second, "refresh_profiles", return_value=[]):
+                second.apply_federation_users()
+            remaining = captured[-1]["users"][0]["devices"]
+            self.assertEqual([(item["key"], item["token"]) for item in remaining], [
+                ("00000000-0000-4000-8000-000000000002", "token_02_abcdefghijklmnop")
+            ])
+
+            user_key = first._federation_user_key(node_ids[0], "7")
+            base_payload = json.loads(first.db.connection.execute(
+                "SELECT payload FROM federation_entities WHERE entity_key=?", ("user:" + user_key,)
+            ).fetchone()[0])
+            event_two = second.create_event("user.upsert", "user:" + user_key,
+                                            {**base_payload, "name": "from-second"})
+            event_three = third.create_event("user.upsert", "user:" + user_key,
+                                             {**base_payload, "name": "from-third"})
+            for receiver in (first, second, third):
+                receiver.federation_import_events([event_three, event_two])
+            winner = max((event_two, event_three), key=first._event_sort_key)
+            expected_name = json.loads(winner["payload"])["name"]
+            self.assertEqual({json.loads(item.db.connection.execute(
+                "SELECT payload FROM federation_entities WHERE entity_key=?", ("user:" + user_key,)
+            ).fetchone()[0])["name"] for item in (first, second, third)}, {expected_name})
+
+            with mock.patch.object(lun_cluster, "export_master_users",
+                                   return_value={"schema_version": 1, "users": []}):
+                first.publish_local_user_events()
+            deletion_events = first.federation_events_since(second.federation_manifest())
+            second.federation_import_events(reversed(deletion_events))
+            captured.clear()
+            with mock.patch.object(second, "_apply_federation_user_bundle",
+                                   side_effect=lambda value: captured.append(value) or {"users": 0}), \
+                    mock.patch.object(second, "refresh_profiles", return_value=[]):
+                second.apply_federation_users()
+            self.assertEqual(captured[-1]["users"], [])
+            self.assertEqual(second.db.connection.execute(
+                "SELECT deleted FROM federation_entities WHERE entity_key=?", ("user:" + user_key,)
+            ).fetchone()[0], 1)
+            audit = json.dumps([dict(row) for row in first.db.connection.execute("SELECT * FROM audit_log")])
+            self.assertNotIn("token_02_abcdefghijklmnop", audit)
+            self.assertNotIn("password-2-secure", audit)
+        finally:
+            first.close()
+            second.close()
+            third.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_migration_publishes_existing_users_and_rolls_back_publish_failure(self) -> None:
+        self.cluster.init_master("127.0.0.1", 27911)
+        local_id = self.cluster.load_config()["node_id"]
+        self.cluster.assign_user_nodes(7, [local_id])
+        database = self.root / "modules" / "multiuser" / "data" / "lun.db"
+        database.parent.mkdir(parents=True)
+        sqlite3.connect(database).close()
+        with mock.patch.object(lun_cluster, "export_master_users",
+                               return_value=self._sample_federation_user_bundle()):
+            migrated = self.cluster.migrate_to_federation()
+        self.assertEqual(migrated["migrated_users"]["users"], 1)
+        event_types = {row[0] for row in self.cluster.db.connection.execute(
+            "SELECT type FROM federation_events"
+        )}
+        self.assertTrue({"user.upsert", "device.upsert", "authorization.upsert", "token.upsert"} <= event_types)
+        token_payload = json.loads(self.cluster.db.connection.execute(
+            "SELECT payload FROM federation_entities WHERE type='token.upsert' ORDER BY entity_key LIMIT 1"
+        ).fetchone()[0])
+        self.assertEqual(token_payload["token"], "token_01_abcdefghijklmnop")
+        authorization = json.loads(self.cluster.db.connection.execute(
+            "SELECT payload FROM federation_entities WHERE type='authorization.upsert' LIMIT 1"
+        ).fetchone()[0])
+        self.assertEqual(authorization["nodes"], [local_id])
+
+        failed = self._blank_cluster("migration-failure")
+        try:
+            failed.init_master("127.0.0.1", 27912)
+            failed_db = failed.root / "modules" / "multiuser" / "data" / "lun.db"
+            failed_db.parent.mkdir(parents=True)
+            sqlite3.connect(failed_db).close()
+            old_config = failed.config_path.read_bytes()
+            old_ca = (failed.pki / "cluster-ca.key").read_bytes()
+            with mock.patch.object(failed, "publish_local_user_events",
+                                   side_effect=lun_cluster.ClusterError("publish failed")):
+                with self.assertRaisesRegex(lun_cluster.ClusterError, "publish failed"):
+                    failed.migrate_to_federation()
+            self.assertEqual(failed.config_path.read_bytes(), old_config)
+            self.assertEqual((failed.pki / "cluster-ca.key").read_bytes(), old_ca)
+            self.assertEqual(failed.load_config()["role"], "master")
+        finally:
+            failed.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_failure_coordinator_jitter_two_node_and_three_node_majority(self) -> None:
+        first = self._federation_cluster("health-first", 27921)
+        second = self._federation_cluster("health-second", 27922)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            second_id = second.load_config()["node_id"]
+            with mock.patch.object(lun_cluster, "mutual_request",
+                                   side_effect=lun_cluster.FederationTransportError("offline")) as transport, \
+                    mock.patch.object(first, "_coordinate_after_failures",
+                                      return_value={"revoked": False, "state": "suspect"}) as coordinate:
+                with self.assertRaises(lun_cluster.FederationTransportError):
+                    lun_cluster.federation_sync(first, second_id)
+            self.assertEqual(transport.call_count, 3)
+            coordinate.assert_called_once()
+            outcomes = iter((False, True))
+            recovered = first.coordinate_member_health(second_id, probe=lambda *_: next(outcomes))
+            self.assertFalse(recovered["revoked"])
+            self.assertEqual(first.db.connection.execute(
+                "SELECT COUNT(*) FROM federation_failures WHERE candidate_id=?", (second_id,)
+            ).fetchone()[0], 0)
+            forged = second.create_probe_vote(first.load_config()["node_id"], False)
+            forged["signature"] = base64.b64encode(b"forged").decode()
+            with self.assertRaises(lun_cluster.ClusterError):
+                first.record_probe_vote(forged)
+            verdict = first.coordinate_member_health(second_id, probe=lambda *_: False)
+            self.assertTrue(verdict["revoked"])
+            self.assertEqual(verdict["unreachable_votes"], 3)
+        finally:
+            first.close()
+            second.close()
+
+        first = self._federation_cluster("majority-first", 27923)
+        candidate = self._federation_cluster("majority-candidate", 27924)
+        voter = self._federation_cluster("majority-voter", 27925)
+        try:
+            first.federation_register_peer(candidate.federation_public_bundle())
+            first.federation_register_peer(voter.federation_public_bundle())
+            candidate_id = candidate.load_config()["node_id"]
+            with mock.patch.object(lun_cluster, "mutual_request",
+                                   side_effect=lun_cluster.FederationTransportError("partition")):
+                insufficient = first.coordinate_member_health(candidate_id, probe=lambda *_: False)
+            self.assertFalse(insufficient["revoked"])
+            self.assertEqual(insufficient["unreachable_votes"], 1)
+            first.record_transport_success(candidate_id)
+
+            def witness(_cluster, _host, _port, method, path, body=None, timeout=30):
+                self.assertEqual((method, path), ("POST", "/v1/federation/probe"))
+                return {"vote": voter.create_probe_vote(candidate_id, False, nonce=body["nonce"])}
+
+            with mock.patch.object(lun_cluster, "mutual_request", side_effect=witness):
+                majority = first.coordinate_member_health(candidate_id, probe=lambda *_: False)
+            self.assertTrue(majority["revoked"])
+            self.assertEqual(majority["unreachable_votes"], 2)
+        finally:
+            first.close()
+            candidate.close()
+            voter.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_member_and_user_tombstones_are_monotonic_in_both_orders(self) -> None:
+        peer = self._federation_cluster("tombstone-peer", 27931)
+        try:
+            self.cluster.federation_init("127.0.0.1", 27930)
+            bundle = peer.federation_public_bundle()
+            self.cluster.federation_register_peer(bundle)
+            peer_id = peer.load_config()["node_id"]
+            member_payload = self.cluster.federation_member_payload(
+                peer.local_status(), peer.federation_root_certificate(),
+                peer.federation_identity_certificate(), False,
+            )
+
+            def signed(event_type, entity_key, payload, lamport, suffix):
+                event = {
+                    "author_id": self.cluster.load_config()["node_id"], "author_seq": suffix,
+                    "prev_hash": "", "lamport": lamport, "type": event_type,
+                    "entity_key": entity_key, "payload": lun_cluster.json_dumps(payload),
+                    "created_at": lun_cluster.utc_now(),
+                }
+                event["signature"] = self.cluster._sign_federation(lun_cluster.canonical_event_fields(event))
+                event["event_id"] = lun_cluster.event_hash(event)
+                self.assertTrue(self.cluster._verify_federation_signature(
+                    self.cluster.federation_root_certificate(), lun_cluster.canonical_event_fields(event),
+                    event["signature"],
+                ))
+                return event
+
+            high_upsert = signed("member.upsert", "member:" + peer_id, member_payload, 100, 10)
+            low_revoke = signed("member.revoke", "member:" + peer_id,
+                                {"node_id": peer_id, "revoked_after_seq": 1, "reason": "test"}, 1, 11)
+            self.cluster._apply_federation_entity(high_upsert, member_payload)
+            self.cluster._apply_federation_entity(low_revoke, json.loads(low_revoke["payload"]))
+            self.assertEqual(self.cluster.db.connection.execute(
+                "SELECT deleted FROM federation_entities WHERE entity_key=?", ("member:" + peer_id,)
+            ).fetchone()[0], 1)
+            self.cluster._apply_federation_entity(high_upsert, member_payload)
+            self.assertNotEqual(self.cluster.db.connection.execute(
+                "SELECT revoked_at FROM federation_keys WHERE node_id=?", (peer_id,)
+            ).fetchone()[0], 0)
+
+            owner = self.cluster.load_config()["node_id"]
+            user_key = self.cluster._federation_user_key(owner, "9")
+            user_payload = {"owner_id": owner, "user_key": user_key, "source_key": "9", "name": "user",
+                            "manual_disabled": False, "lifetime_quota": 0, "monthly_quota": 1,
+                            "reset_day": 1, "expires_at": None, "max_devices": 1}
+            user_upsert = signed("user.upsert", "user:" + user_key, user_payload, 200, 12)
+            user_delete_payload = {"owner_id": owner, "user_key": user_key}
+            user_delete = signed("user.delete", "user:" + user_key, user_delete_payload, 2, 13)
+            for order in ((user_upsert, user_delete), (user_delete, user_upsert)):
+                with self.cluster.db.connection:
+                    self.cluster.db.connection.execute(
+                        "DELETE FROM federation_entities WHERE entity_key=?", ("user:" + user_key,)
+                    )
+                for event in order:
+                    self.cluster._apply_federation_entity(event, json.loads(event["payload"]))
+                row = self.cluster.db.connection.execute(
+                    "SELECT type,deleted FROM federation_entities WHERE entity_key=?", ("user:" + user_key,)
+                ).fetchone()
+                self.assertEqual((row["type"], row["deleted"]), ("user.delete", 1))
+        finally:
+            peer.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_revoked_self_cleanup_replay_rollback_and_new_identity(self) -> None:
+        local = self._federation_cluster("cleanup-local", 27941)
+        survivor = self._federation_cluster("cleanup-survivor", 27942)
+        try:
+            local.federation_register_peer(survivor.federation_public_bundle())
+            survivor.import_federation_bundle(local.federation_public_bundle(), allow_cluster_adopt=True)
+            local_id = local.load_config()["node_id"]
+            nonce = "clean_non_revoked_nonce_123"
+            live_proof = survivor.membership_status_proof(local_id, nonce)
+            self.assertTrue(local.verify_membership_status_proof(live_proof, local_id, nonce, consume=True))
+            with self.assertRaises(lun_cluster.ClusterError):
+                local.verify_membership_status_proof(live_proof, local_id, nonce, consume=True)
+            survivor.revoke_member(local_id, "test")
+            marker = local.root / "ordinary-local-data.txt"
+            marker.write_text("keep-me", encoding="utf-8")
+            (local.root / "xr.json").write_text('{"inbounds": []}\n', encoding="utf-8")
+            old_number = int(local.load_config()["server_number"])
+            with mock.patch.object(local, "check_self_revocation", return_value={"cleaned": True}), \
+                    mock.patch.object(lun_cluster, "ThreadingClusterServer") as preflight_listener:
+                lun_cluster.serve(local)
+            preflight_listener.assert_not_called()
+
+            def forged(_peer, proof_nonce):
+                proof = survivor.membership_status_proof(local_id, proof_nonce)
+                proof["signature"] = base64.b64encode(b"forged").decode()
+                return {"proof": proof}
+
+            rejected = local.check_self_revocation(query=forged)
+            self.assertFalse(rejected["cleaned"])
+            self.assertTrue(local.is_federation())
+
+            cleaned = local.check_self_revocation(query=lambda _peer, proof_nonce: {
+                "proof": survivor.membership_status_proof(local_id, proof_nonce)
+            })
+            self.assertTrue(cleaned["cleaned"])
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep-me")
+            self.assertTrue((local.root / "xr.json").is_file())
+            self.assertFalse((local.pki / "federation-root.key").exists())
+            self.assertFalse(local.load_config()["enabled"])
+            with mock.patch.object(lun_cluster, "ThreadingClusterServer") as listener:
+                lun_cluster.serve(local)
+            listener.assert_not_called()
+            new_config = local.federation_init("127.0.0.1", 27943)
+            self.assertNotEqual(new_config["node_id"], local_id)
+            self.assertNotEqual(int(new_config["server_number"]), old_number)
+        finally:
+            local.close()
+            survivor.close()
+
+        local = self._federation_cluster("rollback-local", 27944)
+        survivor = self._federation_cluster("rollback-survivor", 27945)
+        held: sqlite3.Connection | None = None
+        try:
+            local.federation_register_peer(survivor.federation_public_bundle())
+            survivor.import_federation_bundle(local.federation_public_bundle(), allow_cluster_adopt=True)
+            local_id = local.load_config()["node_id"]
+            survivor.revoke_member(local_id, "test rollback")
+            multi_db = local.root / "modules" / "multiuser" / "data" / "lun.db"
+            multi_db.parent.mkdir(parents=True)
+            held = sqlite3.connect(multi_db)
+            held.execute("CREATE TABLE marker(value TEXT)")
+            held.execute("INSERT INTO marker VALUES('ordinary')")
+            held.commit()
+            old_config = local.config_path.read_bytes()
+            old_key = (local.pki / "federation-root.key").read_bytes()
+
+            def mutate(_bundle):
+                writer = sqlite3.connect(multi_db)
+                try:
+                    writer.execute("UPDATE marker SET value='changed'")
+                    writer.commit()
+                finally:
+                    writer.close()
+                return {"users": 0}
+
+            proof_nonce = "cleanup_rollback_nonce_123"
+            proof = survivor.membership_status_proof(local_id, proof_nonce)
+            with mock.patch.object(local, "_apply_federation_user_bundle", side_effect=mutate), \
+                    mock.patch.object(local, "_after_revoked_cleanup_reset",
+                                      side_effect=lun_cluster.ClusterError("injected cleanup failure")):
+                with self.assertRaisesRegex(lun_cluster.ClusterError, "injected cleanup failure"):
+                    local.exit_revoked_federation(proof, proof_nonce)
+            self.assertEqual(local.config_path.read_bytes(), old_config)
+            self.assertEqual((local.pki / "federation-root.key").read_bytes(), old_key)
+            self.assertEqual(held.execute("SELECT value FROM marker").fetchone()[0], "ordinary")
+        finally:
+            if held is not None:
+                held.close()
+            local.close()
+            survivor.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_public_membership_status_works_without_client_cert_but_control_requires_mtls(self) -> None:
+        first_port, second_port = free_port(), free_port()
+        first = self._federation_cluster("tls-first", first_port)
+        second = self._federation_cluster("tls-second", second_port)
+        server = None
+        thread = None
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            second.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            first_id = first.load_config()["node_id"]
+            second_id = second.load_config()["node_id"]
+            second.revoke_member(first_id, "tls test")
+            server = lun_cluster.ThreadingClusterServer(("127.0.0.1", second_port), lun_cluster.ClusterHandler)
+            server.cluster = second
+            server.restart_requested = False
+            server.socket = lun_cluster.server_context(second).wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            peer = dict(first.node(second_id))
+            nonce = "public_tls_nonce_123456"
+            response = lun_cluster.membership_status_request(first, peer, first_id, nonce)
+            self.assertTrue(response["proof"]["revoked"])
+            self.assertTrue(first.verify_membership_status_proof(response["proof"], first_id, nonce))
+
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                                 cadata=second.federation_root_certificate())
+            context.check_hostname = False
+            connection = lun_cluster.http.client.HTTPSConnection(
+                "127.0.0.1", second_port, context=context, timeout=5
+            )
+            try:
+                connection.request("GET", "/v1/status")
+                controlled = connection.getresponse()
+                controlled.read()
+                self.assertEqual(controlled.status, 403)
+            finally:
+                connection.close()
+            with self.assertRaises(lun_cluster.FederationTransportError):
+                lun_cluster.mutual_request(first, "127.0.0.1", second_port, "GET", "/v1/status")
+        finally:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            if thread is not None:
+                thread.join(timeout=5)
+            first.close()
+            second.close()
+
+    def _blank_cluster(self, name: str) -> object:
+        root = Path(self.temporary.name) / name
+        root.mkdir()
+        (root / "uuid").write_text("11111111-1111-4111-8111-111111111111\n", encoding="utf-8")
+        return lun_cluster.Cluster(root)
+
+    @staticmethod
+    def _sample_federation_user_bundle(device_count: int = 2) -> dict[str, object]:
+        devices = [
+            {
+                "name": f"device-{index}",
+                "uuid": f"00000000-0000-4000-8000-{index:012d}",
+                "password": f"password-{index}-secure",
+                "ss_password": f"ss-password-{index}-secure",
+                "token": f"token_{index:02d}_abcdefghijklmnop",
+                "enabled": True,
+            }
+            for index in range(1, device_count + 1)
+        ]
+        return {"schema_version": 1, "users": [{
+            "key": "7", "name": "federation-user", "manual_disabled": False,
+            "lifetime_quota": 123456789, "monthly_quota": 98765432,
+            "reset_day": 3, "expires_at": 2_000_000_000, "max_devices": max(2, device_count),
+            "devices": devices, "permissions": {"vl": True, "ss": False},
+        }]}
+
+    def _federation_cluster(self, name: str, port: int):
+        cluster = self._blank_cluster(name)
+        cluster.federation_init("127.0.0.1", port, remark=name)
+        return cluster
 
     def _add_node(self, node_id: str, country: str) -> None:
         self.cluster.upsert_node({

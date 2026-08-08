@@ -511,6 +511,8 @@ class Agent:
         self.config_path = self.module / "config.json"
         self.lock_path = self.module / ".lock"
         self.db = Database(self.data_dir / "lun.db")
+        self._cluster_refresh_lock = threading.Lock()
+        self._cluster_refresh_started: dict[str, float] = {}
         self.db.migrate()
 
     def close(self) -> None:
@@ -1128,11 +1130,51 @@ class Agent:
         self.module.mkdir(parents=True, exist_ok=True)
         self.generated.mkdir(parents=True, exist_ok=True)
         self.backups.mkdir(parents=True, exist_ok=True)
+        config = self._subscription_config(args, enabled=True, subscription_only=False)
+        if args.scheme == "https":
+            if not (config["certificate"] and config["private_key"]):
+                raise AgentError("HTTPS 订阅缺少证书或私钥")
+            if not Path(config["certificate"]).is_file() or not Path(config["private_key"]).is_file():
+                raise AgentError("HTTPS 订阅证书文件不存在")
+        self.save_config(config)
+        with self.db.connection:
+            self._ensure_legacy_identity(config["legacy_uuid"], config["legacy_token"])
+            self.db.audit("module.init", "module", f"scheme={args.scheme},port={args.port}")
+        self.sync_legacy_subscription_state()
+        self.backup_database()
+        self.secure_sensitive_files()
+        return config
+
+    def initialize_subscription_only(self, args: argparse.Namespace) -> dict[str, Any]:
+        """Start subscription delivery without managing proxy cores or traffic."""
+        self.module.mkdir(parents=True, exist_ok=True)
+        self.generated.mkdir(parents=True, exist_ok=True)
+        self.backups.mkdir(parents=True, exist_ok=True)
+        config = self._subscription_config(args, enabled=False, subscription_only=True)
+        if args.scheme == "https":
+            if not (config["certificate"] and config["private_key"]):
+                raise AgentError("HTTPS 订阅缺少证书或私钥")
+            if not Path(config["certificate"]).is_file() or not Path(config["private_key"]).is_file():
+                raise AgentError("HTTPS 订阅证书文件不存在")
+        self.save_config(config)
+        with self.db.connection:
+            self._ensure_legacy_identity(config["legacy_uuid"], config["legacy_token"])
+            self.db.audit("subscription-only.init", "module", f"scheme={args.scheme},port={args.port}")
+        self.sync_legacy_subscription_state()
+        self.render_all_subscriptions()
+        self.backup_database()
+        self.secure_sensitive_files()
+        return config
+
+    def _subscription_config(
+        self, args: argparse.Namespace, *, enabled: bool, subscription_only: bool
+    ) -> dict[str, Any]:
         legacy_uuid = args.legacy_uuid or self._read_text("uuid") or str(__import__("uuid").uuid4())
         legacy_token = args.legacy_token or self._read_text("subtoken.log") or legacy_uuid
-        config = {
+        return {
             "version": VERSION,
-            "enabled": True,
+            "enabled": enabled,
+            "subscription_only": subscription_only,
             "bind": args.bind,
             "port": args.port,
             "public_port": args.public_port or args.port,
@@ -1142,28 +1184,15 @@ class Agent:
             "public_host": args.public_host,
             "certificate": args.certificate or "",
             "private_key": args.private_key or "",
-            "xray_api": args.xray_api,
-            "singbox_api": args.singbox_api,
-            "poll_interval": max(15, args.poll_interval),
+            "xray_api": getattr(args, "xray_api", "127.0.0.1:10085"),
+            "singbox_api": getattr(args, "singbox_api", "127.0.0.1:10086"),
+            "poll_interval": max(15, getattr(args, "poll_interval", 30)),
             "legacy_uuid": legacy_uuid,
             "legacy_token": legacy_token,
-            "ss_port": max(0, args.ss_port),
-            "ss_public_port": max(0, args.ss_public_port or args.ss_port),
-            "ss_server_password": args.ss_server_password or base64.b64encode(secrets.token_bytes(16)).decode(),
+            "ss_port": max(0, getattr(args, "ss_port", 0)),
+            "ss_public_port": max(0, getattr(args, "ss_public_port", 0) or getattr(args, "ss_port", 0)),
+            "ss_server_password": getattr(args, "ss_server_password", None) or base64.b64encode(secrets.token_bytes(16)).decode(),
         }
-        if args.scheme == "https":
-            if not (config["certificate"] and config["private_key"]):
-                raise AgentError("HTTPS 订阅缺少证书或私钥")
-            if not Path(config["certificate"]).is_file() or not Path(config["private_key"]).is_file():
-                raise AgentError("HTTPS 订阅证书文件不存在")
-        self.save_config(config)
-        with self.db.connection:
-            self._ensure_legacy_identity(legacy_uuid, legacy_token)
-            self.db.audit("module.init", "module", f"scheme={args.scheme},port={args.port}")
-        self.sync_legacy_subscription_state()
-        self.backup_database()
-        self.secure_sensitive_files()
-        return config
 
     def _read_text(self, name: str) -> str:
         try:
@@ -1368,6 +1397,8 @@ class Agent:
                 "SELECT name,uuid,password,ss_password,token,enabled FROM devices WHERE user_id=? ORDER BY id",
                 (user["id"],),
             )]
+            for device in devices:
+                device["key"] = device["uuid"]
             permissions = {
                 row["protocol"]: bool(row["enabled"])
                 for row in self.db.connection.execute(
@@ -1414,9 +1445,23 @@ class Agent:
             if max_devices > 64:
                 raise AgentError("设备上限无效")
             checked_devices: list[dict[str, Any]] = []
+            seen_device_keys: set[str] = set()
             for index, device in enumerate(devices):
                 if not isinstance(device, dict):
                     raise AgentError("设备数据无效")
+                if "key" in device:
+                    device_key = str(device["key"]).strip()
+                    try:
+                        device_key = str(__import__("uuid").UUID(device_key))
+                    except ValueError:
+                        pass
+                    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", device_key):
+                        raise AgentError("设备稳定标识无效")
+                else:
+                    device_key = str(index)
+                if device_key in seen_device_keys:
+                    raise AgentError("同一用户的设备稳定标识重复")
+                seen_device_keys.add(device_key)
                 device_name = str(device.get("name", "")).strip()
                 device_uuid = str(device.get("uuid", ""))
                 try:
@@ -1434,7 +1479,7 @@ class Agent:
                         raise AgentError("设备 UUID 或订阅 token 重复")
                     seen_credentials.add(value)
                 checked_devices.append({
-                    "key": str(index), "name": device_name, "uuid": device_uuid,
+                    "key": device_key, "name": device_name, "uuid": device_uuid,
                     "password": password, "ss_password": ss_password, "token": token,
                     "enabled": int(bool(device.get("enabled", True))),
                 })
@@ -1499,7 +1544,20 @@ class Agent:
                         (device["uuid"], device["token"], device_key),
                     ).fetchone()
                     if conflict:
-                        raise AgentError("主 VPS 设备凭据与子 VPS 本地设备冲突")
+                        legacy_prefix = f"{user_key}:device:"
+                        same_managed_device = (
+                            existing is None
+                            and conflict["user_id"] == user_id
+                            and str(conflict["cluster_key"] or "").startswith(legacy_prefix)
+                            and conflict["uuid"] == device["uuid"]
+                            and conflict["token"] == device["token"]
+                        )
+                        if not same_managed_device:
+                            raise AgentError("主 VPS 设备凭据与子 VPS 本地设备冲突")
+                        self.db.connection.execute(
+                            "UPDATE devices SET cluster_key=? WHERE id=?", (device_key, conflict["id"])
+                        )
+                        existing = conflict
                     values = (
                         user_id, device["name"], device["uuid"], device["password"],
                         device["ss_password"], device["token"], device["enabled"], now, device_key,
@@ -2250,6 +2308,46 @@ class Agent:
             if connection is not None:
                 connection.close()
 
+    def refresh_cluster_subscription_async(self, token: str) -> None:
+        """Ask the cluster to catch up after returning its cached subscription."""
+        script = self.root / "modules" / "cluster" / "lun_cluster.py"
+        if not script.is_file():
+            sys.stderr.write("cluster subscription refresh unavailable\n")
+            return
+        token_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        now = time.monotonic()
+        with self._cluster_refresh_lock:
+            previous = self._cluster_refresh_started.get(token_key)
+            if previous is not None and now - previous < 30:
+                return
+            try:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(script),
+                        "--root",
+                        str(self.root),
+                        "subscription-access",
+                        "--token",
+                        token,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except OSError:
+                sys.stderr.write("cluster subscription refresh could not start\n")
+                return
+            self._cluster_refresh_started[token_key] = now
+
+        def report_failure() -> None:
+            if process.wait() != 0:
+                sys.stderr.write("cluster subscription refresh failed\n")
+
+        threading.Thread(target=report_failure, name="cluster-subscription-refresh", daemon=True).start()
+
     def sample_core_stats(self, core: str, server: str) -> int:
         if core == "singbox":
             helper = self.module / "lun-sb-stats"
@@ -2953,6 +3051,7 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             if send_body:
                 self.wfile.write(payload)
+                agent.refresh_cluster_subscription_async(token)
             return
         device, active, reason = agent.find_device_by_token(token)
         if not device:
@@ -2997,11 +3096,15 @@ class DualStackServer(http.server.ThreadingHTTPServer):
 
 def serve(agent: Agent) -> None:
     config = agent.load_config()
-    if not config.get("enabled"):
+    subscription_only = bool(config.get("subscription_only"))
+    if not config.get("enabled") and not subscription_only:
         raise AgentError("多用户模块已停用")
     agent.sync_legacy_subscription_state()
     config = agent.load_config()
-    agent.reconcile(validate=False)
+    if not subscription_only:
+        agent.reconcile(validate=False)
+    else:
+        agent.render_all_subscriptions()
     bind = config.get("bind", "::")
     server_class: type[http.server.ThreadingHTTPServer] = DualStackServer if ":" in bind else http.server.ThreadingHTTPServer
 
@@ -3041,7 +3144,8 @@ def serve(agent: Agent) -> None:
             except Exception as exc:  # service must keep subscriptions alive on stats failure
                 sys.stderr.write(f"maintenance failed: {exc}\n")
 
-    threading.Thread(target=maintenance_loop, name="maintenance", daemon=True).start()
+    if not subscription_only:
+        threading.Thread(target=maintenance_loop, name="maintenance", daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
@@ -3115,6 +3219,19 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--ss-port", type=int, default=0)
     init.add_argument("--ss-public-port", type=int, default=0)
     init.add_argument("--ss-server-password")
+
+    subscription_only = sub.add_parser("init-subscription-only")
+    subscription_only.add_argument("--legacy-uuid")
+    subscription_only.add_argument("--legacy-token")
+    subscription_only.add_argument("--bind", default="::")
+    subscription_only.add_argument("--port", type=int, required=True)
+    subscription_only.add_argument("--public-port", type=int, default=0)
+    subscription_only.add_argument("--legacy-http-port", type=int, default=0)
+    subscription_only.add_argument("--legacy-http-public-port", type=int, default=0)
+    subscription_only.add_argument("--scheme", choices=("http", "https"), required=True)
+    subscription_only.add_argument("--public-host", required=True)
+    subscription_only.add_argument("--certificate")
+    subscription_only.add_argument("--private-key")
 
     add = sub.add_parser("add-user")
     add.add_argument("--name", required=True)
@@ -3238,6 +3355,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             result = agent.initialize(args)
             print("多用户模块初始化完成。")
+        elif args.command == "init-subscription-only":
+            result = agent.initialize_subscription_only(args)
+            print("订阅专用服务初始化完成。")
         elif args.command == "add-user":
             device = agent.add_user(args)
             result = dict(device)

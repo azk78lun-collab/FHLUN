@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -62,6 +63,52 @@ class AgentTestCase(unittest.TestCase):
             max_devices=3,
             device_name="phone",
         ))
+
+    def add_cluster_subscription(self, token="cluster-token-123456", filename="jhsub.txt", payload=b"cached-cluster"):
+        database = self.root / "modules" / "cluster" / "data" / "cluster.db"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE profiles (token TEXT, enabled INTEGER)")
+            connection.execute("INSERT INTO profiles VALUES (?, 1)", (token,))
+            connection.commit()
+        finally:
+            connection.close()
+        target = self.root / "modules" / "cluster" / "generated" / token / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return token, filename, payload
+
+    def add_cluster_script(self):
+        script = self.root / "modules" / "cluster" / "lun_cluster.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("# test stub\n", encoding="utf-8")
+        return script
+
+    def serve_subscription(self, token, filename, send_body=True):
+        class Response:
+            def __init__(self, agent):
+                self.server = type("Server", (), {"agent": agent, "legacy_only": False})()
+                self.path = f"/{token}/{filename}"
+                self.wfile = io.BytesIO()
+                self.status = None
+                self.headers = []
+
+            def send_response(self, status):
+                self.status = status
+
+            def send_header(self, key, value):
+                self.headers.append((key, value))
+
+            def end_headers(self):
+                pass
+
+            def send_error(self, status, *_args):
+                self.status = status
+
+        response = Response(self.agent)
+        lun_agent.SubscriptionHandler._serve_subscription(response, send_body)
+        return response
 
     def test_init_imports_legacy_identity(self):
         user = self.agent.db.connection.execute("SELECT * FROM users WHERE name='legacy-admin'").fetchone()
@@ -178,6 +225,83 @@ class AgentTestCase(unittest.TestCase):
                 self.assertIsNone(child.db.connection.execute(
                     "SELECT 1 FROM users WHERE cluster_managed=1"
                 ).fetchone())
+            finally:
+                child.close()
+
+    def test_cluster_device_stable_key_survives_deleting_an_earlier_device(self):
+        first = self.add_user("stable-user")
+        second = self.agent.add_device(first["user_id"], "second")
+        bundle = self.agent.export_cluster_users([first["user_id"]])
+        self.assertEqual(
+            [device["key"] for device in bundle["users"][0]["devices"]],
+            [first["uuid"], second["uuid"]],
+        )
+        origin = "b" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            child = lun_agent.Agent(Path(directory) / "lun")
+            try:
+                child.import_cluster_users(bundle, origin)
+                before = child.db.connection.execute(
+                    "SELECT id,uuid,token FROM devices WHERE uuid=?", (second["uuid"],)
+                ).fetchone()
+                reduced = json.loads(json.dumps(bundle))
+                reduced["users"][0]["devices"] = [reduced["users"][0]["devices"][1]]
+                child.import_cluster_users(reduced, origin)
+                remaining = child.db.connection.execute(
+                    "SELECT id,uuid,token FROM devices WHERE cluster_key LIKE ?",
+                    (f"{origin}:user:%",),
+                ).fetchall()
+                self.assertEqual(len(remaining), 1)
+                self.assertEqual(dict(remaining[0]), dict(before))
+            finally:
+                child.close()
+
+    def test_cluster_device_keys_reject_duplicates_and_unsafe_values(self):
+        first = self.add_user("validated-user")
+        self.agent.add_device(first["user_id"], "second")
+        bundle = self.agent.export_cluster_users([first["user_id"]])
+        duplicate = json.loads(json.dumps(bundle))
+        duplicate["users"][0]["devices"][1]["key"] = duplicate["users"][0]["devices"][0]["key"]
+        with self.assertRaisesRegex(lun_agent.AgentError, "重复"):
+            self.agent._validate_cluster_bundle(duplicate, "c" * 32)
+
+        for unsafe in ("../device", "device/key", "device\\key", "\x00device", "-device", "x" * 129):
+            invalid = json.loads(json.dumps(bundle))
+            invalid["users"][0]["devices"][0]["key"] = unsafe
+            with self.subTest(key=repr(unsafe)), self.assertRaisesRegex(lun_agent.AgentError, "稳定标识"):
+                self.agent._validate_cluster_bundle(invalid, "c" * 32)
+
+    def test_cluster_schema_v1_bundle_without_device_keys_uses_legacy_indexes(self):
+        first = self.add_user("legacy-bundle-user")
+        self.agent.add_device(first["user_id"], "second")
+        bundle = self.agent.export_cluster_users([first["user_id"]])
+        for device in bundle["users"][0]["devices"]:
+            device.pop("key")
+        checked = self.agent._validate_cluster_bundle(bundle, "d" * 32)
+        self.assertEqual([device["key"] for device in checked[0]["devices"]], ["0", "1"])
+
+    def test_cluster_stable_keys_migrate_existing_index_identity(self):
+        source = self.add_user("migration-user")
+        stable = self.agent.export_cluster_users([source["user_id"]])
+        legacy = json.loads(json.dumps(stable))
+        legacy["users"][0]["devices"][0].pop("key")
+        origin = "e" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            child = lun_agent.Agent(Path(directory) / "lun")
+            try:
+                child.import_cluster_users(legacy, origin)
+                before = child.db.connection.execute(
+                    "SELECT id,uuid,token FROM devices WHERE cluster_key=?",
+                    (f"{origin}:user:{stable['users'][0]['key']}:device:0",),
+                ).fetchone()
+                child.import_cluster_users(stable, origin)
+                after = child.db.connection.execute(
+                    "SELECT id,uuid,token,cluster_key FROM devices WHERE id=?", (before["id"],)
+                ).fetchone()
+                self.assertEqual(after["id"], before["id"])
+                self.assertEqual(after["uuid"], before["uuid"])
+                self.assertEqual(after["token"], before["token"])
+                self.assertTrue(after["cluster_key"].endswith(f":device:{source['uuid']}"))
             finally:
                 child.close()
 
@@ -821,6 +945,151 @@ rules:
         lifetime, monthly = self.agent.usage_for_user(device["user_id"])
         self.assertEqual(lifetime, 100)
         self.assertEqual(monthly, 100)
+
+    def test_cluster_subscription_returns_cache_before_async_refresh(self):
+        token, filename, payload = self.add_cluster_subscription()
+        observed = []
+        with mock.patch.object(self.agent, "refresh_cluster_subscription_async") as refresh:
+            refresh.side_effect = observed.append
+            response = self.serve_subscription(token, filename)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.wfile.getvalue(), payload)
+        self.assertEqual(observed, [token])
+
+    def test_cluster_refresh_uses_nonblocking_fixed_command_and_debounces(self):
+        self.add_cluster_script()
+        token = "cluster-token-123456"
+        other = "cluster-token-654321"
+        process = mock.Mock()
+        with mock.patch.object(lun_agent.subprocess, "Popen", return_value=process) as popen, \
+             mock.patch.object(lun_agent.threading, "Thread") as worker:
+            self.agent.refresh_cluster_subscription_async(token)
+            self.agent.refresh_cluster_subscription_async(token)
+            self.agent.refresh_cluster_subscription_async(other)
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(
+            popen.call_args_list[0].args[0],
+            [
+                lun_agent.sys.executable,
+                str(self.agent.root / "modules" / "cluster" / "lun_cluster.py"),
+                "--root", str(self.agent.root), "subscription-access", "--token", token,
+            ],
+        )
+        self.assertEqual(popen.call_args_list[0].kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args_list[0].kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args_list[0].kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(popen.call_args_list[0].kwargs["start_new_session"])
+        self.assertFalse(process.wait.called)
+        self.assertEqual(worker.call_count, 2)
+        self.assertNotIn(token, self.agent._cluster_refresh_started)
+        self.assertIn(lun_agent.hashlib.sha256(token.encode()).hexdigest(), self.agent._cluster_refresh_started)
+
+    def test_cluster_head_and_regular_device_do_not_trigger_refresh(self):
+        token, filename, _ = self.add_cluster_subscription()
+        with mock.patch.object(self.agent, "refresh_cluster_subscription_async") as refresh:
+            response = self.serve_subscription(token, filename, send_body=False)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.wfile.getvalue(), b"")
+        refresh.assert_not_called()
+
+        device = self.add_user()
+        target = self.agent.generated / device["token"] / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"regular-device")
+        with mock.patch.object(self.agent, "refresh_cluster_subscription_async") as refresh:
+            response = self.serve_subscription(device["token"], filename)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.wfile.getvalue(), b"regular-device")
+        refresh.assert_not_called()
+
+    def test_cluster_refresh_errors_do_not_expose_token_or_break_cached_response(self):
+        token, filename, payload = self.add_cluster_subscription()
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            response = self.serve_subscription(token, filename)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.wfile.getvalue(), payload)
+        self.assertNotIn(token, captured.getvalue())
+
+        self.add_cluster_script()
+        with contextlib.redirect_stderr(captured), \
+             mock.patch.object(lun_agent.subprocess, "Popen", side_effect=OSError(token)):
+            self.agent.refresh_cluster_subscription_async(token)
+        self.assertNotIn(token, captured.getvalue())
+
+    def test_subscription_only_initialization_preserves_cores_and_serves_static_and_cluster_files(self):
+        core_xray = '{"inbounds":["unchanged"]}\n'
+        core_singbox = '{"inbounds":["unchanged"]}\n'
+        (self.root / "xr.json").write_text(core_xray, encoding="utf-8")
+        (self.root / "sb.json").write_text(core_singbox, encoding="utf-8")
+        (self.root / "jhsub.txt").write_text("vless://legacy\n", encoding="utf-8")
+        args = argparse.Namespace(
+            legacy_uuid=None, legacy_token=None, bind="127.0.0.1", port=31001,
+            public_port=32001, legacy_http_port=0, legacy_http_public_port=0,
+            scheme="http", public_host="example.com", certificate=None, private_key=None,
+        )
+        config = self.agent.initialize_subscription_only(args)
+        legacy = self.agent.local_subscription_device()
+        static = self.agent.generated / legacy["token"] / "jhsub.txt"
+        self.assertFalse(config["enabled"])
+        self.assertTrue(config["subscription_only"])
+        self.assertEqual((self.root / "xr.json").read_text(encoding="utf-8"), core_xray)
+        self.assertEqual((self.root / "sb.json").read_text(encoding="utf-8"), core_singbox)
+        self.assertEqual(static.read_text(encoding="utf-8"), "vless://legacy\n")
+
+        response = self.serve_subscription(legacy["token"], "jhsub.txt")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.wfile.getvalue(), b"vless://legacy\n")
+        token, filename, payload = self.add_cluster_subscription("cluster-token-789012")
+        with mock.patch.object(self.agent, "refresh_cluster_subscription_async") as refresh:
+            response = self.serve_subscription(token, filename)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.wfile.getvalue(), payload)
+        refresh.assert_called_once_with(token)
+
+    def test_subscription_only_serve_skips_core_reconcile_and_maintenance(self):
+        config = self.agent.load_config()
+        config.update({"enabled": False, "subscription_only": True, "bind": "127.0.0.1", "port": 31002})
+        self.agent.save_config(config)
+
+        class Server:
+            def __init__(self, *_args):
+                self.socket = mock.Mock()
+
+            def serve_forever(self, **_kwargs):
+                pass
+
+            def server_close(self):
+                pass
+
+        with mock.patch.object(lun_agent.http.server, "ThreadingHTTPServer", Server), \
+             mock.patch.object(self.agent, "reconcile") as reconcile, \
+             mock.patch.object(self.agent, "maintenance_once") as maintenance, \
+             mock.patch.object(lun_agent.threading, "Thread") as worker:
+            lun_agent.serve(self.agent)
+        reconcile.assert_not_called()
+        maintenance.assert_not_called()
+        worker.assert_not_called()
+
+    def test_regular_initialization_clears_subscription_only_without_rotating_legacy_identity(self):
+        previous = self.agent.local_subscription_device()
+        self.agent.initialize_subscription_only(argparse.Namespace(
+            legacy_uuid=None, legacy_token=None, bind="127.0.0.1", port=31001,
+            public_port=31001, legacy_http_port=0, legacy_http_public_port=0,
+            scheme="http", public_host="example.com", certificate=None, private_key=None,
+        ))
+        self.agent.initialize(argparse.Namespace(
+            legacy_uuid=None, legacy_token=None, bind="127.0.0.1", port=31000,
+            public_port=31000, legacy_http_port=0, legacy_http_public_port=0,
+            scheme="http", public_host="example.com", certificate=None, private_key=None,
+            xray_api="127.0.0.1:10085", singbox_api="127.0.0.1:10086", poll_interval=30,
+            ss_port=32000, ss_public_port=32000, ss_server_password="AAAAAAAAAAAAAAAAAAAAAA==",
+        ))
+        current = self.agent.local_subscription_device()
+        self.assertTrue(self.agent.load_config()["enabled"])
+        self.assertFalse(self.agent.load_config()["subscription_only"])
+        self.assertEqual(current["id"], previous["id"])
+        self.assertEqual(current["token"], previous["token"])
 
     def test_protocol_disable_removes_generic_node(self):
         device = self.add_user()

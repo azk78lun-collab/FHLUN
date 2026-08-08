@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.8.3"
+echo "当前版本：V26.8.9.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -3600,9 +3600,9 @@ fi
 if cluster_enabled; then
 if { pidof systemd >/dev/null 2>&1 && systemctl is-active --quiet lun-cluster-agent 2>/dev/null; } \
 || { command -v rc-service >/dev/null 2>&1 && rc-service lun-cluster-agent status >/dev/null 2>&1; }; then
-echo "服务器联动：$(cluster_role) / 运行中"
+echo "分布式服务器集群：运行中"
 else
-echo "服务器联动：$(cluster_role) / 未运行"
+echo "分布式服务器集群：未运行"
 fi
 fi
 }
@@ -3649,6 +3649,16 @@ multiuser_installed || return 1
 grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' "$(multiuser_module_dir)/config.json" 2>/dev/null
 }
 
+subscription_only_enabled(){
+multiuser_installed || return 1
+grep -Eq '"subscription_only"[[:space:]]*:[[:space:]]*true' "$(multiuser_module_dir)/config.json" 2>/dev/null
+}
+
+subscription_agent_enabled(){
+multiuser_installed || return 1
+grep -Eq '"(enabled|subscription_only)"[[:space:]]*:[[:space:]]*true' "$(multiuser_module_dir)/config.json" 2>/dev/null
+}
+
 multiuser_cmd(){
 agent=$(multiuser_agent)
 [ -x "$agent" ] || { echo "多用户代理程序未安装。" >&2; return 1; }
@@ -3656,7 +3666,7 @@ agent=$(multiuser_agent)
 }
 
 multiuser_sync_subscription_state(){
-multiuser_enabled || return 0
+subscription_agent_enabled || return 0
 multiuser_cmd sync-subscription-state >/dev/null
 }
 
@@ -3685,7 +3695,7 @@ rm -f /etc/local.d/alpinesublun.start
 }
 
 multiuser_prepare_service_port(){
-multiuser_enabled || return 0
+subscription_agent_enabled || return 0
 stop_subscription_service
 multiuser_clear_legacy_subscription_autostart
 sleep 1
@@ -3715,7 +3725,7 @@ apply_lun_firewall_rules quiet || true
 }
 
 multiuser_service_start(){
-multiuser_enabled || return 0
+subscription_agent_enabled || return 0
 multiuser_service_stop
 multiuser_prepare_service_port || return 1
 if pidof systemd >/dev/null 2>&1; then
@@ -3733,7 +3743,7 @@ fi
 }
 
 multiuser_service_restart(){
-multiuser_enabled || return 0
+subscription_agent_enabled || return 0
 multiuser_service_stop
 multiuser_service_start
 }
@@ -3744,7 +3754,7 @@ agent_py="$(multiuser_module_dir)/lun_agent.py"
 if pidof systemd >/dev/null 2>&1; then
 cat > /etc/systemd/system/lun-agent.service <<EOF
 [Unit]
-Description=FHLUN multi-user and subscription agent
+Description=Lun subscription and multi-user agent
 After=network.target xr.service sb.service
 
 [Service]
@@ -3768,7 +3778,7 @@ systemctl enable lun-agent >/dev/null 2>&1
 elif command -v rc-service >/dev/null 2>&1; then
 cat > /etc/init.d/lun-agent <<EOF
 #!/sbin/openrc-run
-description="FHLUN multi-user and subscription agent"
+description="Lun subscription and multi-user agent"
 command="$python_bin"
 command_args="$agent_py --root $HOME/lun serve"
 command_background=yes
@@ -3942,9 +3952,133 @@ cluster_role(){
 cluster_config_value role
 }
 
+cluster_is_federation(){
+[ "$(cluster_config_value mode 2>/dev/null)" = federation ] \
+|| [ "$(cluster_role 2>/dev/null)" = federation ]
+}
+
+cluster_legacy_present(){
+cluster_installed || return 1
+cluster_is_federation && return 1
+case "$(cluster_role 2>/dev/null)" in master|child) return 0 ;; esac
+return 1
+}
+
+cluster_node_allowed(){
+cluster_target_id=$1
+cluster_nodes_json=$(mktemp 2>/dev/null) || return 1
+cluster_cmd --json nodes > "$cluster_nodes_json" 2>/dev/null || { rm -f "$cluster_nodes_json"; return 1; }
+python3 - "$cluster_nodes_json" "$cluster_target_id" <<'PY'
+import json, sys
+target = sys.argv[2]
+try:
+    rows = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+for row in rows:
+    if row.get("id") != target and str(row.get("server_number", "")) != target.lstrip("0"):
+        continue
+    if row.get("trusted") is not True:
+        raise SystemExit(3)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+cluster_allowed_rc=$?
+rm -f "$cluster_nodes_json"
+case "$cluster_allowed_rc" in
+0) return 0 ;;
+3) yellow_line "该记录尚未完成 API v3 联邦配对，状态为 待重新配对/未信任。" ;;
+*) red_line "未找到可信 API v3 成员。" ;;
+esac
+return 1
+}
+
+cluster_show_nodes(){
+cluster_nodes_json=$(mktemp 2>/dev/null) || { cluster_cmd nodes; return; }
+if ! cluster_cmd --json nodes > "$cluster_nodes_json" 2>/dev/null; then
+rm -f "$cluster_nodes_json"
+cluster_cmd nodes
+return
+fi
+python3 - "$cluster_nodes_json" <<'PY'
+import json, sys
+state = {"online": "在线", "unreachable": "离线", "unknown": "未知", "revoked": "已撤销"}
+try:
+    rows = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    rows = []
+print("编号  状态                    地区                 地址")
+for row in sorted(rows, key=lambda item: int(item.get("server_number") or 999999)):
+    host = str(row.get("endpoint_host") or "-")
+    raw = str(row.get("state") or row.get("status") or "unknown")
+    if row.get("trusted") is not True:
+        label = "待重新配对/未信任"
+    else:
+        label = state.get(raw, "未知")
+    number = int(row.get("server_number") or 0)
+    number = f"{number:02d}" if number and number < 100 else str(number or "-")
+    region = str(row.get("region") or row.get("country") or "未设置地区")
+    port = row.get("public_port") or row.get("endpoint_port") or "-"
+    print(f"{number:<5} {label:<22} {region:<20} {host}:{port}")
+PY
+rm -f "$cluster_nodes_json"
+}
+
+cluster_trusted_member_ids(){
+cluster_nodes_json=$(mktemp 2>/dev/null) || return 1
+cluster_cmd --json nodes > "$cluster_nodes_json" 2>/dev/null || { rm -f "$cluster_nodes_json"; return 1; }
+python3 - "$cluster_nodes_json" "$(cluster_config_value node_id)" <<'PY'
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    rows = []
+for row in rows:
+    if row.get("id") == sys.argv[2]:
+        continue
+    if row.get("trusted") is not True:
+        continue
+    print(row["id"])
+PY
+rm -f "$cluster_nodes_json"
+}
+
+cluster_untrusted_member_numbers(){
+cluster_nodes_json=$(mktemp 2>/dev/null) || return 1
+cluster_cmd --json nodes > "$cluster_nodes_json" 2>/dev/null || { rm -f "$cluster_nodes_json"; return 1; }
+python3 - "$cluster_nodes_json" <<'PY'
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    rows = []
+for row in rows:
+    if row.get("id") == "":
+        continue
+    if row.get("trusted") is not True:
+        number = row.get("server_number")
+        print(number or row.get("id", ""))
+PY
+rm -f "$cluster_nodes_json"
+}
+
+cluster_filter_remote_targets(){
+cluster_target_input=$1
+if [ "$cluster_target_input" = all ]; then
+cluster_trusted_member_ids
+return
+fi
+cluster_filtered=
+for cluster_one in $(printf '%s' "$cluster_target_input" | tr ',' ' '); do
+cluster_node_allowed "$cluster_one" || return 1
+cluster_filtered="${cluster_filtered:+$cluster_filtered,}$cluster_one"
+done
+printf '%s\n' "$cluster_filtered"
+}
+
 cluster_cmd(){
 cluster_exec=$(cluster_agent)
-[ -x "$cluster_exec" ] || { echo "服务器联动程序未安装。" >&2; return 1; }
+[ -x "$cluster_exec" ] || { echo "分布式集群程序未安装。" >&2; return 1; }
 "$cluster_exec" --root "$HOME/lun" "$@"
 }
 
@@ -4014,7 +4148,7 @@ agent_py="$(cluster_module_dir)/lun_cluster.py"
 if pidof systemd >/dev/null 2>&1; then
 cat > /etc/systemd/system/lun-cluster-agent.service <<EOF
 [Unit]
-Description=FHLUN on-demand cluster controller and managed-node agent
+Description=Lun on-demand federation member service
 After=network-online.target
 Wants=network-online.target
 
@@ -4023,7 +4157,7 @@ Type=simple
 User=root
 Environment=LUN_SCRIPT=/usr/bin/lun
 ExecStart=$python_bin $agent_py --root $HOME/lun serve
-Restart=always
+Restart=on-failure
 RestartSec=3s
 PrivateTmp=yes
 UMask=0077
@@ -4038,12 +4172,13 @@ systemctl enable lun-cluster-agent >/dev/null 2>&1
 elif command -v rc-service >/dev/null 2>&1; then
 cat > /etc/init.d/lun-cluster-agent <<EOF
 #!/sbin/openrc-run
-description="FHLUN on-demand cluster controller and managed-node agent"
+description="Lun on-demand federation member service"
 command="$python_bin"
 command_args="$agent_py --root $HOME/lun serve"
 supervisor="supervise-daemon"
 respawn_delay=3
-respawn_max=0
+respawn_max=1
+respawn_period=60
 pidfile="/run/lun-cluster-agent.pid"
 output_log="/var/log/lun-cluster-agent.log"
 error_log="/var/log/lun-cluster-agent.log"
@@ -4055,7 +4190,7 @@ EOF
 chmod +x /etc/init.d/lun-cluster-agent
 rc-update add lun-cluster-agent default >/dev/null 2>&1
 else
-red_line "服务器联动要求 systemd 或 OpenRC；当前系统无法安装可靠服务。"
+red_line "分布式集群要求 systemd 或 OpenRC；当前系统无法安装可靠服务。"
 return 1
 fi
 }
@@ -4105,7 +4240,7 @@ rm -f "$cluster_tmp"
 return 1
 fi
 fi
-python3 -m py_compile "$cluster_tmp" >/dev/null 2>&1 || { rm -f "$cluster_tmp"; red_line "服务器联动程序语法校验失败。"; return 1; }
+python3 -m py_compile "$cluster_tmp" >/dev/null 2>&1 || { rm -f "$cluster_tmp"; red_line "分布式集群程序语法校验失败。"; return 1; }
 mv -f "$cluster_tmp" "$cluster_target"
 chmod 700 "$cluster_target"
 cat > "$cluster_dir/lun-cluster" <<EOF
@@ -4145,13 +4280,286 @@ fi
 printf '%s\n' "$cluster_host"
 }
 
+subscription_agent_init_single_user(){
+[ -s "$HOME/lun/uuid" ] || { echo "订阅代理缺少现有 UUID。" >&2; return 1; }
+sa_uuid=$(cat "$HOME/lun/uuid" 2>/dev/null)
+if [ -s "$HOME/lun/subtoken.log" ]; then
+sa_token=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
+else
+sa_token=$sa_uuid
+printf '%s\n' "$sa_token" > "$HOME/lun/subtoken.log" || return 1
+chmod 600 "$HOME/lun/subtoken.log" 2>/dev/null || true
+fi
+sa_port=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+if ! valid_port_value "$sa_port"; then
+sa_port=$(select_subscription_port "") || return 1
+printf '%s\n' "$sa_port" > "$HOME/lun/subport.log" || return 1
+fi
+sa_public_port=$(client_port "$sa_port")
+if is_nat_mode; then
+sa_mapped=no
+for sa_pair in $ptmap; do
+[ "${sa_pair#*-}" = "$sa_port" ] && sa_mapped=yes
+done
+[ "$sa_mapped" = yes ] || {
+echo "NAT VPS 的订阅内网端口 $sa_port 没有公网映射。" >&2
+return 1
+}
+fi
+
+sa_scheme=http
+sa_host=
+sa_cert=no
+if cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key" && sync_cert_metadata; then
+sa_cert_mode=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+case "$sa_cert_mode" in
+ca|domain|dns|ip)
+sa_cert_host=$(cat "$HOME/lun/domain" 2>/dev/null)
+[ -n "$sa_cert_host" ] && cert_covers_domain "$HOME/lun/cert.crt" "$sa_cert_host" || sa_cert_host=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+if [ -n "$sa_cert_host" ] && [ "$sa_cert_host" != "未知" ] && \
+cert_covers_domain "$HOME/lun/cert.crt" "$sa_cert_host" && \
+cert_publicly_trusted_for_domain "$HOME/lun/cert.crt" "$sa_cert_host"; then
+sa_scheme=https
+sa_host=$(uri_host "$sa_cert_host")
+sa_cert=yes
+fi
+;;
+esac
+fi
+if [ -z "$sa_host" ]; then
+sa_host=$(cat "$HOME/lun/domain" 2>/dev/null)
+[ -z "$sa_host" ] && sa_host=$(cat "$HOME/lun/addym" 2>/dev/null)
+if [ -z "$sa_host" ]; then
+sa_host=$(cluster_detect_public_host)
+sa_host=$(uri_host "$sa_host")
+fi
+fi
+[ -n "$sa_host" ] || { echo "没有可用于订阅输出的域名或公网 IP。" >&2; return 1; }
+
+sa_legacy_port=0
+sa_legacy_public=0
+if [ "$sa_scheme" = http ] && [ -s "$HOME/lun/subport_public.log" ]; then
+sa_second_port=$(cat "$HOME/lun/subport_public.log" 2>/dev/null)
+if valid_port_value "$sa_second_port" && [ "$sa_second_port" != "$sa_port" ]; then
+sa_legacy_port=$sa_second_port
+sa_legacy_public=$sa_second_port
+fi
+fi
+set -- init-subscription-only --legacy-uuid "$sa_uuid" --legacy-token "$sa_token" \
+--bind "::" --port "$sa_port" --public-port "$sa_public_port" \
+--legacy-http-port "$sa_legacy_port" --legacy-http-public-port "$sa_legacy_public" \
+--scheme "$sa_scheme" --public-host "$sa_host"
+if [ "$sa_cert" = yes ]; then
+set -- "$@" --certificate "$HOME/lun/cert.crt" --private-key "$HOME/lun/private.key"
+fi
+multiuser_cmd "$@" >/dev/null
+}
+
+subscription_agent_ready(){
+sa_ready_scheme=$(multiuser_config_value scheme)
+sa_ready_port=$(multiuser_config_value port)
+sa_ready_token=$(multiuser_config_value legacy_token)
+[ -n "$sa_ready_scheme" ] && valid_port_value "$sa_ready_port" && [ -n "$sa_ready_token" ] || return 1
+if command -v curl >/dev/null 2>&1; then
+curl -kfsS --max-time 5 "$sa_ready_scheme://127.0.0.1:$sa_ready_port/$sa_ready_token/jhsub.txt" >/dev/null 2>&1
+else
+wget --no-check-certificate -qO /dev/null "$sa_ready_scheme://127.0.0.1:$sa_ready_port/$sa_ready_token/jhsub.txt" 2>/dev/null
+fi
+}
+
+cluster_subscription_takeover_start(){
+if multiuser_enabled; then
+multiuser_install_service && multiuser_service_start
+return $?
+fi
+multiuser_service_stop
+subscription_agent_init_single_user || return 1
+multiuser_install_service || return 1
+stop_subscription_service
+multiuser_clear_legacy_subscription_autostart
+multiuser_service_start || return 1
+multiuser_sync_subscription_state || return 1
+subscription_agent_ready
+}
+
+cluster_subscription_state_snapshot(){
+cluster_sub_snapshot=$1
+mkdir -p "$cluster_sub_snapshot" || return 1
+chmod 700 "$cluster_sub_snapshot" 2>/dev/null || true
+multiuser_enabled && : > "$cluster_sub_snapshot/real-multiuser"
+subscription_only_enabled && : > "$cluster_sub_snapshot/subscription-only"
+if [ -s "$(multiuser_module_dir)/config.json" ]; then
+cp -p "$(multiuser_module_dir)/config.json" "$cluster_sub_snapshot/config.json" || return 1
+: > "$cluster_sub_snapshot/config.present"
+fi
+if [ -s /etc/systemd/system/lun-agent.service ]; then
+cp -p /etc/systemd/system/lun-agent.service "$cluster_sub_snapshot/lun-agent.service" || return 1
+: > "$cluster_sub_snapshot/systemd.present"
+systemctl is-enabled --quiet lun-agent 2>/dev/null && : > "$cluster_sub_snapshot/agent.enabled"
+systemctl is-active --quiet lun-agent 2>/dev/null && : > "$cluster_sub_snapshot/agent.active"
+fi
+if [ -s /etc/init.d/lun-agent ]; then
+cp -p /etc/init.d/lun-agent "$cluster_sub_snapshot/lun-agent.openrc" || return 1
+: > "$cluster_sub_snapshot/openrc.present"
+rc-service lun-agent status >/dev/null 2>&1 && : > "$cluster_sub_snapshot/agent.active"
+rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])lun-agent([[:space:]]|$)' && : > "$cluster_sub_snapshot/agent.enabled"
+fi
+pgrep -f "httpd.*-h $HOME/weblun" >/dev/null 2>&1 && : > "$cluster_sub_snapshot/busybox.active"
+if command -v crontab >/dev/null 2>&1; then
+crontab -l 2>/dev/null | grep 'weblun' > "$cluster_sub_snapshot/weblun.cron" || :
+fi
+if [ -s /etc/local.d/alpinesublun.start ]; then
+cp -p /etc/local.d/alpinesublun.start "$cluster_sub_snapshot/alpinesublun.start" || return 1
+fi
+for cluster_sub_file in subport.log subport_public.log subport_legacy.log subtoken.log; do
+if [ -e "$HOME/lun/$cluster_sub_file" ]; then
+cp -p "$HOME/lun/$cluster_sub_file" "$cluster_sub_snapshot/$cluster_sub_file" || return 1
+: > "$cluster_sub_snapshot/$cluster_sub_file.present"
+fi
+done
+chmod -R go-rwx "$cluster_sub_snapshot" 2>/dev/null || true
+}
+
+cluster_subscription_state_restore(){
+cluster_sub_snapshot=$1
+cluster_sub_force=${2:-no}
+[ -d "$cluster_sub_snapshot" ] || return 1
+multiuser_service_stop
+stop_subscription_service
+if [ -e "$cluster_sub_snapshot/config.present" ]; then
+mkdir -p "$(multiuser_module_dir)"
+cp -p "$cluster_sub_snapshot/config.json" "$(multiuser_module_dir)/config.json" || return 1
+else
+rm -f "$(multiuser_module_dir)/config.json"
+fi
+for cluster_sub_file in subport.log subport_public.log subport_legacy.log subtoken.log; do
+if [ -e "$cluster_sub_snapshot/$cluster_sub_file.present" ]; then
+cp -p "$cluster_sub_snapshot/$cluster_sub_file" "$HOME/lun/$cluster_sub_file" || return 1
+else
+rm -f "$HOME/lun/$cluster_sub_file"
+fi
+done
+
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable lun-agent >/dev/null 2>&1 || true
+if [ -e "$cluster_sub_snapshot/systemd.present" ]; then
+cp -p "$cluster_sub_snapshot/lun-agent.service" /etc/systemd/system/lun-agent.service || return 1
+else
+rm -f /etc/systemd/system/lun-agent.service
+fi
+systemctl daemon-reload >/dev/null 2>&1 || true
+[ -e "$cluster_sub_snapshot/agent.enabled" ] && systemctl enable lun-agent >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update del lun-agent default >/dev/null 2>&1 || true
+if [ -e "$cluster_sub_snapshot/openrc.present" ]; then
+cp -p "$cluster_sub_snapshot/lun-agent.openrc" /etc/init.d/lun-agent || return 1
+chmod +x /etc/init.d/lun-agent
+else
+rm -f /etc/init.d/lun-agent
+fi
+[ -e "$cluster_sub_snapshot/agent.enabled" ] && rc-update add lun-agent default >/dev/null 2>&1 || true
+fi
+
+if command -v crontab >/dev/null 2>&1; then
+cluster_cron_tmp=$(mktemp 2>/dev/null) || return 1
+crontab -l > "$cluster_cron_tmp" 2>/dev/null || : > "$cluster_cron_tmp"
+sed -i '/weblun/d' "$cluster_cron_tmp"
+[ -s "$cluster_sub_snapshot/weblun.cron" ] && cat "$cluster_sub_snapshot/weblun.cron" >> "$cluster_cron_tmp"
+crontab "$cluster_cron_tmp" >/dev/null 2>&1 || true
+rm -f "$cluster_cron_tmp"
+fi
+if [ -s "$cluster_sub_snapshot/alpinesublun.start" ]; then
+mkdir -p /etc/local.d
+cp -p "$cluster_sub_snapshot/alpinesublun.start" /etc/local.d/alpinesublun.start || return 1
+else
+rm -f /etc/local.d/alpinesublun.start
+fi
+
+if [ -e "$cluster_sub_snapshot/agent.active" ] && subscription_agent_enabled; then
+multiuser_service_start || return 1
+elif [ -e "$cluster_sub_snapshot/busybox.active" ] || [ "$cluster_sub_force" = yes ]; then
+start_subscription_busybox_runtime || return 1
+fi
+return 0
+}
+
+cluster_install_state_snapshot(){
+cluster_install_snapshot=$1
+mkdir -p "$cluster_install_snapshot/cluster" || return 1
+chmod 700 "$cluster_install_snapshot" 2>/dev/null || true
+if [ -s /etc/systemd/system/lun-cluster-agent.service ]; then
+cp -p /etc/systemd/system/lun-cluster-agent.service "$cluster_install_snapshot/lun-cluster-agent.service" || return 1
+: > "$cluster_install_snapshot/cluster-systemd.present"
+systemctl is-enabled --quiet lun-cluster-agent 2>/dev/null && : > "$cluster_install_snapshot/cluster.enabled"
+systemctl is-active --quiet lun-cluster-agent 2>/dev/null && : > "$cluster_install_snapshot/cluster.active"
+fi
+if [ -s /etc/init.d/lun-cluster-agent ]; then
+cp -p /etc/init.d/lun-cluster-agent "$cluster_install_snapshot/lun-cluster-agent.openrc" || return 1
+: > "$cluster_install_snapshot/cluster-openrc.present"
+rc-service lun-cluster-agent status >/dev/null 2>&1 && : > "$cluster_install_snapshot/cluster.active"
+rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])lun-cluster-agent([[:space:]]|$)' && : > "$cluster_install_snapshot/cluster.enabled"
+fi
+cluster_service_stop
+if [ -d "$(cluster_module_dir)" ]; then
+: > "$cluster_install_snapshot/cluster.present"
+cp -a "$(cluster_module_dir)/." "$cluster_install_snapshot/cluster/" || return 1
+fi
+cluster_subscription_state_snapshot "$cluster_install_snapshot/subscription"
+}
+
+cluster_install_state_restore(){
+cluster_install_snapshot=$1
+cluster_service_stop
+rm -rf "$(cluster_module_dir)"
+if [ -e "$cluster_install_snapshot/cluster.present" ]; then
+mkdir -p "$(cluster_module_dir)"
+cp -a "$cluster_install_snapshot/cluster/." "$(cluster_module_dir)/" || return 1
+fi
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable lun-cluster-agent >/dev/null 2>&1 || true
+if [ -e "$cluster_install_snapshot/cluster-systemd.present" ]; then
+cp -p "$cluster_install_snapshot/lun-cluster-agent.service" /etc/systemd/system/lun-cluster-agent.service || return 1
+else
+rm -f /etc/systemd/system/lun-cluster-agent.service
+fi
+systemctl daemon-reload >/dev/null 2>&1 || true
+[ -e "$cluster_install_snapshot/cluster.enabled" ] && systemctl enable lun-cluster-agent >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-update del lun-cluster-agent default >/dev/null 2>&1 || true
+if [ -e "$cluster_install_snapshot/cluster-openrc.present" ]; then
+cp -p "$cluster_install_snapshot/lun-cluster-agent.openrc" /etc/init.d/lun-cluster-agent || return 1
+chmod +x /etc/init.d/lun-cluster-agent
+else
+rm -f /etc/init.d/lun-cluster-agent
+fi
+[ -e "$cluster_install_snapshot/cluster.enabled" ] && rc-update add lun-cluster-agent default >/dev/null 2>&1 || true
+fi
+cluster_subscription_state_restore "$cluster_install_snapshot/subscription" || return 1
+[ -e "$cluster_install_snapshot/cluster.active" ] && cluster_service_start >/dev/null 2>&1 || true
+apply_lun_firewall_rules quiet || true
+}
+
+cluster_install_rollback(){
+cluster_install_snapshot=$1
+yellow_line "联邦启用未完成，正在恢复原订阅服务和本机集群状态……"
+if cluster_install_state_restore "$cluster_install_snapshot"; then
+green_line "原订阅服务与本机集群状态已恢复。"
+else
+red_line "自动恢复未完整完成；快照保留在：$cluster_install_snapshot"
+return 1
+fi
+rm -rf "$cluster_install_snapshot"
+}
+
 cluster_push_event(){
-[ "$(cluster_role 2>/dev/null)" = child ] || return 0
+cluster_enabled || return 0
+(
 cluster_cmd push >/dev/null 2>&1 || true
+cluster_cmd refresh-profiles >/dev/null 2>&1 || true
+) >/dev/null 2>&1 &
 }
 
 cluster_refresh_profiles(){
-[ "$(cluster_role 2>/dev/null)" = master ] || return 1
 cluster_cmd refresh-profiles || return 1
 if multiuser_enabled; then
 multiuser_service_restart || true
@@ -4160,22 +4568,27 @@ restart_subscription_service >/dev/null 2>&1 || true
 fi
 }
 
+cluster_refresh_profiles_async(){
+cluster_enabled || return 0
+(
+cluster_refresh_profiles >/dev/null 2>&1 || true
+) >/dev/null 2>&1 &
+}
+
 cluster_install(){
-cluster_new_role=$1
-[ "$(id -u 2>/dev/null)" = 0 ] || { red_line "服务器联动安装需要 root。"; return 1; }
+[ "$(id -u 2>/dev/null)" = 0 ] || { red_line "分布式集群安装需要 root。"; return 1; }
 { pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
-red_line "服务器联动只支持 systemd 或 OpenRC。"
+red_line "分布式集群只支持 systemd 或 OpenRC。"
 return 1
 }
 [ -s "$HOME/lun/uuid" ] || { red_line "请先完成至少一个风火轮代理协议安装。"; return 1; }
 multiuser_install_python || return 1
-multiuser_download_agent || { red_line "服务器联动需要的多用户程序下载 / 复制失败。"; return 1; }
-command -v openssl >/dev/null 2>&1 || { red_line "服务器联动需要 OpenSSL。"; return 1; }
-cluster_download_agent || { red_line "服务器联动程序下载 / 复制失败。"; return 1; }
+multiuser_download_agent || { red_line "分布式集群需要的多用户程序下载 / 复制失败。"; return 1; }
+command -v openssl >/dev/null 2>&1 || { red_line "分布式集群需要 OpenSSL。"; return 1; }
 cluster_host=$(cluster_detect_public_host)
 [ -n "$cluster_host" ] || { red_line "未检测到公网 IP，请先在节点地址设置中指定本机地址。"; return 1; }
 cluster_default_port=$(cluster_pick_port) || {
-red_line "没有可用于服务器联动的空闲端口。"
+red_line "没有可用于分布式集群的空闲端口。"
 is_nat_mode && yellow_line "NAT VPS 必须先增加一组未被协议占用的公网端口 → 内网端口映射。"
 return 1
 }
@@ -4190,7 +4603,7 @@ IFS= read -r cluster_input_port
 [ "$cluster_input_port" = 0 ] && return 1
 [ -n "$cluster_input_port" ] && cluster_default_port=$cluster_input_port
 port_valid "$cluster_default_port" || { red_line "通信端口无效。"; return 1; }
-[ "$cluster_default_port" = 443 ] && { red_line "服务器联动默认禁止使用热门端口 443，请换一个高位 TCP 端口。"; return 1; }
+[ "$cluster_default_port" = 443 ] && { red_line "分布式集群默认禁止使用热门端口 443，请换一个高位 TCP 端口。"; return 1; }
 port_reserved "$cluster_default_port" && { red_line "端口已被风火轮协议或订阅占用。"; return 1; }
 port_in_use "$cluster_default_port" && { red_line "端口已被其他服务占用。"; return 1; }
 cluster_default_public=$(client_port "$cluster_default_port")
@@ -4205,22 +4618,66 @@ yellow_line "请在服务商面板新增 公网 TCP 端口 → $cluster_default_
 return 1
 }
 fi
-cluster_remark=
-if [ "$cluster_new_role" = master ]; then
-cluster_cmd init-master --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public" --remark "$cluster_remark" || return 1
-else
-cluster_cmd init-child --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public" --remark "$cluster_remark" || return 1
+cluster_migrate=${1:-no}
+cluster_install_txn=$(mktemp -d "$HOME/lun/.cluster-install.XXXXXX" 2>/dev/null) || {
+red_line "无法创建联邦启用事务快照。"
+return 1
+}
+if ! cluster_install_state_snapshot "$cluster_install_txn"; then
+[ -e "$cluster_install_txn/cluster.active" ] && cluster_service_start >/dev/null 2>&1 || true
+rm -rf "$cluster_install_txn"
+red_line "无法保存联邦启用前的订阅与服务状态。"
+return 1
 fi
-cluster_install_service || return 1
+if ! cluster_download_agent; then
+red_line "分布式集群程序下载 / 复制失败。"
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
+fi
+if [ "$cluster_migrate" = yes ]; then
+yellow_line "正在迁移旧式 API v2 集群：保留服务器编号、用户、Token 与订阅快照；不会复制旧共享 CA 私钥。"
+if ! cluster_cmd federation-init --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public" --migrate; then
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
+fi
+else
+if ! cluster_cmd federation-init --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public"; then
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
+fi
+fi
+if ! cluster_subscription_takeover_start; then
+red_line "lun-agent 未能接管单用户订阅，联邦不会以半启用状态保留。"
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
+fi
+cluster_takeover_state="$(cluster_module_dir)/subscription-takeover"
+rm -rf "$cluster_takeover_state"
+mkdir -p "$cluster_takeover_state" \
+&& cp -a "$cluster_install_txn/subscription/." "$cluster_takeover_state/" \
+&& chmod -R go-rwx "$cluster_takeover_state" 2>/dev/null || {
+red_line "无法保存订阅接管回退状态。"
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
+}
+if ! cluster_install_service; then
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
+fi
 apply_lun_firewall_rules || true
-cluster_service_start || { red_line "服务器联动服务启动失败。"; return 1; }
-if [ "$cluster_new_role" = master ]; then
-cluster_refresh_profiles >/dev/null 2>&1 || true
-green_line "主 VPS 集群控制器已启用。"
-else
-green_line "子 VPS 联动服务已启用；把上方整条 lunjoin:// 加入地址粘贴到主 VPS。"
-is_nat_mode && yellow_line "还需确认服务商公网 TCP $cluster_default_public 已映射到内网 $cluster_default_port。"
+if ! cluster_service_start; then
+red_line "分布式集群服务启动失败。"
+cluster_install_rollback "$cluster_install_txn" || true
+return 1
 fi
+rm -rf "$cluster_install_txn"
+if [ "$cluster_migrate" != yes ]; then
+cluster_push_event
+else
+yellow_line "迁移仅完成本机状态转换；旧记录均为 待重新配对/未信任，需在任意成员显式重新配对后才会激活。"
+fi
+green_line "本机联邦身份已启用；任意可信成员均可管理其它成员。"
+is_nat_mode && yellow_line "还需确认服务商公网 TCP $cluster_default_public 已映射到内网 $cluster_default_port。"
 return 0
 }
 
@@ -4239,40 +4696,69 @@ printf '%s\n' "$cluster_password_file"
 
 cluster_backup_ui(){
 while :; do
-ui_title "Lun 集群备份 / 加载备份"
-echo " 1. 创建加密备份"
-echo " 2. 加载备份"
-echo " 3. 查看集群状态"
+ui_title "Lun 联邦备份"
+echo " 1. 导出联邦数据备份（无私钥，可载入其它成员并合并）"
+echo " 2. 载入联邦数据备份（不替换本机身份）"
+echo " 3. 导出本机完整身份备份（密码加密，含本机私钥）"
+echo " 4. 恢复本机完整身份备份（在线身份重复会拒绝）"
+echo " 5. 查看联邦状态"
 echo " 0. 返回"
-printf "请选择 [0-3]："
+printf "请选择 [0-5]："
 IFS= read -r cluster_choice
 case "$cluster_choice" in
 1)
-cluster_backup_path="$HOME/lun-cluster-backup-$(date +%Y%m%d-%H%M%S).lcb"
+cluster_backup_path="$HOME/lun-federation-data-$(date +%Y%m%d-%H%M%S).lcb"
 cluster_password_file=$(cluster_read_password_file "输入备份口令（至少8位，输入不显示）：") || continue
-cluster_cmd backup --path "$cluster_backup_path" --password-file "$cluster_password_file"
+cluster_cmd federation-backup --path "$cluster_backup_path" --password-file "$cluster_password_file"
 cluster_rc=$?
 rm -f "$cluster_password_file"
-[ "$cluster_rc" = 0 ] && green_line "集群备份已保存：$cluster_backup_path"
+[ "$cluster_rc" = 0 ] && green_line "联邦数据备份已保存：$cluster_backup_path"
 ui_pause
 ;;
 2)
-printf "备份文件绝对路径（输入 0 返回）："
+printf "联邦数据备份绝对路径（输入 0 返回）："
 IFS= read -r cluster_backup_path
 [ "$cluster_backup_path" = 0 ] && continue
 [ -s "$cluster_backup_path" ] || { red_line "备份文件不存在。"; ui_pause; continue; }
 cluster_password_file=$(cluster_read_password_file "输入备份口令（输入不显示）：") || continue
-cluster_cmd restore --path "$cluster_backup_path" --password-file "$cluster_password_file"
+cluster_cmd federation-restore --path "$cluster_backup_path" --password-file "$cluster_password_file"
 cluster_rc=$?
 rm -f "$cluster_password_file"
 if [ "$cluster_rc" = 0 ]; then
 cluster_install_service && cluster_service_restart
 apply_lun_firewall_rules || true
-green_line "备份已加载；请运行立即同步更新所有子机的主 VPS 地址。"
+green_line "联邦数据已合并；本机身份、私钥和公开订阅入口保持不变。"
 fi
 ui_pause
 ;;
-3) cluster_cmd status; ui_pause ;;
+3)
+cluster_backup_path="$HOME/lun-federation-identity-$(date +%Y%m%d-%H%M%S).lcb"
+red_line "完整身份备份含本机私钥，只能妥善离线保存；不要发送给其它成员。"
+cluster_password_file=$(cluster_read_password_file "输入备份口令（至少8位，输入不显示）：") || continue
+cluster_cmd identity-backup --path "$cluster_backup_path" --password-file "$cluster_password_file"
+cluster_rc=$?
+rm -f "$cluster_password_file"
+[ "$cluster_rc" = 0 ] && green_line "本机完整身份备份已保存：$cluster_backup_path"
+ui_pause
+;;
+4)
+printf "本机完整身份备份绝对路径（输入 0 返回）："
+IFS= read -r cluster_backup_path
+[ "$cluster_backup_path" = 0 ] && continue
+[ -s "$cluster_backup_path" ] || { red_line "备份文件不存在。"; ui_pause; continue; }
+red_line "仅在本机身份已离线、且确认需要灾难恢复时使用；在线重复身份会被后端拒绝。"
+cluster_password_file=$(cluster_read_password_file "输入备份口令（输入不显示）：") || continue
+cluster_cmd identity-restore --path "$cluster_backup_path" --password-file "$cluster_password_file"
+cluster_rc=$?
+rm -f "$cluster_password_file"
+if [ "$cluster_rc" = 0 ]; then
+cluster_install_service && cluster_service_restart
+apply_lun_firewall_rules || true
+green_line "身份恢复完成；请立即执行按需同步确认成员状态。"
+fi
+ui_pause
+;;
+5) cluster_cmd status; ui_pause ;;
 0|"") return ;;
 *) echo "输入错误。" ;;
 esac
@@ -4280,12 +4766,14 @@ done
 }
 
 cluster_show_subscription_links(){
-cluster_refresh_profiles >/dev/null || return 1
+# Use the locally trusted aggregate first.  Event repair stays asynchronous so
+# a slow or partitioned peer never delays a subscriber-facing response.
+cluster_refresh_profiles_async
 cluster_host=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
 cluster_host=${cluster_host#\[}; cluster_host=${cluster_host%\]}
 cluster_scheme=http
 cluster_sub_port=$(cat "$HOME/lun/subport.log" 2>/dev/null)
-if multiuser_enabled; then
+if subscription_agent_enabled; then
 cluster_scheme=$(multiuser_config_value scheme)
 cluster_host=$(multiuser_config_value public_host)
 cluster_sub_port=$(multiuser_config_value public_port)
@@ -4397,8 +4885,13 @@ xray) lunstatus | sed -n '/^Xray/p' ;;
 singbox) lunstatus | sed -n '/^Sing-box/p' ;;
 argo) argo_status_line ;;
 subscription)
+if subscription_agent_enabled; then
 if multiuser_enabled; then
-cluster_service_is_active lun-agent lun-agent && echo "订阅服务：由多用户服务承载 / 运行中" || echo "订阅服务：由多用户服务承载 / 未运行"
+cluster_subscription_label="多用户 lun-agent"
+else
+cluster_subscription_label="联邦单用户 lun-agent"
+fi
+cluster_service_is_active lun-agent lun-agent && echo "订阅服务：由 $cluster_subscription_label 承载 / 运行中" || echo "订阅服务：由 $cluster_subscription_label 承载 / 未运行"
 elif pgrep -f "httpd.*-h $HOME/weblun" >/dev/null 2>&1; then
 echo "订阅服务：运行中"
 else
@@ -4438,8 +4931,11 @@ subscription)
 if multiuser_enabled; then
 echo "当前订阅由多用户服务承载，请直接控制“多用户服务”。" >&2
 return 1
-fi
+elif subscription_only_enabled; then
+multiuser_service_stop
+else
 stop_subscription_service
+fi
 ;;
 multiuser) multiuser_service_stop ;;
 visit) visit_monitor_service_stop ;;
@@ -4451,7 +4947,7 @@ xray) [ -x "$HOME/lun/xray" ] && [ -s "$HOME/lun/xr.json" ] || { echo "Xray 内�
 singbox) [ -x "$HOME/lun/sing-box" ] && [ -s "$HOME/lun/sb.json" ] || { echo "Sing-box 内核或配置不存在。" >&2; return 1; }; sbrestart ;;
 argo) cluster_argo_start ;;
 subscription) restart_subscription_service ;;
-multiuser) multiuser_installed || { echo "多用户模块未安装。" >&2; return 1; }; multiuser_service_start ;;
+multiuser) multiuser_enabled || { echo "多用户模块未启用。" >&2; return 1; }; multiuser_service_start ;;
 visit) visit_monitor_enabled || { echo "网站访问监控未启用。" >&2; return 1; }; visit_monitor_service_start ;;
 esac
 cluster_service_status "$cluster_component"
@@ -4484,7 +4980,7 @@ cluster_update_source=$(command -v lun 2>/dev/null)
 cluster_update_action=script.install
 cluster_update_label="Lun 主脚本"
 ;;
-agent) cluster_update_source="$(cluster_module_dir)/lun_cluster.py"; cluster_update_action=agent.install; cluster_update_label="服务器联动程序" ;;
+agent) cluster_update_source="$(cluster_module_dir)/lun_cluster.py"; cluster_update_action=agent.install; cluster_update_label="分布式集群程序" ;;
 *) return 1 ;;
 esac
 cluster_update_payload=$(mktemp "$HOME/lun/.cluster-update.XXXXXX") || return 1
@@ -4500,12 +4996,17 @@ return 1
 
 cluster_update_all_ui(){
 ui_title "Lun 一键更新全部集群服务器"
-cluster_cmd nodes || return 1
-yellow_line "本机先从官方 main 检查一次更新；随后复用本机脚本，通过 mTLS 推送给主 VPS 与全部子 VPS。"
+cluster_show_nodes || return 1
+yellow_line "本机先从官方 main 检查一次更新；随后复用本机脚本，通过 mTLS 推送给全部已信任 API v3 成员。"
 yellow_line "远端服务器不再分别访问 GitHub；脚本和联动程序均执行语法、SHA-256 与原子替换校验。"
 printf "排除的服务器编号（多个用空格或逗号分隔；回车不排除；输入 0 返回）："
 IFS= read -r cluster_update_exclude
 [ "$cluster_update_exclude" = 0 ] && return 2
+cluster_auto_exclude=$(cluster_untrusted_member_numbers | tr '\n' ',' | sed 's/,$//')
+if [ -n "$cluster_auto_exclude" ]; then
+yellow_line "以下旧/撤销/禁止连接记录将自动排除：$cluster_auto_exclude"
+cluster_update_exclude="${cluster_update_exclude:+$cluster_update_exclude,}$cluster_auto_exclude"
+fi
 
 if ! update_lun_script; then
 red_line "本机主脚本未能更新，已停止集群推送。"
@@ -4520,19 +5021,19 @@ cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
 if [ -s "$cluster_agent_source" ] \
 && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 \
 && grep -q 'update-all' "$cluster_agent_source"; then
-green_line "已复用本机通过校验的服务器联动程序。"
+green_line "已复用本机通过校验的分布式集群程序。"
 elif ! cluster_download_agent; then
-red_line "服务器联动程序下载失败，且本机缓存不支持集群更新。"
+red_line "分布式集群程序下载失败，且本机缓存不支持集群更新。"
 return 1
 else
 cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
 [ -s "$cluster_agent_source" ] && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 && grep -q 'update-all' "$cluster_agent_source" || {
-red_line "下载的服务器联动程序不支持集群更新，已停止推送。"
+red_line "下载的分布式集群程序不支持集群更新，已停止推送。"
 return 1
 }
 fi
 cluster_install_service || return 1
-cluster_service_restart || { red_line "本机服务器联动服务重启失败。"; return 1; }
+cluster_service_restart || { red_line "本机分布式集群服务重启失败。"; return 1; }
 
 cluster_script_payload=$(mktemp "$HOME/lun/.cluster-script.XXXXXX") || return 1
 cluster_agent_payload=$(mktemp "$HOME/lun/.cluster-agent.XXXXXX") || { rm -f "$cluster_script_payload"; return 1; }
@@ -4546,10 +5047,8 @@ cluster_update_rc=1
 fi
 rm -f "$cluster_script_payload" "$cluster_agent_payload"
 if [ "$cluster_update_rc" = 0 ]; then
-green_line "集群一键更新完成；主 VPS 与全部未排除子 VPS 已使用同一份本机脚本。"
-cluster_role_now=$(cluster_role 2>/dev/null)
-[ "$cluster_role_now" = child ] && cluster_cmd push >/dev/null 2>&1 || true
-[ "$cluster_role_now" = master ] && cluster_refresh_profiles >/dev/null 2>&1 || true
+green_line "集群一键更新完成；全部已信任成员已使用同一份本机脚本。"
+cluster_push_event
 return 0
 fi
 red_line "至少一台服务器更新失败；已成功的服务器保持新版本，请按上方编号重试。"
@@ -4566,7 +5065,7 @@ echo " 3. Argo / Cloudflared"
 echo " 4. 订阅服务"
 echo " 5. 多用户服务"
 echo " 6. 网站访问监控"
-echo " 7. 服务器联动服务（可查看/重启）"
+echo " 7. 分布式集群服务（可查看/重启）"
 echo " 0. 返回"
 printf "请选择 [0-7]："
 IFS= read -r cluster_service_choice
@@ -4606,17 +5105,18 @@ done
 }
 
 cluster_node_action_ui(){
-printf "子 VPS 节点编号（输入 0 返回）："
+printf "目标节点 ID（输入 0 返回）："
 IFS= read -r cluster_node_id
 [ "$cluster_node_id" = 0 ] && return
+cluster_node_allowed "$cluster_node_id" || return 1
 while :; do
-ui_title "Lun 远程配置子 VPS"
+ui_title "Lun 远程配置成员"
 echo "目标节点：$cluster_node_id"
 echo " 1. 刷新状态"
 echo " 2. 进程 / 服务控制"
 echo " 3. 重启全部代理服务"
 echo " 4. 下发当前 Lun 主脚本"
-echo " 5. 下发当前服务器联动程序"
+echo " 5. 下发当前分布式集群程序"
 echo " 6. 更新 Xray 内核"
 echo " 7. 更新 Sing-box 内核"
 echo " 8. 同步防火墙"
@@ -4648,7 +5148,7 @@ cluster_cmd action --node-id "$cluster_node_id" --action protocol.apply --payloa
 10) cluster_cmd action --node-id "$cluster_node_id" --action snapshot.create --payload '{"label":"manual-remote"}' ;;
 11|12)
 cluster_action=$([ "$cluster_choice" = 11 ] && echo lun.factory-reset || echo lun.uninstall)
-red_line "危险操作只能单机执行；子机将先创建快照。"
+red_line "危险操作只能单机执行；目标成员会先创建快照。"
 printf "再次输入目标节点编号确认（输入 0 返回）："
 IFS= read -r cluster_confirm
 [ "$cluster_confirm" = 0 ] && continue
@@ -4661,45 +5161,36 @@ ui_pause
 done
 }
 
-cluster_add_node_ui(){
-ui_title "Lun 添加子 VPS"
-yellow_line "在子 VPS 进入同一模块并生成 lunjoin:// 地址，然后整条粘贴到这里。"
-printf "加入地址（输入 0 返回）："
-IFS= read -r cluster_join_uri
-[ "$cluster_join_uri" = 0 ] && return
-if cluster_cmd add-node --uri "$cluster_join_uri"; then
-cluster_service_restart || true
-cluster_refresh_profiles >/dev/null 2>&1 || true
-green_line "子 VPS 已加入；若它原来属于其他主 VPS，旧主控授权已由本次配对取代。"
-fi
-ui_pause
-}
-
 cluster_assignment_ui(){
 ui_title "Lun 用户与服务器授权"
 multiuser_enabled || { yellow_line "多用户管理未启用；当前使用单用户全部/地区聚合订阅。"; ui_pause; return; }
 multiuser_cmd list-users
-cluster_cmd nodes
+cluster_show_nodes
 printf "用户 ID（输入 0 返回）："
 IFS= read -r cluster_user_id
 [ "$cluster_user_id" = 0 ] && return
-printf "允许的节点编号，多个用逗号分隔；留空表示不开放子机："
+printf "允许的成员节点编号，多个用逗号分隔；留空表示不开放远程成员："
 IFS= read -r cluster_node_ids
+if [ -n "$cluster_node_ids" ]; then
+cluster_node_ids=$(cluster_filter_remote_targets "$cluster_node_ids") || { ui_pause; return 1; }
+fi
 cluster_cmd assign-user --user-id "$cluster_user_id" --nodes "$cluster_node_ids"
 if [ $? = 0 ]; then
 yellow_line "正在把该用户凭据、协议权限和订阅下发到授权节点……"
-cluster_cmd sync-users || red_line "授权已保存，但有子 VPS 未完成同步；请在服务器总览检查通信。"
+cluster_cmd sync-users || red_line "授权已保存，但有成员未完成同步；请在服务器总览检查通信。"
 fi
 ui_pause
 }
 
 cluster_batch_action_ui(){
 ui_title "Lun 批量配置（金丝雀）"
-cluster_cmd nodes
+cluster_show_nodes
 yellow_line "第一台为金丝雀；只有它成功后才会继续，其余最多 3 台并行。"
-printf "子 VPS 节点编号（多个用空格或逗号分隔，输入 0 返回）："
+printf "成员节点 ID（多个用空格或逗号分隔，输入 0 返回）："
 IFS= read -r cluster_node_ids
 [ "$cluster_node_ids" = 0 ] && return
+cluster_node_ids=$(cluster_filter_remote_targets "$cluster_node_ids") || return 1
+[ -n "$cluster_node_ids" ] || { yellow_line "没有可执行的已信任 API v3 成员。"; return 1; }
 echo " 1. 重启代理服务"
 echo " 2. 同步防火墙"
 echo " 3. 更新 Xray 内核"
@@ -4730,162 +5221,170 @@ cluster_rc=$?
 ui_pause
 }
 
-cluster_switch_master_ui(){
-ui_title "Lun 主 VPS / 子 VPS 角色互换"
-cluster_cmd nodes || return 1
-yellow_line "请选择要提升为新主 VPS 的子机；当前主 VPS 会在成功后自动降为子机。"
-yellow_line "服务器编号、地区和节点名称保持不变，不会因角色变化重新编号。"
-red_line "聚合订阅地址会改为新主 VPS；切换期间请勿关闭 SSH 或重启任一服务器。"
-printf "目标子 VPS 编号（输入 0 返回）："
+cluster_sync_ui(){
+printf "节点 ID（输入 all 同步全部，输入 0 返回）："
 IFS= read -r cluster_node_id
-[ "$cluster_node_id" = 0 ] && return 2
-case "$cluster_node_id" in ''|*[!0-9]*) red_line "请输入服务器编号。"; return 1 ;; esac
-cluster_number=$(printf '%s' "$cluster_node_id" | sed 's/^0*//')
-[ -n "$cluster_number" ] || cluster_number=0
-[ "$cluster_number" -gt 0 ] 2>/dev/null || { red_line "服务器编号无效。"; return 1; }
-if [ "$cluster_number" -lt 100 ]; then cluster_number=$(printf '%02d' "$cluster_number"); fi
-red_line "将转移集群数据库和 CA 私钥，并更新全部子机的主控授权；失败会自动回滚。"
-printf "回车确认切换到服务器 %s（输入 0 返回）：" "$cluster_number"
-IFS= read -r cluster_confirm
-[ "$cluster_confirm" = 0 ] && return 2
-[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; return 1; }
-cluster_confirm=CONFIRM
-if cluster_cmd switch-master --node-id "$cluster_node_id" --confirm "$cluster_confirm"; then
-cluster_service_restart || yellow_line "本机已降为子 VPS，但联动服务重启失败；请执行 systemctl restart lun-cluster-agent。"
-apply_lun_firewall_rules >/dev/null 2>&1 || true
-green_line "角色互换完成。请登录新主 VPS 查看新的聚合订阅地址。"
-return 0
-fi
-return 1
-}
-
-cluster_master_menu(){
-while :; do
-ui_title "Lun 节点集群 / 主 VPS"
-cluster_cmd nodes
-ui_dash
-echo " 1. 刷新服务器总览"
-echo " 2. 添加子 VPS"
-echo " 3. 配置单台子 VPS"
-echo " 4. 批量配置（金丝雀 + 失败回滚）"
-echo " 5. 立即同步子 VPS"
-printf " 6. %s刷新并查看聚合订阅%s\n" "$LUN_GREEN" "$LUN_RESET"
-echo " 7. 用户与服务器授权"
-echo " 8. 地区设置"
-echo " 9. 集群备份 / 加载备份"
-echo "10. 通信状态 / 修复服务"
-echo "11. 一键更新全部集群服务器"
-echo "12. 更新本机服务器联动程序"
-echo "13. 移除子 VPS / 撤销访问"
-echo "14. 停用并卸载服务器联动模块"
-printf "15. %s主 VPS / 子 VPS 角色互换%s\n" "$LUN_RED" "$LUN_RESET"
-echo " 0. 返回"
-printf "请选择 [0-15]："
-IFS= read -r cluster_choice
-case "$cluster_choice" in
-1) cluster_cmd nodes; ui_pause ;;
-2) cluster_add_node_ui ;;
-3) cluster_node_action_ui ;;
-4) cluster_batch_action_ui ;;
-5)
-printf "节点编号（输入 all 同步全部，输入 0 返回）："
-IFS= read -r cluster_node_id
-[ "$cluster_node_id" = 0 ] && continue
+[ "$cluster_node_id" = 0 ] && return
 if [ "$cluster_node_id" = all ]; then
 cluster_cmd sync-users || true
-cluster_cmd --json nodes 2>/dev/null | python3 -c 'import json,sys; print(" ".join(x["id"] for x in json.load(sys.stdin) if x["role"]=="child"))' | while read -r cluster_ids; do
-for cluster_id in $cluster_ids; do cluster_cmd sync --node-id "$cluster_id" || true; done
+cluster_trusted_member_ids | while read -r cluster_id; do
+cluster_cmd sync --node-id "$cluster_id" || true
 done
 else
+cluster_node_allowed "$cluster_node_id" || return 1
 cluster_cmd sync-users --node-id "$cluster_node_id" || true
 cluster_cmd sync --node-id "$cluster_node_id"
 fi
-cluster_refresh_profiles >/dev/null 2>&1 || true
-ui_pause
-;;
-6) cluster_show_subscription_links; ui_pause ;;
-7) cluster_assignment_ui ;;
-8)
-printf "节点编号（输入 0 返回）："; IFS= read -r cluster_node_id; [ "$cluster_node_id" = 0 ] && continue
+cluster_refresh_profiles_async
+}
+
+cluster_join_ui(){
+ui_title "Lun 加入联邦成员"
+yellow_line "在任意可信成员选择“生成加入地址”，复制整条 lunjoin:// 地址到这里；地址只可使用一次，15 分钟后失效。"
+printf "加入地址（输入 0 返回）："
+IFS= read -r cluster_join_uri
+[ "$cluster_join_uri" = 0 ] && return
+[ -n "$cluster_join_uri" ] || { red_line "加入地址不能为空。"; return 1; }
+if cluster_cmd add-peer --uri "$cluster_join_uri"; then
+cluster_install_service && cluster_service_restart || true
+apply_lun_firewall_rules || true
+cluster_push_event
+green_line "成员已加入联邦；本机和其它成员拥有相同的受控管理权限。"
+fi
+}
+
+cluster_location_ui(){
+printf "节点 ID（输入 0 返回）："; IFS= read -r cluster_node_id; [ "$cluster_node_id" = 0 ] && return
+cluster_node_allowed "$cluster_node_id" || return 1
 printf "地区（如 日本-大阪 / 美国-洛杉矶 / 德国）："; IFS= read -r cluster_region
-[ -n "$cluster_region" ] || { red_line "地区不能为空。"; ui_pause; continue; }
-cluster_cmd set-location --node-id "$cluster_node_id" --region "$cluster_region"
-cluster_refresh_profiles >/dev/null 2>&1 || true
-ui_pause
-;;
-9) cluster_backup_ui ;;
-10) cluster_cmd status; cluster_install_service; cluster_service_restart; apply_lun_firewall_rules; ui_pause ;;
-11) cluster_update_all_ui; ui_pause ;;
-12) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
-13)
-cluster_cmd nodes
-printf "要移除的子 VPS 节点编号（输入 0 返回）："; IFS= read -r cluster_node_id
-[ "$cluster_node_id" = 0 ] && continue
-printf "再次输入该节点编号确认（输入 0 返回）："; IFS= read -r cluster_confirm
+[ -n "$cluster_region" ] || { red_line "地区不能为空。"; return 1; }
+cluster_cmd set-location --node-id "$cluster_node_id" --region "$cluster_region" && cluster_refresh_profiles_async
+}
+
+cluster_cdn_payload(){
+cluster_cdn_mode=$1
+cluster_cdn_values=$(cdn_ip_list 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+[ -n "$cluster_cdn_values" ] || return 1
+python3 - "$cluster_cdn_mode" "$cluster_cdn_values" <<'PY'
+import json, sys
+print(json.dumps({"mode": sys.argv[1], "cfip": sys.argv[2]}, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+cluster_cdn_sync_ui(){
+ui_title "Lun CDN 优选池同步"
+cluster_cdn_values=$(cdn_ip_list 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+[ -n "$cluster_cdn_values" ] || { red_line "本机没有 cfip/cdnip 优选地址可同步。"; return 1; }
+echo "来源（本机 cfip/cdnip）：$cluster_cdn_values"
+printf "目标节点 ID（输入 all 同步全部，输入 0 返回）："; IFS= read -r cluster_node_ids
+[ "$cluster_node_ids" = 0 ] && return
+echo " 1. 合并（默认：来源优先，追加目标独有地址并去重）"
+echo " 2. 覆盖（完全替换目标优选池）"
+printf "请选择 [1-2，回车为 1]："; IFS= read -r cluster_cdn_mode
+case "$cluster_cdn_mode" in ""|1) cluster_cdn_mode=merge ;; 2) cluster_cdn_mode=replace ;; *) red_line "输入错误。"; return 1 ;; esac
+cluster_cdn_payload=$(cluster_cdn_payload "$cluster_cdn_mode") || return 1
+yellow_line "只传递 cfip/cdnip 地址池，不传 CDN Host、证书、Token、Origin Rules、Tunnel、协议模式或端口。"
+echo "受控同步载荷：$cluster_cdn_payload"
+cluster_target_list=$(cluster_filter_remote_targets "$cluster_node_ids") || return 1
+[ -n "$cluster_target_list" ] || { yellow_line "没有可同步的可信联邦成员。"; return 1; }
+for cluster_id in $(printf '%s' "$cluster_target_list" | tr ',' ' '); do
+ui_dash
+echo "目标成员：$cluster_id"
+cluster_cmd cdn-pool-preview --node-id "$cluster_id" --mode "$cluster_cdn_mode" --cfip "$cluster_cdn_values" || continue
+printf "回车确认同步此成员（输入 0 跳过）："; IFS= read -r cluster_confirm
 [ "$cluster_confirm" = 0 ] && continue
-if cluster_cmd remove-node --node-id "$cluster_node_id" --confirm "$cluster_confirm"; then
-cluster_cmd sync-users >/dev/null 2>&1 || true
-cluster_refresh_profiles >/dev/null 2>&1 || true
-fi
-ui_pause
-;;
-14)
-red_line "卸载只移除本机集群控制面；不会卸载代理协议或远端子 VPS。"
-printf "回车确认卸载（输入 0 返回）："; IFS= read -r cluster_confirm
-[ "$cluster_confirm" = 0 ] && continue
-[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; continue; }
-cluster_remove_service
-rm -rf "$(cluster_module_dir)"
-apply_lun_firewall_rules quiet || true
-green_line "服务器联动模块已卸载。"
-return
-;;
-15)
-if cluster_switch_master_ui; then
-ui_pause
-return
-fi
-ui_pause
-;;
-0|"") return ;;
-*) echo "输入错误。" ;;
-esac
+cluster_cmd cdn-pool-sync --node-id "$cluster_id" --mode "$cluster_cdn_mode" --cfip "$cluster_cdn_values" \
+&& green_line "成员 $cluster_id 的 CDN 优选池已同步。" \
+|| red_line "成员 $cluster_id 同步失败；后端应已恢复该成员的独立快照。"
 done
 }
 
-cluster_child_menu(){
-while :; do
-ui_title "Lun 节点集群 / 子 VPS"
-cluster_cmd status
-ui_dash
-echo " 1. 生成新的一次性加入地址"
-echo " 2. 立即向主 VPS 推送配置与订阅"
-echo " 3. 修复 / 重启联动服务"
-echo " 4. 集群备份 / 加载备份"
-echo " 5. 一键更新全部集群服务器"
-echo " 6. 更新本机服务器联动程序"
-echo " 7. 解除并卸载本机联动模块"
-echo " 0. 返回"
-printf "请选择 [0-7]："
-IFS= read -r cluster_choice
-case "$cluster_choice" in
-1) cluster_cmd join-code; ui_pause ;;
-2) cluster_cmd push; ui_pause ;;
-3) cluster_install_service; cluster_service_restart; apply_lun_firewall_rules; ui_pause ;;
-4) cluster_backup_ui ;;
-5) cluster_update_all_ui; ui_pause ;;
-6) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
-7)
-red_line "解除后主 VPS 不能再管理本机；代理协议不会删除。"
-printf "回车确认解除（输入 0 返回）："; IFS= read -r cluster_confirm
-[ "$cluster_confirm" = 0 ] && continue
-[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; continue; }
+cluster_remove_member_ui(){
+cluster_cmd nodes || return 1
+printf "要撤销的成员节点 ID（输入 0 返回）："; IFS= read -r cluster_node_id
+[ "$cluster_node_id" = 0 ] && return
+printf "回车确认撤销（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && return
+cluster_cmd remove-peer --node-id "$cluster_node_id" --reason manual && cluster_refresh_profiles_async
+}
+
+cluster_subscription_takeover_release(){
+multiuser_enabled && return 0
+cluster_takeover_state="$(cluster_module_dir)/subscription-takeover"
+if [ -d "$cluster_takeover_state" ]; then
+cluster_subscription_state_restore "$cluster_takeover_state" yes
+return $?
+fi
+if subscription_only_enabled; then
+multiuser_service_stop
+multiuser_remove_service
+rm -f "$(multiuser_module_dir)/config.json"
+restart_subscription_busybox || return 1
+fi
+return 0
+}
+
+cluster_disable_ui(){
+red_line "停用只移除本机联邦控制面；不会卸载代理协议、普通本机数据或网站访问监控。"
+printf "回车确认停用本机联邦（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && return
+[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; return 1; }
+cluster_disable_keeps_multiuser=no
+multiuser_enabled && cluster_disable_keeps_multiuser=yes
 cluster_remove_service
+if ! cluster_subscription_takeover_release; then
+red_line "单用户订阅恢复失败，已保留联邦数据和回退快照；请运行状态/修复后重试。"
+return 1
+fi
 rm -rf "$(cluster_module_dir)"
 apply_lun_firewall_rules quiet || true
-green_line "本机服务器联动模块已卸载。"
-return
-;;
+if [ "$cluster_disable_keeps_multiuser" = yes ]; then
+green_line "本机联邦控制面已停用；现有多用户 lun-agent 保持运行。"
+else
+green_line "本机联邦控制面已停用；单用户订阅已恢复为原 BusyBox 服务。"
+fi
+}
+
+cluster_federation_menu(){
+while :; do
+ui_title "Lun 分布式服务器集群"
+cluster_show_nodes
+ui_dash
+echo " 1. 服务器总览"
+echo " 2. 生成加入地址"
+echo " 3. 加入成员"
+echo " 4. 配置单台"
+echo " 5. 批量金丝雀"
+echo " 6. 立即按需同步"
+printf " 7. %s刷新并查看聚合订阅%s\n" "$LUN_GREEN" "$LUN_RESET"
+echo " 8. 用户 / 服务器授权"
+echo " 9. 地区设置"
+echo "10. CDN 优选池同步"
+echo "11. 联邦数据备份"
+echo "12. 本机完整身份备份 / 恢复"
+echo "13. 状态 / 修复"
+echo "14. 一键更新全部"
+echo "15. 移除 / 撤销成员"
+echo "16. 停用本机联邦"
+echo " 0. 返回"
+printf "请选择 [0-16]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in
+1) cluster_show_nodes; ui_pause ;;
+2) cluster_cmd federation-join-code; ui_pause ;;
+3) cluster_join_ui; ui_pause ;;
+4) cluster_node_action_ui; ui_pause ;;
+5) cluster_batch_action_ui ;;
+6) cluster_sync_ui; ui_pause ;;
+7) cluster_show_subscription_links; ui_pause ;;
+8) cluster_assignment_ui ;;
+9) cluster_location_ui; ui_pause ;;
+10) cluster_cdn_sync_ui; ui_pause ;;
+11|12) cluster_backup_ui ;;
+13) cluster_cmd status; cluster_install_service; cluster_service_restart; restart_subscription_service; apply_lun_firewall_rules; ui_pause ;;
+14) cluster_update_all_ui; ui_pause ;;
+15) cluster_remove_member_ui; ui_pause ;;
+16) cluster_disable_ui; ui_pause ;;
 0|"") return ;;
 *) echo "输入错误。" ;;
 esac
@@ -4894,26 +5393,33 @@ done
 
 cluster_menu(){
 if ! cluster_installed; then
-ui_title "Lun 节点集群（服务器联动）"
-echo "可选模块；不开启时不会安装 Python 服务或开放通信端口。"
-echo "服务器之间使用专用 TCP + mTLS，仅按需通信，不需要 SSH 密钥。"
-echo " 1. 本机作为主 VPS / 控制器"
-echo " 2. 本机作为子 VPS / 受管节点"
+ui_title "Lun 分布式服务器集群"
+echo "可选模块；不开启时不会安装联邦服务或开放通信端口。"
+echo "成员之间通过专用 TCP + 双向 TLS 按需通信；不使用 SSH，也不开放任意 Shell。"
+echo " 1. 一键开启本机联邦身份"
 echo " 0. 返回"
-printf "请选择 [0-2]："
+printf "请选择 [0-1]："
 IFS= read -r cluster_choice
 case "$cluster_choice" in
-1) cluster_install master || { ui_pause; return; } ;;
-2) cluster_install child || { ui_pause; return; } ;;
+1) cluster_install || { ui_pause; return; } ;;
 0|"") return ;;
 *) echo "输入错误。"; return ;;
 esac
 fi
-case "$(cluster_role 2>/dev/null)" in
-master) cluster_master_menu ;;
-child) cluster_child_menu ;;
-*) red_line "集群角色配置无效，请卸载模块后重新初始化。"; ui_pause ;;
-esac
+if cluster_is_federation; then
+cluster_federation_menu
+elif cluster_legacy_present; then
+ui_title "Lun 分布式服务器集群迁移"
+yellow_line "检测到旧式 API v2 集群。安全迁移会保留编号、用户、Token 与订阅快照，并改为独立身份密钥联邦。"
+echo " 1. 安全迁移到联邦"
+echo " 0. 返回"
+printf "请选择 [0-1]："
+IFS= read -r cluster_choice
+case "$cluster_choice" in 1) cluster_install yes && cluster_federation_menu ;; 0|"") return ;; *) echo "输入错误。" ;; esac
+else
+red_line "联邦配置无效；请先运行状态/修复或从备份恢复。"
+ui_pause
+fi
 }
 
 multiuser_reconcile_configs(){
@@ -5270,18 +5776,29 @@ curl -fsS --max-time 3 "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" >/d
 fi
 }
 
-restart_subscription_service(){
-[ -s "$(multiuser_module_dir)/config.json" ] && multiuser_enabled && {
-multiuser_sync_subscription_state || return 1
-multiuser_cmd reconcile >/dev/null 2>&1 || return 1
-if pidof systemd >/dev/null 2>&1; then
-systemctl is-active --quiet lun-agent 2>/dev/null || multiuser_service_start
-elif command -v rc-service >/dev/null 2>&1; then
-rc-service lun-agent status >/dev/null 2>&1 || multiuser_service_start
+start_subscription_busybox_runtime(){
+[ -s "$HOME/lun/subport.log" ] && [ -s "$HOME/lun/subtoken.log" ] || return 1
+runtime_subport=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+runtime_subtoken=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
+valid_port_value "$runtime_subport" && [ -n "$runtime_subtoken" ] || return 1
+stop_subscription_service
+mkdir -p "$HOME/weblun/$runtime_subtoken"
+ln -sf "$HOME/lun/clmi.yaml" "$HOME/weblun/$runtime_subtoken/clmi.yaml"
+ln -sf "$HOME/lun/sbox.json" "$HOME/weblun/$runtime_subtoken/sbox.json"
+ln -sf "$HOME/lun/jhsub.txt" "$HOME/weblun/$runtime_subtoken/jhsub.txt"
+start_subscription_httpd "$runtime_subport"
+sleep 1
+subscription_httpd_ready "$runtime_subport" "$runtime_subtoken" || return 1
+if [ -s "$HOME/lun/subport_public.log" ]; then
+runtime_public_port=$(cat "$HOME/lun/subport_public.log" 2>/dev/null)
+if valid_port_value "$runtime_public_port" && [ "$runtime_public_port" != "$runtime_subport" ] && ! port_in_use "$runtime_public_port"; then
+start_subscription_httpd "$runtime_public_port"
 fi
-apply_lun_firewall_rules quiet || true
+fi
 return 0
 }
+
+restart_subscription_busybox(){
 [ -s "$HOME/lun/subport.log" ] || [ -n "$sub" ] || return 0
 if [ -n "$subid" ]; then
 subtoken="$subid"
@@ -5344,6 +5861,38 @@ fi
 echo "本地订阅服务已刷新。"
 show_port_mapping_hint "$subport"
 apply_lun_firewall_rules quiet || true
+}
+
+cluster_subscription_agent_ensure(){
+cluster_enabled || return 1
+multiuser_service_stop
+subscription_agent_init_single_user || return 1
+multiuser_install_service || return 1
+stop_subscription_service
+multiuser_clear_legacy_subscription_autostart
+multiuser_service_start || return 1
+multiuser_sync_subscription_state || return 1
+subscription_agent_ready
+}
+
+restart_subscription_service(){
+if multiuser_enabled; then
+multiuser_sync_subscription_state || return 1
+multiuser_cmd reconcile >/dev/null 2>&1 || return 1
+multiuser_install_service || return 1
+multiuser_service_start || return 1
+apply_lun_firewall_rules quiet || true
+return 0
+fi
+if cluster_enabled; then
+cluster_subscription_agent_ensure || {
+red_line "联邦单用户订阅必须由 lun-agent 承载，已禁止回落到 BusyBox。"
+return 1
+}
+apply_lun_firewall_rules quiet || true
+return 0
+fi
+restart_subscription_busybox
 }
 
 cip(){
@@ -6664,7 +7213,7 @@ fi
 }
 factory_reset(){
 if cluster_enabled && [ "${LUN_CLUSTER_DESTRUCTIVE:-no}" != yes ]; then
-red_line "本机已加入服务器联动；请先在主 VPS 中解除，或从联动模块执行带快照的远程清空。"
+red_line "本机已启用分布式集群；请先停用本机联邦，或从集群模块执行带快照的远程清空。"
 return 1
 fi
 if multiuser_installed; then
@@ -7570,9 +8119,9 @@ return 1
 }
 
 show_subscription_links(){
-if multiuser_enabled; then
+if subscription_agent_enabled; then
 multiuser_sync_subscription_state || {
-red_line "多用户订阅状态同步失败，无法输出有效链接。"
+red_line "lun-agent 订阅状态同步失败，无法输出有效链接。"
 return 1
 }
 echo "**********************************************************"
@@ -8289,7 +8838,7 @@ echo " 4. 服务与更新"
 echo " 5. 高级设置"
 printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
 printf " 7. %s网站访问监控%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 8. %s服务器联动 / 节点集群%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 8. %s分布式服务器集群%s\n" "$LUN_GREEN" "$LUN_RESET"
 printf " 9. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
 echo " 0. 退出"
 }
@@ -8581,6 +9130,11 @@ yellow_line "当前为多用户模式：订阅 token 按设备独立管理，不
 green_line "请用“刷新并查看节点信息”查看本机设备链接；其他设备在“多用户管理”中查看或轮换。"
 return 3
 fi
+if cluster_enabled; then
+yellow_line "当前为联邦单用户模式：聚合 Token 和订阅端口由 lun-agent 管理，不能切回 BusyBox。"
+green_line "请在“分布式服务器集群 → 刷新并查看聚合订阅”中查看链接。"
+return 3
+fi
 printf "是否启用节点订阅分享？[y/N]，0 返回："
 IFS= read -r val
 case "$val" in
@@ -8655,6 +9209,8 @@ refresh_subscription_share(){
 if multiuser_enabled; then
 multiuser_cmd reconcile >/dev/null 2>&1 || { red_line "多用户订阅配置修复失败。"; return 1; }
 multiuser_service_start >/dev/null 2>&1 || { red_line "多用户订阅服务启动失败。"; return 1; }
+elif cluster_enabled; then
+restart_subscription_service >/dev/null 2>&1 || { red_line "联邦单用户订阅服务修复失败。"; return 1; }
 else
 [ -s "$HOME/lun/uuid" ] || { red_line "缺少代理 UUID，无法开启订阅。"; return 1; }
 if [ ! -s "$HOME/lun/subtoken.log" ]; then
@@ -8678,12 +9234,12 @@ cip || return 1
 if multiuser_enabled; then
 multiuser_cmd apply >/dev/null 2>&1 || return 1
 multiuser_service_restart >/dev/null 2>&1 || true
+elif subscription_only_enabled; then
+multiuser_sync_subscription_state >/dev/null 2>&1 || return 1
+multiuser_service_restart >/dev/null 2>&1 || true
 fi
 if cluster_enabled; then
-case "$(cluster_role 2>/dev/null)" in
-child) cluster_cmd push >/dev/null 2>&1 || true ;;
-master) cluster_refresh_profiles >/dev/null 2>&1 || true ;;
-esac
+cluster_push_event
 fi
 }
 
@@ -8702,11 +9258,6 @@ printf "请选择 [0-2]："
 IFS= read -r identity_choice
 case "$identity_choice" in
 1|2)
-if cluster_enabled && [ "$(cluster_role 2>/dev/null)" = child ]; then
-yellow_line "当前是已配对子 VPS；地区和编号由主 VPS 统一管理，请在主 VPS 的“地区设置”中修改。"
-ui_pause
-continue
-fi
 if [ "$identity_choice" = 1 ]; then
 v4v6
 identity_place=$(detect_server_place)
@@ -8717,7 +9268,7 @@ IFS= read -r identity_place
 [ "$identity_place" = 0 ] && continue
 identity_place=$(sanitize_server_place "$identity_place") || { red_line "地区格式无效。"; ui_pause; continue; }
 fi
-if cluster_enabled && [ "$(cluster_role 2>/dev/null)" = master ]; then
+if cluster_enabled && cluster_is_federation; then
 identity_node_id=$(cluster_config_value node_id)
 cluster_cmd set-location --node-id "$identity_node_id" --region "$identity_place" || { ui_pause; continue; }
 else
@@ -12582,6 +13133,20 @@ if [ -s "$mu_abort_dir/backups/preinstall-sb.json" ]; then
 cp -p "$mu_abort_dir/backups/preinstall-sb.json" "$HOME/lun/sb.json"
 sbrestart
 fi
+if [ "${multiuser_had_subscription_only:-no}" = yes ] && [ -s "$mu_abort_dir/backups/preinstall-subscription-config.json" ]; then
+cp -p "$mu_abort_dir/backups/preinstall-subscription-config.json" "$mu_abort_dir/config.json"
+for mu_abort_file in subport.log subport_public.log subport_legacy.log subtoken.log; do
+if [ -e "$mu_abort_dir/backups/preinstall-$mu_abort_file.present" ]; then
+cp -p "$mu_abort_dir/backups/preinstall-$mu_abort_file" "$HOME/lun/$mu_abort_file"
+else
+rm -f "$HOME/lun/$mu_abort_file"
+fi
+done
+multiuser_install_service >/dev/null 2>&1 || true
+multiuser_service_start >/dev/null 2>&1 || true
+visit_monitor_service_start >/dev/null 2>&1 || true
+return 0
+fi
 [ -x "$mu_abort_dir/lun-agent" ] && "$mu_abort_dir/lun-agent" --root "$HOME/lun" set-module --enabled no >/dev/null 2>&1 || true
 multiuser_remove_service
 multiuser_restore_legacy_subscription_port
@@ -12604,6 +13169,22 @@ return 1
 [ -s "$HOME/lun/uuid" ] || { red_line "请先完成至少一个风火轮协议安装。"; return 1; }
 multiuser_had_visit=no
 visit_monitor_enabled && multiuser_had_visit=yes
+multiuser_had_subscription_only=no
+if subscription_only_enabled; then
+multiuser_had_subscription_only=yes
+mu_dir=$(multiuser_module_dir)
+mkdir -p "$mu_dir/backups"
+cp -p "$mu_dir/config.json" "$mu_dir/backups/preinstall-subscription-config.json" || return 1
+for mu_install_file in subport.log subport_public.log subport_legacy.log subtoken.log; do
+if [ -e "$HOME/lun/$mu_install_file" ]; then
+cp -p "$HOME/lun/$mu_install_file" "$mu_dir/backups/preinstall-$mu_install_file" || return 1
+: > "$mu_dir/backups/preinstall-$mu_install_file.present"
+else
+rm -f "$mu_dir/backups/preinstall-$mu_install_file.present"
+fi
+done
+multiuser_service_stop
+fi
 visit_monitor_service_stop
 multiuser_install_python || return 1
 multiuser_download_agent || { red_line "多用户代理程序下载/复制失败。"; multiuser_abort_install; return 1; }
@@ -12667,9 +13248,9 @@ multiuser_service_stop
 if multiuser_cmd apply; then
 multiuser_service_start || true
 green_line "多用户配置已校验并生效。"
-if cluster_enabled && [ "$(cluster_role 2>/dev/null)" = master ]; then
-yellow_line "正在同步已授权子 VPS 的用户与订阅……"
-cluster_cmd sync-users || yellow_line "本机已生效，但至少一台子 VPS 暂未同步。"
+if cluster_enabled && cluster_is_federation; then
+yellow_line "正在同步已授权成员的用户与订阅……"
+cluster_cmd sync-users || yellow_line "本机已生效，但至少一台成员暂未同步。"
 fi
 return 0
 fi
@@ -13369,7 +13950,13 @@ done
 }
 
 multiuser_menu(){
-if ! multiuser_installed; then
+if subscription_only_enabled; then
+ui_title "Lun 多用户管理"
+echo "当前 lun-agent 仅承载联邦单用户订阅；尚未启用用户、额度、权限或流量管理。"
+printf "现在升级为完整多用户模块？[y/N]："
+IFS= read -r mu_install
+case "$mu_install" in y|Y|yes|YES) multiuser_install || { ui_pause; return; } ;; *) return ;; esac
+elif ! multiuser_installed; then
 ui_title "Lun 多用户管理"
 echo "这是可选模块；不安装时普通风火轮行为完全不变。"
 echo "模块将导入当前 UUID 为 legacy-admin/legacy-device，并保留原订阅。"
@@ -13579,6 +14166,9 @@ cip || exit $?
 if multiuser_enabled; then
 multiuser_cmd apply >/dev/null 2>&1 || exit $?
 multiuser_service_restart >/dev/null 2>&1 || true
+elif subscription_only_enabled; then
+multiuser_sync_subscription_state >/dev/null 2>&1 || exit $?
+multiuser_service_restart >/dev/null 2>&1 || true
 fi
 exit 0
 elif [ "$1" = "cluster-service-control" ]; then
@@ -13750,10 +14340,12 @@ if multiuser_enabled; then
 [ -s "$HOME/lun/xr.json" ] && xrestart
 [ -s "$HOME/lun/sb.json" ] && sbrestart
 multiuser_service_start || yellow_line "多用户代理服务未能自动启动，请进入多用户管理 → 诊断。"
+elif subscription_only_enabled; then
+multiuser_service_start || yellow_line "联邦单用户订阅服务未能自动启动，请进入分布式服务器集群 → 状态 / 修复。"
 fi
 visit_monitor_service_start || yellow_line "网站监控服务未能自动启动，请进入网站访问监控 → 运行状态 / 自检。"
 fi
-if [ -n "$sub" ] && ! multiuser_enabled; then
+if [ -n "$sub" ] && ! subscription_agent_enabled; then
 subtokenipsub(){
 if [ -z "$subid" ]; then
 subtoken="$(cat "$HOME/lun/uuid")"
@@ -13825,9 +14417,8 @@ fi
 commit_rebuild_snapshot
 fi
 if cluster_enabled; then
-cluster_service_start || yellow_line "服务器联动服务未能自动启动。"
-cluster_push_event >/dev/null 2>&1 || true
-[ "$(cluster_role 2>/dev/null)" = master ] && cluster_refresh_profiles >/dev/null 2>&1 || true
+cluster_service_start || yellow_line "分布式集群服务未能自动启动。"
+cluster_push_event
 fi
 green_line "Lun 安装与配置校验全部完成。"
 echo

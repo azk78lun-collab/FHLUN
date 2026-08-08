@@ -43,8 +43,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.0"
-API_VERSION = 2
+VERSION = "0.2.0"
+API_VERSION = 3
 JOIN_TTL = 15 * 60
 MAX_BODY = 4 * 1024 * 1024
 ROLE_TRANSFER_CHUNK = 512 * 1024
@@ -53,6 +53,20 @@ ROLE_TRANSFER_TTL = 15 * 60
 BACKUP_MAGIC = b"LUNCLUSTER1\0"
 BACKUP_KDF_ITERATIONS = 300_000
 SUBSCRIPTION_FILES = ("jhsub.txt", "clmi.yaml", "sbox.json")
+CDN_POOL_MAX_ENTRIES = 64
+CDN_POOL_MAX_TEXT = 8192
+FEDERATION_EVENT_TYPES = {
+    "member.upsert", "member.revoke", "node.metadata", "profile.upsert", "token.upsert",
+    "token.delete", "user.upsert", "user.delete", "device.upsert", "device.delete",
+    "authorization.upsert", "usage.absolute", "snapshot.head", "revocation.proof",
+}
+FEDERATION_USER_EVENT_TYPES = {
+    "user.upsert", "user.delete", "device.upsert", "device.delete",
+    "authorization.upsert", "token.upsert", "token.delete",
+}
+FEDERATION_USER_MAX = 1000
+FEDERATION_DEVICE_MAX = 64
+FEDERATION_PROTOCOLS = {"vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"}
 
 COUNTRY_NAMES_ZH = {
     "AU": "澳大利亚", "CA": "加拿大", "DE": "德国", "FR": "法国", "GB": "英国",
@@ -88,11 +102,17 @@ ACTION_NAMES = {
     "role.stage", "role.discard", "role.promote", "role.rollback", "role.finalize",
     "role.children-commit", "role.children-revert", "controller.prepare",
     "controller.commit", "controller.abort", "controller.reassign",
+    "cdn.pool.preview", "cdn.pool.apply",
 }
 
 
 class ClusterError(RuntimeError):
     pass
+
+
+class FederationTransportError(ClusterError):
+    """A retryable mTLS transport failure, distinct from a remote rejection."""
+
 
 
 def utc_now() -> int:
@@ -107,6 +127,18 @@ def iso_time(value: int | None) -> str:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def canonical_event_fields(event: dict[str, Any]) -> bytes:
+    """The exact signed representation.  Keep this deliberately small and stable."""
+    fields = {key: event[key] for key in (
+        "author_id", "author_seq", "prev_hash", "lamport", "type", "entity_key", "payload", "created_at"
+    )}
+    return json_dumps(fields).encode("utf-8")
+
+
+def event_hash(event: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_event_fields(event) + b"." + str(event["signature"]).encode("ascii")).hexdigest()
 
 
 def b64url(data: bytes) -> str:
@@ -380,13 +412,74 @@ class Database:
               id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER NOT NULL,action TEXT NOT NULL,
               target TEXT NOT NULL,detail TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS federation_keys(
+              node_id TEXT PRIMARY KEY,root_certificate TEXT NOT NULL,identity_certificate TEXT NOT NULL DEFAULT '',
+              revoked_at INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS federation_events(
+              event_id TEXT PRIMARY KEY,author_id TEXT NOT NULL,author_seq INTEGER NOT NULL,prev_hash TEXT NOT NULL,
+              lamport INTEGER NOT NULL,type TEXT NOT NULL,entity_key TEXT NOT NULL,payload TEXT NOT NULL,
+              created_at INTEGER NOT NULL,signature TEXT NOT NULL,event_hash TEXT NOT NULL,
+              UNIQUE(author_id,author_seq)
+            );
+            CREATE INDEX IF NOT EXISTS federation_events_author_idx ON federation_events(author_id,author_seq);
+            CREATE TABLE IF NOT EXISTS federation_heads(
+              author_id TEXT PRIMARY KEY,author_seq INTEGER NOT NULL,event_hash TEXT NOT NULL,lamport INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS federation_entities(
+              entity_key TEXT PRIMARY KEY,type TEXT NOT NULL,payload TEXT NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,
+              lamport INTEGER NOT NULL,author_id TEXT NOT NULL,event_id TEXT NOT NULL,updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS federation_failures(
+              candidate_id TEXT NOT NULL,reporter_id TEXT NOT NULL,failed_at INTEGER NOT NULL,
+              PRIMARY KEY(candidate_id,reporter_id,failed_at)
+            );
+            CREATE TABLE IF NOT EXISTS federation_probe_votes(
+              candidate_id TEXT NOT NULL,voter_id TEXT NOT NULL,reachable INTEGER NOT NULL,created_at INTEGER NOT NULL,
+              signature TEXT NOT NULL DEFAULT '',PRIMARY KEY(candidate_id,voter_id)
+            );
+            CREATE TABLE IF NOT EXISTS federation_probe_observations(
+              vote_id TEXT PRIMARY KEY,candidate_id TEXT NOT NULL,voter_id TEXT NOT NULL,
+              reachable INTEGER NOT NULL,observed_at INTEGER NOT NULL,nonce TEXT NOT NULL,
+              signature TEXT NOT NULL,received_at INTEGER NOT NULL,UNIQUE(voter_id,nonce)
+            );
+            CREATE INDEX IF NOT EXISTS federation_probe_window_idx
+              ON federation_probe_observations(candidate_id,observed_at,voter_id);
+            CREATE TABLE IF NOT EXISTS federation_number_claims(
+              node_id TEXT PRIMARY KEY,requested_number INTEGER NOT NULL,fixed INTEGER NOT NULL DEFAULT 0,
+              lamport INTEGER NOT NULL,author_id TEXT NOT NULL,event_id TEXT NOT NULL,
+              assigned_number INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS federation_join_transactions(
+              transaction_id TEXT PRIMARY KEY,direction TEXT NOT NULL,token_hash TEXT NOT NULL,
+              peer_id TEXT NOT NULL,bundle_sha256 TEXT NOT NULL,transaction_signature TEXT NOT NULL,
+              transaction_payload TEXT NOT NULL DEFAULT '',response_bundle TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,
+              created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created_at DESC);
-            UPDATE schema_meta SET version=2;
+            UPDATE schema_meta SET version=3;
             """
         )
         node_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(nodes)")}
         if "server_number" not in node_columns:
             self.connection.execute("ALTER TABLE nodes ADD COLUMN server_number INTEGER NOT NULL DEFAULT 0")
+        key_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(federation_keys)")}
+        for definition in (
+            "root_fingerprint TEXT NOT NULL DEFAULT ''",
+            "identity_fingerprint TEXT NOT NULL DEFAULT ''",
+            "revoked_after_seq INTEGER NOT NULL DEFAULT -1",
+            "revocation_event_id TEXT NOT NULL DEFAULT ''",
+        ):
+            name = definition.split()[0]
+            if name not in key_columns:
+                self.connection.execute(f"ALTER TABLE federation_keys ADD COLUMN {definition}")
+        transaction_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(federation_join_transactions)")
+        }
+        if "transaction_payload" not in transaction_columns:
+            self.connection.execute(
+                "ALTER TABLE federation_join_transactions ADD COLUMN transaction_payload TEXT NOT NULL DEFAULT ''"
+            )
         rows = self.connection.execute(
             "SELECT id,role,server_number,created_at FROM nodes "
             "ORDER BY CASE role WHEN 'master' THEN 0 ELSE 1 END,created_at,id"
@@ -644,11 +737,11 @@ class Cluster:
             raise ClusterError(message)
         return result
 
-    def _openssl(self, arguments: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    def _openssl(self, arguments: list[str], timeout: int = 60, check: bool = True) -> subprocess.CompletedProcess[str]:
         executable = shutil.which("openssl")
         if not executable:
             raise ClusterError("服务器联动需要 OpenSSL")
-        return self._run([executable, *arguments], timeout=timeout)
+        return self._run([executable, *arguments], timeout=timeout, check=check)
 
     def _create_key_and_csr(self, name: str, common_name: str | None = None) -> tuple[Path, Path]:
         self.pki.mkdir(parents=True, exist_ok=True)
@@ -705,7 +798,8 @@ class Cluster:
         ])
 
     def certificate_fingerprint(self, certificate: Path | None = None) -> str:
-        cert = certificate or self.pki / "node.crt"
+        serving = self.pki / "node-serving.crt"
+        cert = certificate or (self.pki / "federation-node.crt" if self.is_federation() else (serving if serving.is_file() else self.pki / "node.crt"))
         result = self._openssl(["x509", "-in", str(cert), "-noout", "-fingerprint", "-sha256"])
         value = result.stdout.strip().split("=", 1)[-1].replace(":", "").lower()
         if not re.fullmatch(r"[0-9a-f]{64}", value):
@@ -767,7 +861,7 @@ class Cluster:
 
     def create_join_code(self) -> str:
         config = self.load_config()
-        if config.get("role") != "child":
+        if config.get("role") != "child" and not self.is_federation():
             raise ClusterError("只有子 VPS 可以生成加入地址")
         token = b64url(secrets.token_bytes(32))
         expires = utc_now() + JOIN_TTL
@@ -909,7 +1003,159 @@ class Cluster:
         if config.get("role") == "master" and re.fullmatch(r"[0-9a-f]{32}", str(config.get("node_id", ""))):
             self.upsert_node(self.local_status(), role="master")
         rows = self.db.connection.execute("SELECT * FROM nodes ORDER BY server_number,id").fetchall()
-        return [{**dict(row), "number": int(row["server_number"])} for row in rows]
+        trusted: set[str] = set()
+        if self.is_federation():
+            trusted = {str(row[0]) for row in self.db.connection.execute(
+                "SELECT n.id FROM nodes n JOIN federation_keys k ON k.node_id=n.id "
+                "WHERE k.revoked_at=0 AND n.state NOT IN ('legacy-unverified','revoked','removed')"
+            )}
+        return [
+            {**dict(row), "number": int(row["server_number"]),
+             **({"trusted": str(row["id"]) in trusted} if self.is_federation() else {})}
+            for row in rows
+        ]
+
+    def trusted_federation_nodes(self, *, include_self: bool = False) -> list[sqlite3.Row]:
+        if not self.is_federation():
+            return []
+        local_id = str(self.load_config().get("node_id", ""))
+        rows = self.db.connection.execute(
+            "SELECT n.* FROM nodes n JOIN federation_keys k ON k.node_id=n.id "
+            "WHERE k.revoked_at=0 AND n.state NOT IN ('legacy-unverified','revoked','removed') "
+            "ORDER BY n.server_number,n.id"
+        ).fetchall()
+        return [row for row in rows if include_self or str(row["id"]) != local_id]
+
+    @staticmethod
+    def normalize_cdn_pool(value: str) -> list[str]:
+        if not isinstance(value, str) or not value.strip():
+            raise ClusterError("CDN 优选池不能为空")
+        if len(value.encode("utf-8")) > CDN_POOL_MAX_TEXT:
+            raise ClusterError("CDN 优选池总长度超过限制")
+        if "://" in value or any(character in value for character in "/\\?#@`$|<>"):
+            raise ClusterError("CDN 优选池包含 URL、路径或危险字符")
+        if any(ord(character) < 32 and character not in "\r\n\t" for character in value):
+            raise ClusterError("CDN 优选池包含控制字符")
+        tokens = [item for item in re.split(r"[\s,;]+", value.strip()) if item]
+        if not tokens or len(tokens) > CDN_POOL_MAX_ENTRIES:
+            raise ClusterError("CDN 优选池数量无效")
+        result: list[str] = []
+        for token in tokens:
+            if len(token.encode("utf-8")) > 253 or any(character in token for character in "'\"(){}[]!*=&%"):
+                raise ClusterError(f"CDN 优选地址无效：{token[:80]}")
+            try:
+                normalized = ipaddress.ip_address(token).compressed.lower()
+            except ValueError:
+                try:
+                    normalized = token.rstrip(".").encode("idna").decode("ascii").lower()
+                except UnicodeError as exc:
+                    raise ClusterError(f"CDN 优选域名无效：{token[:80]}") from exc
+                labels = normalized.split(".")
+                if len(normalized) > 253 or len(labels) < 2 or any(
+                    not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                    for label in labels
+                ):
+                    raise ClusterError(f"CDN 优选域名无效：{token[:80]}")
+            if normalized not in result:
+                result.append(normalized)
+        if not result:
+            raise ClusterError("CDN 优选池不能为空")
+        return result
+
+    def _cdn_pool_numbered_paths(self) -> list[Path]:
+        return sorted(
+            (path for path in self.root.glob("cdnip[0-9]*") if re.fullmatch(r"cdnip[1-9][0-9]*", path.name)),
+            key=lambda path: int(path.name[5:]),
+        )
+
+    def read_cdn_pool(self) -> list[str]:
+        primary = self.root / "cdnip"
+        paths = [primary] if primary.is_file() and primary.stat().st_size else self._cdn_pool_numbered_paths()
+        values: list[str] = []
+        for path in paths:
+            if path.stat().st_size > CDN_POOL_MAX_TEXT:
+                raise ClusterError(f"CDN 优选池文件过大：{path.name}")
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                continue
+            for item in self.normalize_cdn_pool(text):
+                if item not in values:
+                    values.append(item)
+        return values
+
+    def preview_cdn_pool(self, mode: str, cfip: str) -> dict[str, Any]:
+        if mode not in {"merge", "replace"}:
+            raise ClusterError("CDN 优选池模式只支持 merge 或 replace")
+        source = self.normalize_cdn_pool(cfip)
+        current = self.read_cdn_pool()
+        result = source + [item for item in current if mode == "merge" and item not in source]
+        return {
+            "mode": mode, "current": current, "source": source, "result": result,
+            "add": [item for item in result if item not in current],
+            "keep": [item for item in result if item in current],
+            "remove": [item for item in current if item not in result],
+        }
+
+    def _capture_cdn_pool(self) -> dict[str, Any]:
+        paths = [self.root / "cdnip", *self._cdn_pool_numbered_paths()]
+        files: dict[str, dict[str, Any]] = {}
+        for path in paths:
+            if path.is_file():
+                files[path.name] = {
+                    "content": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "mode": path.stat().st_mode & 0o777,
+                }
+        return {"created_at": utc_now(), "files": files}
+
+    def _restore_cdn_pool(self, snapshot: dict[str, Any]) -> None:
+        for path in [self.root / "cdnip", *self._cdn_pool_numbered_paths()]:
+            path.unlink(missing_ok=True)
+        files = snapshot.get("files") if isinstance(snapshot.get("files"), dict) else {}
+        for name, item in files.items():
+            if name != "cdnip" and not re.fullmatch(r"cdnip[1-9][0-9]*", str(name)):
+                raise ClusterError("CDN 优选池快照包含非法文件")
+            if not isinstance(item, dict):
+                raise ClusterError("CDN 优选池快照无效")
+            try:
+                content = base64.b64decode(str(item.get("content", "")), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ClusterError("CDN 优选池快照编码无效") from exc
+            atomic_write(self.root / str(name), content, int(item.get("mode", 0o600)) & 0o777)
+
+    def _write_cdn_pool(self, values: list[str]) -> None:
+        atomic_write(self.root / "cdnip", " ".join(values) + "\n", 0o600)
+        for index, value in enumerate(values, 1):
+            atomic_write(self.root / f"cdnip{index}", value + "\n", 0o600)
+        for path in self._cdn_pool_numbered_paths():
+            if int(path.name[5:]) > len(values):
+                path.unlink(missing_ok=True)
+
+    def apply_cdn_pool(self, mode: str, cfip: str, script: Path) -> dict[str, Any]:
+        preview = self.preview_cdn_pool(mode, cfip)
+        if not script.is_file():
+            raise ClusterError("没有找到可执行的 Lun 主脚本")
+        snapshot = self._capture_cdn_pool()
+        self.backups.mkdir(parents=True, exist_ok=True)
+        snapshot_path = self.backups / f"cdn-pool-{utc_now()}-{secrets.token_hex(4)}.json"
+        atomic_write(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", 0o600)
+        self._write_cdn_pool(preview["result"])
+        refreshed = self._run(["bash", str(script), "subscription-refresh"], timeout=300, check=False)
+        if refreshed.returncode:
+            self._restore_cdn_pool(snapshot)
+            rollback_refresh = self._run(["bash", str(script), "subscription-refresh"], timeout=300, check=False)
+            rollback = {"restored": True, "refresh_returncode": rollback_refresh.returncode}
+            self.db.audit("cdn.pool.rollback", str(self.load_config().get("node_id", "")), json_dumps(rollback))
+            return {**preview, "applied": False, "snapshot": str(snapshot_path), "rollback": rollback,
+                    "error": ((refreshed.stderr or refreshed.stdout or "订阅重建失败")[-2000:])}
+        published: dict[str, Any] = {}
+        if self.is_federation():
+            with contextlib.suppress(ClusterError, OSError, sqlite3.Error):
+                published = push_snapshot(self)
+        else:
+            self.record_local_snapshot()
+        self.db.audit("cdn.pool.apply", str(self.load_config().get("node_id", "")), json_dumps(preview["result"]))
+        return {**preview, "applied": True, "snapshot": str(snapshot_path), "rollback": None,
+                "published": published}
 
     def remove_node(self, node_id: str) -> None:
         config = self.load_config()
@@ -993,7 +1239,9 @@ class Cluster:
         self.db.audit("snapshot.record", node_id, profile_key)
 
     def record_local_snapshot(self, profile_key: str = "legacy") -> None:
-        self.record_snapshot(self.local_snapshot(profile_key), role="master")
+        self.record_snapshot(
+            self.local_snapshot(profile_key), role="federation" if self.is_federation() else "master"
+        )
 
     def ensure_profile(self, name: str, selector: str, profile_key: str = "legacy",
                        token: str = "") -> sqlite3.Row:
@@ -1072,6 +1320,50 @@ class Cluster:
             })
         self.db.audit("profiles.refresh", self.load_config().get("node_id", ""), str(len(result)))
         return result
+
+    def subscription_catchup(self) -> dict[str, Any]:
+        received: dict[str, int] = {}
+        failures: dict[str, str] = {}
+        if self.is_federation():
+            try:
+                self.publish_local_user_events()
+            except (ClusterError, OSError, sqlite3.Error) as exc:
+                self.db.set_setting("federation.users.pending", "1")
+                failures["local-user-publish"] = exc.__class__.__name__
+        for node in self.trusted_federation_nodes():
+            node_id = str(node["id"])
+            try:
+                result = federation_sync(self, node_id)
+                received[node_id] = int(result.get("received", 0))
+            except (ClusterError, OSError, sqlite3.Error) as exc:
+                failures[node_id] = str(exc)[-2000:]
+                self.db.audit("subscription.access.sync-failed", node_id, exc.__class__.__name__)
+        try:
+            applied = self.apply_federation_users(refresh=False) if self.is_federation() else {}
+        except (ClusterError, OSError, sqlite3.Error):
+            applied = {"pending": True}
+            failures["local-user-apply"] = "pending"
+        refreshed = self.refresh_profiles()
+        return {"debounced": False, "received": received, "failures": failures,
+                "refreshed": len(refreshed), "users": applied}
+
+    def subscription_access(self, token: str, *, now: int | None = None) -> dict[str, Any]:
+        now = int(now or utc_now())
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+            raise ClusterError("订阅 token 无效")
+        row = self.db.connection.execute(
+            "SELECT 1 FROM profiles WHERE enabled=1 AND token=?", (token,)
+        ).fetchone()
+        if not row:
+            raise ClusterError("订阅 token 不存在或已停用")
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        key = f"subscription.access.{digest}"
+        last = int(self.db.setting(key, "0") or 0)
+        if now - last < 30:
+            return {"debounced": True, "received": {}, "failures": {}, "refreshed": 0}
+        self.db.set_setting(key, now)
+        self.db.audit("subscription.access", digest[:16], "catchup")
+        return self.subscription_catchup()
 
     def assign_user_nodes(self, user_id: int, node_ids: Iterable[str]) -> None:
         selected = list(dict.fromkeys(str(self.node(node_id)["id"]) for node_id in node_ids))
@@ -1170,7 +1462,10 @@ class Cluster:
                 "downlink": int(row["downlink"]), "month_uplink": int(row["month_uplink"]),
                 "month_downlink": int(row["month_downlink"]), "sequence": sequence,
             }
-            if config.get("role") == "master":
+            if self.is_federation():
+                self.create_event("usage.absolute", f"usage:{row['uuid']}:{row['period_start']}:{config['node_id']}", report)
+                totals = self.global_usage(row["uuid"], row["period_start"])
+            elif config.get("role") == "master":
                 self.record_usage(**report)
                 totals = self.global_usage(row["uuid"], row["period_start"])
             else:
@@ -1203,6 +1498,8 @@ class Cluster:
     def _selected_nodes(self, selector: str, profile_key: str) -> list[sqlite3.Row]:
         clauses = ["s.profile_key=?"]
         params: list[Any] = [profile_key]
+        if self.is_federation():
+            clauses.append("EXISTS(SELECT 1 FROM federation_keys fk WHERE fk.node_id=n.id AND fk.revoked_at=0)")
         if selector.startswith("region:"):
             code = normalize_country_code(selector.split(":", 1)[1])
             clauses.append("n.country_code=?")
@@ -1436,7 +1733,7 @@ class Cluster:
                     destination = (extract / member.name).resolve()
                     if extract.resolve() not in destination.parents:
                         raise ClusterError("角色切换恢复文件包含不安全路径")
-                archive.extractall(extract)
+                archive.extractall(extract, filter="data")
             if not (extract / "config.json").is_file() or not (extract / "data" / "cluster.db").is_file():
                 raise ClusterError("角色切换恢复文件不完整")
             shutil.copy2(extract / "config.json", self.config_path)
@@ -1600,7 +1897,7 @@ class Cluster:
                         destination = (extract / member.name).resolve()
                         if extract.resolve() not in destination.parents:
                             raise ClusterError("角色切换包包含不安全路径")
-                    archive.extractall(extract)
+                    archive.extractall(extract, filter="data")
                 manifest = json.loads((extract / "manifest.json").read_text(encoding="utf-8"))
                 if (
                     int(manifest.get("format", 0)) != 1
@@ -1727,7 +2024,7 @@ class Cluster:
                     destination = (extract / member.name).resolve()
                     if extract.resolve() not in destination.parents:
                         raise ClusterError("快照包含不安全路径")
-                archive.extractall(extract)
+                archive.extractall(extract, filter="data")
             restored = extract / "lun"
             for path in self.root.glob("port_*"):
                 if path.is_file():
@@ -1743,6 +2040,8 @@ class Cluster:
         return {"path": str(source), "rollback": str(rollback)}
 
     def export_backup(self, target: Path, password: str) -> Path:
+        if self.is_federation():
+            return self.export_federation_backup(target, password)
         if len(password) < 8:
             raise ClusterError("备份口令至少8个字符")
         self.db.connection.execute("PRAGMA wal_checkpoint(FULL)")
@@ -1836,7 +2135,7 @@ class Cluster:
                     destination = (extract / member.name).resolve()
                     if extract.resolve() not in destination.parents and destination != extract.resolve():
                         raise ClusterError("备份包含不安全路径")
-                tar.extractall(extract)
+                tar.extractall(extract, filter="data")
             manifest = json.loads((extract / "manifest.json").read_text(encoding="utf-8"))
             if int(manifest.get("api_version", 0)) > API_VERSION:
                 raise ClusterError("备份来自更高版本，请先更新 Lun")
@@ -1853,6 +2152,1682 @@ class Cluster:
         return {"manifest": manifest, "pre_restore_snapshot": str(current),
                 "pre_restore_cluster_state": str(recovery)}
 
+    # Federation v3 ---------------------------------------------------------
+    # Old master/child methods intentionally remain above: migration is explicit
+    # and a failed rollout can still use the existing recovery path.
+    def is_federation(self) -> bool:
+        return self.load_config().get("mode") == "federation"
+
+    def _create_federation_identity(self, node_id: str) -> None:
+        self.pki.mkdir(parents=True, exist_ok=True)
+        root_key, root_cert = self.pki / "federation-root.key", self.pki / "federation-root.crt"
+        identity_key, identity_csr = self.pki / "federation-node.key", self.pki / "federation-node.csr"
+        identity_cert = self.pki / "federation-node.crt"
+        if not root_key.exists():
+            self._openssl(["ecparam", "-genkey", "-name", "prime256v1", "-out", str(root_key)])
+            self._openssl(["req", "-new", "-x509", "-sha256", "-days", "3650", "-key", str(root_key),
+                           "-out", str(root_cert), "-subj", f"/CN=Lun Federation Root {node_id}"])
+        if not identity_key.exists():
+            self._openssl(["ecparam", "-genkey", "-name", "prime256v1", "-out", str(identity_key)])
+            self._openssl(["req", "-new", "-key", str(identity_key), "-out", str(identity_csr),
+                           "-subj", f"/CN={node_id}"])
+            ext = self.pki / ".federation-node.ext"
+            try:
+                atomic_write(ext, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                             "extendedKeyUsage=serverAuth,clientAuth\n"
+                             f"subjectAltName=URI:lun-federation:{node_id}\n", 0o600)
+                self._openssl(["x509", "-req", "-in", str(identity_csr), "-CA", str(root_cert),
+                               "-CAkey", str(root_key), "-CAcreateserial", "-out", str(identity_cert),
+                               "-days", "3650", "-sha256", "-extfile", str(ext)])
+            finally:
+                ext.unlink(missing_ok=True)
+                identity_csr.unlink(missing_ok=True)
+        self.secure_files()
+
+    def _federation_init(self, public_host: str, internal_port: int, public_port: int | None = None,
+                         remark: str = "", migrate: bool = False) -> dict[str, Any]:
+        if not valid_port(internal_port) or not valid_port(public_port or internal_port):
+            raise ClusterError("通信端口必须在 1-65535")
+        old = self.load_config()
+        if old.get("enabled") and old.get("mode") != "federation" and not migrate:
+            raise ClusterError("旧主从集群需要使用 federation-init --migrate 显式迁移")
+        node_id = str(old.get("node_id", "")) if re.fullmatch(r"[0-9a-f]{32}", str(old.get("node_id", ""))) else random_node_id()
+        cluster_id = str(old.get("cluster_id", "")) if re.fullmatch(r"[0-9a-f]{32}", str(old.get("cluster_id", ""))) else uuid.uuid4().hex
+        number = self.allocate_server_number(node_id, int(old.get("server_number", 1) or 1))
+        location = self.normalize_identity_location(old.get("location"), str(old.get("place", "")))
+        config = {**old, "enabled": True, "mode": "federation", "role": "federation", "cluster_id": cluster_id,
+                  "node_id": node_id, "bind": str(old.get("bind", "0.0.0.0")),
+                  "public_host": normalize_host(public_host), "internal_port": int(internal_port),
+                  "public_port": int(public_port or internal_port), "remark": safe_label(remark or str(old.get("remark", ""))),
+                  "server_number": number, "location": location, "paired": True, "created_at": int(old.get("created_at", utc_now())),
+                  "federation_migrated_at": utc_now() if old.get("enabled") else 0}
+        for key in ("controller_id", "controller_host", "controller_port", "pending_controller", "role_switch_pending"):
+            config.pop(key, None)
+        self._create_federation_identity(node_id)
+        self.save_config(config)
+        self.apply_local_identity(number, location, str(old.get("place", "")))
+        self.upsert_node(self.local_status(), role="federation")
+        self.register_federation_key(node_id, self.federation_root_certificate(), self.federation_identity_certificate())
+        if not self.db.connection.execute("SELECT 1 FROM federation_events LIMIT 1").fetchone():
+            self.create_event("member.upsert", f"member:{node_id}", self.federation_member_payload(
+                self.local_status(), legacy_number=bool(migrate)
+            ))
+        self.ensure_profile("全部节点", "all")
+        self.record_local_snapshot()
+        self.db.audit("federation.init", node_id, "migrated" if migrate else "new")
+        return config
+
+    def federation_init(self, public_host: str, internal_port: int, public_port: int | None = None,
+                        remark: str = "", migrate: bool = False) -> dict[str, Any]:
+        if not migrate:
+            return self._federation_init(public_host, internal_port, public_port, remark, False)
+        self.backups.mkdir(parents=True, exist_ok=True)
+        recovery = self.backups / f"legacy-cluster-rollback-{utc_now()}-{secrets.token_hex(3)}.tar.gz"
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            db_copy = Path(temporary) / "cluster.db"
+            destination = sqlite3.connect(db_copy)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            old_names = {path.name for path in self.pki.iterdir() if path.is_file()} if self.pki.exists() else set()
+            with tarfile.open(recovery, "w:gz") as archive:
+                if self.config_path.is_file():
+                    archive.add(self.config_path, arcname="config.json", recursive=False)
+                archive.add(db_copy, arcname="data/cluster.db", recursive=False)
+                for path in self.pki.iterdir() if self.pki.exists() else []:
+                    if path.is_file():
+                        archive.add(path, arcname=f"pki/{path.name}", recursive=False)
+            os.chmod(recovery, 0o600)
+            try:
+                result = self._federation_init(public_host, internal_port, public_port, remark, True)
+                migrated_users = self.publish_local_user_events()
+                with self.db.connection:
+                    self.db.connection.execute(
+                        "UPDATE nodes SET role='legacy-candidate',state='legacy-unverified',updated_at=? WHERE id<>?",
+                        (utc_now(), result["node_id"]),
+                    )
+                (self.pki / "cluster-ca.key").unlink(missing_ok=True)
+                if (self.pki / "cluster-ca.key").exists():
+                    raise ClusterError("旧共享 CA 私钥未退出活动 PKI")
+                result = {**result, "legacy_rollback_archive": str(recovery),
+                          "migrated_users": migrated_users}
+                self.save_config(result)
+                return result
+            except Exception:
+                self.replace_database(db_copy)
+                with tarfile.open(recovery, "r:gz") as archive:
+                    config_member = archive.getmember("config.json") if "config.json" in archive.getnames() else None
+                    if config_member:
+                        atomic_write(self.config_path, archive.extractfile(config_member).read(), 0o600)  # type: ignore[union-attr]
+                    for path in list(self.pki.iterdir()) if self.pki.exists() else []:
+                        if path.is_file() and path.name not in old_names:
+                            path.unlink(missing_ok=True)
+                    for member in archive.getmembers():
+                        if member.isfile() and member.name.startswith("pki/") and "/" not in member.name[4:]:
+                            atomic_write(self.pki / member.name[4:], archive.extractfile(member).read(), 0o600)  # type: ignore[union-attr]
+                raise
+
+    def migrate_to_federation(self) -> dict[str, Any]:
+        config = self.load_config()
+        return self.federation_init(str(config.get("public_host", "127.0.0.1")),
+                                    int(config.get("internal_port", 0)), int(config.get("public_port", 0)) or None,
+                                    str(config.get("remark", "")), migrate=True)
+
+    def federation_root_certificate(self) -> str:
+        path = self.pki / "federation-root.crt"
+        if not path.is_file():
+            raise ClusterError("联邦身份尚未初始化")
+        return path.read_text(encoding="utf-8")
+
+    def federation_identity_certificate(self) -> str:
+        path = self.pki / "federation-node.crt"
+        if not path.is_file():
+            raise ClusterError("联邦身份尚未初始化")
+        return path.read_text(encoding="utf-8")
+
+    def _certificate_fingerprint_pem(self, certificate: str) -> str:
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            path = Path(temporary) / "certificate.crt"
+            path.write_text(certificate, encoding="utf-8")
+            result = self._openssl(["x509", "-in", str(path), "-noout", "-fingerprint", "-sha256"])
+        value = result.stdout.strip().split("=", 1)[-1].replace(":", "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ClusterError("联邦证书指纹无效")
+        return value
+
+    def validate_federation_certificates(self, node_id: str, root_certificate: str,
+                                         identity_certificate: str) -> tuple[str, str]:
+        if not re.fullmatch(r"[0-9a-f]{32}", node_id):
+            raise ClusterError("联邦成员 node_id 无效")
+        if "BEGIN CERTIFICATE" not in root_certificate or "BEGIN CERTIFICATE" not in identity_certificate:
+            raise ClusterError("联邦成员证书不完整")
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            root, identity = Path(temporary) / "root.crt", Path(temporary) / "identity.crt"
+            root.write_text(root_certificate, encoding="utf-8")
+            identity.write_text(identity_certificate, encoding="utf-8")
+            root_text = self._openssl(["x509", "-in", str(root), "-noout", "-text"]).stdout
+            if not re.search(r"Basic Constraints:.*?CA:TRUE", root_text, re.DOTALL | re.IGNORECASE):
+                raise ClusterError("联邦根证书不是 CA 证书")
+            verify = self._openssl(["verify", "-CAfile", str(root), str(identity)], check=False)
+            if verify.returncode:
+                raise ClusterError("联邦身份证书不受所提供根证书签发")
+            subject = self._openssl(["x509", "-in", str(identity), "-noout", "-subject", "-nameopt", "RFC2253"]).stdout.strip()
+            match = re.search(r"(?:^|,)CN=([^,]+)", subject.removeprefix("subject="))
+            if not match or match.group(1) != node_id:
+                raise ClusterError("联邦身份证书 CN 与 node_id 不一致")
+            purpose = self._openssl(["x509", "-in", str(identity), "-noout", "-purpose"]).stdout
+            if not re.search(r"SSL client\s*:\s*Yes", purpose, re.IGNORECASE) or not re.search(r"SSL server\s*:\s*Yes", purpose, re.IGNORECASE):
+                raise ClusterError("联邦身份证书必须同时支持客户端和服务端 TLS")
+        return self._certificate_fingerprint_pem(root_certificate), self._certificate_fingerprint_pem(identity_certificate)
+
+    def register_federation_key(self, node_id: str, root_certificate: str, identity_certificate: str = "") -> None:
+        root_fingerprint, identity_fingerprint = self.validate_federation_certificates(
+            node_id, root_certificate, identity_certificate
+        )
+        existing = self.db.connection.execute("SELECT * FROM federation_keys WHERE node_id=?", (node_id,)).fetchone()
+        if existing and str(existing["root_fingerprint"] or self._certificate_fingerprint_pem(str(existing["root_certificate"]))) != root_fingerprint:
+            raise ClusterError("活动 node_id 的根证书不可替换；请使用新 node_id 重新加入")
+        if existing and str(existing["identity_fingerprint"] or self._certificate_fingerprint_pem(str(existing["identity_certificate"]))) != identity_fingerprint:
+            raise ClusterError("活动 node_id 的身份证书不可替换；请使用新 node_id 重新加入")
+        now = utc_now()
+        with self.db.connection:
+            self.db.connection.execute(
+                "INSERT INTO federation_keys(node_id,root_certificate,identity_certificate,root_fingerprint,identity_fingerprint,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(node_id) DO UPDATE SET updated_at=excluded.updated_at",
+                (node_id, root_certificate, identity_certificate, root_fingerprint, identity_fingerprint, now, now),
+            )
+
+    def federation_member_payload(self, status: dict[str, Any], root_certificate: str | None = None,
+                                  identity_certificate: str | None = None, legacy_number: bool = False) -> dict[str, Any]:
+        return {"status": status, "root_certificate": root_certificate or self.federation_root_certificate(),
+                "identity_certificate": identity_certificate or self.federation_identity_certificate(),
+                "server_number": int(status.get("server_number", self.load_config().get("server_number", 1))),
+                "legacy_number": bool(legacy_number)}
+
+    def _sign_federation(self, content: bytes) -> str:
+        key = self.pki / "federation-root.key"
+        if not key.is_file():
+            raise ClusterError("联邦签名私钥不存在")
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            source, signature = Path(temporary) / "content", Path(temporary) / "signature"
+            source.write_bytes(content)
+            self._openssl(["dgst", "-sha256", "-sign", str(key), "-out", str(signature), str(source)])
+            return base64.b64encode(signature.read_bytes()).decode("ascii")
+
+    def _verify_federation_signature(self, certificate: str, content: bytes, signature: str) -> bool:
+        try:
+            raw_signature = base64.b64decode(signature.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error):
+            return False
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            cert, public, source, sig = (Path(temporary) / name for name in ("root.crt", "root.pub", "content", "signature"))
+            cert.write_text(certificate, encoding="utf-8")
+            source.write_bytes(content)
+            sig.write_bytes(raw_signature)
+            try:
+                self._openssl(["x509", "-in", str(cert), "-pubkey", "-noout", "-out", str(public)])
+                return self._openssl(["dgst", "-sha256", "-verify", str(public), "-signature", str(sig), str(source)], check=False).returncode == 0
+            except ClusterError:
+                return False
+
+    def federation_lamport(self) -> int:
+        return int(self.db.setting("federation.lamport", "0") or 0)
+
+    @staticmethod
+    def _federation_user_key(owner_id: str, source_key: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{32}", owner_id) or not re.fullmatch(r"[0-9]{1,18}", source_key):
+            raise ClusterError("federation user key is invalid")
+        return f"{owner_id}:user:{source_key}"
+
+    @staticmethod
+    def _federation_agent_user_key(user_key: str) -> str:
+        value = int.from_bytes(hashlib.sha256(user_key.encode("utf-8")).digest()[:7], "big")
+        return str(max(1, value))
+
+    def _validate_federation_user_event(self, event_type: str, entity_key: str,
+                                        payload: dict[str, Any]) -> None:
+        if len(json_dumps(payload).encode("utf-8")) > 64 * 1024:
+            raise ClusterError("federation user event is too large")
+        owner_id = str(payload.get("owner_id", ""))
+        user_key = str(payload.get("user_key", ""))
+        if not re.fullmatch(r"[0-9a-f]{32}", owner_id) or not re.fullmatch(
+                r"[0-9a-f]{32}:user:[0-9]{1,18}", user_key):
+            raise ClusterError("federation user identity is invalid")
+        if not user_key.startswith(owner_id + ":user:"):
+            raise ClusterError("federation user owner does not match its stable key")
+        if event_type in {"user.upsert", "user.delete"}:
+            if entity_key != "user:" + user_key:
+                raise ClusterError("federation user entity key is invalid")
+            if event_type == "user.delete":
+                return
+            name = str(payload.get("name", "")).strip()
+            if not name or len(name) > 128:
+                raise ClusterError("federation user name is invalid")
+            try:
+                quotas = [int(payload.get(field, 0)) for field in ("lifetime_quota", "monthly_quota")]
+                reset_day = int(payload.get("reset_day", 1))
+                max_devices = int(payload.get("max_devices", 1))
+            except (TypeError, ValueError) as exc:
+                raise ClusterError("federation user numeric policy is invalid") from exc
+            if any(value < 0 or value > 2 ** 63 - 1 for value in quotas):
+                raise ClusterError("federation user quota is invalid")
+            if reset_day not in range(1, 29) or max_devices not in range(1, FEDERATION_DEVICE_MAX + 1):
+                raise ClusterError("federation user reset day or device limit is invalid")
+            expires_at = payload.get("expires_at")
+            if expires_at is not None and (not isinstance(expires_at, int) or expires_at < 0):
+                raise ClusterError("federation user expiry is invalid")
+            return
+        if event_type == "authorization.upsert":
+            if entity_key != "authorization:" + user_key:
+                raise ClusterError("federation authorization entity key is invalid")
+            nodes = payload.get("nodes")
+            permissions = payload.get("permissions")
+            if not isinstance(nodes, list) or len(nodes) > 256 or any(
+                    not re.fullmatch(r"[0-9a-f]{32}", str(node)) for node in nodes):
+                raise ClusterError("federation authorization node list is invalid")
+            if len(nodes) != len(set(str(node) for node in nodes)):
+                raise ClusterError("federation authorization node list contains duplicates")
+            if not isinstance(permissions, dict) or any(
+                    key not in FEDERATION_PROTOCOLS or not isinstance(value, bool)
+                    for key, value in permissions.items()):
+                raise ClusterError("federation protocol authorization is invalid")
+            if not isinstance(payload.get("enabled", True), bool) or not isinstance(payload.get("deleted", False), bool):
+                raise ClusterError("federation authorization state is invalid")
+            return
+        device_key = str(payload.get("device_key", ""))
+        if not re.fullmatch(re.escape(user_key) + r":device:[0-9a-f-]{36}", device_key):
+            raise ClusterError("federation device key is invalid")
+        try:
+            stable_device_uuid = str(uuid.UUID(device_key.rsplit(":device:", 1)[1]))
+        except ValueError as exc:
+            raise ClusterError("federation stable device UUID is invalid") from exc
+        if not device_key.endswith(":device:" + stable_device_uuid):
+            raise ClusterError("federation stable device UUID is not canonical")
+        if event_type in {"device.upsert", "device.delete"}:
+            if entity_key != "device:" + device_key:
+                raise ClusterError("federation device entity key is invalid")
+            if event_type == "device.delete":
+                return
+            try:
+                device_uuid = str(uuid.UUID(str(payload.get("uuid", ""))))
+            except ValueError as exc:
+                raise ClusterError("federation device UUID is invalid") from exc
+            if device_uuid != stable_device_uuid:
+                raise ClusterError("federation device UUID does not match its stable key")
+            name = str(payload.get("name", "")).strip()
+            password, ss_password = str(payload.get("password", "")), str(payload.get("ss_password", ""))
+            if not name or len(name) > 128 or not (8 <= len(password) <= 256) or not (8 <= len(ss_password) <= 256):
+                raise ClusterError("federation device credentials are invalid")
+            if not isinstance(payload.get("enabled", True), bool):
+                raise ClusterError("federation device state is invalid")
+            return
+        if event_type in {"token.upsert", "token.delete"}:
+            if entity_key != "token:" + device_key:
+                raise ClusterError("federation token entity key is invalid")
+            if event_type == "token.delete":
+                return
+            token = str(payload.get("token", ""))
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token) or not isinstance(payload.get("enabled", True), bool):
+                raise ClusterError("federation subscription token is invalid")
+            return
+        raise ClusterError("unsupported federation user event")
+
+    def _validate_event_payload(self, event_type: str, entity_key: str, payload: dict[str, Any]) -> None:
+        if event_type in FEDERATION_USER_EVENT_TYPES:
+            self._validate_federation_user_event(event_type, entity_key, payload)
+
+    def _create_event_if_changed(self, event_type: str, entity_key: str,
+                                 payload: dict[str, Any]) -> dict[str, Any] | None:
+        current = self.db.connection.execute(
+            "SELECT type,payload,deleted FROM federation_entities WHERE entity_key=?", (entity_key,)
+        ).fetchone()
+        deleted = event_type in {"user.delete", "device.delete", "token.delete"}
+        if current and bool(current["deleted"]) and not deleted:
+            return None
+        if current and str(current["type"]) == event_type and bool(current["deleted"]) == deleted \
+                and hmac.compare_digest(str(current["payload"]), json_dumps(payload)):
+            return None
+        return self.create_event(event_type, entity_key, payload)
+
+    def publish_local_user_events(self) -> dict[str, Any]:
+        if not self.is_federation():
+            raise ClusterError("federation mode is not enabled")
+        database = self.root / "modules" / "multiuser" / "data" / "lun.db"
+        if not database.is_file():
+            return {"users": 0, "events": 0, "skipped": True}
+        owner_id = str(self.load_config().get("node_id", ""))
+        bundle = export_master_users(self)
+        users = bundle.get("users")
+        if int(bundle.get("schema_version", 0)) != 1 or not isinstance(users, list) \
+                or len(users) > FEDERATION_USER_MAX:
+            raise ClusterError("local multi-user export is invalid")
+        current_entities: set[str] = set()
+        events: list[dict[str, Any]] = []
+        for raw in users:
+            if not isinstance(raw, dict):
+                raise ClusterError("local multi-user export contains a non-object user")
+            source_key = str(raw.get("key", ""))
+            user_key = self._federation_user_key(owner_id, source_key)
+            user_entity = "user:" + user_key
+            user_payload = {
+                "owner_id": owner_id, "user_key": user_key, "source_key": source_key,
+                "name": str(raw.get("name", "")).strip(),
+                "manual_disabled": bool(raw.get("manual_disabled", False)),
+                "lifetime_quota": int(raw.get("lifetime_quota", 0)),
+                "monthly_quota": int(raw.get("monthly_quota", 0)),
+                "reset_day": int(raw.get("reset_day", 1)), "expires_at": raw.get("expires_at"),
+                "max_devices": int(raw.get("max_devices", 1)),
+            }
+            self._validate_federation_user_event("user.upsert", user_entity, user_payload)
+            current_entities.add(user_entity)
+            created = self._create_event_if_changed("user.upsert", user_entity, user_payload)
+            if created:
+                events.append(created)
+            assigned = [str(row[0]) for row in self.db.connection.execute(
+                "SELECT node_id FROM user_nodes WHERE user_id=? ORDER BY node_id", (int(source_key),)
+            ) if re.fullmatch(r"[0-9a-f]{32}", str(row[0]))]
+            permissions = raw.get("permissions") if isinstance(raw.get("permissions"), dict) else {}
+            authorization_entity = "authorization:" + user_key
+            authorization_payload = {
+                "owner_id": owner_id, "user_key": user_key, "nodes": list(dict.fromkeys(assigned)),
+                "permissions": {key: bool(value) for key, value in permissions.items() if key in FEDERATION_PROTOCOLS},
+                "enabled": not bool(raw.get("manual_disabled", False)), "deleted": False,
+            }
+            self._validate_federation_user_event("authorization.upsert", authorization_entity, authorization_payload)
+            current_entities.add(authorization_entity)
+            created = self._create_event_if_changed("authorization.upsert", authorization_entity, authorization_payload)
+            if created:
+                events.append(created)
+            devices = raw.get("devices")
+            if not isinstance(devices, list) or len(devices) > FEDERATION_DEVICE_MAX:
+                raise ClusterError("local multi-user device list is invalid")
+            for raw_device in devices:
+                if not isinstance(raw_device, dict):
+                    raise ClusterError("local multi-user export contains a non-object device")
+                try:
+                    device_uuid = str(uuid.UUID(str(raw_device.get("uuid", ""))))
+                except ValueError as exc:
+                    raise ClusterError("local multi-user device UUID is invalid") from exc
+                device_key = f"{user_key}:device:{device_uuid}"
+                device_entity = "device:" + device_key
+                device_payload = {
+                    "owner_id": owner_id, "user_key": user_key, "device_key": device_key,
+                    "name": str(raw_device.get("name", "")).strip(), "uuid": device_uuid,
+                    "password": str(raw_device.get("password", "")),
+                    "ss_password": str(raw_device.get("ss_password", "")),
+                    "enabled": bool(raw_device.get("enabled", True)),
+                }
+                self._validate_federation_user_event("device.upsert", device_entity, device_payload)
+                current_entities.add(device_entity)
+                created = self._create_event_if_changed("device.upsert", device_entity, device_payload)
+                if created:
+                    events.append(created)
+                token_entity = "token:" + device_key
+                token_payload = {
+                    "owner_id": owner_id, "user_key": user_key, "device_key": device_key,
+                    "token": str(raw_device.get("token", "")),
+                    "enabled": bool(raw_device.get("enabled", True)),
+                }
+                self._validate_federation_user_event("token.upsert", token_entity, token_payload)
+                current_entities.add(token_entity)
+                created = self._create_event_if_changed("token.upsert", token_entity, token_payload)
+                if created:
+                    events.append(created)
+        owned: dict[str, tuple[str, dict[str, Any]]] = {}
+        for row in self.db.connection.execute(
+                "SELECT entity_key,type,payload FROM federation_entities WHERE type IN "
+                "('user.upsert','device.upsert','authorization.upsert','token.upsert')"):
+            try:
+                payload = json.loads(str(row["payload"]))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("owner_id") == owner_id:
+                owned[str(row["entity_key"])] = (str(row["type"]), payload)
+        for entity_key, (event_type, payload) in sorted(owned.items()):
+            if entity_key in current_entities:
+                continue
+            common = {"owner_id": owner_id, "user_key": str(payload.get("user_key", ""))}
+            if event_type == "user.upsert":
+                created = self._create_event_if_changed("user.delete", entity_key, common)
+            elif event_type == "device.upsert":
+                common["device_key"] = str(payload.get("device_key", ""))
+                created = self._create_event_if_changed("device.delete", entity_key, common)
+            elif event_type == "token.upsert":
+                common["device_key"] = str(payload.get("device_key", ""))
+                created = self._create_event_if_changed("token.delete", entity_key, common)
+            else:
+                common.update({"nodes": [], "permissions": {}, "enabled": False, "deleted": True})
+                created = self._create_event_if_changed("authorization.upsert", entity_key, common)
+            if created:
+                events.append(created)
+        self.db.audit("federation.users.publish", owner_id, f"users={len(users)} events={len(events)}")
+        return {"users": len(users), "events": len(events)}
+
+    def _apply_federation_user_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]:
+        database = self.root / "modules" / "multiuser" / "data" / "lun.db"
+        if not bundle.get("users") and not database.exists():
+            return {"users": 0, "devices": 0, "skipped": True}
+        agent = _multiuser_agent_path(self)
+        origin = str(self.load_config().get("cluster_id", ""))
+        if not re.fullmatch(r"[0-9a-f]{32}", origin):
+            raise ClusterError("federation cluster identity is invalid")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(self.module), delete=False) as handle:
+            json.dump(bundle, handle, ensure_ascii=False)
+            temporary = Path(handle.name)
+        os.chmod(temporary, 0o600)
+        try:
+            imported = self._run(
+                [str(agent), "--root", str(self.root), "--json", "cluster-import", "--path", str(temporary),
+                 "--origin", origin], timeout=120, check=False,
+            )
+        finally:
+            temporary.unlink(missing_ok=True)
+        if imported.returncode:
+            raise ClusterError((imported.stderr or imported.stdout or "federation user import failed")[-2000:])
+        applied = self._run([str(agent), "--root", str(self.root), "--json", "apply"], timeout=300, check=False)
+        if applied.returncode:
+            raise ClusterError((applied.stderr or applied.stdout or "federation user apply failed")[-2000:])
+        try:
+            result = json.loads(imported.stdout)
+        except json.JSONDecodeError:
+            result = {"users": len(bundle.get("users", []))}
+        return result if isinstance(result, dict) else {"users": len(bundle.get("users", []))}
+
+    def apply_federation_users(self, *, refresh: bool = True) -> dict[str, Any]:
+        if not self.is_federation():
+            return {"users": 0, "profiles": 0, "skipped": True}
+        entities: dict[str, tuple[str, dict[str, Any], bool]] = {}
+        for row in self.db.connection.execute(
+                "SELECT entity_key,type,payload,deleted FROM federation_entities WHERE type IN "
+                "('user.upsert','user.delete','device.upsert','device.delete','authorization.upsert','token.upsert','token.delete')"):
+            try:
+                payload = json.loads(str(row["payload"]))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                entities[str(row["entity_key"])] = (str(row["type"]), payload, bool(row["deleted"]))
+        local_id = str(self.load_config().get("node_id", ""))
+        bundle_users: list[dict[str, Any]] = []
+        active_profile_ids: set[int] = set()
+        seen_agent_keys: dict[str, str] = {}
+        devices_by_user: dict[str, list[dict[str, Any]]] = {}
+        tokens_by_device: dict[str, tuple[str, dict[str, Any], bool]] = {}
+        for entity_key, (event_type, payload, deleted) in entities.items():
+            if entity_key.startswith("device:") and event_type == "device.upsert" and not deleted:
+                devices_by_user.setdefault(str(payload.get("user_key", "")), []).append(payload)
+            elif entity_key.startswith("token:"):
+                tokens_by_device[str(payload.get("device_key", ""))] = (event_type, payload, deleted)
+        seen_credentials: set[str] = set()
+        for entity_key, (event_type, user, deleted) in sorted(entities.items()):
+            if not entity_key.startswith("user:") or event_type != "user.upsert" or deleted:
+                continue
+            user_key = str(user.get("user_key", ""))
+            authorization = entities.get("authorization:" + user_key)
+            if not authorization or authorization[2] or authorization[0] != "authorization.upsert":
+                nodes: list[str] = []
+                permissions: dict[str, bool] = {}
+                authorized = False
+            else:
+                auth = authorization[1]
+                nodes = [str(value) for value in auth.get("nodes", [])]
+                permissions = {str(key): bool(value) for key, value in auth.get("permissions", {}).items()}
+                authorized = bool(auth.get("enabled", True)) and not bool(auth.get("deleted", False))
+            authorized = authorized and not bool(user.get("manual_disabled", False))
+            agent_key = self._federation_agent_user_key(user_key)
+            collision = seen_agent_keys.get(agent_key)
+            if collision and collision != user_key:
+                raise ClusterError("federation user key hash collision")
+            seen_agent_keys[agent_key] = user_key
+            devices: list[dict[str, Any]] = []
+            user_devices = sorted(devices_by_user.get(user_key, []), key=lambda item: str(item.get("device_key", "")))
+            if len(user_devices) > FEDERATION_DEVICE_MAX:
+                raise ClusterError("federation user has too many active devices")
+            for device in user_devices:
+                token_row = tokens_by_device.get(str(device.get("device_key", "")))
+                if not token_row or token_row[0] != "token.upsert" or token_row[2]:
+                    continue
+                token_payload = token_row[1]
+                token = str(token_payload.get("token", ""))
+                for credential in (str(device.get("uuid", "")), token):
+                    if credential in seen_credentials:
+                        raise ClusterError("federation device UUID or token is duplicated")
+                    seen_credentials.add(credential)
+                enabled = bool(device.get("enabled", True)) and bool(token_payload.get("enabled", True))
+                devices.append({
+                    "key": str(device.get("uuid", "")),
+                    "name": str(device.get("name", "")), "uuid": str(device.get("uuid", "")),
+                    "password": str(device.get("password", "")), "ss_password": str(device.get("ss_password", "")),
+                    "token": token, "enabled": enabled,
+                })
+                if authorized and enabled and nodes:
+                    profile_name = safe_label(f"用户 {agent_key} {user.get('name', '')} / {device.get('name', '')}")
+                    profile = self.ensure_profile(profile_name, "nodes:" + ",".join(nodes), token, token)
+                    active_profile_ids.add(int(profile["id"]))
+            if authorized and local_id in nodes and user.get("owner_id") != local_id:
+                bundle_users.append({
+                    "key": agent_key, "name": str(user.get("name", "")),
+                    "manual_disabled": False, "lifetime_quota": int(user.get("lifetime_quota", 0)),
+                    "monthly_quota": int(user.get("monthly_quota", 0)), "reset_day": int(user.get("reset_day", 1)),
+                    "expires_at": user.get("expires_at"), "max_devices": max(int(user.get("max_devices", 1)), len(devices)),
+                    "devices": devices, "permissions": permissions,
+                })
+        try:
+            old_values = json.loads(self.db.setting("federation.user_profile_ids", "[]") or "[]")
+        except json.JSONDecodeError:
+            old_values = []
+        old_profile_ids = {int(value) for value in old_values if isinstance(value, int) or str(value).isdigit()}
+        with self.db.connection:
+            for profile_id in old_profile_ids - active_profile_ids:
+                self.db.connection.execute("UPDATE profiles SET enabled=0,updated_at=? WHERE id=?", (utc_now(), profile_id))
+        self.db.set_setting("federation.user_profile_ids", json_dumps(sorted(active_profile_ids)))
+        try:
+            imported = self._apply_federation_user_bundle({"schema_version": 1, "users": bundle_users})
+            self.db.set_setting("federation.users.pending", "0")
+        except ClusterError:
+            self.db.set_setting("federation.users.pending", "1")
+            raise
+        refreshed = len(self.refresh_profiles()) if refresh else 0
+        self.db.audit("federation.users.apply", local_id,
+                      f"users={len(bundle_users)} profiles={len(active_profile_ids)}")
+        return {"users": len(bundle_users), "profiles": len(active_profile_ids),
+                "refreshed": refreshed, "import": imported}
+
+    def create_event(self, event_type: str, entity_key: str, payload: dict[str, Any], *, created_at: int | None = None) -> dict[str, Any]:
+        self._validate_event_payload(event_type, entity_key, payload)
+        if not self.is_federation() or event_type not in FEDERATION_EVENT_TYPES:
+            raise ClusterError("联邦事件类型或模式无效")
+        config = self.load_config()
+        author_id = str(config["node_id"])
+        head = self.db.connection.execute("SELECT * FROM federation_heads WHERE author_id=?", (author_id,)).fetchone()
+        event = {"author_id": author_id, "author_seq": int(head["author_seq"] if head else 0) + 1,
+                 "prev_hash": str(head["event_hash"] if head else ""), "lamport": max(self.federation_lamport(), int(head["lamport"] if head else 0)) + 1,
+                 "type": event_type, "entity_key": safe_label(entity_key, 160), "payload": json_dumps(payload),
+                 "created_at": int(created_at or utc_now())}
+        event["signature"] = self._sign_federation(canonical_event_fields(event))
+        event["event_id"] = event_hash(event)
+        self.ingest_event(event)
+        return event
+
+    def _event_certificate(self, author_id: str, author_seq: int | None = None) -> str:
+        row = self.db.connection.execute("SELECT * FROM federation_keys WHERE node_id=?", (author_id,)).fetchone()
+        if not row:
+            raise ClusterError("事件作者未受信任")
+        if int(row["revoked_at"]):
+            cutoff = int(row["revoked_after_seq"])
+            if author_seq is None or cutoff < 0 or int(author_seq) > cutoff:
+                raise ClusterError("事件位于作者撤销边界之后")
+        return str(row["root_certificate"])
+
+    @staticmethod
+    def _event_sort_key(event: dict[str, Any]) -> tuple[int, str, str]:
+        return int(event["lamport"]), str(event["author_id"]), str(event["event_id"])
+
+    def _record_number_claim(self, event: dict[str, Any], member_id: str, payload: dict[str, Any]) -> None:
+        requested = max(1, int(payload.get("server_number", 1) or 1))
+        with self.db.connection:
+            self.db.connection.execute(
+                "INSERT INTO federation_number_claims(node_id,requested_number,fixed,lamport,author_id,event_id) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(node_id) DO UPDATE SET requested_number=excluded.requested_number,fixed=MAX(federation_number_claims.fixed,excluded.fixed),lamport=excluded.lamport,author_id=excluded.author_id,event_id=excluded.event_id",
+                (member_id, requested, int(bool(payload.get("legacy_number"))), int(event["lamport"]), event["author_id"], event["event_id"]),
+            )
+        self._resolve_federation_numbers()
+
+    def _resolve_federation_numbers(self) -> None:
+        claims = self.db.connection.execute(
+            "SELECT * FROM federation_number_claims ORDER BY fixed DESC,lamport,author_id,event_id,node_id"
+        ).fetchall()
+        claim_ids = {str(row["node_id"]) for row in claims}
+        used = {int(row["server_number"]) for row in self.db.connection.execute(
+            "SELECT node_id,server_number FROM node_number_history"
+        ) if str(row["node_id"]) not in claim_ids and int(row["server_number"]) > 0}
+        assignments: dict[str, int] = {}
+        for row in claims:
+            requested = int(row["requested_number"])
+            number = requested
+            while number in used:
+                number += 1
+            assignments[str(row["node_id"])] = number
+            used.add(number)
+        with self.db.connection:
+            for index, node_id in enumerate(sorted(claim_ids), 1):
+                self.db.connection.execute("UPDATE node_number_history SET server_number=? WHERE node_id=?", (-index, node_id))
+            for node_id, number in assignments.items():
+                self.db.connection.execute(
+                    "INSERT INTO node_number_history(node_id,server_number,allocated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(node_id) DO UPDATE SET server_number=excluded.server_number",
+                    (node_id, number, utc_now()),
+                )
+                self.db.connection.execute("UPDATE nodes SET server_number=?,updated_at=? WHERE id=?", (number, utc_now(), node_id))
+                self.db.connection.execute("UPDATE federation_number_claims SET assigned_number=? WHERE node_id=?", (number, node_id))
+
+    def ingest_event(self, event: dict[str, Any]) -> bool:
+        required = {"event_id", "author_id", "author_seq", "prev_hash", "lamport", "type", "entity_key", "payload", "created_at", "signature"}
+        if set(event) < required or event.get("type") not in FEDERATION_EVENT_TYPES:
+            raise ClusterError("联邦事件字段无效")
+        if not re.fullmatch(r"[0-9a-f]{32}", str(event["author_id"])) or int(event["author_seq"]) < 1:
+            raise ClusterError("联邦事件作者或序号无效")
+        if not isinstance(event["payload"], str) or event_hash(event) != event["event_id"]:
+            raise ClusterError("联邦事件哈希无效")
+        try:
+            payload = json.loads(event["payload"])
+        except json.JSONDecodeError as exc:
+            raise ClusterError("联邦事件载荷无效") from exc
+        if isinstance(payload, dict):
+            self._validate_event_payload(str(event["type"]), str(event["entity_key"]), payload)
+        if not isinstance(payload, dict) or not self._verify_federation_signature(
+            self._event_certificate(str(event["author_id"]), int(event["author_seq"])),
+            canonical_event_fields(event), str(event["signature"])
+        ):
+            raise ClusterError("联邦事件签名无效")
+        existing = self.db.connection.execute("SELECT event_hash FROM federation_events WHERE event_id=?", (event["event_id"],)).fetchone()
+        if existing:
+            return False
+        head = self.db.connection.execute("SELECT * FROM federation_heads WHERE author_id=?", (event["author_id"],)).fetchone()
+        if int(event["author_seq"]) != int(head["author_seq"] if head else 0) + 1 or str(event["prev_hash"]) != str(head["event_hash"] if head else ""):
+            raise ClusterError("联邦事件链不连续")
+        with self.db.connection:
+            self.db.connection.execute(
+                "INSERT INTO federation_events(event_id,author_id,author_seq,prev_hash,lamport,type,entity_key,payload,created_at,signature,event_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                tuple(event[key] for key in ("event_id", "author_id", "author_seq", "prev_hash", "lamport", "type", "entity_key", "payload", "created_at", "signature")) + (event["event_id"],),
+            )
+            self.db.connection.execute("INSERT INTO federation_heads(author_id,author_seq,event_hash,lamport) VALUES(?,?,?,?) ON CONFLICT(author_id) DO UPDATE SET author_seq=excluded.author_seq,event_hash=excluded.event_hash,lamport=excluded.lamport", (event["author_id"], event["author_seq"], event["event_id"], event["lamport"]))
+            self.db.set_setting("federation.lamport", max(self.federation_lamport(), int(event["lamport"])))
+        self._apply_federation_entity(event, payload)
+        return True
+
+    def _apply_federation_entity(self, event: dict[str, Any], payload: dict[str, Any]) -> None:
+        current = self.db.connection.execute("SELECT * FROM federation_entities WHERE entity_key=?", (event["entity_key"],)).fetchone()
+        tombstone_types = {"member.revoke", "revocation.proof", "user.delete", "device.delete", "token.delete"}
+        incoming_tombstone = event["type"] in tombstone_types
+        permanent_prefix = str(event["entity_key"]).split(":", 1)[0] in {"member", "user", "device", "token"}
+        if event["type"] in {"member.revoke", "revocation.proof"}:
+            node_id = str(payload.get("node_id", str(event["entity_key"]).removeprefix("member:")))
+            cutoff = max(0, int(payload.get("revoked_after_seq", 0)))
+            revoked_time = max(1, int(event["created_at"]))
+            with self.db.connection:
+                self.db.connection.execute(
+                    "UPDATE federation_keys SET revoked_at=CASE WHEN revoked_at=0 THEN ? ELSE MIN(revoked_at,?) END,"
+                    "revoked_after_seq=CASE WHEN revoked_after_seq<0 THEN ? ELSE MIN(revoked_after_seq,?) END,"
+                    "revocation_event_id=CASE WHEN revocation_event_id='' OR ?<revocation_event_id THEN ? ELSE revocation_event_id END,updated_at=? WHERE node_id=?",
+                    (revoked_time, revoked_time, cutoff, cutoff,
+                     event["event_id"], event["event_id"], utc_now(), node_id),
+                )
+                self.db.connection.execute("UPDATE nodes SET state='revoked',updated_at=? WHERE id=?", (utc_now(), node_id))
+        if current and int(current["deleted"]) and permanent_prefix:
+            if not incoming_tombstone or self._event_sort_key(event) <= (
+                    int(current["lamport"]), str(current["author_id"]), str(current["event_id"])):
+                return
+        elif current and not incoming_tombstone and self._event_sort_key(event) <= (
+                int(current["lamport"]), str(current["author_id"]), str(current["event_id"])):
+            return
+        deleted = int(incoming_tombstone)
+        with self.db.connection:
+            self.db.connection.execute(
+                "INSERT INTO federation_entities(entity_key,type,payload,deleted,lamport,author_id,event_id,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(entity_key) DO UPDATE SET type=excluded.type,payload=excluded.payload,deleted=excluded.deleted,lamport=excluded.lamport,author_id=excluded.author_id,event_id=excluded.event_id,updated_at=excluded.updated_at",
+                (event["entity_key"], event["type"], event["payload"], deleted, event["lamport"], event["author_id"], event["event_id"], utc_now()),
+            )
+        if event["type"] == "member.upsert":
+            status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+            member_id = str(status.get("node_id", ""))
+            if re.fullmatch(r"[0-9a-f]{32}", member_id):
+                root = str(payload.get("root_certificate", ""))
+                if root:
+                    self.register_federation_key(member_id, root, str(payload.get("identity_certificate", "")))
+                requested = int(payload.get("server_number", 0) or 0)
+                self.upsert_node({**status, "server_number": requested or status.get("server_number", 0)}, role="federation")
+                self._record_number_claim(event, member_id, payload)
+        elif event["type"] in {"member.revoke", "revocation.proof"}:
+            pass
+        elif event["type"] == "usage.absolute":
+            self.record_usage(str(payload.get("node_id", event["author_id"])), str(payload.get("device_uuid", "")),
+                              str(payload.get("epoch", "")), int(payload.get("uplink", 0)), int(payload.get("downlink", 0)),
+                              int(payload.get("month_uplink", 0)), int(payload.get("month_downlink", 0)), int(payload.get("sequence", 0)))
+        elif event["type"] == "profile.upsert":
+            name, token = safe_label(str(payload.get("name", ""))), str(payload.get("token", ""))
+            if name and token:
+                self.ensure_profile(name, str(payload.get("selector", "all")), token, str(payload.get("profile_key", token)))
+
+    def federation_manifest(self) -> dict[str, Any]:
+        heads = self.db.connection.execute("SELECT author_id,author_seq,event_hash,lamport FROM federation_heads ORDER BY author_id").fetchall()
+        return {"api_version": API_VERSION, "node_id": self.load_config().get("node_id", ""),
+                "heads": [dict(row) for row in heads], "generated_at": utc_now()}
+
+    def federation_events_since(self, manifest: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        seen = {str(item.get("author_id")): int(item.get("author_seq", 0)) for item in (manifest or {}).get("heads", []) if isinstance(item, dict)}
+        rows = self.db.connection.execute("SELECT * FROM federation_events ORDER BY author_id,author_seq").fetchall()
+        return [{key: row[key] for key in ("event_id", "author_id", "author_seq", "prev_hash", "lamport", "type", "entity_key", "payload", "created_at", "signature")} for row in rows if int(row["author_seq"]) > seen.get(str(row["author_id"]), 0)]
+
+    def federation_import_events(self, events: Iterable[dict[str, Any]], trusted: dict[str, dict[str, str]] | None = None) -> int:
+        event_list = list(events)
+        for node_id, certificates in (trusted or {}).items():
+            existing = self.db.connection.execute("SELECT root_certificate,identity_certificate FROM federation_keys WHERE node_id=?", (node_id,)).fetchone()
+            if not existing or self._certificate_fingerprint_pem(str(existing["root_certificate"])) != self._certificate_fingerprint_pem(str(certificates.get("root_certificate", ""))):
+                raise ClusterError("不得通过 events 接口无条件注入信任根")
+        ordered, _ = self._validate_event_batch(event_list)
+        count = 0
+        for event in ordered:
+            count += int(self.ingest_event(event))
+        if any(str(event.get("type", "")) in FEDERATION_USER_EVENT_TYPES for event in event_list):
+            try:
+                self.apply_federation_users(refresh=False)
+            except (ClusterError, OSError, sqlite3.Error):
+                self.db.set_setting("federation.users.pending", "1")
+                self.db.audit("federation.users.apply-pending", "events", "retry-required")
+        return count
+
+    def federation_trust_bundle(self) -> Path:
+        bundle = self.pki / "federation-trust.pem"
+        certificates = [str(row[0]).strip() for row in self.db.connection.execute("SELECT root_certificate FROM federation_keys WHERE revoked_at=0 ORDER BY node_id")]
+        atomic_write(bundle, "\n".join(certificates) + "\n", 0o644)
+        return bundle
+
+    def federation_snapshot(self, profile: str = "legacy") -> dict[str, Any]:
+        snapshot = self.local_snapshot(profile)
+        digest = hashlib.sha256(json_dumps(snapshot.get("files", {})).encode("utf-8")).hexdigest()
+        signed = {"node_id": self.load_config().get("node_id", ""), "profile_key": profile, "content_sha256": digest, "created_at": utc_now()}
+        signed["signature"] = self._sign_federation(json_dumps(signed).encode("utf-8"))
+        snapshot["federation_signature"] = signed
+        return snapshot
+
+    def record_federation_snapshot(self, snapshot: dict[str, Any]) -> None:
+        signature = snapshot.get("federation_signature") if isinstance(snapshot.get("federation_signature"), dict) else {}
+        status = snapshot.get("status") if isinstance(snapshot.get("status"), dict) else {}
+        node_id = str(status.get("node_id", ""))
+        signed = {key: signature.get(key) for key in ("node_id", "profile_key", "content_sha256", "created_at")}
+        digest = hashlib.sha256(json_dumps(snapshot.get("files", {})).encode("utf-8")).hexdigest()
+        if node_id != signed.get("node_id") or digest != signed.get("content_sha256") or not self._verify_federation_signature(self._event_certificate(node_id), json_dumps(signed).encode("utf-8"), str(signature.get("signature", ""))):
+            raise ClusterError("订阅快照签名或哈希无效")
+        self.record_snapshot(snapshot, role="federation")
+        self.create_event("snapshot.head", f"snapshot:{node_id}:{signed['profile_key']}", {"node_id": node_id, **signed})
+
+    def record_transport_failure(self, candidate_id: str, reporter_id: str | None = None, when: int | None = None) -> dict[str, Any]:
+        reporter_id = reporter_id or str(self.load_config().get("node_id", ""))
+        when = int(when or utc_now())
+        with self.db.connection:
+            self.db.connection.execute("INSERT OR IGNORE INTO federation_failures(candidate_id,reporter_id,failed_at) VALUES(?,?,?)", (candidate_id, reporter_id, when))
+            self.db.connection.execute("DELETE FROM federation_failures WHERE failed_at<?", (when - 60,))
+            self.db.connection.execute("UPDATE nodes SET state='suspect',last_failure=?,updated_at=? WHERE id=?", (when, when, candidate_id))
+        count = self.db.connection.execute("SELECT COUNT(*) FROM federation_failures WHERE candidate_id=? AND reporter_id=? AND failed_at>=?", (candidate_id, reporter_id, when - 60)).fetchone()[0]
+        return {"candidate_id": candidate_id, "state": "suspect", "failures": int(count), "needs_probe": int(count) >= 3}
+
+    def record_transport_success(self, candidate_id: str, when: int | None = None) -> dict[str, Any]:
+        when = int(when or utc_now())
+        with self.db.connection:
+            self.db.connection.execute("DELETE FROM federation_failures WHERE candidate_id=?", (candidate_id,))
+            self.db.connection.execute("DELETE FROM federation_probe_observations WHERE candidate_id=?", (candidate_id,))
+            self.db.connection.execute(
+                "UPDATE nodes SET state='online',last_success=?,updated_at=? WHERE id=? AND state NOT IN ('revoked','removed')",
+                (when, when, candidate_id),
+            )
+        return {"candidate_id": candidate_id, "state": "online", "cleared": True}
+
+    def _active_federation_count(self) -> int:
+        return int(self.db.connection.execute(
+            "SELECT COUNT(*) FROM nodes n JOIN federation_keys k ON k.node_id=n.id "
+            "WHERE n.state NOT IN ('legacy-unverified','revoked','removed') AND k.revoked_at=0"
+        ).fetchone()[0])
+
+    def probe_vote_for_member(self, candidate_id: str, nonce: str, requester_id: str = "") -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{16,64}", nonce):
+            raise ClusterError("probe nonce is invalid")
+        local_id = str(self.load_config().get("node_id", ""))
+        if candidate_id in {local_id, requester_id}:
+            raise ClusterError("probe candidate is invalid")
+        node = self.node(candidate_id)
+        key = self.db.connection.execute(
+            "SELECT revoked_at FROM federation_keys WHERE node_id=?", (candidate_id,)
+        ).fetchone()
+        if not key or int(key["revoked_at"]) or str(node["state"]) in {"legacy-unverified", "revoked", "removed"}:
+            raise ClusterError("probe candidate is not an active trusted member")
+        reachable = False
+        try:
+            response = mutual_request(self, str(node["endpoint_host"]), int(node["endpoint_port"]),
+                                      "GET", "/v1/status", timeout=10)
+            reachable = str(response.get("status", {}).get("node_id", "")) == candidate_id
+        except (ClusterError, OSError, ssl.SSLError):
+            reachable = False
+        if reachable:
+            self.record_transport_success(candidate_id)
+        return self.create_probe_vote(candidate_id, reachable, nonce=nonce)
+
+    def _coordinate_after_failures(self, candidate_id: str, failure_times: list[int]) -> dict[str, Any]:
+        if len(failure_times) < 3 or max(failure_times) - min(failure_times) > 60:
+            return {"candidate_id": candidate_id, "state": "suspect", "revoked": False,
+                    "reason": "three failures within 60 seconds are required"}
+        local_id = str(self.load_config().get("node_id", ""))
+        for observed_at in failure_times[-3:]:
+            vote = self.create_probe_vote(candidate_id, False, observed_at=observed_at,
+                                          nonce=secrets.token_hex(16))
+            with contextlib.suppress(ClusterError):
+                self.record_probe_vote(vote)
+        if self._active_federation_count() > 2:
+            for voter in self.trusted_federation_nodes():
+                voter_id = str(voter["id"])
+                if voter_id in {candidate_id, local_id}:
+                    continue
+                nonce = secrets.token_hex(16)
+                try:
+                    response = mutual_request(
+                        self, str(voter["endpoint_host"]), int(voter["endpoint_port"]), "POST",
+                        "/v1/federation/probe", {"candidate_id": candidate_id, "nonce": nonce}, timeout=20,
+                    )
+                    vote = response.get("vote") if isinstance(response.get("vote"), dict) else {}
+                    if vote.get("nonce") != nonce:
+                        raise ClusterError("probe vote is not bound to the request nonce")
+                    verdict = self.record_probe_vote(vote)
+                    if bool(vote.get("reachable")):
+                        return {**verdict, "revoked": False, "recovered": True}
+                except (ClusterError, OSError, ssl.SSLError):
+                    continue
+        return self.finalize_suspect(candidate_id)
+
+    def coordinate_member_health(self, candidate_id: str, *, probe: Any | None = None,
+                                 now: int | None = None) -> dict[str, Any]:
+        node = self.node(candidate_id)
+        key = self.db.connection.execute(
+            "SELECT revoked_at FROM federation_keys WHERE node_id=?", (candidate_id,)
+        ).fetchone()
+        if not key or int(key["revoked_at"]) or str(node["state"]) in {"legacy-unverified", "revoked", "removed"}:
+            raise ClusterError("health candidate is not an active trusted member")
+        base = int(now or utc_now())
+        failures: list[int] = []
+        for attempt in range(3):
+            observed_at = base + attempt
+            try:
+                if probe is None:
+                    response = mutual_request(self, str(node["endpoint_host"]), int(node["endpoint_port"]),
+                                              "GET", "/v1/status", timeout=10)
+                    if str(response.get("status", {}).get("node_id", "")) != candidate_id:
+                        raise FederationTransportError("probe identity mismatch")
+                else:
+                    if not bool(probe(candidate_id, attempt)):
+                        raise FederationTransportError("probe failed")
+                return {**self.record_transport_success(candidate_id, observed_at), "revoked": False,
+                        "attempts": attempt + 1}
+            except (FederationTransportError, OSError, ssl.SSLError):
+                failures.append(observed_at)
+                self.record_transport_failure(candidate_id, when=observed_at)
+        return {**self._coordinate_after_failures(candidate_id, failures), "attempts": 3}
+
+    @staticmethod
+    def canonical_probe_vote(vote: dict[str, Any]) -> bytes:
+        return json_dumps({key: vote[key] for key in (
+            "candidate_id", "voter_id", "reachable", "observed_at", "nonce"
+        )}).encode("utf-8")
+
+    def create_probe_vote(self, candidate_id: str, reachable: bool, *, observed_at: int | None = None,
+                          nonce: str | None = None) -> dict[str, Any]:
+        vote = {"candidate_id": candidate_id, "voter_id": str(self.load_config().get("node_id", "")),
+                "reachable": bool(reachable), "observed_at": int(observed_at or utc_now()),
+                "nonce": nonce or secrets.token_hex(16)}
+        vote["signature"] = self._sign_federation(self.canonical_probe_vote(vote))
+        vote["vote_id"] = hashlib.sha256(self.canonical_probe_vote(vote) + b"." + vote["signature"].encode("ascii")).hexdigest()
+        return vote
+
+    def verify_probe_vote(self, vote: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+        now = int(now or utc_now())
+        required = {"candidate_id", "voter_id", "reachable", "observed_at", "nonce", "signature", "vote_id"}
+        if set(vote) < required or not re.fullmatch(r"[0-9a-f]{32}", str(vote["candidate_id"])) \
+                or not re.fullmatch(r"[0-9a-f]{32}", str(vote["voter_id"])):
+            raise ClusterError("探测投票字段无效")
+        if vote["candidate_id"] == vote["voter_id"] or not re.fullmatch(r"[0-9a-f]{16,64}", str(vote["nonce"])):
+            raise ClusterError("候选节点不能为自己投票或 nonce 无效")
+        observed_at = int(vote["observed_at"])
+        if observed_at < now - 60 or observed_at > now + 5:
+            raise ClusterError("探测投票已过期或时间超前")
+        row = self.db.connection.execute(
+            "SELECT n.state,k.root_certificate,k.revoked_at FROM nodes n JOIN federation_keys k ON k.node_id=n.id WHERE n.id=?",
+            (vote["voter_id"],),
+        ).fetchone()
+        if not row or row["state"] in {"revoked", "removed"} or int(row["revoked_at"]):
+            raise ClusterError("探测投票者不是活动成员")
+        expected_id = hashlib.sha256(self.canonical_probe_vote(vote) + b"." + str(vote["signature"]).encode("ascii")).hexdigest()
+        if expected_id != vote["vote_id"] or not self._verify_federation_signature(
+            str(row["root_certificate"]), self.canonical_probe_vote(vote), str(vote["signature"])
+        ):
+            raise ClusterError("探测投票签名无效")
+        return vote
+
+    def _probe_verdict(self, candidate_id: str, now: int | None = None) -> dict[str, Any]:
+        now = int(now or utc_now())
+        active = self._active_federation_count()
+        rows = self.db.connection.execute(
+            "SELECT * FROM federation_probe_observations WHERE candidate_id=? AND reachable=0 AND observed_at>=? ORDER BY observed_at,vote_id",
+            (candidate_id, now - 60),
+        ).fetchall()
+        valid_rows: list[sqlite3.Row] = []
+        for row in rows:
+            vote = {key: row[key] for key in (
+                "vote_id", "candidate_id", "voter_id", "reachable", "observed_at", "nonce", "signature"
+            )}
+            vote["reachable"] = bool(vote["reachable"])
+            try:
+                self.verify_probe_vote(vote, now=now)
+            except ClusterError:
+                continue
+            valid_rows.append(row)
+        if active == 2:
+            voters = {str(row["voter_id"]) for row in valid_rows}
+            valid_count = len(valid_rows) if len(voters) == 1 else 0
+            required = 3
+        else:
+            valid_count = len({str(row["voter_id"]) for row in valid_rows})
+            required = max(1, ((max(0, active - 1)) // 2) + 1)
+        return {"candidate_id": candidate_id, "unreachable_votes": valid_count, "required": required,
+                "revocable": valid_count >= required, "vote_ids": [str(row["vote_id"]) for row in valid_rows]}
+
+    def record_probe_vote(self, vote: dict[str, Any] | str, voter_id: str | None = None,
+                          reachable: bool | None = None, signature: str = "") -> dict[str, Any]:
+        if not isinstance(vote, dict):
+            candidate_id = vote
+            if voter_id != self.load_config().get("node_id") or signature:
+                raise ClusterError("远端探测投票必须提交完整规范化载荷")
+            vote = self.create_probe_vote(candidate_id, bool(reachable))
+        self.verify_probe_vote(vote)
+        if bool(vote["reachable"]):
+            return {**self.record_transport_success(str(vote["candidate_id"])),
+                    "unreachable_votes": 0, "required": self._probe_verdict(str(vote["candidate_id"]))["required"],
+                    "revocable": False, "vote_ids": []}
+        try:
+            with self.db.connection:
+                self.db.connection.execute(
+                    "INSERT INTO federation_probe_observations(vote_id,candidate_id,voter_id,reachable,observed_at,nonce,signature,received_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (vote["vote_id"], vote["candidate_id"], vote["voter_id"], int(bool(vote["reachable"])),
+                     int(vote["observed_at"]), vote["nonce"], vote["signature"], utc_now()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ClusterError("探测投票 nonce 或 vote_id 已重放") from exc
+        return self._probe_verdict(str(vote["candidate_id"]))
+
+    def finalize_suspect(self, candidate_id: str) -> dict[str, Any]:
+        verdict = self._probe_verdict(candidate_id)
+        if not verdict["revocable"]:
+            return {**verdict, "revoked": False}
+        head = self.db.connection.execute("SELECT author_seq FROM federation_heads WHERE author_id=?", (candidate_id,)).fetchone()
+        event = self.create_event("revocation.proof", f"member:{candidate_id}", {
+            "node_id": candidate_id, "reason": "majority probe failure", "votes": verdict["unreachable_votes"],
+            "required": verdict["required"], "vote_ids": verdict["vote_ids"],
+            "revoked_after_seq": int(head[0] if head else 0),
+        })
+        return {**verdict, "revoked": True, "proof": event}
+
+    def revoke_member(self, node_id: str, reason: str = "manual") -> dict[str, Any]:
+        if not self.is_federation():
+            raise ClusterError("当前不是联邦模式")
+        head = self.db.connection.execute("SELECT author_seq FROM federation_heads WHERE author_id=?", (node_id,)).fetchone()
+        event = self.create_event("member.revoke", f"member:{node_id}", {
+            "node_id": node_id, "reason": safe_label(reason, 200),
+            "revoked_after_seq": int(head[0] if head else 0),
+        })
+        return {"event": event, "node_id": node_id}
+
+    def federation_cleanup_plan(self, node_id: str | None = None) -> dict[str, Any]:
+        node_id = node_id or str(self.load_config().get("node_id", ""))
+        row = self.db.connection.execute("SELECT revoked_at FROM federation_keys WHERE node_id=?", (node_id,)).fetchone()
+        tombstone = self.db.connection.execute(
+            "SELECT deleted FROM federation_entities WHERE entity_key=?", ("member:" + node_id,)
+        ).fetchone()
+        return {"revoked": bool((row and row[0]) or (tombstone and tombstone[0])), "node_id": node_id,
+                "remove": ["federation memberships", "federation users", "federation subscription profiles"],
+                "preserve": ["proxy protocols", "local Lun data", "visit monitor"]}
+
+    def membership_status_proof(self, node_id: str, nonce: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9A-Za-z_-]{16,128}", nonce):
+            raise ClusterError("membership-status nonce 无效")
+        signer = str(self.load_config().get("node_id", ""))
+        certificate = self.federation_root_certificate()
+        proof = {"node_id": node_id, "revoked": self.federation_cleanup_plan(node_id)["revoked"],
+                 "nonce": nonce, "created_at": utc_now(), "signer": signer,
+                 "certificate_fingerprint": self._certificate_fingerprint_pem(certificate)}
+        proof["signature"] = self._sign_federation(json_dumps(proof).encode("utf-8"))
+        proof["signer_root_certificate"] = certificate
+        return proof
+
+    def verify_membership_status_proof(self, proof: dict[str, Any], expected_node_id: str,
+                                       expected_nonce: str, *, now: int | None = None,
+                                       consume: bool = False) -> bool:
+        now = int(now or utc_now())
+        signed = {key: proof.get(key) for key in (
+            "node_id", "revoked", "nonce", "created_at", "signer", "certificate_fingerprint"
+        )}
+        if signed["node_id"] != expected_node_id or signed["nonce"] != expected_nonce:
+            raise ClusterError("membership-status proof 请求绑定不匹配")
+        if int(signed["created_at"] or 0) < now - 60 or int(signed["created_at"] or 0) > now + 5:
+            raise ClusterError("membership-status proof 已过期")
+        signer = str(signed["signer"])
+        row = self.db.connection.execute("SELECT root_certificate,root_fingerprint,revoked_at FROM federation_keys WHERE node_id=?", (signer,)).fetchone()
+        certificate = str(proof.get("signer_root_certificate", ""))
+        fingerprint = self._certificate_fingerprint_pem(certificate)
+        if not row or int(row["revoked_at"]) or fingerprint != signed["certificate_fingerprint"] or fingerprint != str(row["root_fingerprint"]):
+            raise ClusterError("membership-status proof 签名者不受信任")
+        if not self._verify_federation_signature(certificate, json_dumps(signed).encode("utf-8"), str(proof.get("signature", ""))):
+            raise ClusterError("membership-status proof 签名无效")
+        proof_id = hashlib.sha256(
+            json_dumps(signed).encode("utf-8") + b"." + str(proof.get("signature", "")).encode("ascii")
+        ).hexdigest()
+        if consume:
+            key = "membership.proof." + proof_id
+            if self.db.setting(key):
+                raise ClusterError("membership-status proof has already been consumed")
+            self.db.set_setting(key, now)
+        return True
+
+    def _after_revoked_cleanup_reset(self) -> None:
+        """Test seam after destructive reset and before commit."""
+
+    def exit_revoked_federation(self, proof: dict[str, Any], expected_nonce: str) -> dict[str, Any]:
+        config = self.load_config()
+        local_id = str(config.get("node_id", ""))
+        if not self.is_federation() or not re.fullmatch(r"[0-9a-f]{32}", local_id):
+            raise ClusterError("local node is not an active federation identity")
+        self.verify_membership_status_proof(proof, local_id, expected_nonce)
+        if not bool(proof.get("revoked")) or str(proof.get("signer", "")) == local_id:
+            raise ClusterError("proof does not establish revocation by a surviving trusted member")
+        old_cluster = str(config.get("cluster_id", ""))
+        profile_tokens = [str(row[0]) for row in self.db.connection.execute("SELECT token FROM profiles")]
+        multi_db = self.root / "modules" / "multiuser" / "data" / "lun.db"
+        multi_generated = self.root / "modules" / "multiuser" / "generated"
+        webroot = self.root.parent / "weblun"
+        preserved_files = [self.root / "xr.json", self.root / "sb.json"]
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            checkpoint_dir = Path(temporary)
+            cluster_db = checkpoint_dir / "cluster.db"
+            destination = sqlite3.connect(cluster_db)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            config_bytes = self.config_path.read_bytes() if self.config_path.is_file() else None
+            for source, name in ((self.pki, "pki"), (self.cache, "cache"),
+                                 (multi_generated, "multi-generated")):
+                if source.exists():
+                    shutil.copytree(source, checkpoint_dir / name)
+            for token in profile_tokens:
+                source = webroot / token
+                if source.exists():
+                    shutil.copytree(source, checkpoint_dir / "web" / token)
+            multi_checkpoint = checkpoint_dir / "multiuser.db"
+            if multi_db.is_file():
+                source_db = sqlite3.connect(f"file:{multi_db.resolve().as_posix()}?mode=ro", uri=True)
+                target_db = sqlite3.connect(multi_checkpoint)
+                try:
+                    source_db.backup(target_db)
+                finally:
+                    source_db.close()
+                    target_db.close()
+            file_backups = {path: path.read_bytes() for path in preserved_files if path.is_file()}
+            history = [tuple(row) for row in self.db.connection.execute(
+                "SELECT node_id,server_number,allocated_at FROM node_number_history ORDER BY server_number"
+            )]
+            try:
+                if multi_db.exists():
+                    self._apply_federation_user_bundle({"schema_version": 1, "users": []})
+                fresh_path = checkpoint_dir / "fresh.db"
+                fresh = Database(fresh_path)
+                try:
+                    fresh.migrate()
+                    with fresh.connection:
+                        fresh.connection.executemany(
+                            "INSERT OR IGNORE INTO node_number_history(node_id,server_number,allocated_at) VALUES(?,?,?)",
+                            history,
+                        )
+                finally:
+                    fresh.close()
+                self.replace_database(fresh_path)
+                shutil.rmtree(self.pki, ignore_errors=True)
+                shutil.rmtree(self.cache, ignore_errors=True)
+                for token in profile_tokens:
+                    shutil.rmtree(webroot / token, ignore_errors=True)
+                retired_numbers = sorted({int(row[1]) for row in history if int(row[1]) > 0})
+                self.save_config({
+                    "enabled": False, "role": "disabled", "retired_node_id": local_id,
+                    "retired_cluster_id": old_cluster, "retired_server_numbers": retired_numbers,
+                    "revoked_at": utc_now(),
+                })
+                self._after_revoked_cleanup_reset()
+            except Exception:
+                self.replace_database(cluster_db)
+                if config_bytes is None:
+                    self.config_path.unlink(missing_ok=True)
+                else:
+                    atomic_write(self.config_path, config_bytes, 0o600)
+                for target, name in ((self.pki, "pki"), (self.cache, "cache"),
+                                     (multi_generated, "multi-generated")):
+                    shutil.rmtree(target, ignore_errors=True)
+                    backup = checkpoint_dir / name
+                    if backup.exists():
+                        shutil.copytree(backup, target)
+                for token in profile_tokens:
+                    shutil.rmtree(webroot / token, ignore_errors=True)
+                    backup = checkpoint_dir / "web" / token
+                    if backup.exists():
+                        shutil.copytree(backup, webroot / token)
+                if multi_checkpoint.is_file():
+                    multi_db.parent.mkdir(parents=True, exist_ok=True)
+                    source_db = sqlite3.connect(
+                        f"file:{multi_checkpoint.resolve().as_posix()}?mode=ro", uri=True
+                    )
+                    target_db = sqlite3.connect(multi_db)
+                    try:
+                        source_db.backup(target_db)
+                    finally:
+                        source_db.close()
+                        target_db.close()
+                for path in preserved_files:
+                    if path in file_backups:
+                        atomic_write(path, file_backups[path], 0o600)
+                    else:
+                        path.unlink(missing_ok=True)
+                self.secure_files()
+                raise
+        self.secure_files()
+        return {"cleaned": True, "retired_node_id": local_id, "retired_cluster_id": old_cluster,
+                "preserved": ["proxy protocols", "ordinary local users", "visit monitor"],
+                "next": "run federation-init to create a new identity"}
+
+    def check_self_revocation(self, *, query: Any | None = None) -> dict[str, Any]:
+        if not self.is_federation():
+            return {"checked": 0, "cleaned": False, "skipped": True}
+        local_id = str(self.load_config().get("node_id", ""))
+        checked = 0
+        failures: dict[str, str] = {}
+        for peer in self.trusted_federation_nodes():
+            peer_id = str(peer["id"])
+            nonce = secrets.token_urlsafe(24)
+            verified_revoked = False
+            try:
+                if query is None:
+                    response = membership_status_request(self, dict(peer), local_id, nonce)
+                    proof = response.get("proof") if isinstance(response.get("proof"), dict) else {}
+                else:
+                    response = query(dict(peer), nonce)
+                    proof = response.get("proof") if isinstance(response, dict) and isinstance(response.get("proof"), dict) else response
+                if not isinstance(proof, dict):
+                    raise ClusterError("membership-status response has no proof")
+                if str(proof.get("signer", "")) != peer_id:
+                    raise ClusterError("membership-status signer does not match the queried peer")
+                self.verify_membership_status_proof(proof, local_id, nonce)
+                checked += 1
+                if bool(proof.get("revoked")):
+                    verified_revoked = True
+                    return {**self.exit_revoked_federation(proof, nonce), "checked": checked,
+                            "signer": peer_id}
+                self.verify_membership_status_proof(proof, local_id, nonce, consume=True)
+            except (ClusterError, OSError, ssl.SSLError) as exc:
+                if verified_revoked:
+                    raise
+                failures[peer_id] = exc.__class__.__name__
+        return {"checked": checked, "cleaned": False, "failures": failures}
+
+    def federation_public_bundle(self) -> dict[str, Any]:
+        config = self.load_config()
+        trust = [dict(row) for row in self.db.connection.execute(
+            "SELECT node_id,root_certificate,identity_certificate,root_fingerprint,identity_fingerprint,"
+            "revoked_at,revoked_after_seq,revocation_event_id FROM federation_keys ORDER BY node_id"
+        ).fetchall()]
+        roster = [dict(row) for row in self.db.connection.execute(
+            "SELECT id,endpoint_host,endpoint_port,internal_port,remark,server_number,country_code,country,region,city,provider,state FROM nodes ORDER BY server_number,id"
+        ).fetchall()]
+        bundle = {"format": 3, "api_version": API_VERSION, "cluster_id": config.get("cluster_id", ""),
+                  "node_id": config.get("node_id", ""), "status": self.local_status(),
+                  "root_certificate": self.federation_root_certificate(),
+                  "identity_certificate": self.federation_identity_certificate(),
+                  "manifest": self.federation_manifest(), "events": self.federation_events_since({}),
+                  "trust": trust, "roster": roster, "created_at": utc_now(), "nonce": secrets.token_hex(16)}
+        bundle["signature"] = self._sign_federation(json_dumps(bundle).encode("utf-8"))
+        return bundle
+
+    def _validate_event_batch(self, events: Iterable[dict[str, Any]], anchor: dict[str, dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        known: dict[str, dict[str, Any]] = {}
+        for row in self.db.connection.execute("SELECT * FROM federation_keys"):
+            known[str(row["node_id"])] = dict(row)
+        for node_id, value in (anchor or {}).items():
+            root = str(value.get("root_certificate", ""))
+            identity = str(value.get("identity_certificate", ""))
+            root_fp, identity_fp = self.validate_federation_certificates(node_id, root, identity)
+            existing = known.get(node_id)
+            if existing and str(existing.get("root_fingerprint") or self._certificate_fingerprint_pem(str(existing["root_certificate"]))) != root_fp:
+                raise ClusterError("bundle 尝试替换活动 node_id 的根证书")
+            known[node_id] = {**(existing or {}), "node_id": node_id, "root_certificate": root,
+                              "identity_certificate": identity, "root_fingerprint": root_fp,
+                              "identity_fingerprint": identity_fp, "revoked_at": int((existing or {}).get("revoked_at", 0)),
+                              "revoked_after_seq": int((existing or {}).get("revoked_after_seq", -1))}
+        heads = {str(row["author_id"]): (int(row["author_seq"]), str(row["event_hash"]))
+                 for row in self.db.connection.execute("SELECT * FROM federation_heads")}
+        pending = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise ClusterError("bundle 事件不是对象")
+            existing = self.db.connection.execute("SELECT event_hash FROM federation_events WHERE event_id=?", (event.get("event_id", ""),)).fetchone()
+            if existing:
+                continue
+            pending.append(dict(event))
+        accepted: list[dict[str, Any]] = []
+        while pending:
+            progress = False
+            for event in sorted(list(pending), key=lambda item: (str(item.get("author_id", "")), int(item.get("author_seq", 0)))):
+                required = {"event_id", "author_id", "author_seq", "prev_hash", "lamport", "type", "entity_key", "payload", "created_at", "signature"}
+                if set(event) < required or event.get("type") not in FEDERATION_EVENT_TYPES or event_hash(event) != event.get("event_id"):
+                    raise ClusterError("bundle 事件字段或哈希无效")
+                author = str(event["author_id"])
+                key = known.get(author)
+                if not key:
+                    continue
+                expected_seq, expected_hash = heads.get(author, (0, ""))
+                if int(event["author_seq"]) != expected_seq + 1 or str(event["prev_hash"]) != expected_hash:
+                    continue
+                cutoff = int(key.get("revoked_after_seq", -1))
+                if int(key.get("revoked_at", 0)) and (cutoff < 0 or int(event["author_seq"]) > cutoff):
+                    raise ClusterError("bundle 包含撤销边界后的作者事件")
+                if not self._verify_federation_signature(str(key["root_certificate"]), canonical_event_fields(event), str(event["signature"])):
+                    raise ClusterError("bundle 事件签名无效")
+                try:
+                    payload = json.loads(str(event["payload"]))
+                except json.JSONDecodeError as exc:
+                    raise ClusterError("bundle 事件载荷无效") from exc
+                if not isinstance(payload, dict):
+                    raise ClusterError("bundle 事件载荷必须是对象")
+                self._validate_event_payload(str(event["type"]), str(event["entity_key"]), payload)
+                if event["type"] == "member.upsert":
+                    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+                    member_id = str(status.get("node_id", ""))
+                    root, identity = str(payload.get("root_certificate", "")), str(payload.get("identity_certificate", ""))
+                    root_fp, identity_fp = self.validate_federation_certificates(member_id, root, identity)
+                    old = known.get(member_id)
+                    if old and str(old.get("root_fingerprint") or self._certificate_fingerprint_pem(str(old["root_certificate"]))) != root_fp:
+                        raise ClusterError("成员事件尝试替换活动 node_id 的根证书")
+                    known.setdefault(member_id, {"node_id": member_id, "root_certificate": root,
+                                                 "identity_certificate": identity, "root_fingerprint": root_fp,
+                                                 "identity_fingerprint": identity_fp, "revoked_at": 0,
+                                                 "revoked_after_seq": -1})
+                elif event["type"] in {"member.revoke", "revocation.proof"}:
+                    target = str(payload.get("node_id", ""))
+                    if target in known:
+                        known[target]["revoked_at"] = int(event["created_at"])
+                        known[target]["revoked_after_seq"] = int(payload.get("revoked_after_seq", 0))
+                heads[author] = (int(event["author_seq"]), str(event["event_id"]))
+                accepted.append(event)
+                pending.remove(event)
+                progress = True
+            if not progress:
+                raise ClusterError("bundle 事件依赖不完整、作者不受信或事件链存在缺口")
+        return accepted, known
+
+    def validate_federation_bundle(self, bundle: dict[str, Any], *, pinned_identity_fingerprint: str = "",
+                                   allow_cluster_adopt: bool = False, allow_foreign_single: bool = False) -> dict[str, Any]:
+        unsigned = {key: value for key, value in bundle.items() if key != "signature"}
+        node_id = str(bundle.get("node_id", ""))
+        cluster_id = str(bundle.get("cluster_id", ""))
+        if int(bundle.get("format", 0)) != 3 or not re.fullmatch(r"[0-9a-f]{32}", cluster_id):
+            raise ClusterError("联邦 bundle 格式或 cluster_id 无效")
+        root, identity = str(bundle.get("root_certificate", "")), str(bundle.get("identity_certificate", ""))
+        root_fp, identity_fp = self.validate_federation_certificates(node_id, root, identity)
+        if pinned_identity_fingerprint and not hmac.compare_digest(identity_fp, pinned_identity_fingerprint):
+            raise ClusterError("联邦 bundle 身份证书与加入地址指纹不一致")
+        if not self._verify_federation_signature(root, json_dumps(unsigned).encode("utf-8"), str(bundle.get("signature", ""))):
+            raise ClusterError("联邦 bundle 签名无效")
+        local = self.load_config()
+        local_cluster = str(local.get("cluster_id", ""))
+        local_members = int(self.db.connection.execute("SELECT COUNT(*) FROM federation_keys").fetchone()[0])
+        remote_members = len(bundle.get("trust", [])) if isinstance(bundle.get("trust"), list) else 0
+        adopt = bool(local_cluster != cluster_id and allow_cluster_adopt and local_members <= 1)
+        foreign_single = bool(local_cluster != cluster_id and allow_foreign_single and remote_members <= 1)
+        if local_cluster and local_cluster != cluster_id and not adopt and not foreign_single:
+            if local_members > 1 and remote_members > 1:
+                raise ClusterError("拒绝合并两个 cluster_id 不同的既有多成员 federation")
+            raise ClusterError("联邦 cluster_id 不一致")
+        events = bundle.get("events") if isinstance(bundle.get("events"), list) else []
+        ordered, known = self._validate_event_batch(events, {node_id: {
+            "root_certificate": root, "identity_certificate": identity,
+        }})
+        for item in bundle.get("trust", []) if isinstance(bundle.get("trust"), list) else []:
+            if not isinstance(item, dict) or str(item.get("node_id", "")) not in known:
+                raise ClusterError("bundle trust 未由签名成员事件授权")
+            trusted = known[str(item["node_id"])]
+            if self._certificate_fingerprint_pem(str(item.get("root_certificate", ""))) != str(trusted["root_fingerprint"]):
+                raise ClusterError("bundle trust 与签名成员事件不一致")
+        return {"node_id": node_id, "cluster_id": cluster_id, "adopt_cluster": adopt,
+                "root_certificate": root, "identity_certificate": identity, "root_fingerprint": root_fp,
+                "identity_fingerprint": identity_fp, "events": ordered}
+
+    def _restore_database_checkpoint(self, database: Path, config_bytes: bytes | None) -> None:
+        self.replace_database(database)
+        if config_bytes is None:
+            self.config_path.unlink(missing_ok=True)
+        else:
+            atomic_write(self.config_path, config_bytes, 0o600)
+
+    def import_federation_bundle(self, bundle: dict[str, Any], *, pinned_identity_fingerprint: str = "",
+                                 allow_cluster_adopt: bool = False, allow_foreign_single: bool = False) -> dict[str, Any]:
+        plan = self.validate_federation_bundle(bundle, pinned_identity_fingerprint=pinned_identity_fingerprint,
+                                               allow_cluster_adopt=allow_cluster_adopt,
+                                               allow_foreign_single=allow_foreign_single)
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            checkpoint = Path(temporary) / "cluster.db"
+            destination = sqlite3.connect(checkpoint)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            config_bytes = self.config_path.read_bytes() if self.config_path.is_file() else None
+            try:
+                if plan["adopt_cluster"]:
+                    config = self.load_config()
+                    config["cluster_id"] = plan["cluster_id"]
+                    self.save_config(config)
+                self.register_federation_key(plan["node_id"], plan["root_certificate"], plan["identity_certificate"])
+                accepted = self.federation_import_events(plan["events"])
+                return {**plan, "accepted": accepted}
+            except Exception:
+                self._restore_database_checkpoint(checkpoint, config_bytes)
+                raise
+
+    @staticmethod
+    def canonical_join_transaction(transaction: dict[str, Any]) -> bytes:
+        return json_dumps({key: transaction[key] for key in (
+            "transaction_id", "initiator_id", "responder_id", "bundle_sha256", "created_at"
+        )}).encode("utf-8")
+
+    def create_join_transaction(self, bundle: dict[str, Any], responder_id: str) -> dict[str, Any]:
+        transaction = {
+            "transaction_id": secrets.token_hex(16),
+            "initiator_id": str(self.load_config().get("node_id", "")),
+            "responder_id": responder_id,
+            "bundle_sha256": hashlib.sha256(json_dumps(bundle).encode("utf-8")).hexdigest(),
+            "created_at": utc_now(),
+        }
+        transaction["signature"] = self._sign_federation(self.canonical_join_transaction(transaction))
+        return transaction
+
+    def verify_join_transaction(self, transaction: dict[str, Any], bundle: dict[str, Any],
+                                responder_id: str, *, now: int | None = None) -> dict[str, Any]:
+        required = {"transaction_id", "initiator_id", "responder_id", "bundle_sha256", "created_at", "signature"}
+        now = int(now or utc_now())
+        if set(transaction) < required or not re.fullmatch(r"[0-9a-f]{32}", str(transaction.get("transaction_id", ""))):
+            raise ClusterError("联邦配对 transaction_id 无效")
+        if transaction.get("initiator_id") != bundle.get("node_id") or transaction.get("responder_id") != responder_id:
+            raise ClusterError("联邦配对事务身份绑定不匹配")
+        created_at = int(transaction.get("created_at", 0))
+        if created_at < now - JOIN_TTL or created_at > now + 5:
+            raise ClusterError("联邦配对事务已过期")
+        digest = hashlib.sha256(json_dumps(bundle).encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(str(transaction.get("bundle_sha256", "")), digest):
+            raise ClusterError("联邦配对事务未绑定当前 bundle")
+        root = str(bundle.get("root_certificate", ""))
+        if not self._verify_federation_signature(
+            root, self.canonical_join_transaction(transaction), str(transaction.get("signature", ""))
+        ):
+            raise ClusterError("联邦配对事务签名无效")
+        return transaction
+
+    def federation_join_status(self, token: str, transaction: dict[str, Any]) -> dict[str, Any]:
+        transaction_id = str(transaction.get("transaction_id", ""))
+        row = self.db.connection.execute(
+            "SELECT * FROM federation_join_transactions WHERE transaction_id=? AND direction='incoming'",
+            (transaction_id,),
+        ).fetchone()
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if not row or not hmac.compare_digest(str(row["token_hash"]), token_hash) or row["status"] != "committed":
+            raise ClusterError("联邦配对事务不存在或尚未提交")
+        stored = json.loads(str(row["transaction_payload"]))
+        if not hmac.compare_digest(json_dumps(stored), json_dumps(transaction)):
+            raise ClusterError("联邦配对事务状态请求不匹配")
+        key = self.db.connection.execute(
+            "SELECT root_certificate,revoked_at FROM federation_keys WHERE node_id=?", (row["peer_id"],)
+        ).fetchone()
+        if not key or int(key["revoked_at"]) or not self._verify_federation_signature(
+            str(key["root_certificate"]), self.canonical_join_transaction(stored), str(stored.get("signature", ""))
+        ):
+            raise ClusterError("联邦配对事务状态签名无效")
+        return {"transaction_id": transaction_id, "bundle": json.loads(str(row["response_bundle"]))}
+
+    def save_outgoing_join_transaction(self, token: str, transaction: dict[str, Any],
+                                       response_bundle: dict[str, Any] | None, status: str) -> None:
+        now = utc_now()
+        with self.db.connection:
+            self.db.connection.execute(
+                "INSERT INTO federation_join_transactions(transaction_id,direction,token_hash,peer_id,bundle_sha256,"
+                "transaction_signature,transaction_payload,response_bundle,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET "
+                "response_bundle=excluded.response_bundle,status=excluded.status,updated_at=excluded.updated_at",
+                (transaction["transaction_id"], "outgoing", hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                 transaction["responder_id"], transaction["bundle_sha256"], transaction["signature"],
+                 json_dumps(transaction), json_dumps(response_bundle) if response_bundle else "", status, now, now),
+            )
+
+    def accept_federation_join(self, token: str, bundle: dict[str, Any],
+                               transaction: dict[str, Any]) -> dict[str, Any]:
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        self.verify_join_transaction(transaction, bundle, str(self.load_config().get("node_id", "")))
+        transaction_id = str(transaction["transaction_id"])
+        existing = self.db.connection.execute(
+            "SELECT * FROM federation_join_transactions WHERE transaction_id=?", (transaction_id,)
+        ).fetchone()
+        if existing:
+            if existing["direction"] != "incoming" or not hmac.compare_digest(str(existing["token_hash"]), digest) \
+                    or not hmac.compare_digest(str(existing["transaction_payload"]), json_dumps(transaction)):
+                raise ClusterError("联邦配对 transaction_id 已被其他请求使用")
+            if existing["status"] != "committed":
+                raise ClusterError("联邦配对事务尚未完成，可稍后重试")
+            return {"node_id": existing["peer_id"], "transaction_id": transaction_id,
+                    "bundle": json.loads(str(existing["response_bundle"])), "replayed": True}
+        row = self.db.connection.execute("SELECT * FROM join_tokens WHERE token_hash=?", (digest,)).fetchone()
+        if not row or row["used_at"] or row["expires_at"] < utc_now():
+            raise ClusterError("一次性加入令牌无效、已使用或已过期")
+        self.validate_federation_bundle(bundle, allow_cluster_adopt=True)
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            checkpoint = Path(temporary) / "cluster.db"
+            destination = sqlite3.connect(checkpoint)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            config_bytes = self.config_path.read_bytes() if self.config_path.is_file() else None
+            try:
+                imported = self.import_federation_bundle(bundle, allow_cluster_adopt=True)
+                status = bundle.get("status") if isinstance(bundle.get("status"), dict) else {}
+                payload = self.federation_member_payload(
+                    {**status, "node_id": imported["node_id"]}, imported["root_certificate"],
+                    imported["identity_certificate"], False,
+                )
+                confirmation = self.create_event("member.upsert", f"member:{imported['node_id']}", payload)
+                response_bundle = self.federation_public_bundle()
+                now = utc_now()
+                with self.db.connection:
+                    self.db.connection.execute(
+                        "INSERT INTO federation_join_transactions(transaction_id,direction,token_hash,peer_id,bundle_sha256,"
+                        "transaction_signature,transaction_payload,response_bundle,status,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (transaction_id, "incoming", digest, imported["node_id"], transaction["bundle_sha256"],
+                         transaction["signature"], json_dumps(transaction), json_dumps(response_bundle),
+                         "committed", now, now),
+                    )
+                self.consume_join_token(token)
+                return {"node_id": imported["node_id"], "confirmation": confirmation,
+                        "transaction_id": transaction_id, "bundle": response_bundle}
+            except Exception:
+                self._restore_database_checkpoint(checkpoint, config_bytes)
+                raise
+
+    def federation_register_peer(self, bundle: dict[str, Any], remark: str = "") -> dict[str, Any]:
+        status = bundle.get("status") if isinstance(bundle.get("status"), dict) else {}
+        node_id = str(bundle.get("node_id", status.get("node_id", "")))
+        if not re.fullmatch(r"[0-9a-f]{32}", node_id) or node_id == self.load_config().get("node_id"):
+            raise ClusterError("联邦成员身份无效")
+        plan = self.import_federation_bundle(bundle, allow_foreign_single=True)
+        root, identity = str(plan["root_certificate"]), str(plan["identity_certificate"])
+        status = {**status, "node_id": node_id}
+        payload = self.federation_member_payload(status, root, identity)
+        if remark:
+            payload["status"]["remark"] = safe_label(remark)
+        event = self.create_event("member.upsert", f"member:{node_id}", payload)
+        return {"node_id": node_id, "event": event}
+
+    def _encrypt_backup_payload(self, plaintext: bytes, target: Path, password: str) -> Path:
+        if len(password) < 8:
+            raise ClusterError("备份口令至少8个字符")
+        salt, iv = secrets.token_bytes(16), secrets.token_bytes(16)
+        material = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, BACKUP_KDF_ITERATIONS, 64)
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            source, cipher = Path(temporary) / "plain", Path(temporary) / "cipher"
+            source.write_bytes(plaintext)
+            self._run([shutil.which("openssl") or "openssl", "enc", "-aes-256-cbc", "-K", material[:32].hex(), "-iv", iv.hex(), "-in", str(source), "-out", str(cipher)])
+            encrypted = cipher.read_bytes()
+        header = BACKUP_MAGIC + salt + iv
+        atomic_write(target, header + encrypted + hmac.new(material[32:], header + encrypted, hashlib.sha256).digest(), 0o600)
+        return target
+
+    def export_federation_backup(self, target: Path, password: str, *, include_identity: bool = False) -> Path:
+        """Portable federation data backup. Private material is opt-in only."""
+        self.db.connection.execute("PRAGMA wal_checkpoint(FULL)")
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            directory, db_copy = Path(temporary), Path(temporary) / "cluster.db"
+            destination = sqlite3.connect(db_copy)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            config = dict(self.load_config())
+            manifest = {"format": 3, "kind": "identity" if include_identity else "federation-data",
+                        "api_version": API_VERSION, "cluster_id": config.get("cluster_id", ""),
+                        "node_id": config.get("node_id", ""), "created_at": utc_now()}
+            archive = directory / "federation.tar.gz"
+            config_path, manifest_path = directory / "config.json", directory / "manifest.json"
+            atomic_write(config_path, json.dumps(config, ensure_ascii=False, indent=2) + "\n", 0o600)
+            atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", 0o600)
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(db_copy, arcname="data/cluster.db")
+                tar.add(manifest_path, arcname="manifest.json")
+                if include_identity:
+                    tar.add(config_path, arcname="config.json")
+                    for name in ("federation-root.crt", "federation-node.crt",
+                                 "federation-root.key", "federation-node.key"):
+                        path = self.pki / name
+                        if not path.is_file():
+                            raise ClusterError("完整身份备份缺少本机联邦身份文件")
+                        tar.add(path, arcname=f"pki/{name}", recursive=False)
+            return self._encrypt_backup_payload(archive.read_bytes(), target, password)
+
+    def export_identity_backup(self, target: Path, password: str) -> Path:
+        return self.export_federation_backup(target, password, include_identity=True)
+
+    def _private_key_matches_certificate(self, private_key: bytes, certificate: bytes) -> bool:
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            key_path, cert_path = Path(temporary) / "identity.key", Path(temporary) / "identity.crt"
+            key_pub, cert_pub = Path(temporary) / "key.pub", Path(temporary) / "cert.pub"
+            key_path.write_bytes(private_key)
+            cert_path.write_bytes(certificate)
+            if self._openssl(["pkey", "-in", str(key_path), "-pubout", "-out", str(key_pub)], check=False).returncode:
+                return False
+            if self._openssl(["x509", "-in", str(cert_path), "-pubkey", "-noout", "-out", str(cert_pub)], check=False).returncode:
+                return False
+            return hmac.compare_digest(key_pub.read_bytes(), cert_pub.read_bytes())
+
+    def restore_federation_backup(self, source: Path, password: str, *, require_identity: bool = False) -> dict[str, Any]:
+        payload = source.read_bytes()
+        minimum = len(BACKUP_MAGIC) + 16 + 16 + 32
+        if len(payload) < minimum or not payload.startswith(BACKUP_MAGIC):
+            raise ClusterError("不是有效的 Lun 联邦备份")
+        offset = len(BACKUP_MAGIC)
+        salt, iv, cipher, tag = payload[offset:offset + 16], payload[offset + 16:offset + 32], payload[offset + 32:-32], payload[-32:]
+        material = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, BACKUP_KDF_ITERATIONS, 64)
+        if not hmac.compare_digest(tag, hmac.new(material[32:], payload[:-32], hashlib.sha256).digest()):
+            raise ClusterError("备份口令错误或文件已损坏")
+        with tempfile.TemporaryDirectory(dir=self.module) as temporary:
+            directory, cipher_path, archive = Path(temporary), Path(temporary) / "cipher", Path(temporary) / "archive.tar.gz"
+            cipher_path.write_bytes(cipher)
+            self._run([shutil.which("openssl") or "openssl", "enc", "-d", "-aes-256-cbc", "-K", material[:32].hex(), "-iv", iv.hex(), "-in", str(cipher_path), "-out", str(archive)])
+            with tarfile.open(archive, "r:gz") as tar:
+                members = tar.getmembers()
+                allowed = {"config.json", "manifest.json", "data/cluster.db", "pki/federation-root.crt",
+                           "pki/federation-node.crt", "pki/federation-root.key", "pki/federation-node.key"}
+                names = [member.name for member in members]
+                if len(names) != len(set(names)) or any(not member.isfile() or member.name not in allowed for member in members):
+                    raise ClusterError("联邦备份包含不安全内容")
+                contents = {member.name: tar.extractfile(member).read() for member in members}  # type: ignore[union-attr]
+            if "manifest.json" not in contents or "data/cluster.db" not in contents:
+                raise ClusterError("联邦备份缺少清单或数据库")
+            manifest = json.loads(contents["manifest.json"].decode("utf-8"))
+            if int(manifest.get("format", 0)) != 3 or int(manifest.get("api_version", 0)) > API_VERSION:
+                raise ClusterError("备份来自更高版本")
+            kind = str(manifest.get("kind", ""))
+            if kind not in {"identity", "federation-data"}:
+                raise ClusterError("联邦备份类型无效")
+            identity = kind == "identity"
+            if require_identity and not identity:
+                raise ClusterError("identity-restore 只接受完整身份备份，拒绝 federation-data")
+            expected = {"manifest.json", "data/cluster.db"} if not identity else allowed
+            if set(contents) != expected:
+                raise ClusterError("联邦备份成员与备份类型不匹配")
+            source_db = directory / "source.db"
+            source_db.write_bytes(contents["data/cluster.db"])
+            checker = sqlite3.connect(f"file:{source_db.resolve().as_posix()}?mode=ro", uri=True)
+            checker.row_factory = sqlite3.Row
+            try:
+                if checker.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ClusterError("联邦备份数据库完整性检查失败")
+                source_events = [{key: row[key] for key in (
+                    "event_id", "author_id", "author_seq", "prev_hash", "lamport", "type", "entity_key",
+                    "payload", "created_at", "signature"
+                )} for row in checker.execute("SELECT * FROM federation_events ORDER BY author_id,author_seq")]
+            except sqlite3.Error as exc:
+                raise ClusterError("联邦备份数据库结构无效") from exc
+            finally:
+                checker.close()
+            backup_id = str(manifest.get("node_id", ""))
+            backup_cluster = str(manifest.get("cluster_id", ""))
+            current = self.load_config()
+            current_id = str(self.load_config().get("node_id", ""))
+            current_cluster = str(current.get("cluster_id", ""))
+            if not identity and current_cluster and current_cluster != backup_cluster:
+                raise ClusterError("联邦备份 cluster_id 与目标不一致")
+            online = self.db.connection.execute("SELECT 1 FROM nodes WHERE id=? AND state='online'", (backup_id,)).fetchone()
+            if identity and backup_id != current_id and online:
+                raise ClusterError("拒绝恢复：同一联邦身份仍显示在线")
+            checkpoint = directory / "checkpoint.db"
+            destination = sqlite3.connect(checkpoint)
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            config_bytes = self.config_path.read_bytes() if self.config_path.is_file() else None
+            identity_names = ("federation-root.crt", "federation-node.crt", "federation-root.key", "federation-node.key")
+            old_identity = {name: (self.pki / name).read_bytes() for name in identity_names if (self.pki / name).is_file()}
+            try:
+                if not identity:
+                    accepted = self.federation_import_events(source_events)
+                    return {"manifest": manifest, "identity_restored": False, "accepted": accepted}
+                config = json.loads(contents["config.json"].decode("utf-8"))
+                if config.get("mode") != "federation" or config.get("node_id") != backup_id or config.get("cluster_id") != backup_cluster:
+                    raise ClusterError("身份备份配置与清单不一致")
+                root = contents["pki/federation-root.crt"]
+                node = contents["pki/federation-node.crt"]
+                self.validate_federation_certificates(backup_id, root.decode("utf-8"), node.decode("utf-8"))
+                if not self._private_key_matches_certificate(contents["pki/federation-root.key"], root) \
+                        or not self._private_key_matches_certificate(contents["pki/federation-node.key"], node):
+                    raise ClusterError("身份备份私钥与证书不匹配")
+                self.replace_database(source_db)
+                atomic_write(self.config_path, contents["config.json"], 0o600)
+                self.pki.mkdir(parents=True, exist_ok=True)
+                for name in identity_names:
+                    atomic_write(self.pki / name, contents[f"pki/{name}"], 0o600 if name.endswith(".key") else 0o644)
+            except Exception:
+                self._restore_database_checkpoint(checkpoint, config_bytes)
+                for name in identity_names:
+                    path = self.pki / name
+                    if name in old_identity:
+                        atomic_write(path, old_identity[name], 0o600 if name.endswith(".key") else 0o644)
+                    else:
+                        path.unlink(missing_ok=True)
+                raise
+        self.secure_files()
+        return {"manifest": manifest, "identity_restored": identity}
+
+    def restore_identity_backup(self, source: Path, password: str) -> dict[str, Any]:
+        return self.restore_federation_backup(source, password, require_identity=True)
+
 
 def print_nodes(rows: list[dict[str, Any]]) -> None:
     headers = ("编号", "状态", "类型", "地区", "地址", "备注", "快照")
@@ -1861,7 +3836,8 @@ def print_nodes(rows: list[dict[str, Any]]) -> None:
     for row in rows:
         values.append((
             f"{int(row.get('number', len(values) + 1)):02d}", STATE_NAMES_ZH.get(row["state"], "异常"),
-            "主机" if row["role"] == "master" else "子机",
+            {"master": "主机", "child": "子机", "federation": "对等节点",
+             "legacy-candidate": "未验证候选"}.get(str(row["role"]), "未知"),
             place_labels.get(str(row.get("id", "")), chinese_place(row)),
             f"{uri_host(row['endpoint_host'])}:{row['endpoint_port']}", row["remark"] or "-",
             iso_time(row["snapshot_at"]),
@@ -1875,7 +3851,7 @@ def print_nodes(rows: list[dict[str, Any]]) -> None:
 
 
 def _peer_common_name(handler: http.server.BaseHTTPRequestHandler) -> str:
-    with contextlib.suppress(ValueError, ssl.SSLError):
+    with contextlib.suppress(AttributeError, TypeError, ValueError, ssl.SSLError):
         certificate = handler.connection.getpeercert()  # type: ignore[attr-defined]
         for group in certificate.get("subject", ()):
             for key, value in group:
@@ -1921,6 +3897,13 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         if not re.fullmatch(r"[0-9a-f]{32}", common_name):
             raise ClusterError("需要有效的集群客户端证书")
         config = self.cluster.load_config()
+        if config.get("mode") == "federation":
+            row = self.cluster.db.connection.execute(
+                "SELECT revoked_at FROM federation_keys WHERE node_id=?", (common_name,)
+            ).fetchone()
+            if not row or int(row["revoked_at"]):
+                raise ClusterError("该证书不是活动联邦成员")
+            return common_name
         if config.get("role") == "child":
             pending = config.get("pending_controller") if isinstance(config.get("pending_controller"), dict) else {}
             pending_valid = (
@@ -1940,11 +3923,33 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         try:
             parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/v1/federation/membership-status":
+                query = urllib.parse.parse_qs(parsed.query)
+                node_id = query.get("node_id", [""])[0]
+                nonce = query.get("nonce", [""])[0]
+                plan = self.cluster.federation_cleanup_plan(node_id)
+                proof = self.cluster.membership_status_proof(node_id, nonce)
+                self._reply(200, {"ok": True, "status": plan, "proof": proof})
+                return
+            if parsed.path == "/v1/federation/bootstrap" and self.cluster.is_federation():
+                token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+                digest = hashlib.sha256(token.encode()).hexdigest()
+                row = self.cluster.db.connection.execute("SELECT * FROM join_tokens WHERE token_hash=?", (digest,)).fetchone()
+                if not row or row["used_at"] or row["expires_at"] < utc_now():
+                    raise ClusterError("一次性加入令牌无效或已过期")
+                self._reply(200, {"ok": True, "bundle": self.cluster.federation_public_bundle()})
+                return
             if parsed.path == "/v1/bootstrap/csr":
                 self._bootstrap_csr(parsed)
                 return
             self._require_peer()
-            if parsed.path == "/v1/status":
+            if parsed.path == "/v1/federation/manifest" and self.cluster.is_federation():
+                self._reply(200, {"ok": True, "manifest": self.cluster.federation_manifest()})
+            elif parsed.path == "/v1/federation/events" and self.cluster.is_federation():
+                query = urllib.parse.parse_qs(parsed.query)
+                manifest = json.loads(query.get("manifest", ["{}"])[0])
+                self._reply(200, {"ok": True, "manifest": self.cluster.federation_manifest(), "events": self.cluster.federation_events_since(manifest)})
+            elif parsed.path == "/v1/status":
                 self._reply(200, {"ok": True, "status": self.cluster.local_status()})
             elif parsed.path == "/v1/snapshot":
                 query = urllib.parse.parse_qs(parsed.query)
@@ -1967,8 +3972,39 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
             if parsed.path == "/v1/bootstrap/complete":
                 self._bootstrap_complete(body)
                 return
+            if parsed.path == "/v1/federation/join" and self.cluster.is_federation():
+                token = str(body.get("token", ""))
+                bundle = body.get("bundle") if isinstance(body.get("bundle"), dict) else {}
+                transaction = body.get("transaction") if isinstance(body.get("transaction"), dict) else {}
+                accepted = self.cluster.accept_federation_join(token, bundle, transaction)
+                self._reply(200, {"ok": True, "transaction_id": accepted["transaction_id"],
+                                  "bundle": accepted["bundle"]})
+                return
+            if parsed.path == "/v1/federation/join-status" and self.cluster.is_federation():
+                token = str(body.get("token", ""))
+                transaction = body.get("transaction") if isinstance(body.get("transaction"), dict) else {}
+                status = self.cluster.federation_join_status(token, transaction)
+                self._reply(200, {"ok": True, **status})
+                return
             peer = self._require_peer()
-            if parsed.path == "/v1/events/snapshot":
+            if parsed.path == "/v1/federation/probe" and self.cluster.is_federation():
+                if set(body) != {"candidate_id", "nonce"}:
+                    raise ClusterError("federation probe accepts only candidate_id and nonce")
+                vote = self.cluster.probe_vote_for_member(
+                    str(body.get("candidate_id", "")), str(body.get("nonce", "")), peer
+                )
+                self._reply(200, {"ok": True, "vote": vote})
+            elif parsed.path == "/v1/federation/events" and self.cluster.is_federation():
+                events = body.get("events") if isinstance(body.get("events"), list) else []
+                self._reply(200, {"ok": True, "accepted": self.cluster.federation_import_events(events)})
+            elif parsed.path == "/v1/federation/snapshot" and self.cluster.is_federation():
+                snapshot = body.get("snapshot") if isinstance(body.get("snapshot"), dict) else {}
+                status = snapshot.get("status") if isinstance(snapshot.get("status"), dict) else {}
+                if status.get("node_id") != peer:
+                    raise ClusterError("订阅快照节点身份不匹配")
+                self.cluster.record_federation_snapshot(snapshot)
+                self._reply(200, {"ok": True})
+            elif parsed.path == "/v1/events/snapshot":
                 if self.cluster.load_config().get("role") != "master":
                     raise ClusterError("当前节点不是主 VPS")
                 snapshot = body.get("snapshot", {})
@@ -2050,6 +4086,8 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
         if not valid_port(port) or "BEGIN CERTIFICATE" not in ca or "BEGIN CERTIFICATE" not in certificate:
             raise ClusterError("配对证书或主 VPS 地址无效")
         self.cluster.consume_join_token(token)
+        if (self.cluster.pki / "node.crt").is_file():
+            shutil.copy2(self.cluster.pki / "node.crt", self.cluster.pki / "node-serving.crt")
         atomic_write(self.cluster.pki / "cluster-ca.crt", ca, 0o644)
         atomic_write(self.cluster.pki / "node.crt", certificate, 0o644)
         config.update({
@@ -2084,6 +4122,11 @@ class ThreadingClusterServer(http.server.ThreadingHTTPServer):
 def server_context(cluster: Cluster) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+    if cluster.is_federation():
+        context.load_cert_chain(str(cluster.pki / "federation-node.crt"), str(cluster.pki / "federation-node.key"))
+        context.load_verify_locations(cafile=str(cluster.federation_trust_bundle()))
+        context.verify_mode = ssl.CERT_OPTIONAL
+        return context
     context.load_cert_chain(str(cluster.pki / "node.crt"), str(cluster.pki / "node.key"))
     ca = cluster.pki / "cluster-ca.crt"
     if ca.exists():
@@ -2096,12 +4139,21 @@ def server_context(cluster: Cluster) -> ssl.SSLContext:
 
 def serve(cluster: Cluster) -> None:
     config = cluster.load_config()
-    if not config.get("enabled") or config.get("role") not in {"master", "child"}:
+    if not config.get("enabled") and config.get("retired_node_id") and config.get("revoked_at"):
+        return
+    if not config.get("enabled") or (config.get("role") not in {"master", "child"} and not cluster.is_federation()):
         raise ClusterError("服务器联动模块尚未启用")
     bind = config.get("bind", "0.0.0.0")
     port = int(config.get("internal_port", 0))
     if not valid_port(port):
         raise ClusterError("服务器联动监听端口无效")
+    if cluster.is_federation():
+        revocation = cluster.check_self_revocation()
+        if revocation.get("cleaned"):
+            return
+    # A re-pair may change node.crt while the old TLS listener is still alive.
+    # The compatibility fingerprint is only needed until this fresh process starts.
+    (cluster.pki / "node-serving.crt").unlink(missing_ok=True)
     server = ThreadingClusterServer((bind, port), ClusterHandler)
     server.cluster = cluster  # type: ignore[attr-defined]
     server.restart_requested = False  # type: ignore[attr-defined]
@@ -2123,6 +4175,12 @@ def serve(cluster: Cluster) -> None:
                 return
 
     threading.Thread(target=watch_restart, daemon=True).start()
+
+    def initial_subscription_catchup() -> None:
+        with contextlib.suppress(ClusterError, OSError, sqlite3.Error):
+            cluster.subscription_catchup()
+
+    threading.Thread(target=initial_subscription_catchup, daemon=True).start()
 
     def usage_loop() -> None:
         while not stopping.is_set():
@@ -2166,10 +4224,15 @@ def bootstrap_request(join: dict[str, Any], method: str, path: str, body: dict[s
 
 def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: str,
                    body: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(cluster.pki / "cluster-ca.crt"))
+    if cluster.is_federation():
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(cluster.federation_trust_bundle()))
+        certificate, key = cluster.pki / "federation-node.crt", cluster.pki / "federation-node.key"
+    else:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(cluster.pki / "cluster-ca.crt"))
+        certificate, key = cluster.pki / "node.crt", cluster.pki / "node.key"
     context.check_hostname = False
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(str(cluster.pki / "node.crt"), str(cluster.pki / "node.key"))
+    context.load_cert_chain(str(certificate), str(key))
     connection = http.client.HTTPSConnection(host, int(port), context=context, timeout=timeout)
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json"} if payload is not None else {}
@@ -2178,7 +4241,7 @@ def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: st
         response = connection.getresponse()
         data = response.read(MAX_BODY + 1)
     except (OSError, ssl.SSLError, TimeoutError) as exc:
-        raise ClusterError(f"无法连接服务器联动端口：{exc}") from exc
+        raise FederationTransportError(f"federation transport failed: {exc}") from exc
     finally:
         connection.close()
     if len(data) > MAX_BODY:
@@ -2192,9 +4255,159 @@ def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: st
     return result
 
 
+def membership_status_request(cluster: Cluster, peer: dict[str, Any], node_id: str,
+                              nonce: str, timeout: int = 15) -> dict[str, Any]:
+    """Fetch only the public revocation proof without presenting a client certificate."""
+    peer_id = str(peer.get("id", ""))
+    key = cluster.db.connection.execute(
+        "SELECT root_certificate,revoked_at FROM federation_keys WHERE node_id=?", (peer_id,)
+    ).fetchone()
+    if not key or int(key["revoked_at"]) or str(peer.get("state", "")) in {
+            "legacy-unverified", "revoked", "removed"}:
+        raise ClusterError("membership-status peer is not an active trusted member")
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cadata=str(key["root_certificate"]))
+    context.check_hostname = False
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    host, port = str(peer.get("endpoint_host", "")), int(peer.get("endpoint_port", 0))
+    connection = http.client.HTTPSConnection(host, port, context=context, timeout=timeout)
+    path = "/v1/federation/membership-status?node_id=" + urllib.parse.quote(node_id) \
+        + "&nonce=" + urllib.parse.quote(nonce)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        data = response.read(MAX_BODY + 1)
+    except (OSError, ssl.SSLError, TimeoutError) as exc:
+        raise FederationTransportError(f"membership-status transport failed: {exc}") from exc
+    finally:
+        connection.close()
+    if len(data) > MAX_BODY:
+        raise ClusterError("membership-status response exceeds size limit")
+    try:
+        result = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ClusterError("membership-status returned invalid JSON") from exc
+    if response.status >= 400 or not isinstance(result, dict) or not result.get("ok"):
+        raise ClusterError(str(result.get("error", "membership-status request failed")) if isinstance(result, dict)
+                           else "membership-status request failed")
+    return result
+
+
+def federation_add_peer(cluster: Cluster, join_uri: str, remark: str = "") -> dict[str, Any]:
+    if not cluster.is_federation():
+        raise ClusterError("请先初始化或迁移为联邦模式")
+    join = parse_join_uri(join_uri)
+    token_hash = hashlib.sha256(join["token"].encode("utf-8")).hexdigest()
+    pending = cluster.db.connection.execute(
+        "SELECT * FROM federation_join_transactions WHERE direction='outgoing' AND token_hash=? "
+        "AND status='remote-committed-local-pending' ORDER BY updated_at DESC LIMIT 1",
+        (token_hash,),
+    ).fetchone()
+    if pending:
+        transaction = json.loads(str(pending["transaction_payload"]))
+        if transaction.get("responder_id") != join["node_id"]:
+            raise ClusterError("待恢复配对事务与加入地址身份不一致")
+        recovery = bootstrap_request(join, "POST", "/v1/federation/join-status", {
+            "token": join["token"], "transaction": transaction,
+        })
+        if recovery.get("transaction_id") != transaction["transaction_id"] \
+                or not isinstance(recovery.get("bundle"), dict):
+            raise ClusterError("远端未返回匹配的待恢复配对事务")
+        registered = cluster.import_federation_bundle(
+            recovery["bundle"], pinned_identity_fingerprint=join["fingerprint"], allow_foreign_single=False
+        )
+        cluster.save_outgoing_join_transaction(join["token"], transaction, recovery["bundle"], "committed")
+        cluster.db.audit("federation.add-peer.recovered", str(join["node_id"]), remark)
+        return {"node_id": registered["node_id"], "accepted": registered["accepted"],
+                "transaction_id": transaction["transaction_id"], "recovered": True}
+    remote = bootstrap_request(join, "GET", "/v1/federation/bootstrap?token=" + urllib.parse.quote(join["token"]))
+    bundle = remote.get("bundle") if isinstance(remote.get("bundle"), dict) else {}
+    if bundle.get("node_id") != join["node_id"]:
+        raise ClusterError("加入地址与远端联邦身份不一致")
+    cluster.validate_federation_bundle(bundle, pinned_identity_fingerprint=join["fingerprint"],
+                                       allow_foreign_single=True)
+    local = cluster.federation_public_bundle()
+    transaction = cluster.create_join_transaction(local, str(bundle["node_id"]))
+    remote_bundle: dict[str, Any] | None = None
+    initial_error = ""
+    try:
+        response = bootstrap_request(join, "POST", "/v1/federation/join", {
+            "token": join["token"], "bundle": local, "transaction": transaction,
+        })
+        if response.get("transaction_id") != transaction["transaction_id"] \
+                or not isinstance(response.get("bundle"), dict):
+            raise ClusterError("远端联邦配对响应缺少匹配的 transaction_id 或 bundle")
+        remote_bundle = response["bundle"]
+        registered = cluster.import_federation_bundle(
+            remote_bundle, pinned_identity_fingerprint=join["fingerprint"], allow_foreign_single=False
+        )
+    except ClusterError as exc:
+        initial_error = str(exc)
+        try:
+            recovery = bootstrap_request(join, "POST", "/v1/federation/join-status", {
+                "token": join["token"], "transaction": transaction,
+            })
+            if recovery.get("transaction_id") != transaction["transaction_id"] \
+                    or not isinstance(recovery.get("bundle"), dict):
+                raise ClusterError("远端未返回匹配的配对事务状态")
+            remote_bundle = recovery["bundle"]
+            registered = cluster.import_federation_bundle(
+                remote_bundle, pinned_identity_fingerprint=join["fingerprint"], allow_foreign_single=False
+            )
+        except ClusterError as recovery_error:
+            cluster.save_outgoing_join_transaction(
+                join["token"], transaction, remote_bundle, "remote-committed-local-pending"
+            )
+            raise ClusterError(
+                "联邦配对未能在本机完成；已保留可恢复事务 " + transaction["transaction_id"]
+                + "。首次错误：" + initial_error + "；状态恢复错误：" + str(recovery_error)
+            ) from recovery_error
+    cluster.save_outgoing_join_transaction(join["token"], transaction, remote_bundle, "committed")
+    cluster.db.audit("federation.add-peer", str(bundle["node_id"]), remark)
+    return {"node_id": registered["node_id"], "accepted": registered["accepted"],
+            "transaction_id": transaction["transaction_id"], "recovered": bool(initial_error)}
+
+
+def federation_sync(cluster: Cluster, node_id: str) -> dict[str, Any]:
+    if not cluster.is_federation():
+        raise ClusterError("当前不是联邦模式")
+    node = cluster.node(node_id)
+    trusted = cluster.db.connection.execute("SELECT revoked_at FROM federation_keys WHERE node_id=?", (node["id"],)).fetchone()
+    if not trusted or int(trusted["revoked_at"]):
+        raise ClusterError("旧迁移候选或已撤销节点必须重新显式配对后才能同步")
+    failures: list[int] = []
+    last_error: FederationTransportError | None = None
+    base = utc_now()
+    for attempt in range(3):
+        try:
+            local_manifest = cluster.federation_manifest()
+            remote = mutual_request(
+                cluster, str(node["endpoint_host"]), int(node["endpoint_port"]), "GET",
+                "/v1/federation/events?manifest=" + urllib.parse.quote(json_dumps(local_manifest)),
+            )
+            received = cluster.federation_import_events(
+                remote.get("events", []) if isinstance(remote.get("events"), list) else []
+            )
+            response = mutual_request(
+                cluster, str(node["endpoint_host"]), int(node["endpoint_port"]), "POST",
+                "/v1/federation/events", {"events": cluster.federation_events_since(remote.get("manifest", {}))},
+            )
+            cluster.record_transport_success(str(node["id"]))
+            return {"node_id": str(node["id"]), "received": received,
+                    "accepted_by_peer": int(response.get("accepted", 0)), "attempts": attempt + 1}
+        except FederationTransportError as exc:
+            last_error = exc
+            observed_at = base + attempt
+            failures.append(observed_at)
+            cluster.record_transport_failure(str(node["id"]), when=observed_at)
+    health = cluster._coordinate_after_failures(str(node["id"]), failures)
+    raise FederationTransportError(
+        f"federation sync failed after 3 attempts; health={json_dumps(health)}; error={last_error}"
+    ) from last_error
+
+
 def add_node(cluster: Cluster, join_uri: str, remark: str = "", expected_uuid: str = "") -> dict[str, Any]:
     config = cluster.load_config()
-    if config.get("role") != "master":
+    if config.get("role") != "master" and not cluster.is_federation():
         raise ClusterError("只有主 VPS 可以添加子 VPS")
     join = parse_join_uri(join_uri)
     result = bootstrap_request(join, "GET", "/v1/bootstrap/csr?token=" + urllib.parse.quote(join["token"]))
@@ -2276,6 +4489,18 @@ def push_node_identity(cluster: Cluster, node_id: str) -> dict[str, Any]:
 
 def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
     config = cluster.load_config()
+    if cluster.is_federation():
+        cluster.record_local_snapshot(profile)
+        snapshot = cluster.federation_snapshot(profile)
+        delivered: dict[str, str] = {}
+        for row in cluster.trusted_federation_nodes():
+            try:
+                mutual_request(cluster, str(row["endpoint_host"]), int(row["endpoint_port"]), "POST", "/v1/federation/snapshot", {"snapshot": snapshot})
+                delivered[str(row["id"])] = "ok"
+            except ClusterError as exc:
+                cluster.record_transport_failure(str(row["id"]))
+                delivered[str(row["id"])] = f"failed: {exc}"
+        return {"snapshot": snapshot, "peers": delivered}
     if config.get("role") != "child" or not config.get("paired"):
         raise ClusterError("当前服务器不是已配对子 VPS")
     return mutual_request(
@@ -2594,6 +4819,13 @@ def install_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any], request: dict[str, Any],
                            peer_id: str = "local") -> dict[str, Any]:
     script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+    if action in {"cdn.pool.preview", "cdn.pool.apply"}:
+        if set(payload) != {"mode", "cfip"}:
+            raise ClusterError("CDN 优选池操作只接受 mode 与 cfip")
+        mode, cfip = str(payload.get("mode", "")), str(payload.get("cfip", ""))
+        if action == "cdn.pool.preview":
+            return cluster.preview_cdn_pool(mode, cfip)
+        return cluster.apply_cdn_pool(mode, cfip, script)
     if action == "role.stage":
         return cluster.stage_role_transfer(payload, peer_id)
     if action == "role.discard":
@@ -2788,7 +5020,7 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         )
         return {"snapshot": str(recovery), "scheduled": True}
     if action == "cluster.update-all":
-        if cluster.load_config().get("role") != "master":
+        if cluster.load_config().get("role") != "master" and not cluster.is_federation():
             raise ClusterError("只有主 VPS 可以向全部服务器分发更新")
         return distribute_cluster_update(cluster, payload, source_peer=peer_id, install_local=True)
     if action == "script.install":
@@ -2841,20 +5073,57 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
 def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, Any],
                 timeout: int = 900) -> dict[str, Any]:
     node = cluster.node(node_id)
+    if cluster.is_federation():
+        trusted = cluster.db.connection.execute("SELECT revoked_at FROM federation_keys WHERE node_id=?", (node["id"],)).fetchone()
+        if not trusted or int(trusted["revoked_at"]):
+            raise ClusterError("旧迁移候选或已撤销节点不能执行联邦远控")
     if action in {"lun.factory-reset", "lun.uninstall"} and str(payload.get("confirm", "")) == node_id:
         payload = {**payload, "confirm": short_id(node["id"])}
     request = {"schema_version": API_VERSION, "request_id": uuid.uuid4().hex, "action": action, "payload": payload}
-    result = mutual_request(
-        cluster, node["endpoint_host"], node["endpoint_port"],
-        "POST", "/v1/action", request, timeout=timeout,
-    )
-    return result["result"]
+    failures: list[int] = []
+    last_error: FederationTransportError | None = None
+    attempts = 3 if cluster.is_federation() else 1
+    base = utc_now()
+    for attempt in range(attempts):
+        try:
+            result = mutual_request(
+                cluster, node["endpoint_host"], node["endpoint_port"],
+                "POST", "/v1/action", request, timeout=timeout,
+            )
+            if cluster.is_federation():
+                cluster.record_transport_success(str(node["id"]))
+            return result["result"]
+        except FederationTransportError as exc:
+            last_error = exc
+            observed_at = base + attempt
+            failures.append(observed_at)
+            if cluster.is_federation():
+                cluster.record_transport_failure(str(node["id"]), when=observed_at)
+    if cluster.is_federation() and len(failures) == 3:
+        health = cluster._coordinate_after_failures(str(node["id"]), failures)
+        raise FederationTransportError(
+            f"federation action failed after 3 idempotent attempts; health={json_dumps(health)}; error={last_error}"
+        ) from last_error
+    if last_error:
+        raise last_error
+    raise ClusterError("remote action failed")
+
+
+def cdn_pool_command(cluster: Cluster, node_id: str, mode: str, cfip: str, *, apply: bool) -> dict[str, Any]:
+    row = cluster.node(node_id)
+    action = "cdn.pool.apply" if apply else "cdn.pool.preview"
+    payload = {"mode": mode, "cfip": cfip}
+    if str(row["id"]) != str(cluster.load_config().get("node_id", "")):
+        return send_action(cluster, str(row["id"]), action, payload)
+    request = {"schema_version": API_VERSION, "request_id": uuid.uuid4().hex,
+               "action": action, "payload": payload}
+    return execute_action(cluster, request)["result"]
 
 
 def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_peer: str = "local",
                               install_local: bool = False) -> dict[str, Any]:
     config = cluster.load_config()
-    if config.get("role") != "master":
+    if config.get("role") != "master" and not cluster.is_federation():
         raise ClusterError("只有主 VPS 可以向全部服务器分发更新")
     script_payload = payload.get("script") if isinstance(payload.get("script"), dict) else {}
     agent_payload = payload.get("agent") if isinstance(payload.get("agent"), dict) else {}
@@ -2974,8 +5243,37 @@ def export_master_users(cluster: Cluster, user_ids: Iterable[int] | None = None)
     return bundle
 
 
+def sync_federation_users(cluster: Cluster, only_node: str = "") -> dict[str, Any]:
+    published = cluster.publish_local_user_events()
+    local = cluster.apply_federation_users(refresh=False)
+    local_id = str(cluster.load_config().get("node_id", ""))
+    rows = cluster.trusted_federation_nodes()
+    if only_node:
+        target = str(cluster.node(only_node)["id"])
+        rows = [row for row in rows if str(row["id"]) == target]
+        if target != local_id and not rows:
+            raise ClusterError("target is not an active trusted federation member")
+    results: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    for node in rows:
+        node_id = str(node["id"])
+        try:
+            results[node_id] = federation_sync(cluster, node_id)
+        except (ClusterError, OSError, sqlite3.Error) as exc:
+            failures[node_id] = str(exc)[-1000:]
+    # Pulls may have introduced concurrent user events. Re-apply the converged view.
+    local = cluster.apply_federation_users(refresh=False)
+    refreshed = len(cluster.refresh_profiles())
+    cluster.db.audit("federation.users.sync", only_node or "all",
+                     f"events={published['events']} peers={len(results)} failures={len(failures)}")
+    return {"published": published, "local": local, "nodes": results,
+            "failures": failures, "refreshed": refreshed}
+
+
 def sync_cluster_users(cluster: Cluster, only_node: str = "") -> dict[str, Any]:
     config = cluster.load_config()
+    if cluster.is_federation():
+        return sync_federation_users(cluster, only_node)
     if config.get("role") != "master":
         raise ClusterError("只有主 VPS 可以下发统一用户")
     all_bundle = export_master_users(cluster)
@@ -3116,6 +5414,19 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--port", type=int, required=True)
         item.add_argument("--public-port", type=int)
         item.add_argument("--remark", default="")
+    federation_init = sub.add_parser("federation-init")
+    federation_init.add_argument("--host", required=True)
+    federation_init.add_argument("--port", type=int, required=True)
+    federation_init.add_argument("--public-port", type=int)
+    federation_init.add_argument("--remark", default="")
+    federation_init.add_argument("--migrate", action="store_true")
+    sub.add_parser("federation-join-code")
+    peer = sub.add_parser("add-peer")
+    peer.add_argument("--uri", required=True)
+    peer.add_argument("--remark", default="")
+    remove_peer = sub.add_parser("remove-peer")
+    remove_peer.add_argument("--node-id", required=True)
+    remove_peer.add_argument("--reason", default="manual")
     sub.add_parser("join-code")
     add = sub.add_parser("add-node")
     add.add_argument("--uri", required=True)
@@ -3138,7 +5449,14 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--profile", default="legacy")
     refresh_profiles = sub.add_parser("refresh-profiles")
     refresh_profiles.add_argument("--profile", default="legacy")
+    subscription_access = sub.add_parser("subscription-access")
+    subscription_access.add_argument("--token", required=True)
     sub.add_parser("profiles")
+    for command in ("cdn-pool-preview", "cdn-pool-sync"):
+        cdn_pool = sub.add_parser(command)
+        cdn_pool.add_argument("--node-id", required=True)
+        cdn_pool.add_argument("--mode", choices=("merge", "replace"), required=True)
+        cdn_pool.add_argument("--cfip", required=True)
     action = sub.add_parser("action")
     action.add_argument("--node-id", required=True)
     action.add_argument("--action", choices=sorted(ACTION_NAMES), required=True)
@@ -3175,6 +5493,19 @@ def build_parser() -> argparse.ArgumentParser:
     restore = sub.add_parser("restore")
     restore.add_argument("--path", required=True)
     restore.add_argument("--password-file")
+    federation_backup = sub.add_parser("federation-backup")
+    federation_backup.add_argument("--path", required=True)
+    federation_backup.add_argument("--password-file")
+    identity_backup = sub.add_parser("identity-backup")
+    identity_backup.add_argument("--path", required=True)
+    identity_backup.add_argument("--password-file")
+    federation_restore = sub.add_parser("federation-restore")
+    federation_restore.add_argument("--path", required=True)
+    federation_restore.add_argument("--password-file")
+    identity_restore = sub.add_parser("identity-restore")
+    identity_restore.add_argument("--path", required=True)
+    identity_restore.add_argument("--password-file")
+    sub.add_parser("revocation-check")
     sub.add_parser("status")
     sub.add_parser("serve")
     return parser
@@ -3196,6 +5527,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init-master":
             result = cluster.init_master(args.host, args.port, args.public_port, args.remark)
             print("主 VPS 集群控制器已初始化。")
+        elif args.command == "federation-init":
+            result = cluster.federation_init(args.host, args.port, args.public_port, args.remark, args.migrate)
+            print("Lun 分布式服务器集群已初始化")
+        elif args.command == "federation-join-code":
+            result = {"join_uri": cluster.create_join_code()}
+            print("联邦加入地址：" + result["join_uri"])
+        elif args.command == "add-peer":
+            result = federation_add_peer(cluster, args.uri, args.remark)
+            print("联邦成员已加入：" + short_id(result["node_id"]))
+        elif args.command == "remove-peer":
+            row = cluster.node(args.node_id)
+            result = cluster.revoke_member(str(row["id"]), args.reason)
+            print("联邦成员已撤销：" + short_id(str(row["id"])))
         elif args.command == "init-child":
             result = cluster.init_child(args.host, args.port, args.public_port, args.remark)
             print("子 VPS 联动服务已初始化。")
@@ -3231,7 +5575,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.json:
                 print_nodes(result)
         elif args.command == "sync":
-            result = sync_node(cluster, args.node_id, args.profile)
+            result = federation_sync(cluster, args.node_id) if cluster.is_federation() else sync_node(cluster, args.node_id, args.profile)
             print("节点状态和订阅快照已同步。")
         elif args.command == "push":
             result = push_snapshot(cluster, args.profile)
@@ -3245,11 +5589,35 @@ def main(argv: list[str] | None = None) -> int:
             result = cluster.refresh_profiles(args.profile)
             if not args.json:
                 print(f"已刷新 {len(result)} 组集群订阅。")
+        elif args.command == "subscription-access":
+            result = cluster.subscription_access(args.token)
+            if not args.json:
+                if result["debounced"]:
+                    print("30 秒内已补齐过该订阅，本次已防抖跳过。")
+                else:
+                    print(f"订阅补齐完成：收到 {sum(result['received'].values())} 个事件，"
+                          f"失败成员 {len(result['failures'])} 个，刷新 {result['refreshed']} 组订阅。")
         elif args.command == "profiles":
             result = cluster.profiles()
             if not args.json:
                 for item in result:
                     print(f"{item['id']}. {item['name']}  selector={item['selector']}  token={item['token']}")
+        elif args.command in {"cdn-pool-preview", "cdn-pool-sync"}:
+            result = cdn_pool_command(cluster, args.node_id, args.mode, args.cfip,
+                                      apply=args.command == "cdn-pool-sync")
+            if not args.json:
+                for label, key in (("当前", "current"), ("来源", "source"), ("结果", "result"),
+                                   ("新增", "add"), ("保留", "keep"), ("移除", "remove")):
+                    print(f"{label}：{' '.join(result.get(key, [])) or '-'}")
+                if args.command == "cdn-pool-sync":
+                    print("应用成功。" if result.get("applied") else
+                          f"应用失败，已回滚：{json_dumps(result.get('rollback'))}")
+            if args.command == "cdn-pool-sync" and not result.get("applied"):
+                failed = result
+                if args.json:
+                    print(json.dumps(failed, ensure_ascii=False, indent=2))
+                    result = None
+                raise ClusterError("CDN 优选池应用失败，回滚状态：" + json_dumps(failed.get("rollback")))
         elif args.command == "action":
             payload_text = Path(args.payload_file).read_text(encoding="utf-8") if args.payload_file else args.payload
             payload = json.loads(payload_text)
@@ -3270,7 +5638,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(script_payload, dict) or not isinstance(agent_payload, dict):
                 raise ClusterError("更新载荷必须是 JSON 对象")
             payload = {"script": script_payload, "agent": agent_payload, "exclude": args.exclude}
-            if cluster.load_config().get("role") == "master":
+            if cluster.load_config().get("role") == "master" or cluster.is_federation():
                 result = distribute_cluster_update(cluster, payload)
             else:
                 result = request_cluster_update(cluster, payload)
@@ -3307,12 +5675,33 @@ def main(argv: list[str] | None = None) -> int:
             print("主 VPS 用户、凭据、权限与订阅已同步。")
         elif args.command == "backup":
             password = read_password(args.password_file, "备份口令：")
-            result = {"path": str(cluster.export_backup(Path(args.path), password))}
+            exporter = cluster.export_federation_backup if cluster.is_federation() else cluster.export_backup
+            result = {"path": str(exporter(Path(args.path), password))}
             print("集群加密备份已创建：" + result["path"])
         elif args.command == "restore":
             password = read_password(args.password_file, "备份口令：")
-            result = cluster.restore_backup(Path(args.path), password)
+            restore = cluster.restore_federation_backup if cluster.is_federation() else cluster.restore_backup
+            result = restore(Path(args.path), password)
             print("集群备份已加载。")
+        elif args.command == "federation-backup":
+            password = read_password(args.password_file, "Federation backup password: ")
+            result = {"path": str(cluster.export_federation_backup(Path(args.path), password))}
+        elif args.command == "identity-backup":
+            password = read_password(args.password_file, "Identity backup password: ")
+            result = {"path": str(cluster.export_identity_backup(Path(args.path), password))}
+        elif args.command == "federation-restore":
+            password = read_password(args.password_file, "Federation backup password: ")
+            result = cluster.restore_federation_backup(Path(args.path), password)
+        elif args.command == "identity-restore":
+            password = read_password(args.password_file, "Identity backup password: ")
+            result = cluster.restore_identity_backup(Path(args.path), password)
+            if not args.json:
+                print("本机联邦身份备份已恢复。")
+        elif args.command == "revocation-check":
+            result = cluster.check_self_revocation()
+            if not args.json:
+                print("revoked federation identity cleaned" if result.get("cleaned") else
+                      f"membership checked: {result.get('checked', 0)}")
         elif args.command == "status":
             result = {"config": cluster.load_config(), "nodes": cluster.nodes(),
                       "database": cluster.db.connection.execute("PRAGMA integrity_check").fetchone()[0]}
