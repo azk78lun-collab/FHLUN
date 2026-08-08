@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.8.2"
+echo "当前版本：V26.8.8.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1735,6 +1735,10 @@ cert_covers_domain(){ (
 cert_file=$1
 cert_name=$(printf '%s' "$2" | sed 's/^\[//; s/\]$//; s/\.$//')
 [ -n "$cert_name" ] || return 1
+if is_ip_literal "$cert_name" && openssl x509 -help 2>&1 | grep -q -- '-checkip'; then
+openssl x509 -in "$cert_file" -noout -checkip "$cert_name" >/dev/null 2>&1
+return $?
+fi
 
 cert_san_output=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null) || cert_san_output=
 if [ -n "$cert_san_output" ]; then
@@ -1762,7 +1766,9 @@ if cert_covers_domain "$cert_file" "$preferred_name"; then
 printf '%s\n' "$preferred_name"
 return
 fi
-sans=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^[[:space:]]*DNS://p')
+sans=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n \
+  -e 's/^[[:space:]]*DNS://p' \
+  -e 's/^[[:space:]]*IP Address://p')
 subject=$(printf '%s\n' "$sans" | sed '/^\*/d; /^$/d' | sed -n 1p)
 [ -z "$subject" ] && subject=$(printf '%s\n' "$sans" | sed '/^$/d' | sed -n 1p)
 [ -z "$subject" ] && subject=$(openssl x509 -in "$cert_file" -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p')
@@ -2049,18 +2055,113 @@ fi
 "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 }
 
+acme_challenge_firewall_open(){
+printf '80\n' > "$HOME/lun/acme_http01_port"
+apply_lun_firewall_rules quiet >/dev/null 2>&1 || yellow_line "未能自动放行临时 TCP 80，请检查系统防火墙或云安全组。"
+}
+
+acme_challenge_firewall_close(){
+rm -f "$HOME/lun/acme_http01_port"
+apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
+}
+
+reload_runtime_after_cert(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl try-restart xr sb >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service xray status >/dev/null 2>&1 && rc-service xray restart >/dev/null 2>&1 || true
+rc-service sing-box status >/dev/null 2>&1 && rc-service sing-box restart >/dev/null 2>&1 || true
+fi
+}
+
+acme_stage_dir(){
+stage_subject=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g; s/^_*//; s/_*$//')
+[ -n "$stage_subject" ] || return 1
+printf '%s/lun/acme-live/%s\n' "$HOME" "$stage_subject"
+}
+
+deploy_acme_cert(){
+subject=$1
+mode=$2
+stage=$(acme_stage_dir "$subject") || return 1
+[ -s "$stage/cert.crt" ] && [ -s "$stage/private.key" ] || return 1
+openssl x509 -in "$stage/cert.crt" -noout -checkend 0 >/dev/null 2>&1 || return 1
+cert_key_matches "$stage/cert.crt" "$stage/private.key" || return 1
+cert_covers_domain "$stage/cert.crt" "$subject" || return 1
+cp "$stage/private.key" "$HOME/lun/private.key.new" || return 1
+cp "$stage/cert.crt" "$HOME/lun/cert.crt.new" || { rm -f "$HOME/lun/private.key.new"; return 1; }
+chmod 600 "$HOME/lun/private.key.new"
+chmod 644 "$HOME/lun/cert.crt.new"
+mv -f "$HOME/lun/private.key.new" "$HOME/lun/private.key"
+mv -f "$HOME/lun/cert.crt.new" "$HOME/lun/cert.crt"
+printf '%s\n' "$mode" > "$HOME/lun/cert_mode"
+printf '%s\n' "$subject" > "$HOME/lun/cert_subject"
+rm -f "$HOME/lun/cert_source"
+cert_hash_update || return 1
+reload_runtime_after_cert
+}
+
 install_acme_cert(){
 subject=$1
 mode=$2
 acme="$HOME/.acme.sh/acme.sh"
+stage=$(acme_stage_dir "$subject") || return 1
+mkdir -p "$stage" || return 1
+chmod 700 "$stage"
+rm -f "$stage/private.key" "$stage/cert.crt"
+reload_cmd="if command -v lun >/dev/null 2>&1; then lun cert-deploy '$subject' '$mode' >/dev/null 2>&1 || true; fi"
 "$acme" --install-cert -d "$subject" --ecc \
---key-file "$HOME/lun/private.key" \
---fullchain-file "$HOME/lun/cert.crt" \
---reloadcmd "lun res >/dev/null 2>&1 || true" >/dev/null 2>&1 || return 1
-echo "$mode" > "$HOME/lun/cert_mode"
-echo "$subject" > "$HOME/lun/cert_subject"
-rm -f "$HOME/lun/cert_source"
-cert_hash_update
+--key-file "$stage/private.key" \
+--fullchain-file "$stage/cert.crt" \
+--reloadcmd "$reload_cmd" >/dev/null 2>&1 || return 1
+deploy_acme_cert "$subject" "$mode"
+}
+
+acme_issued_artifacts_valid(){
+issued_subject=$1
+issued_dir="$HOME/.acme.sh/${issued_subject}_ecc"
+issued_cert="$issued_dir/fullchain.cer"
+issued_key="$issued_dir/${issued_subject}.key"
+[ -s "$issued_cert" ] && [ -s "$issued_key" ] || return 1
+openssl x509 -in "$issued_cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+cert_key_matches "$issued_cert" "$issued_key" || return 1
+cert_covers_domain "$issued_cert" "$issued_subject"
+}
+
+saved_dns_acme_available(){
+[ -s "$HOME/lun/cert.env" ] && [ -s "$HOME/lun/acme_dns" ] && return 0
+token_file="$HOME/lun/cdn_cloudflare_token"
+[ -s "$token_file" ] || return 1
+cf_saved_token=$(cat "$token_file" 2>/dev/null)
+printf '%s' "$cf_saved_token" | grep -Eq '^[A-Za-z0-9_-]{20,}$' || return 1
+umask 077
+printf "export CF_Token='%s'\n" "$cf_saved_token" > "$HOME/lun/cert.env"
+printf '%s\n' dns_cf > "$HOME/lun/acme_dns"
+chmod 600 "$HOME/lun/cert.env" "$HOME/lun/acme_dns"
+return 0
+}
+
+issue_public_domain_cert(){
+subject=$1
+if saved_dns_acme_available; then
+green_line "检测到已保存的 DNS API 凭据，使用 DNS-01 申请约 90 天的公开域名证书。"
+issue_acme_cert dns "$subject"
+else
+yellow_line "未保存 DNS API 凭据，使用公网 TCP 80 的 HTTP-01 申请约 90 天证书。"
+issue_acme_cert domain "$subject"
+fi
+}
+
+select_ip_cert_subject(){
+if is_nat_mode; then
+nat_cert_ip=$(local_public_ips | awk 'index($0, ":") {print; exit}')
+[ -n "$nat_cert_ip" ] && { printf '%s\n' "$nat_cert_ip"; return; }
+[ "$(client_port 80)" = 80 ] || return 1
+fi
+saved_ip=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
+saved_ip=${saved_ip#\[}; saved_ip=${saved_ip%\]}
+is_ip_literal "$saved_ip" && { printf '%s\n' "$saved_ip"; return; }
+local_public_ips | sed -n 1p
 }
 
 issue_acme_cert(){
@@ -2082,29 +2183,46 @@ return 1
 resolved_v4=$(resolve_domain_ipv4 "$subject")
 resolved_v6=$(resolve_domain_ipv6 "$subject")
 acme_listen=
-[ -z "$resolved_v4" ] && [ -n "$resolved_v6" ] && acme_listen=--listen-v6
+if [ -n "$resolved_v6" ] && { [ -z "$resolved_v4" ] || { is_nat_mode && [ "$(client_port 80)" != 80 ]; }; }; then
+acme_listen=--listen-v6
+fi
 show_domain_acme_diagnostics "$subject"
+if is_nat_mode && [ "$acme_listen" != --listen-v6 ] && [ "$(client_port 80)" != 80 ]; then
+echo "NAT VPS 的公网 TCP 80 未映射到内网 80，HTTP-01 无法验证。请保存 Cloudflare Token 后改用 DNS-01。"
+return 1
+fi
 if command -v ss >/dev/null 2>&1 && ss -lnt 2>/dev/null | awk '$4 ~ /(^|\]|:)80$/ {found=1} END{exit !found}'; then
 echo "TCP 80 已被占用，acme.sh standalone 无法启动。请先释放 80 端口，或改用 DNS API 证书。"
 return 1
 fi
 echo "开始申请证书，验证监听：${acme_listen:-系统默认（IPv4/IPv6）}"
+acme_challenge_firewall_open
 if ! "$acme" --issue --server letsencrypt --keylength ec-256 -d "$subject" --standalone $acme_listen > "$acme_log" 2>&1; then
+acme_challenge_firewall_close
+if acme_issued_artifacts_valid "$subject"; then
+yellow_line "acme.sh 返回了兼容性警告，但签发产物校验有效，继续安装。"
+else
 echo "域名证书申请失败，acme.sh 最后错误如下："
 tail -30 "$acme_log" 2>/dev/null
 echo "完整日志：$acme_log"
 return 1
 fi
+fi
+acme_challenge_firewall_close
 ;;
 dns)
 [ -s "$HOME/lun/cert.env" ] && . "$HOME/lun/cert.env"
 [ -z "$acme_dns" ] && [ -s "$HOME/lun/acme_dns" ] && acme_dns=$(cat "$HOME/lun/acme_dns" 2>/dev/null)
 [ -n "$acme_dns" ] || return 1
 if ! "$acme" --issue --server letsencrypt --keylength ec-256 -d "$subject" --dns "$acme_dns" > "$acme_log" 2>&1; then
+if acme_issued_artifacts_valid "$subject"; then
+yellow_line "acme.sh 返回了兼容性警告，但签发产物校验有效，继续安装。"
+else
 echo "DNS API 证书申请失败，acme.sh 最后错误如下："
 tail -30 "$acme_log" 2>/dev/null
 echo "完整日志：$acme_log"
 return 1
+fi
 fi
 ;;
 ip)
@@ -2112,12 +2230,27 @@ ip_subject=$subject
 ip_subject=$(printf '%s' "$ip_subject" | sed 's/^\[//; s/\]$//')
 is_ip_literal "$ip_subject" || return 1
 case "$ip_subject" in *:*) acme_listen=--listen-v6 ;; *) acme_listen= ;; esac
-if ! "$acme" --issue --server letsencrypt --keylength ec-256 --cert-profile shortlived --days 3 -d "$ip_subject" --standalone $acme_listen > "$acme_log" 2>&1; then
+if command -v ss >/dev/null 2>&1 && ss -lnt 2>/dev/null | awk '$4 ~ /(^|\]|:)80$/ {found=1} END{exit !found}'; then
+echo "TCP 80 已被占用，IP 证书的 HTTP-01 验证无法启动。"
+return 1
+fi
+if is_nat_mode && [ -z "$acme_listen" ] && [ "$(client_port 80)" != 80 ]; then
+echo "NAT VPS 的公网 TCP 80 未映射到内网 80，IPv4 地址证书无法完成 HTTP-01 验证；优先使用直连 IPv6 或域名 DNS-01。"
+return 1
+fi
+acme_challenge_firewall_open
+if ! "$acme" --issue --server letsencrypt --keylength ec-256 --certificate-profile shortlived --days 4 -d "$ip_subject" --standalone $acme_listen > "$acme_log" 2>&1; then
+acme_challenge_firewall_close
+if acme_issued_artifacts_valid "$ip_subject"; then
+yellow_line "acme.sh 无法解析短证书日期，但 Let’s Encrypt 签发产物校验有效，继续安装。"
+else
 echo "IP 证书申请失败，acme.sh 最后错误如下："
 tail -30 "$acme_log" 2>/dev/null
 echo "完整日志：$acme_log"
 return 1
 fi
+fi
+acme_challenge_firewall_close
 subject="$ip_subject"
 ;;
 *) return 1 ;;
@@ -2130,20 +2263,29 @@ load_domain_cert_config
 if [ "${ONECLICK_FORCE_CERT:-no}" != yes ] && reuse_local_cert_interactive; then return 0; fi
 subject=$(cert_subject_default)
 case "$certmode" in
-domain|dns)
+domain)
 [ -n "$domain" ] && subject="$domain"
-echo "证书模式：ACME $certmode，证书主体：$subject"
-issue_acme_cert "$certmode" "$subject" && return 0
-echo "ACME 证书申请失败或条件不满足，自动恢复自签证书。"
-self_signed_cert
+echo "证书模式：自动公开域名证书，证书主体：$subject"
+issue_public_domain_cert "$subject" && return 0
+red_line "公开域名证书申请失败；现有证书保持不变，不会自动改成自签。"
+sync_cert_metadata >/dev/null 2>&1 || true
+return 1
+;;
+dns)
+[ -n "$domain" ] && subject="$domain"
+echo "证书模式：ACME DNS-01，证书主体：$subject"
+issue_acme_cert dns "$subject" && return 0
+red_line "DNS API 证书申请失败；现有证书保持不变，不会自动改成自签。"
+sync_cert_metadata >/dev/null 2>&1 || true
+return 1
 ;;
 ip)
-subject=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
-[ -z "$subject" ] && subject=$(local_public_ips | sed -n 1p)
-echo "证书模式：ACME IP short-lived，证书主体：$subject"
+subject=$(select_ip_cert_subject)
+echo "证书模式：Let's Encrypt IP 短期证书（约 6 天），证书主体：$subject"
 issue_acme_cert ip "$subject" && return 0
-echo "ACME IP 证书申请失败，自动恢复自签证书。"
-self_signed_cert
+red_line "IP 证书申请失败；现有证书保持不变，不会自动改成自签。"
+sync_cert_metadata >/dev/null 2>&1 || true
+return 1
 ;;
 self|*)
 if [ ! -f "$HOME/lun/private.key" ] || [ ! -f "$HOME/lun/cert.crt" ] || [ ! -f "$HOME/lun/SHA256.txt" ]; then
@@ -3044,7 +3186,7 @@ fi
 
 xrsbout(){
 if [ -e "$HOME/lun/xr.json" ]; then
-sed -i '${s/,\s*$//}' "$HOME/lun/xr.json"
+sed -i '${s/,[[:space:]]*$//}' "$HOME/lun/xr.json"
 cat >> "$HOME/lun/xr.json" <<EOF
   ],
   "outbounds": [
@@ -3147,7 +3289,7 @@ nohup "$HOME/lun/xray" run -c "$HOME/lun/xr.json" >/dev/null 2>&1 &
 fi
 fi
 if [ -e "$HOME/lun/sb.json" ]; then
-sed -i '${s/,\s*$//}' "$HOME/lun/sb.json"
+sed -i '${s/,[[:space:]]*$//}' "$HOME/lun/sb.json"
 cat >> "$HOME/lun/sb.json" <<EOF
   ],
   "outbounds": [
@@ -3312,12 +3454,16 @@ else
 argoname='临时'
 nohup "$HOME/lun/cloudflared" tunnel --url http://localhost:$(cat $HOME/lun/argoport.log) --edge-ip-version auto --no-autoupdate --protocol http2 > $HOME/lun/argo.log 2>&1 &
 fi
-echo "申请Argo$argoname隧道中……请稍等"
-sleep 15
+echo "正在检查 Argo$argoname 隧道……"
 if [ -n "${ARGO_DOMAIN}" ] && [ -n "${ARGO_AUTH}" ]; then
 argodomain=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
 else
-argodomain=$(grep -a trycloudflare.com "$HOME/lun/argo.log" 2>/dev/null | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+argodomain=
+for argo_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+argodomain=$(grep -aoE 'https://[-A-Za-z0-9.]+\.trycloudflare\.com' "$HOME/lun/argo.log" 2>/dev/null | tail -1 | sed 's#https://##')
+[ -n "$argodomain" ] && break
+sleep 1
+done
 fi
 if [ -n "${argodomain}" ]; then
 echo "Argo$argoname隧道申请成功"
@@ -3325,7 +3471,7 @@ else
 echo "Argo$argoname隧道申请失败，请稍后再试"
 fi
 fi
-sleep 5
+sleep 1
 echo
 if { find /proc/[0-9]*/exe -type l 2>/dev/null | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(sing-box|xray)$'; } 2>/dev/null || pgrep -f 'lun/(sing-box|xray)([[:space:]]|$)' >/dev/null 2>&1 || systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; then
 [ -f ~/.bashrc ] || touch ~/.bashrc
@@ -3389,7 +3535,7 @@ fi
 fi
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
-echo "Lun脚本进程启动成功，安装完毕" && sleep 2
+echo "代理内核已启动，正在完成配置校验……"
 else
 echo "Lun脚本进程未启动，安装失败" && exit
 fi
@@ -3808,11 +3954,37 @@ systemctl stop lun-cluster-agent >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-cluster-agent stop >/dev/null 2>&1 || true
 fi
+cluster_stop_orphan_processes
+}
+
+cluster_stop_orphan_processes(){
+agent_py="$(cluster_module_dir)/lun_cluster.py"
+cluster_pids=
 for P in /proc/[0-9]*; do
 [ -r "$P/cmdline" ] || continue
 PID=$(basename "$P")
 CMD=$(tr '\0' ' ' < "$P/cmdline" 2>/dev/null)
-case "$CMD" in *"/lun/modules/cluster/lun_cluster.py"*" serve"*) kill "$PID" 2>/dev/null || true ;; esac
+case " $CMD " in
+*" $agent_py --root $HOME/lun serve "*)
+cluster_pids="$cluster_pids $PID"
+kill "$PID" 2>/dev/null || true
+;;
+esac
+done
+[ -n "$cluster_pids" ] || return 0
+cluster_wait=0
+while [ "$cluster_wait" -lt 20 ]; do
+cluster_alive=
+for PID in $cluster_pids; do
+kill -0 "$PID" 2>/dev/null && cluster_alive="$cluster_alive $PID"
+done
+[ -z "$cluster_alive" ] && return 0
+cluster_pids=$cluster_alive
+sleep 0.1
+cluster_wait=$((cluster_wait + 1))
+done
+for PID in $cluster_pids; do
+kill -KILL "$PID" 2>/dev/null || true
 done
 }
 
@@ -4033,8 +4205,7 @@ yellow_line "请在服务商面板新增 公网 TCP 端口 → $cluster_default_
 return 1
 }
 fi
-printf "节点备注（可留空）："
-IFS= read -r cluster_remark
+cluster_remark=
 if [ "$cluster_new_role" = master ]; then
 cluster_cmd init-master --host "$cluster_host" --port "$cluster_default_port" --public-port "$cluster_default_public" --remark "$cluster_remark" || return 1
 else
@@ -4118,8 +4289,14 @@ if multiuser_enabled; then
 cluster_scheme=$(multiuser_config_value scheme)
 cluster_host=$(multiuser_config_value public_host)
 cluster_sub_port=$(multiuser_config_value public_port)
+cluster_domain=$(subscription_direct_domain)
+if [ -n "$cluster_domain" ] && { [ "$cluster_scheme" = http ] || cert_covers_domain "$HOME/lun/cert.crt" "$cluster_domain"; }; then
+cluster_host=$cluster_domain
+fi
 else
 cluster_sub_port=$(client_port "$cluster_sub_port")
+cluster_domain=$(subscription_direct_domain)
+[ -n "$cluster_domain" ] && cluster_host=$cluster_domain
 fi
 [ -n "$cluster_host" ] && [ -n "$cluster_sub_port" ] || { red_line "没有可用于输出订阅的地址或端口。"; return 1; }
 cluster_profiles_file=$(mktemp 2>/dev/null) || return 1
@@ -4490,16 +4667,10 @@ yellow_line "在子 VPS 进入同一模块并生成 lunjoin:// 地址，然后�
 printf "加入地址（输入 0 返回）："
 IFS= read -r cluster_join_uri
 [ "$cluster_join_uri" = 0 ] && return
-printf "节点备注（可留空）："
-IFS= read -r cluster_remark
-printf "预期代理 UUID（可留空，仅用于防止加错服务器）："
-IFS= read -r cluster_expected_uuid
-set -- add-node --uri "$cluster_join_uri" --remark "$cluster_remark"
-[ -n "$cluster_expected_uuid" ] && set -- "$@" --expected-uuid "$cluster_expected_uuid"
-if cluster_cmd "$@"; then
+if cluster_cmd add-node --uri "$cluster_join_uri"; then
 cluster_service_restart || true
 cluster_refresh_profiles >/dev/null 2>&1 || true
-green_line "子 VPS 已加入；其一次性加入地址已经失效。"
+green_line "子 VPS 已加入；若它原来属于其他主 VPS，旧主控授权已由本次配对取代。"
 fi
 ui_pause
 }
@@ -4574,9 +4745,11 @@ cluster_number=$(printf '%s' "$cluster_node_id" | sed 's/^0*//')
 [ "$cluster_number" -gt 0 ] 2>/dev/null || { red_line "服务器编号无效。"; return 1; }
 if [ "$cluster_number" -lt 100 ]; then cluster_number=$(printf '%02d' "$cluster_number"); fi
 red_line "将转移集群数据库和 CA 私钥，并更新全部子机的主控授权；失败会自动回滚。"
-printf "输入 SWITCH-%s 确认（输入 0 返回）：" "$cluster_number"
+printf "回车确认切换到服务器 %s（输入 0 返回）：" "$cluster_number"
 IFS= read -r cluster_confirm
 [ "$cluster_confirm" = 0 ] && return 2
+[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; return 1; }
+cluster_confirm=CONFIRM
 if cluster_cmd switch-master --node-id "$cluster_node_id" --confirm "$cluster_confirm"; then
 cluster_service_restart || yellow_line "本机已降为子 VPS，但联动服务重启失败；请执行 systemctl restart lun-cluster-agent。"
 apply_lun_firewall_rules >/dev/null 2>&1 || true
@@ -4658,8 +4831,9 @@ ui_pause
 ;;
 14)
 red_line "卸载只移除本机集群控制面；不会卸载代理协议或远端子 VPS。"
-printf "输入 REMOVE 确认（输入 0 返回）："; IFS= read -r cluster_confirm
-[ "$cluster_confirm" = REMOVE ] || continue
+printf "回车确认卸载（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && continue
+[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; continue; }
 cluster_remove_service
 rm -rf "$(cluster_module_dir)"
 apply_lun_firewall_rules quiet || true
@@ -4703,8 +4877,9 @@ case "$cluster_choice" in
 6) cluster_download_agent && cluster_install_service && cluster_service_restart && green_line "服务器联动程序已更新。"; ui_pause ;;
 7)
 red_line "解除后主 VPS 不能再管理本机；代理协议不会删除。"
-printf "输入 REMOVE 确认（输入 0 返回）："; IFS= read -r cluster_confirm
-[ "$cluster_confirm" = REMOVE ] || continue
+printf "回车确认解除（输入 0 返回）："; IFS= read -r cluster_confirm
+[ "$cluster_confirm" = 0 ] && continue
+[ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; continue; }
 cluster_remove_service
 rm -rf "$(cluster_module_dir)"
 apply_lun_firewall_rules quiet || true
@@ -4785,7 +4960,9 @@ firewall_append_file "$fw_proto" "$fw_root/$fw_file" "$fw_output"
 done
 firewall_append_file tcp "$fw_root/subport.log" "$fw_output"
 firewall_append_file tcp "$fw_root/subport_legacy.log" "$fw_output"
+firewall_append_file tcp "$fw_root/subport_public.log" "$fw_output"
 firewall_append_file tcp "$fw_root/cdnopt_port" "$fw_output"
+firewall_append_file tcp "$fw_root/acme_http01_port" "$fw_output"
 
 fw_config="$fw_root/modules/multiuser/config.json"
 if [ -s "$fw_config" ]; then
@@ -5074,6 +5251,25 @@ esac
 done
 }
 
+start_subscription_httpd(){
+httpd_port=$1
+if command -v apk >/dev/null 2>&1; then
+busybox-extras httpd -f -p "$httpd_port" -h "$HOME/weblun" > /dev/null 2>&1 &
+else
+busybox httpd -f -p "$httpd_port" -h "$HOME/weblun" > /dev/null 2>&1 &
+fi
+}
+
+subscription_httpd_ready(){
+httpd_port=$1
+httpd_token=$2
+if command -v wget >/dev/null 2>&1; then
+wget -qO /dev/null "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" 2>/dev/null
+else
+curl -fsS --max-time 3 "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" >/dev/null 2>&1
+fi
+}
+
 restart_subscription_service(){
 [ -s "$(multiuser_module_dir)/config.json" ] && multiuser_enabled && {
 multiuser_sync_subscription_state || return 1
@@ -5105,6 +5301,7 @@ else
 requested_subport=
 fi
 subport=$(select_subscription_port "$requested_subport") || { echo "订阅服务无法取得可用端口，已跳过。"; return 1; }
+stop_subscription_service
 rm -rf "$HOME/weblun/$subtoken"
 mkdir -p "$HOME/weblun/$subtoken"
 printf "%s\n" "$subtoken" > "$HOME/lun/subtoken.log"
@@ -5112,16 +5309,27 @@ printf "%s\n" "$subport" > "$HOME/lun/subport.log"
 ln -sf "$HOME/lun/clmi.yaml" "$HOME/weblun/$subtoken/clmi.yaml"
 ln -sf "$HOME/lun/sbox.json" "$HOME/weblun/$subtoken/sbox.json"
 ln -sf "$HOME/lun/jhsub.txt" "$HOME/weblun/$subtoken/jhsub.txt"
-if command -v apk >/dev/null 2>&1; then
-busybox-extras httpd -f -p "$subport" -h "$HOME/weblun" > /dev/null 2>&1 &
+rm -f "$HOME/lun/subport_public.log"
+start_subscription_httpd "$subport"
+sleep 1
+subscription_httpd_ready "$subport" "$subtoken" || { echo "订阅 HTTP 服务未能监听内网端口 $subport。"; return 1; }
+sub_public_port=$(client_port "$subport")
+if is_nat_mode && [ "$sub_public_port" != "$subport" ] && ! port_in_use "$sub_public_port"; then
+start_subscription_httpd "$sub_public_port"
+sleep 1
+if subscription_httpd_ready "$sub_public_port" "$subtoken"; then
+printf '%s\n' "$sub_public_port" > "$HOME/lun/subport_public.log"
+green_line "双栈订阅兼容：IPv4 使用 NAT $sub_public_port→$subport，IPv6 直连监听 $sub_public_port。"
 else
-busybox httpd -f -p "$subport" -h "$HOME/weblun" > /dev/null 2>&1 &
+yellow_line "无法在公网映射端口 $sub_public_port 增加 IPv6 直连监听，订阅链接将继续使用 IPv4 地址。"
+fi
 fi
 if command -v apk >/dev/null 2>&1; then
 cat > /etc/local.d/alpinesublun.start <<EOF
 #!/bin/bash
 sleep 10
 busybox-extras httpd -f -p \$(cat $HOME/lun/subport.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &
+[ ! -s $HOME/lun/subport_public.log ] || busybox-extras httpd -f -p \$(cat $HOME/lun/subport_public.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &
 EOF
 chmod +x /etc/local.d/alpinesublun.start
 rc-update add local default >/dev/null 2>&1
@@ -5129,6 +5337,7 @@ else
 crontab -l 2>/dev/null > /tmp/crontab.tmp
 sed -i '/weblun/d' /tmp/crontab.tmp
 echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat $HOME/lun/subport.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &"' >> /tmp/crontab.tmp
+[ ! -s "$HOME/lun/subport_public.log" ] || echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat $HOME/lun/subport_public.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &"' >> /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 fi
@@ -6380,18 +6589,22 @@ echo "已恢复上一次配置。"
 return 0
 }
 
-validate_rebuild(){
+validate_core_configs(){
 rebuild_configs=0
 if [ -s "$HOME/lun/xr.json" ]; then
 rebuild_configs=$((rebuild_configs + 1))
-"$HOME/lun/xray" run -test -c "$HOME/lun/xr.json" >/dev/null 2>&1 || { echo "Xray 新配置校验失败。"; return 1; }
+"$HOME/lun/xray" run -test -c "$HOME/lun/xr.json" >/dev/null 2>&1 || { echo "Xray 配置校验失败。"; return 1; }
 fi
 if [ -s "$HOME/lun/sb.json" ]; then
 rebuild_configs=$((rebuild_configs + 1))
-"$HOME/lun/sing-box" check -c "$HOME/lun/sb.json" >/dev/null 2>&1 || { echo "Sing-box 新配置校验失败。"; return 1; }
+"$HOME/lun/sing-box" check -c "$HOME/lun/sb.json" >/dev/null 2>&1 || { echo "Sing-box 配置校验失败。"; return 1; }
 fi
 [ "$rebuild_configs" -gt 0 ] || { echo "没有生成任何协议配置。"; return 1; }
 return 0
+}
+
+validate_rebuild(){
+validate_core_configs
 }
 
 commit_rebuild_snapshot(){
@@ -6480,7 +6693,7 @@ rm -f "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/argo* "$HOME/lun"/warp* "$HO
 rm -f "$HOME/lun/address_mode"
 rm -f "$HOME/lun"/xr.json "$HOME/lun"/sb.json "$HOME/lun"/addym "$HOME/lun"/addout
 rm -f "$HOME/lun"/cfip* "$HOME/lun"/xvvmcdnym "$HOME/lun"/ym_vl_re "$HOME/lun"/argoport.log "$HOME/lun"/argo.log "$HOME/lun"/sbargoym.log "$HOME/lun"/sbargotoken.log
-rm -f "$HOME/lun"/subport.log "$HOME/lun"/subtoken.log "$HOME/lun"/subip_mode
+rm -f "$HOME/lun"/subport.log "$HOME/lun"/subport_public.log "$HOME/lun"/subtoken.log "$HOME/lun"/subip_mode
 rm -rf "$HOME/lun"/xrk "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx" sbx_update
 echo "配置已全部清空，内核和脚本已保留。"
 echo "请重新运行 lun 引导式安装来配置协议。"
@@ -7310,6 +7523,11 @@ fi
 subscription_addresses(){
 mode=${subipmode:-ipv4}
 [ -z "${v4+x}" ] && v4v6
+subscription_domain=$(subscription_direct_domain)
+if [ -n "$subscription_domain" ]; then
+printf '%s\n' "$subscription_domain"
+return
+fi
 case "$mode" in
 ipv6)
 [ -n "$v6" ] && printf '[%s]\n' "$v6"
@@ -7327,6 +7545,28 @@ case "$server_logged" in *:*) ;; *) [ -n "$server_logged" ] && printf '%s\n' "$s
 fi
 ;;
 esac
+}
+
+subscription_direct_domain(){
+for subscription_candidate in \
+"$(cat "$HOME/lun/domain" 2>/dev/null)" \
+"$(cat "$HOME/lun/addym" 2>/dev/null)" \
+"$(cat "$HOME/lun/cdnym" 2>/dev/null)"; do
+[ -n "$subscription_candidate" ] || continue
+is_ip_literal "$subscription_candidate" && continue
+valid_addym "$subscription_candidate" || continue
+domain_matches_local_ip "$subscription_candidate" || continue
+if is_nat_mode && [ -s "$HOME/lun/subport.log" ] && [ -n "$(resolve_domain_ipv6 "$subscription_candidate")" ]; then
+subscription_inner=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+subscription_public=$(client_port "$subscription_inner")
+if [ "$subscription_public" != "$subscription_inner" ]; then
+[ "$(cat "$HOME/lun/subport_public.log" 2>/dev/null)" = "$subscription_public" ] || continue
+fi
+fi
+printf '%s\n' "$subscription_candidate"
+return 0
+done
+return 1
 }
 
 show_subscription_links(){
@@ -8412,12 +8652,25 @@ done
 }
 
 refresh_subscription_share(){
-if [ ! -s "$HOME/lun/jhsub.txt" ] || [ ! -s "$HOME/lun/sbox.json" ] || [ ! -s "$HOME/lun/clmi.yaml" ]; then
-cip
+if multiuser_enabled; then
+multiuser_cmd reconcile >/dev/null 2>&1 || { red_line "多用户订阅配置修复失败。"; return 1; }
+multiuser_service_start >/dev/null 2>&1 || { red_line "多用户订阅服务启动失败。"; return 1; }
 else
-restart_subscription_service
-show_subscription_links
+[ -s "$HOME/lun/uuid" ] || { red_line "缺少代理 UUID，无法开启订阅。"; return 1; }
+if [ ! -s "$HOME/lun/subtoken.log" ]; then
+cat "$HOME/lun/uuid" > "$HOME/lun/subtoken.log"
+chmod 600 "$HOME/lun/subtoken.log" 2>/dev/null || true
 fi
+if [ ! -s "$HOME/lun/subport.log" ]; then
+subport=$(select_subscription_port) || { red_line "没有可用于订阅服务的空闲端口。"; return 1; }
+printf '%s\n' "$subport" > "$HOME/lun/subport.log"
+green_line "已自动补齐订阅端口：内网 $subport / 公网 $(client_port "$subport")"
+fi
+sub=y
+subid=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
+subpt=$(cat "$HOME/lun/subport.log" 2>/dev/null)
+fi
+cip
 }
 
 refresh_identity_subscriptions(){
@@ -8496,7 +8749,7 @@ echo " 0. 返回"
 printf "请选择 [0-4]："
 IFS= read -r c
 case "$c" in
-1) LUN_MENU_ACTION=list; return ;;
+1) refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 2) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 3 ] && { ui_pause; continue; }; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 3) prompt_subscription_ip_mode; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 4) server_identity_menu ;;
@@ -9263,9 +9516,20 @@ cloudflare_prompt_token(){
 ensure_cloudflare_origin_helper || return 1
 token_file=$(cloudflare_token_file)
 echo "首次自动配置需要 Cloudflare API Token，之后不再重复询问。"
-echo "创建位置：我的个人资料 → API 令牌 → 创建自定义令牌（不要使用“账户 API 令牌”）。"
-echo "傻瓜式全配置建议：直接给该用户令牌全部账户、全部区域的最大可用编辑权限，避免逐项补权限。"
-echo "这里只需要令牌正文；Token ID、用户 ID、账户 ID 和邮箱都不用填写。Lun 会先自检，再事务化修改。"
+echo "操作步骤："
+green_line " 1. 打开 Cloudflare 官方页面：https://dash.cloudflare.com/profile/api-tokens"
+echo " 2. 选择：创建令牌 → 创建自定义令牌。"
+echo " 3. 一个用户 API Token 添加以下 6 行权限："
+echo "  区域 → 区域 → 读取"
+echo "  区域 → DNS → 编辑"
+echo "  区域 → Origin Rules → 编辑"
+echo "  区域 → 区域设置 → 编辑"
+echo "  账户 → Cloudflare Tunnel → 编辑"
+echo "  账户 → 账户设置 → 读取"
+echo " 4. 资源范围选当前账户和域名；管理多个域名时可选对应账户下的全部区域。"
+echo " 5. 继续到摘要并创建令牌，只复制创建结果中的 Token 正文。"
+echo " 6. 返回当前 SSH 窗口，将 Token 粘贴到下方。"
+echo "Token ID、用户 ID、账户 ID 和邮箱都不用填写。Lun 只显示官方链接，不会在 VPS 启动浏览器。"
 printf "粘贴 Token（输入会显示，0 返回）："
 IFS= read -r cf_token
 [ "$cf_token" = 0 ] && return 2
@@ -9787,9 +10051,31 @@ esac
 }
 
 oneclick_prompt_cdn_ips(){
-printf "粘贴 CDN 优选 IP/域名（支持 IP:端口#备注；回车直接使用服务域名；输入 0 返回）："
+echo "CDN 优选入口："
+echo "  回车：打开一次性浏览器测速页并自动应用（推荐）"
+echo "  p：手工粘贴优选 IP/域名"
+echo "  d：直接使用服务域名"
+echo "  0：返回"
+printf "请选择："
 IFS= read -r cdn_input
 [ "$cdn_input" = 0 ] && return 2
+case "$cdn_input" in
+"")
+cdnopt_run || return $?
+ONECLICK_CDN_IPS=$(cdn_ip_list)
+[ -n "$ONECLICK_CDN_IPS" ] || { red_line "测速页没有应用任何优选入口。"; return 1; }
+return 0
+;;
+d|D)
+ONECLICK_CDN_IPS="$ONECLICK_HOST"
+return 0
+;;
+p|P)
+printf "粘贴 CDN 优选 IP/域名（支持 IP:端口#备注，输入 0 返回）："
+IFS= read -r cdn_input
+[ "$cdn_input" = 0 ] && return 2
+;;
+esac
 case "$cdn_input" in
 *#*|*"Mbps"*|*"ms]"*)
 yellow_line "可继续粘贴剩余行，最后输入空行结束。"
@@ -9800,7 +10086,6 @@ $extra_line"
 done
 ;;
 esac
-[ -n "$cdn_input" ] || cdn_input="$ONECLICK_HOST"
 ONECLICK_CDN_IPS=$(normalize_cdn_ip_input "$cdn_input")
 [ -n "$ONECLICK_CDN_IPS" ] || { red_line "没有识别到有效 CDN 入口。"; return 1; }
 }
@@ -10236,6 +10521,9 @@ cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
 mkdir -p "$cdnopt_dir" || return 1
 rm -f "$cdnopt_tmp"
+if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 1.1.0 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
+return 0
+fi
 if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
 cp "$LUN_CDNOPT_SOURCE" "$cdnopt_tmp" || return 1
 else
@@ -10276,7 +10564,7 @@ red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
 return 1
 }
 cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
-[ "$cdnopt_version" = 1.0.0 ] || {
+[ "$cdnopt_version" = 1.1.0 ] || {
 rm -f "$cdnopt_tmp"
 red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
 return 1
@@ -10318,7 +10606,8 @@ apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
 cdnopt_run(){
 ui_title "Lun 一键优选 CDN 节点"
 echo "CM IP 提供候选库；真实测速由您打开的电脑/手机浏览器执行。"
-echo "默认剔除延迟 >150 ms 或带宽 <80 Mbps 的 IP，速度为主、延迟辅助排名。"
+echo "网页默认剔除延迟 >150 ms 或带宽 <80 Mbps 的 IP；两个门槛都可在开始前手动修改。"
+echo "测速表会实时显示等待、延迟测速、延迟完成、带宽测速及最终结果。"
 yellow_line "VPS 到优选 IP 的 ping 不代表您本地线路，因此 VPS 不伪装成最终带宽测试。"
 cdnopt_prompt_count || return $?
 cdnopt_top=$CDNOPT_TOP_COUNT
@@ -11554,7 +11843,7 @@ while :; do
 ui_title "Lun 证书管理"
 show_cert_summary
 echo " 1. 恢复/重建自签证书"
-echo " 2. 申请域名证书（HTTP-01）"
+echo " 2. 自动申请公开域名证书（优先 DNS-01，否则 HTTP-01）"
 echo " 3. 申请 DNS API 证书"
 echo " 4. 申请 IP 证书（short-lived）"
 echo " 5. 手动续期当前 ACME 证书"
@@ -11572,9 +11861,11 @@ prompt_service_domain; rc=$?
 if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
 prompt_acme_email; rc=$?
 [ "$rc" = 2 ] && continue
-certmode=domain
-printf "%s\n" "$certmode" > "$HOME/lun/cert_mode"
-issue_acme_cert domain "$domain" && echo "域名证书申请完成。" || { echo "域名证书申请失败，已恢复自签。"; self_signed_cert; }
+if issue_public_domain_cert "$domain"; then
+green_line "公开域名证书申请完成。"
+else
+red_line "公开域名证书申请失败，现有证书未改动。"
+fi
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
 3)
@@ -11587,19 +11878,25 @@ prompt_acme_email; rc=$?
 save_dns_env_interactive; rc=$?
 [ "$rc" = 2 ] && continue
 [ "$rc" = 0 ] || continue
-certmode=dns
-printf "%s\n" "$certmode" > "$HOME/lun/cert_mode"
-issue_acme_cert dns "$domain" && echo "DNS API 证书申请完成。" || { echo "DNS API 证书申请失败，已恢复自签。"; self_signed_cert; }
+if issue_acme_cert dns "$domain"; then
+green_line "DNS API 证书申请完成。"
+else
+red_line "DNS API 证书申请失败，现有证书未改动。"
+fi
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
 4)
 if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
 prompt_acme_email; rc=$?
 [ "$rc" = 2 ] && continue
-certmode=ip
-printf "%s\n" "$certmode" > "$HOME/lun/cert_mode"
-subject=$(local_public_ips | sed -n 1p)
-issue_acme_cert ip "$subject" && echo "IP 证书申请完成。" || { echo "IP 证书申请失败，已恢复自签。"; self_signed_cert; }
+subject=$(select_ip_cert_subject)
+[ -n "$subject" ] || { red_line "未找到可直接从公网完成 TCP 80 验证的 IP。"; ui_pause; continue; }
+yellow_line "Let's Encrypt IP 证书有效期约 6 天，acme.sh 会每日检查并自动续期。"
+if issue_acme_cert ip "$subject"; then
+green_line "IP 证书申请完成。"
+else
+red_line "IP 证书申请失败，现有证书未改动。"
+fi
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
 5) subject=$(cat "$HOME/lun/cert_subject" 2>/dev/null); if [ -n "$subject" ] && [ -x "$HOME/.acme.sh/acme.sh" ]; then "$HOME/.acme.sh/acme.sh" --renew -d "$subject" --ecc --force && install_acme_cert "$subject" "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" && echo "续期完成。"; else echo "当前没有可续期的 ACME 证书。"; fi; LUN_MENU_ACTION=list; ui_pause; return ;;
@@ -13170,8 +13467,10 @@ show_certificate_help(){
 ui_title "Lun 域名 / 证书说明"
 echo "自签证书：适合直连测试；客户端需要跳过校验或使用证书指纹。"
 echo "Cloudflare Origin CA：适合橙云回源，不是客户端直接信任的公网证书。"
-echo "公开可信证书：域名必须匹配，可通过 HTTP-01、DNS API 或本机证书导入获得。"
-yellow_line "HTTP-01 要求域名解析到本机且 TCP 80 可从公网访问。"
+echo "公开可信域名证书：通常约 90 天；优先复用已保存的 DNS API，未配置时使用 HTTP-01。"
+echo "公开可信 IP 证书：Let's Encrypt 当前为约 6 天短证书，acme.sh 自动续期。"
+yellow_line "HTTP-01 要求域名/IP 直达本机 TCP 80；NAT 机无法映射公网 80 时请使用域名 DNS-01。"
+green_line "申请成功后才原子替换证书；失败保留旧证书，不会自动改成自签。"
 red_line "NaiveProxy 必须使用与服务域名匹配的公开可信证书。"
 }
 
@@ -13234,7 +13533,45 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "self-update" ]; then
+if [ "$1" = "cert-deploy" ]; then
+[ "$(cat "$HOME/lun/cert_subject" 2>/dev/null)" = "$2" ] || exit 0
+[ "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" = "$3" ] || exit 0
+deploy_acme_cert "$2" "$3"
+exit $?
+elif [ "$1" = "subscription-refresh" ]; then
+refresh_subscription_share
+exit $?
+elif [ "$1" = "cert-issue" ]; then
+mkdir -p "$HOME/lun"
+load_domain_cert_config
+case "$2" in
+domain|"")
+cert_cli_subject=${3:-${domain:-$(cat "$HOME/lun/domain" 2>/dev/null)}}
+[ -n "$cert_cli_subject" ] || { red_line "用法：lun cert-issue domain 你的域名"; exit 2; }
+issue_public_domain_cert "$cert_cli_subject"
+;;
+dns)
+cert_cli_subject=${3:-${domain:-$(cat "$HOME/lun/domain" 2>/dev/null)}}
+[ -n "$cert_cli_subject" ] || { red_line "用法：lun cert-issue dns 你的域名"; exit 2; }
+issue_acme_cert dns "$cert_cli_subject"
+;;
+ip)
+cert_cli_subject=$3
+[ -n "$cert_cli_subject" ] || cert_cli_subject=$(select_ip_cert_subject)
+[ -n "$cert_cli_subject" ] || { red_line "没有可用于公网 TCP 80 验证的 IP。"; exit 1; }
+yellow_line "IP 证书是 Let's Encrypt 约 6 天的短期证书，会由 acme.sh 自动续期。"
+issue_acme_cert ip "$cert_cli_subject"
+;;
+*) red_line "用法：lun cert-issue domain|dns|ip [域名或 IP]"; exit 2 ;;
+esac
+cert_cli_rc=$?
+if [ "$cert_cli_rc" = 0 ]; then
+green_line "公开证书已安装：$(cat "$HOME/lun/cert_subject" 2>/dev/null)"
+else
+red_line "公开证书申请失败，现有证书未改动。日志：$HOME/lun/acme_issue.log"
+fi
+exit "$cert_cli_rc"
+elif [ "$1" = "self-update" ]; then
 update_lun_script
 exit $?
 elif [ "$1" = "cluster-refresh-identity" ]; then
@@ -13379,6 +13716,11 @@ if ! ins; then
 echo "Lun 内核安装失败，未覆盖已有内核或启动不完整服务。"
 exit 1
 fi
+if ! validate_core_configs; then
+echo "基础代理配置无效，尚未进入多用户配置注入。"
+[ "$_lun_rebuild_request" = yes ] && rollback_rebuild
+exit 1
+fi
 if multiuser_enabled; then
 if ! multiuser_reconcile_configs; then
 echo "多用户配置注入失败，正在恢复重建前配置。"
@@ -13435,33 +13777,11 @@ subport=$(select_subscription_port "$requested_subport") || return 1
 printf '%s\n' "$subport" > "$HOME/lun/subport.log"
 }
 if subportipsub && subtokenipsub; then
-echo "请稍后…………"
-mkdir -p $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"
-ln -sf $HOME/lun/clmi.yaml $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"/clmi.yaml
-ln -sf $HOME/lun/sbox.json $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"/sbox.json
-ln -sf $HOME/lun/jhsub.txt $HOME/weblun/"$(cat $HOME/lun/subtoken.log 2>/dev/null)"/jhsub.txt
-if command -v apk >/dev/null 2>&1; then
-busybox-extras httpd -f -p "$(cat $HOME/lun/subport.log 2>/dev/null)" -h $HOME/weblun > /dev/null 2>&1 &
+if restart_subscription_service; then
+echo "本地订阅服务已启动并通过 HTTP 自检"
 else
-busybox httpd -f -p "$(cat $HOME/lun/subport.log 2>/dev/null)" -h $HOME/weblun > /dev/null 2>&1 &
+echo "订阅 HTTP 服务启动失败，已保留协议服务；可在“节点订阅分享 → 刷新并查看节点信息”自动修复。"
 fi
-sleep 5
-if command -v apk >/dev/null 2>&1; then
-cat > /etc/local.d/alpinesublun.start <<EOF
-#!/bin/bash
-sleep 10
-busybox-extras httpd -f -p \$(cat $HOME/lun/subport.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &
-EOF
-chmod +x /etc/local.d/alpinesublun.start
-rc-update add local default >/dev/null 2>&1
-else
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/weblun/d' /tmp/crontab.tmp
-echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat $HOME/lun/subport.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &"' >> /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
-fi
-echo "本地IP订阅链接已更新完成"
 else
 echo "订阅端口不可用，已保留协议服务并跳过订阅 httpd 启动。"
 fi
@@ -13509,6 +13829,7 @@ cluster_service_start || yellow_line "服务器联动服务未能自动启动。
 cluster_push_event >/dev/null 2>&1 || true
 [ "$(cluster_role 2>/dev/null)" = master ] && cluster_refresh_profiles >/dev/null 2>&1 || true
 fi
+green_line "Lun 安装与配置校验全部完成。"
 echo
 else
 if [ "$(id -u 2>/dev/null)" = "0" ]; then

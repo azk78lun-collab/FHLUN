@@ -42,6 +42,7 @@ for helper in \
   direct_origin_ip_entries \
   direct_address_entries \
   address_mode_label \
+  acme_stage_dir \
   lun_version_is_older \
   lun_script_version \
   lun_update_target \
@@ -49,6 +50,8 @@ for helper in \
   eval "$(sed -n "/^${helper}(){/,/^}/p" "$SCRIPT")"
 done
 
+[[ $(acme_stage_dir 'Example.COM') == "$HOME/lun/acme-live/example.com" ]]
+[[ $(acme_stage_dir '2001:db8::1') == "$HOME/lun/acme-live/2001_db8__1" ]]
 [[ $(normalize_server_number 1) == 01 ]]
 [[ $(normalize_server_number 07) == 07 ]]
 [[ $(normalize_server_number 100) == 100 ]]
@@ -133,9 +136,9 @@ chmod +x "$HOME/bin/lun" "$update_test/system/lun"
 ln -s "$update_test/system/lun" "$update_test/path/lun"
 PATH="$update_test/path:$update_original_path"
 [[ $(lun_update_target) == "$update_test/system/lun" ]]
-printf '#!/usr/bin/env bash\n# V26.8.8.2\nexit 0\n' > "$update_test/new-lun"
+printf '#!/usr/bin/env bash\n# V26.8.8.3\nexit 0\n' > "$update_test/new-lun"
 lun_install_update_stage "$update_test/new-lun" "$update_test/system/lun"
-[[ $(lun_script_version "$update_test/system/lun") == V26.8.8.2 ]]
+[[ $(lun_script_version "$update_test/system/lun") == V26.8.8.3 ]]
 [[ $(lun_script_version "$update_test/system/lun.update-backup") == V26.8.5.10 ]]
 [[ $(sha256sum "$update_test/new-lun" | awk '{print $1}') == $(sha256sum "$update_test/system/lun" | awk '{print $1}') ]]
 PATH=$update_original_path
@@ -219,7 +222,7 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.8.2' "$SCRIPT"
+grep -q '当前版本：V26.8.8.3' "$SCRIPT"
 grep -q '^lun_update_target(){' "$SCRIPT"
 grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
 grep -q '一键更新全部集群服务器' "$SCRIPT"

@@ -2013,8 +2013,8 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
 
     def _bootstrap_csr(self, parsed: urllib.parse.SplitResult) -> None:
         config = self.cluster.load_config()
-        if config.get("role") != "child" or config.get("paired"):
-            raise ClusterError("该子 VPS 已经完成配对")
+        if config.get("role") != "child":
+            raise ClusterError("只有子 VPS 可以生成加入地址")
         token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
         digest = hashlib.sha256(token.encode()).hexdigest()
         row = self.cluster.db.connection.execute(
@@ -2028,8 +2028,9 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
 
     def _bootstrap_complete(self, body: dict[str, Any]) -> None:
         config = self.cluster.load_config()
-        if config.get("role") != "child" or config.get("paired"):
-            raise ClusterError("该子 VPS 已经完成配对")
+        if config.get("role") != "child":
+            raise ClusterError("只有子 VPS 可以完成配对")
+        was_paired = bool(config.get("paired"))
         token = str(body.get("token", ""))
         cluster_id = str(body.get("cluster_id", ""))
         controller_id = str(body.get("controller_id", ""))
@@ -2065,7 +2066,7 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
             self.cluster.rebuild_identity_subscriptions()
         except ClusterError as exc:
             rebuild_error = str(exc)
-        self.cluster.db.audit("cluster.paired", controller_id, f"{host}:{port}")
+        self.cluster.db.audit("cluster.repaired" if was_paired else "cluster.paired", controller_id, f"{host}:{port}")
         self._reply(200, {"ok": True, "snapshot": self.cluster.local_snapshot(),
                           "identity_rebuild_error": rebuild_error, "restart_required": True})
         self.server.restart_requested = True  # type: ignore[attr-defined]
@@ -3215,8 +3216,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "switch-master":
             row = cluster.node(args.node_id)
             number = f"{int(row['server_number']):02d}" if int(row["server_number"]) < 100 else str(row["server_number"])
-            if args.confirm != f"SWITCH-{number}":
-                raise ClusterError(f"确认文字不匹配，请输入 SWITCH-{number}")
+            if args.confirm not in {"CONFIRM", f"SWITCH-{number}"}:
+                raise ClusterError("确认无效，请从 Lun 集群菜单直接回车确认")
             result = switch_master(cluster, str(row["id"]))
             print(
                 f"主 VPS 已切换到服务器 {number}："

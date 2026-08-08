@@ -2,7 +2,7 @@
 
 风火轮 是一个基于 Sing-box、Xray 和 Cloudflared 的终端代理节点脚本，核心逻辑基于开源项目二次开发/优化。它支持变量式无交互安装，也支持通过 `lun` 进入引导式菜单完成安装、证书、订阅、Argo、WARP、端口和节点输出管理。
 
-当前脚本版本：`V26.8.8.2`。
+当前脚本版本：`V26.8.8.3`。
 
 ## 致谢与上游
 
@@ -44,9 +44,9 @@ lun
 
 引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。协议选择和增删改界面共用带边框的对齐表格，分别显示选择状态、监听/公网端口以及直连、CDN 优选、端口回源、CF 隧道能力，支持项使用绿色 `✓`；表格由脚本按终端显示宽度排版，不依赖系统 `column` 命令。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 14 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、一键优选 CDN 节点、Cloudflare Origin Rules（手动登记或 API 自动部署）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
-“安装 / 协议管理 → 3. 一键全配置”用于首次安装或快速重建。用户只需提供 2～4 个端口（NAT VPS 粘贴“公网端口-内网端口”映射）、Cloudflare 用户 API Token 和 CDN 优选入口；脚本会从 Token 可见区域中识别绑定本机公网 IP 的域名，自动申请 DNS-01 公开证书、开启橙云、创建精确 Origin Rules、创建独立 Cloudflare Tunnel，并按端口数量选择无冲突套餐。4 个端口启用 XHTTP TLS CDN/回源、WS 隧道、Reality 直连和订阅；3 个端口省略 Reality；2 个端口让同一 WS 入站承载 HTTP CDN/回源与 Tunnel。Token 推荐直接覆盖全部账户、全部区域并给予最大可用编辑权限，脚本只接收令牌正文，不需要 Token ID、用户 ID 或账户 ID。操作前自动快照，证书、核心配置、回源验证或 Tunnel 任一失败都会回滚。原有手动 Tunnel 与手动/API Origin Rules 菜单继续保留。
+“安装 / 协议管理 → 3. 一键全配置”用于首次安装或快速重建。用户只需提供 2～4 个端口（NAT VPS 粘贴“公网端口-内网端口”映射）、Cloudflare 用户 API Token 和 CDN 优选入口；脚本会从 Token 可见区域中识别绑定本机公网 IP 的域名，自动申请 DNS-01 公开证书、开启橙云、创建精确 Origin Rules、创建独立 Cloudflare Tunnel，并按端口数量选择无冲突套餐。4 个端口启用 XHTTP TLS CDN/回源、WS 隧道、Reality 直连和订阅；3 个端口省略 Reality；2 个端口让同一 WS 入站承载 HTTP CDN/回源与 Tunnel。一个自定义用户 API Token 可覆盖全部流程；建议授予 `区域/区域/读取`、`区域/DNS/编辑`、`区域/Origin Rules/编辑`、`区域/区域设置/编辑`、`账户/Cloudflare Tunnel/编辑`、`账户/账户设置/读取`，脚本只接收令牌正文，不需要 Token ID、用户 ID 或账户 ID。操作前自动快照，证书、核心配置、回源验证或 Tunnel 任一失败都会回滚。原有手动 Tunnel 与手动/API Origin Rules 菜单继续保留。
 
-“一键优选 CDN 节点”是独立按需模块：只有用户进入该菜单时才下载轻量 Python 程序，平时没有常驻进程。模块从 [CM IP 节点包](https://github.com/cmliu/cmliu/blob/main/CF-CIDR.txt) 生成候选列表，然后在 VPS 上启动一个带随机 token、默认 15 分钟过期的临时页面。请用需要实际优化的电脑或手机网络打开该页，它会测量“客户端 → Cloudflare 边缘”延迟与下载带宽，默认剔除延迟超过 `150 ms` 或带宽低于 `80 Mbps` 的 IP，返回综合最快 5 个（可在启动时改数量）。点击网页的“应用到 Lun”后，结果直接写入现有 `cfip`/`~/lun/cdnip`，订阅重建后立即生效；原有手工输入优选 IP 仍完整保留。
+“一键优选 CDN 节点”是独立按需模块：只有用户进入该菜单时才下载轻量 Python 程序，平时没有常驻进程。模块从 [CM IP 节点包](https://github.com/cmliu/cmliu/blob/main/CF-CIDR.txt) 生成候选列表，然后在 VPS 上启动一个带随机 token、默认 15 分钟过期的临时页面。请用需要实际优化的电脑或手机网络打开该页，它会测量“客户端 → Cloudflare 边缘”延迟与下载带宽。网页默认门槛为 `150 ms` / `80 Mbps`，开始前可直接修改延迟和带宽，表格会实时显示等待、延迟测试、延迟完成、带宽测试、失败和最终入选状态。点击“应用到 Lun”后，结果直接写入现有 `cfip`/`~/lun/cdnip`，订阅重建后立即生效；一键全配置默认先打开此测速页，也保留手工粘贴入口。
 
 VPS 只用来托管临时页面、下载候选数据和校验回传结果。`VPS → Cloudflare` 的 ping/带宽不能代表家庭宽带、手机网络或特定运营商的真实线路，因此本模块不会用 VPS 测速替代客户端结果。在线探测方案参考 [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel) 与 BestCF，并在页面中保留 HiDNS、@ktff、@Lfreea 贡献致谢。
 
@@ -100,6 +100,8 @@ SQLite 记录仅包含时间、用户、设备、目标域名/端口、内核和
 
 子 VPS 会生成有效期 15 分钟、仅能使用一次的 `lunjoin://` 加入地址。主 VPS 首次连接会校验该地址内的 TLS 指纹，随后签发独立的 P-256 节点证书；正式通信全部使用 TLS 1.2+ 双向证书校验。通信端口只需 TCP，普通 VPS 自动选择未占用高位端口；NAT VPS 只从现有公网端口→内网端口映射中分配。默认排除 443，并自动同步 Lun 防火墙规则。
 
+已配对的子 VPS 可以再次生成一次性加入地址并加入新主 VPS；新配对证书和 CA 会原子替换旧主控授权，不需要先手工解除。主 VPS 添加子机时只粘贴加入地址，不再要求备注或预期 UUID。
+
 主 VPS 可查看子机 IP、备注、地区、版本、最后成功时间和订阅快照，并执行固定白名单动作：协议变量重建、Xray/Sing-box/Argo/订阅/多用户/网站监控进程的状态、启动、停止和重启、Lun 主脚本与联动程序校验下发、内核更新、防火墙同步、快照和恢复。联动服务本身只允许远程查看或重启，不允许远程停止，避免主 VPS 自行切断控制通道。远程端不接受任意 Shell 文本。批量任务先在第一台金丝雀节点执行，成功后最多 3 台并行；失败时自动恢复本轮已成功节点的配置快照。清空配置和卸载只允许单机执行，且会先在 root 主目录留恢复快照。
 
 主 VPS 与子 VPS 的节点集群菜单都提供“一键更新全部集群服务器”。发起节点先更新本机并优先复用本机已校验的联动程序（缓存不支持时才下载一次），再通过 mTLS 把同一份 Lun 脚本和联动程序分发到主机及所有未排除节点；远端 VPS 不再各自访问 GitHub。每台远端更新前先做 20 秒 mTLS 健康检查，不可达节点会被标记并跳过，不会拖住整批更新。可临时输入服务器编号排除维护中的节点，单台远程下发和“服务与更新 → 更新本机 Lun 脚本”入口继续保留。
@@ -152,7 +154,7 @@ vlpt="" vmpt="" hypt="" bash <(curl -Ls https://raw.githubusercontent.com/azk78l
 | `acme_email` | Let’s Encrypt 账户邮箱 |
 | `acme_dns` | acme.sh DNS provider，例如 `dns_cf`、`dns_ali` |
 
-`certmode=self` 会生成本地 ECDSA 自签证书。`origin` 表示 Cloudflare Origin CA 等仅供服务商回源验证的证书，`ca` 表示公开 CA 签发证书。`domain` 使用 HTTP-01，`dns` 使用 acme.sh 原生 DNS API，`ip` 使用 Let’s Encrypt short-lived IP 证书。
+`certmode=self` 会生成本地 ECDSA 自签证书。`origin` 表示 Cloudflare Origin CA 等仅供服务商回源验证的证书，`ca` 表示公开 CA 签发证书。`domain` 自动优先使用已保存的 DNS API 凭据申请公开域名证书，没有凭据时才使用 HTTP-01；`dns` 强制使用 acme.sh 原生 DNS API。普通域名证书通常约 90 天。`ip` 使用 Let’s Encrypt short-lived IP 证书，有效期约 6 天并由 acme.sh 每日检查续期，不是 90 天证书。申请和安装采用临时目录校验、原子替换；失败时保留现有证书，绝不静默覆盖成自签。可使用 `lun cert-issue domain example.com` 或 `lun cert-issue ip 203.0.113.1` 单独执行。
 
 ### XHTTP TLS 与 NaiveProxy
 
@@ -232,7 +234,7 @@ HTTPS（加密）：443、8443、2053、2083、2087、2096
 
 NAT VPS 需要先在服务商/端口转发处建立“公网端口 → 内网监听端口”。随后进入 `lun → 入口网络管理 → Cloudflare Origin Rules`：已经在 Cloudflare 控制台建好规则时选“手动登记已设置的规则”，输入客户端使用的 CF 边缘端口和规则里的 Destination port；尚未配置时可选“一键自动部署 / 修复”。Lun 会核对 NAT 公网端口确实映射到所选协议，风火轮则自动放行系统防火墙中的内网监听端口；服务商安全组与公网 NAT 映射仍属于外部控制面。若公网映射本身不是 CF 官方边缘端口，也可以作为 Origin Rules 的回源目标，不能把内网端口直接写成 CDN 节点端口。
 
-手动登记不需要 Cloudflare API Token。自动配置应从“我的个人资料 → API 令牌 → 创建自定义令牌”创建**用户 API 令牌**，不要使用账户 API 令牌。按 Cloudflare 当前界面添加四行：`区域 → 区域 → 读取`、`区域 → Origin Rules → 编辑`、`区域 → DNS → 编辑`、`区域 → 区域设置 → 编辑`，区域资源只选择当前域名。脚本只需要创建结果中的令牌正文，不需要 Token ID、用户 ID、账户 ID或邮箱；输入时会直接显示。令牌之后保存在 `~/lun/cdn_cloudflare_token`（权限 `600`）。
+手动登记不需要 Cloudflare API Token。自动配置打开 [Cloudflare API Tokens](https://dash.cloudflare.com/profile/api-tokens)，选择“创建令牌 → 创建自定义令牌”，不要使用账户 API 令牌。一个 Token 可同时服务 DNS-01、橙云、Origin Rules、区域 SSL 设置与 Tunnel；添加六行：`区域 → 区域 → 读取`、`区域 → DNS → 编辑`、`区域 → Origin Rules → 编辑`、`区域 → 区域设置 → 编辑`、`账户 → Cloudflare Tunnel → 编辑`、`账户 → 账户设置 → 读取`。资源可只选当前账户和域名。脚本只需要创建结果中的令牌正文，不需要 Token ID、用户 ID、账户 ID或邮箱；输入时会直接显示。令牌之后保存在 `~/lun/cdn_cloudflare_token`（权限 `600`）。
 
 一键部署会自动开启该 Host 的橙云，按 `Host + 边缘端口 + TLS + UUID Path` 写入精确回源规则，将规则排在现有规则之后，按证书设置 Full/Full (Strict)，在 XHTTP TLS 443 模式开启 HTTP/3，等待生效后验证并刷新订阅。脚本只替换同一 Host 的旧 `tls/nottls` 宽泛规则及自身创建的规则，其它用户规则会保留；更新规则前会在 `~/lun/cdn_cloudflare_backup.json` 保存快照，API 中途失败会自动回滚。
 

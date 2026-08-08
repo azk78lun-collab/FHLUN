@@ -438,6 +438,11 @@ class ClusterTestCase(unittest.TestCase):
             self.assertTrue(child.load_config()["paired"])
             with self.assertRaises(lun_cluster.ClusterError):
                 lun_cluster.add_node(master, child_result["join_uri"], "child")
+            replacement_uri = child.create_join_code()
+            replacement = lun_cluster.add_node(master, replacement_uri)
+            self.assertEqual(replacement["id"], child.load_config()["node_id"])
+            with self.assertRaises(lun_cluster.ClusterError):
+                lun_cluster.add_node(master, replacement_uri)
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
@@ -548,7 +553,7 @@ class ClusterTestCase(unittest.TestCase):
             (target_id, "agent.install"),
         ])
         self.assertTrue(result["complete"])
-        self.assertEqual(result["version"], "V26.8.8.2")
+        self.assertEqual(result["version"], "V26.8.8.3")
         self.assertEqual(result["nodes"]["2"]["status"], "source-current")
         self.assertEqual(result["nodes"]["3"]["script_sha256"], script_payload["sha256"])
         self.assertEqual(result["nodes"]["4"]["status"], "excluded")
@@ -563,7 +568,7 @@ class ClusterTestCase(unittest.TestCase):
         })
         payload = {"script": {}, "agent": {}, "exclude": "4"}
         response = {
-            "result": {"status": "success", "result": {"complete": True, "version": "V26.8.8.2"}}
+            "result": {"status": "success", "result": {"complete": True, "version": "V26.8.8.3"}}
         }
         with mock.patch.object(lun_cluster, "mutual_request", return_value=response) as request:
             result = lun_cluster.request_cluster_update(self.cluster, payload)
@@ -665,7 +670,7 @@ class ClusterTestCase(unittest.TestCase):
 
     @staticmethod
     def _update_payloads() -> tuple[dict[str, str], dict[str, str]]:
-        script = b"#!/usr/bin/env bash\n# V26.8.8.2\nexit 0\n"
+        script = b"#!/usr/bin/env bash\n# V26.8.8.3\nexit 0\n"
         agent = b"#!/usr/bin/env python3\nVALUE = 1\n"
 
         def payload(content: bytes) -> dict[str, str]:

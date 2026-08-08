@@ -16,6 +16,12 @@ SPEC.loader.exec_module(MOD)
 
 
 class OptimizerTests(unittest.TestCase):
+    def test_page_exposes_editable_thresholds_and_live_stages(self):
+        self.assertIn('id="latencyInput"', MOD.PAGE)
+        self.assertIn('id="speedInput"', MOD.PAGE)
+        self.assertIn("等待延迟", MOD.PAGE)
+        self.assertIn("测速中", MOD.PAGE)
+
     def test_thresholds_and_speed_weighted_rank(self):
         candidates = ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"]
         selected, accepted = MOD.rank_results(
@@ -89,6 +95,8 @@ class OptimizerTests(unittest.TestCase):
                 self.assertEqual(json.load(response)["candidates"], server.candidates)
             payload = json.dumps(
                 {
+                    "latency_max": 100,
+                    "speed_min": 150,
                     "measurements": [
                         {"ip": "1.1.1.1", "latency_ms": 30, "speed_mbps": 90},
                         {"ip": "2.2.2.2", "latency_ms": 80, "speed_mbps": 180},
@@ -106,7 +114,10 @@ class OptimizerTests(unittest.TestCase):
             thread.join(timeout=3)
             server.server_close()
             self.assertFalse(thread.is_alive())
-            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["selected"][0]["ip"], "2.2.2.2")
+            result = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(result["selected"][0]["ip"], "2.2.2.2")
+            self.assertEqual(result["latency_max_ms"], 100)
+            self.assertEqual(result["speed_min_mbps"], 150)
 
 
 if __name__ == "__main__":
