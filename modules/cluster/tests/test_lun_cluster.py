@@ -65,6 +65,43 @@ class ClusterTestCase(unittest.TestCase):
         with self.assertRaisesRegex(lun_cluster.ClusterError, "已使用"):
             self.cluster.consume_join_token("secret-token-value-that-is-long-enough")
 
+    def test_federation_join_uses_long_timeout_and_wraps_transport_errors(self) -> None:
+        certificate = b"target-certificate"
+        join = {
+            "host": "198.51.100.9", "port": 23456,
+            "fingerprint": lun_cluster.hashlib.sha256(certificate).hexdigest(),
+        }
+        connection = mock.Mock()
+        connection.sock.getpeercert.return_value = certificate
+        response = mock.Mock(status=200)
+        response.read.return_value = b'{"ok":true}'
+        connection.getresponse.return_value = response
+        with mock.patch.object(lun_cluster.http.client, "HTTPSConnection", return_value=connection) as factory:
+            result = lun_cluster.bootstrap_request(join, "POST", "/v1/federation/join", {})
+        self.assertTrue(result["ok"])
+        self.assertEqual(factory.call_args.kwargs["timeout"], lun_cluster.JOIN_REQUEST_TIMEOUT)
+
+        connection.connect.side_effect = TimeoutError("slow target")
+        with mock.patch.object(lun_cluster.http.client, "HTTPSConnection", return_value=connection):
+            with self.assertRaisesRegex(lun_cluster.FederationTransportError, "联邦加入通信失败"):
+                lun_cluster.bootstrap_request(join, "GET", "/v1/federation/bootstrap")
+
+    def test_federation_join_handler_requests_tls_reload_after_reply(self) -> None:
+        accepted = {"transaction_id": "a" * 32, "bundle": {"node_id": "b" * 32}}
+        cluster = mock.Mock()
+        cluster.is_federation.return_value = True
+        cluster.accept_federation_join.return_value = accepted
+        handler = object.__new__(lun_cluster.ClusterHandler)
+        handler.server = type("Server", (), {"cluster": cluster, "restart_requested": False})()
+        handler.path = "/v1/federation/join"
+        handler._body = mock.Mock(return_value={"token": "token", "bundle": {}, "transaction": {}})
+        handler._reply = mock.Mock(return_value=True)
+        handler.do_POST()
+        self.assertTrue(handler.server.restart_requested)
+        handler._reply.assert_called_once_with(200, {
+            "ok": True, "transaction_id": "a" * 32, "bundle": {"node_id": "b" * 32},
+        })
+
     def test_environment_allowlist_and_ports(self) -> None:
         result = lun_cluster.validate_lun_environment({"vlpt": 12345, "vpsmode": "normal"})
         self.assertEqual(result["vlpt"], "12345")
@@ -98,6 +135,26 @@ class ClusterTestCase(unittest.TestCase):
             "SELECT node_id FROM user_nodes WHERE user_id=7"
         ).fetchall()
         self.assertEqual([row[0] for row in rows], [second])
+
+    def test_repaired_member_replaces_only_matching_untrusted_placeholder(self) -> None:
+        old_id, target_id, other_id = "a" * 32, "b" * 32, "c" * 32
+        self._add_node(old_id, "JP")
+        self._add_node(target_id, "JP")
+        self._add_node(other_id, "DE")
+        with self.cluster.db.connection:
+            self.cluster.db.connection.execute(
+                "UPDATE nodes SET endpoint_host='161.33.24.201',state='legacy-unverified' WHERE id=?", (old_id,)
+            )
+            self.cluster.db.connection.execute(
+                "UPDATE nodes SET endpoint_host='161.33.24.201',state='online' WHERE id=?", (target_id,)
+            )
+            self.cluster.db.connection.execute(
+                "UPDATE nodes SET state='legacy-unverified' WHERE id=?", (other_id,)
+            )
+        removed = self.cluster.reconcile_repaired_legacy_member(target_id)
+        self.assertEqual(removed, [old_id])
+        self.assertIsNone(self.cluster.db.connection.execute("SELECT 1 FROM nodes WHERE id=?", (old_id,)).fetchone())
+        self.assertIsNotNone(self.cluster.db.connection.execute("SELECT 1 FROM nodes WHERE id=?", (other_id,)).fetchone())
 
     def test_node_numbers_and_status_location_are_chinese(self) -> None:
         first, second = "a" * 32, "b" * 32
@@ -1487,10 +1544,24 @@ class ClusterTestCase(unittest.TestCase):
             with mock.patch.object(lun_cluster, "mutual_request",
                                    side_effect=lun_cluster.FederationTransportError("offline")) as transport, \
                     mock.patch.object(first, "_coordinate_after_failures",
-                                      return_value={"revoked": False, "state": "suspect"}) as coordinate:
+                                       return_value={"revoked": False, "state": "suspect"}) as coordinate:
                 with self.assertRaises(lun_cluster.FederationTransportError):
                     lun_cluster.federation_sync(first, second_id)
             self.assertEqual(transport.call_count, 3)
+            coordinate.assert_not_called()
+            self.assertEqual(first.db.connection.execute(
+                "SELECT COUNT(*) FROM federation_failures WHERE candidate_id=?", (second_id,)
+            ).fetchone()[0], 1)
+            first.record_transport_success(second_id)
+            now = lun_cluster.utc_now()
+            first.record_transport_failure(second_id, when=now - 40)
+            first.record_transport_failure(second_id, when=now - 20)
+            with mock.patch.object(lun_cluster, "mutual_request",
+                                   side_effect=lun_cluster.FederationTransportError("offline")), \
+                    mock.patch.object(first, "_coordinate_after_failures",
+                                      return_value={"revoked": False, "state": "suspect"}) as coordinate:
+                with self.assertRaises(lun_cluster.FederationTransportError):
+                    lun_cluster.federation_sync(first, second_id)
             coordinate.assert_called_once()
             outcomes = iter((False, True))
             recovered = first.coordinate_member_health(second_id, probe=lambda *_: next(outcomes))

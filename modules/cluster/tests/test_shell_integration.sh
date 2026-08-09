@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.9.6'
+contains "$SCRIPT" '当前版本：V26.8.9.7'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'
 contains "$SCRIPT" 'subscription_only_enabled(){'
@@ -44,6 +44,11 @@ PUSH=$(section "$SCRIPT" cluster_push_event)
 printf '%s\n' "$PUSH" | grep -Fq 'cluster_cmd push' || fail 'rebuild publication missing push'
 printf '%s\n' "$PUSH" | grep -Fq ') >/dev/null 2>&1 &' || fail 'snapshot publication blocks caller'
 contains "$SCRIPT" 'cluster_push_event'
+
+JOIN=$(section "$SCRIPT" cluster_join_ui)
+printf '%s\n' "$JOIN" | grep -Fq 'cluster_cmd --json add-peer' || fail 'one-paste join does not capture the new member identity'
+printf '%s\n' "$JOIN" | grep -Fq 'finalize-peer --node-id' || fail 'one-paste join does not finalize federation propagation'
+printf '%s\n' "$JOIN" | grep -Fq '无需其它操作' || fail 'one-paste join completion is unclear'
 
 CDN=$(section "$SCRIPT" cluster_cdn_payload)
 printf '%s\n' "$CDN" | grep -Fq '"mode"' || fail 'CDN payload missing mode'

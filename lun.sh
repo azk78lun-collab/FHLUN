@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.9.6"
+echo "当前版本：V26.8.9.7"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -5253,12 +5253,28 @@ printf "加入地址（输入 0 返回）："
 IFS= read -r cluster_join_uri
 [ "$cluster_join_uri" = 0 ] && return
 [ -n "$cluster_join_uri" ] || { red_line "加入地址不能为空。"; return 1; }
-if cluster_cmd add-peer --uri "$cluster_join_uri"; then
+cluster_join_result=$(mktemp)
+if cluster_cmd --json add-peer --uri "$cluster_join_uri" >"$cluster_join_result"; then
+cluster_join_node=$(python3 - "$cluster_join_result" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8")).get("node_id", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+[ -n "$cluster_join_node" ] || { rm -f "$cluster_join_result"; red_line "加入结果缺少成员身份，请重试。"; return 1; }
 cluster_install_service && cluster_service_restart || true
 apply_lun_firewall_rules || true
-cluster_push_event
-green_line "成员已加入联邦；本机和其它成员拥有相同的受控管理权限。"
+yellow_line "成员已接纳，正在自动广播信任、刷新订阅并重载各成员……"
+if cluster_cmd finalize-peer --node-id "$cluster_join_node"; then
+green_line "成员已加入联邦；全部在线成员已自动同步，无需其它操作。"
+else
+yellow_line "新成员已加入，但有旧成员当前不可达；其恢复后会在订阅刷新时自动补齐。"
 fi
+cluster_refresh_profiles_async
+fi
+rm -f "$cluster_join_result"
 }
 
 cluster_location_ui(){

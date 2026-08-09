@@ -47,6 +47,8 @@ VERSION = "0.2.0"
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
+BOOTSTRAP_TIMEOUT = 30
+JOIN_REQUEST_TIMEOUT = 120
 MAX_BODY = 4 * 1024 * 1024
 ROLE_TRANSFER_CHUNK = 512 * 1024
 ROLE_TRANSFER_MAX = 32 * 1024 * 1024
@@ -104,6 +106,7 @@ ACTION_NAMES = {
     "role.children-commit", "role.children-revert", "controller.prepare",
     "controller.commit", "controller.abort", "controller.reassign",
     "cdn.pool.preview", "cdn.pool.apply",
+    "federation.catchup",
 }
 
 
@@ -1026,6 +1029,25 @@ class Cluster:
             "ORDER BY n.server_number,n.id"
         ).fetchall()
         return [row for row in rows if include_self or str(row["id"]) != local_id]
+
+    def reconcile_repaired_legacy_member(self, node_id: str) -> list[str]:
+        """Remove only untrusted migration placeholders for the same physical endpoint."""
+        target = self.node(node_id)
+        stale = self.db.connection.execute(
+            "SELECT n.id FROM nodes n LEFT JOIN federation_keys k ON k.node_id=n.id "
+            "WHERE n.id<>? AND n.state='legacy-unverified' AND n.endpoint_host=? AND k.node_id IS NULL",
+            (target["id"], target["endpoint_host"]),
+        ).fetchall()
+        stale_ids = [str(row["id"]) for row in stale]
+        if not stale_ids:
+            return []
+        with self.db.connection:
+            for stale_id in stale_ids:
+                self.db.connection.execute("DELETE FROM nodes WHERE id=?", (stale_id,))
+                self.db.connection.execute("DELETE FROM node_number_history WHERE node_id=?", (stale_id,))
+        self._resolve_federation_numbers()
+        self.db.audit("federation.legacy-placeholder-replaced", str(target["id"]), ",".join(stale_ids))
+        return stale_ids
 
     @staticmethod
     def normalize_cdn_pool(value: str) -> list[str]:
@@ -2995,8 +3017,18 @@ class Cluster:
             self.db.connection.execute("INSERT OR IGNORE INTO federation_failures(candidate_id,reporter_id,failed_at) VALUES(?,?,?)", (candidate_id, reporter_id, when))
             self.db.connection.execute("DELETE FROM federation_failures WHERE failed_at<?", (when - 60,))
             self.db.connection.execute("UPDATE nodes SET state='suspect',last_failure=?,updated_at=? WHERE id=?", (when, when, candidate_id))
-        count = self.db.connection.execute("SELECT COUNT(*) FROM federation_failures WHERE candidate_id=? AND reporter_id=? AND failed_at>=?", (candidate_id, reporter_id, when - 60)).fetchone()[0]
-        return {"candidate_id": candidate_id, "state": "suspect", "failures": int(count), "needs_probe": int(count) >= 3}
+        rows = self.db.connection.execute(
+            "SELECT failed_at FROM federation_failures WHERE candidate_id=? AND reporter_id=? AND failed_at>=? "
+            "ORDER BY failed_at",
+            (candidate_id, reporter_id, when - 60),
+        ).fetchall()
+        failure_times = [int(row[0]) for row in rows]
+        # Retries inside one request are transport resilience, not independent
+        # evidence that a member died.  Automatic majority probing starts only
+        # after three separate failed operations spanning at least 30 seconds.
+        needs_probe = len(failure_times) >= 3 and failure_times[-1] - failure_times[-3] >= 30
+        return {"candidate_id": candidate_id, "state": "suspect", "failures": len(failure_times),
+                "failure_times": failure_times, "needs_probe": needs_probe}
 
     def record_transport_success(self, candidate_id: str, when: int | None = None) -> dict[str, Any]:
         when = int(when or utc_now())
@@ -3956,15 +3988,24 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
             raise ClusterError("请求正文必须是 JSON 对象")
         return value
 
-    def _reply(self, status: int, value: dict[str, Any]) -> None:
+    def _reply(self, status: int, value: dict[str, Any]) -> bool:
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+            # The join transaction may already be committed when an older client
+            # gives up waiting.  Do not attempt a second response on a dead TLS
+            # stream; join-status can recover the signed transaction safely.
+            self.close_connection = True
+            return False
 
     def _require_peer(self) -> str:
         common_name = _peer_common_name(self)
@@ -4053,6 +4094,10 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
                 accepted = self.cluster.accept_federation_join(token, bundle, transaction)
                 self._reply(200, {"ok": True, "transaction_id": accepted["transaction_id"],
                                   "bundle": accepted["bundle"]})
+                # Importing the peer changes the accepted client CA set.  Reload
+                # the TLS listener after the response has been sent so the new
+                # member can use mTLS without a separate manual restart.
+                self.server.restart_requested = True  # type: ignore[attr-defined]
                 return
             if parsed.path == "/v1/federation/join-status" and self.cluster.is_federation():
                 token = str(body.get("token", ""))
@@ -4077,7 +4122,8 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
                 if status.get("node_id") != peer:
                     raise ClusterError("订阅快照节点身份不匹配")
                 self.cluster.record_federation_snapshot(snapshot)
-                self._reply(200, {"ok": True})
+                refreshed = len(self.cluster.refresh_profiles())
+                self._reply(200, {"ok": True, "refreshed": refreshed})
             elif parsed.path == "/v1/events/snapshot":
                 if self.cluster.load_config().get("role") != "master":
                     raise ClusterError("当前节点不是主 VPS")
@@ -4272,21 +4318,30 @@ def serve(cluster: Cluster) -> None:
         raise SystemExit(RESTART_EXIT_CODE)
 
 
-def bootstrap_request(join: dict[str, Any], method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+def bootstrap_request(join: dict[str, Any], method: str, path: str,
+                      body: dict[str, Any] | None = None,
+                      timeout: int | None = None) -> dict[str, Any]:
+    timeout = JOIN_REQUEST_TIMEOUT if timeout is None and path == "/v1/federation/join" \
+        else int(timeout or BOOTSTRAP_TIMEOUT)
     context = ssl._create_unverified_context()  # fingerprint pinning below is the trust decision
-    connection = http.client.HTTPSConnection(join["host"], join["port"], context=context, timeout=15)
-    connection.connect()
-    certificate = connection.sock.getpeercert(binary_form=True)  # type: ignore[union-attr]
-    fingerprint = hashlib.sha256(certificate).hexdigest()
-    if not hmac.compare_digest(fingerprint, join["fingerprint"]):
+    connection = http.client.HTTPSConnection(join["host"], join["port"], context=context, timeout=timeout)
+    try:
+        connection.connect()
+        certificate = connection.sock.getpeercert(binary_form=True)  # type: ignore[union-attr]
+        fingerprint = hashlib.sha256(certificate).hexdigest()
+        if not hmac.compare_digest(fingerprint, join["fingerprint"]):
+            raise ClusterError("目标 VPS TLS 指纹与加入地址不一致")
+        payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        connection.request(method, path, body=payload, headers=headers)
+        response = connection.getresponse()
+        data = response.read(MAX_BODY + 1)
+    except ClusterError:
+        raise
+    except (OSError, ssl.SSLError, TimeoutError, http.client.HTTPException) as exc:
+        raise FederationTransportError(f"联邦加入通信失败：{exc}") from exc
+    finally:
         connection.close()
-        raise ClusterError("子 VPS TLS 指纹与加入地址不一致")
-    payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
-    headers = {"Content-Type": "application/json"} if payload is not None else {}
-    connection.request(method, path, body=payload, headers=headers)
-    response = connection.getresponse()
-    data = response.read(MAX_BODY + 1)
-    connection.close()
     if len(data) > MAX_BODY:
         raise ClusterError("子 VPS 响应超过大小限制")
     try:
@@ -4446,17 +4501,17 @@ def federation_add_peer(cluster: Cluster, join_uri: str, remark: str = "") -> di
             "transaction_id": transaction["transaction_id"], "recovered": bool(initial_error)}
 
 
-def federation_sync(cluster: Cluster, node_id: str) -> dict[str, Any]:
+def federation_sync(cluster: Cluster, node_id: str, *, attempts: int = 3,
+                    coordinate_failures: bool = True) -> dict[str, Any]:
     if not cluster.is_federation():
         raise ClusterError("当前不是联邦模式")
     node = cluster.node(node_id)
     trusted = cluster.db.connection.execute("SELECT revoked_at FROM federation_keys WHERE node_id=?", (node["id"],)).fetchone()
     if not trusted or int(trusted["revoked_at"]):
         raise ClusterError("旧迁移候选或已撤销节点必须重新显式配对后才能同步")
-    failures: list[int] = []
     last_error: FederationTransportError | None = None
-    base = utc_now()
-    for attempt in range(3):
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
         try:
             local_manifest = cluster.federation_manifest()
             remote = mutual_request(
@@ -4475,13 +4530,104 @@ def federation_sync(cluster: Cluster, node_id: str) -> dict[str, Any]:
                     "accepted_by_peer": int(response.get("accepted", 0)), "attempts": attempt + 1}
         except FederationTransportError as exc:
             last_error = exc
-            observed_at = base + attempt
-            failures.append(observed_at)
-            cluster.record_transport_failure(str(node["id"]), when=observed_at)
-    health = cluster._coordinate_after_failures(str(node["id"]), failures)
+    if coordinate_failures:
+        failure = cluster.record_transport_failure(str(node["id"]))
+        health = cluster._coordinate_after_failures(
+            str(node["id"]), list(failure["failure_times"])[-3:]
+        ) if failure["needs_probe"] else failure
+        raise FederationTransportError(
+            f"federation sync failed after {attempts} attempts; health={json_dumps(health)}; error={last_error}"
+        ) from last_error
     raise FederationTransportError(
-        f"federation sync failed after 3 attempts; health={json_dumps(health)}; error={last_error}"
+        f"federation sync failed after {attempts} attempts; error={last_error}"
     ) from last_error
+
+
+def wait_for_federation_peer(cluster: Cluster, node_id: str, timeout: int = 90) -> dict[str, Any]:
+    node = cluster.node(node_id)
+    deadline = time.monotonic() + max(1, int(timeout))
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            response = mutual_request(
+                cluster, str(node["endpoint_host"]), int(node["endpoint_port"]),
+                "GET", "/v1/status", timeout=min(10, max(1, int(deadline - time.monotonic()))),
+            )
+            status = response.get("status") if isinstance(response.get("status"), dict) else {}
+            if status.get("node_id") == node["id"]:
+                return status
+            last_error = "目标返回了其它节点身份"
+        except ClusterError as exc:
+            last_error = str(exc)
+        time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+    raise FederationTransportError(f"等待联邦成员重载超时：{last_error or '无响应'}")
+
+
+def federation_finalize_peer(cluster: Cluster, node_id: str) -> dict[str, Any]:
+    """Finish one-paste pairing without turning transient rollout errors into revocations."""
+    target = cluster.node(node_id)
+    target_id = str(target["id"])
+    replaced_legacy = cluster.reconcile_repaired_legacy_member(target_id)
+    wait_for_federation_peer(cluster, target_id)
+    target_sync = federation_sync(cluster, target_id, attempts=2, coordinate_failures=False)
+    spread: dict[str, str] = {}
+    restart: dict[str, str] = {}
+    failures: dict[str, str] = {}
+    existing = [row for row in cluster.trusted_federation_nodes() if str(row["id"]) != target_id]
+    for row in existing:
+        peer_id = str(row["id"])
+        try:
+            federation_sync(cluster, peer_id, attempts=2, coordinate_failures=False)
+            spread[peer_id] = "ok"
+        except ClusterError as exc:
+            failures[peer_id] = "广播失败：" + str(exc)
+    for row in existing:
+        peer_id = str(row["id"])
+        if peer_id not in spread:
+            continue
+        try:
+            send_action(
+                cluster, peer_id, "service.control",
+                {"component": "cluster", "operation": "restart"},
+                timeout=30, coordinate_failures=False,
+            )
+            restart[peer_id] = "ok"
+        except ClusterError as exc:
+            failures[peer_id] = "信任重载失败：" + str(exc)
+    for peer_id in restart:
+        try:
+            wait_for_federation_peer(cluster, peer_id, timeout=45)
+        except ClusterError as exc:
+            failures[peer_id] = "重载后自检失败：" + str(exc)
+    catchup: dict[str, str] = {}
+    for row in [*existing, target]:
+        peer_id = str(row["id"])
+        try:
+            send_action(
+                cluster, peer_id, "federation.catchup", {},
+                timeout=180, coordinate_failures=False,
+            )
+            catchup[peer_id] = "ok"
+        except ClusterError as exc:
+            failures[peer_id] = "订阅快照补齐失败：" + str(exc)
+    snapshot = push_snapshot(cluster)
+    convergence: dict[str, str] = {}
+    all_peers = [*existing, target]
+    for round_number in range(1, 3):
+        for row in all_peers:
+            peer_id = str(row["id"])
+            try:
+                federation_sync(cluster, peer_id, attempts=2, coordinate_failures=False)
+                convergence[peer_id] = f"round-{round_number}"
+            except ClusterError as exc:
+                failures[peer_id] = f"第 {round_number} 轮收敛失败：{exc}"
+    profiles = cluster.refresh_profiles()
+    return {
+        "node_id": target_id, "target_sync": target_sync, "spread": spread,
+        "restart": restart, "catchup": catchup, "convergence": convergence,
+        "failures": failures, "snapshot": snapshot,
+        "profiles": len(profiles), "replaced_legacy": replaced_legacy, "complete": not failures,
+    }
 
 
 def add_node(cluster: Cluster, join_uri: str, remark: str = "", expected_uuid: str = "") -> dict[str, Any]:
@@ -5102,6 +5248,10 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         if cluster.load_config().get("role") != "master" and not cluster.is_federation():
             raise ClusterError("只有主 VPS 可以向全部服务器分发更新")
         return distribute_cluster_update(cluster, payload, source_peer=peer_id, install_local=True)
+    if action == "federation.catchup":
+        if not cluster.is_federation():
+            raise ClusterError("当前不是联邦模式")
+        return {"catchup": cluster.subscription_catchup(), "publication": push_snapshot(cluster)}
     if action == "script.install":
         return install_script_payload(cluster, script, payload)
     if action == "agent.install":
@@ -5150,7 +5300,7 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
 
 
 def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, Any],
-                timeout: int = 900) -> dict[str, Any]:
+                timeout: int = 900, *, coordinate_failures: bool = True) -> dict[str, Any]:
     node = cluster.node(node_id)
     if cluster.is_federation():
         trusted = cluster.db.connection.execute("SELECT revoked_at FROM federation_keys WHERE node_id=?", (node["id"],)).fetchone()
@@ -5159,10 +5309,8 @@ def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, 
     if action in {"lun.factory-reset", "lun.uninstall"} and str(payload.get("confirm", "")) == node_id:
         payload = {**payload, "confirm": short_id(node["id"])}
     request = {"schema_version": API_VERSION, "request_id": uuid.uuid4().hex, "action": action, "payload": payload}
-    failures: list[int] = []
     last_error: FederationTransportError | None = None
-    attempts = 3 if cluster.is_federation() else 1
-    base = utc_now()
+    attempts = 3 if cluster.is_federation() and coordinate_failures else 1
     for attempt in range(attempts):
         try:
             result = mutual_request(
@@ -5174,14 +5322,13 @@ def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, 
             return result["result"]
         except FederationTransportError as exc:
             last_error = exc
-            observed_at = base + attempt
-            failures.append(observed_at)
-            if cluster.is_federation():
-                cluster.record_transport_failure(str(node["id"]), when=observed_at)
-    if cluster.is_federation() and len(failures) == 3:
-        health = cluster._coordinate_after_failures(str(node["id"]), failures)
+    if cluster.is_federation() and coordinate_failures:
+        failure = cluster.record_transport_failure(str(node["id"]))
+        health = cluster._coordinate_after_failures(
+            str(node["id"]), list(failure["failure_times"])[-3:]
+        ) if failure["needs_probe"] else failure
         raise FederationTransportError(
-            f"federation action failed after 3 idempotent attempts; health={json_dumps(health)}; error={last_error}"
+            f"federation action failed after {attempts} idempotent attempts; health={json_dumps(health)}; error={last_error}"
         ) from last_error
     if last_error:
         raise last_error
@@ -5504,6 +5651,8 @@ def build_parser() -> argparse.ArgumentParser:
     peer = sub.add_parser("add-peer")
     peer.add_argument("--uri", required=True)
     peer.add_argument("--remark", default="")
+    finalize_peer = sub.add_parser("finalize-peer")
+    finalize_peer.add_argument("--node-id", required=True)
     remove_peer = sub.add_parser("remove-peer")
     remove_peer.add_argument("--node-id", required=True)
     remove_peer.add_argument("--reason", default="manual")
@@ -5615,7 +5764,14 @@ def main(argv: list[str] | None = None) -> int:
             print("联邦加入地址：" + result["join_uri"])
         elif args.command == "add-peer":
             result = federation_add_peer(cluster, args.uri, args.remark)
-            print("联邦成员已加入：" + short_id(result["node_id"]))
+            if not args.json:
+                print("联邦成员已加入：" + short_id(result["node_id"]))
+        elif args.command == "finalize-peer":
+            result = federation_finalize_peer(cluster, args.node_id)
+            if not result["complete"]:
+                raise ClusterError("部分旧成员暂未完成重载：" + json_dumps(result["failures"]))
+            if not args.json:
+                print("联邦成员自动同步完成。")
         elif args.command == "remove-peer":
             row = cluster.node(args.node_id)
             result = cluster.revoke_member(str(row["id"]), args.reason)
