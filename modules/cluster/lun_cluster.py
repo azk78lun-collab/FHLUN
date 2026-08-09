@@ -5144,10 +5144,11 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
 
     results: dict[str, Any] = {}
     failures: dict[str, str] = {}
-    for node in cluster.nodes():
+    nodes = cluster.trusted_federation_nodes() if cluster.is_federation() else [
+        node for node in cluster.nodes() if node["role"] == "child"
+    ]
+    for node in nodes:
         node_id = str(node["id"])
-        if node["role"] != "child":
-            continue
         number = str(int(node["server_number"] or 0))
         if node_id in excluded:
             results[number] = {"status": "excluded" if node_id != source_peer else "source-current"}
@@ -5157,7 +5158,7 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
                 send_action(cluster, node_id, "status.refresh", {}, timeout=20)
             )
             if status:
-                cluster.upsert_node(status, role="child")
+                cluster.upsert_node(status, role="federation" if cluster.is_federation() else "child")
             script_result = _action_result_payload(
                 send_action(cluster, node_id, "script.install", script_payload, timeout=180)
             )
@@ -5189,7 +5190,7 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
         install_agent_payload(agent_payload)
         local_result = {"status": "updated", "version": lun_version}
     with contextlib.suppress(Exception):
-        cluster.upsert_node(cluster.local_status(), role="master")
+        cluster.upsert_node(cluster.local_status(), role="federation" if cluster.is_federation() else "master")
     return {
         "complete": not failures, "version": lun_version, "local": local_result,
         "nodes": results, "failures": failures, "restart_required": install_local,

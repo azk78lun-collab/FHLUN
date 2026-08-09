@@ -578,6 +578,48 @@ class ClusterTestCase(unittest.TestCase):
         self.assertEqual(request.call_args.args[2:5], (20000, "POST", "/v1/action"))
         self.assertEqual(request.call_args.args[5]["action"], "cluster.update-all")
 
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_cluster_update_targets_trusted_federation_members(self) -> None:
+        first = self._federation_cluster("update-first", 27321)
+        second = self._federation_cluster("update-second", 27322)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            legacy_id = "d" * 32
+            first.upsert_node({
+                "node_id": legacy_id, "public_host": "192.0.2.44", "public_port": 27323,
+                "internal_port": 27323, "api_version": 2, "location": {"country_code": "ZZ"},
+            }, role="legacy-candidate")
+            with first.db.connection:
+                first.db.connection.execute(
+                    "UPDATE nodes SET state='legacy-unverified' WHERE id=?", (legacy_id,)
+                )
+            script_payload, agent_payload = self._update_payloads()
+            remote_id = second.load_config()["node_id"]
+            calls: list[tuple[str, str]] = []
+
+            def fake_send(_cluster, node_id, action, payload, timeout=900):
+                calls.append((node_id, action))
+                if action == "status.refresh":
+                    return {"result": second.local_status()}
+                return {"result": {"sha256": payload["sha256"]}}
+
+            with mock.patch.object(lun_cluster, "send_action", side_effect=fake_send):
+                result = lun_cluster.distribute_cluster_update(
+                    first, {"script": script_payload, "agent": agent_payload}
+                )
+            self.assertEqual(calls, [
+                (remote_id, "status.refresh"),
+                (remote_id, "script.install"),
+                (remote_id, "agent.install"),
+            ])
+            self.assertTrue(result["complete"])
+            self.assertEqual(result["nodes"][str(first.node(remote_id)["server_number"])]["status"], "updated")
+            self.assertNotIn(str(first.node(legacy_id)["server_number"]), result["nodes"])
+            self.assertEqual(first.node(remote_id)["role"], "federation")
+        finally:
+            first.close()
+            second.close()
+
     def test_cluster_update_marks_unresponsive_child_and_continues(self) -> None:
         master_id, child_id = "a" * 32, "b" * 32
         self.cluster.save_config({
