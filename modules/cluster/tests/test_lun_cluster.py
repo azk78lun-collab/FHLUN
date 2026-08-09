@@ -1238,6 +1238,41 @@ class ClusterTestCase(unittest.TestCase):
             remote.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_pairing_confirmation_allows_third_member_to_import_full_roster(self) -> None:
+        first = self._federation_cluster("pair-confirm-first", 27811)
+        second = self._federation_cluster("pair-confirm-second", 27812)
+        third = self._federation_cluster("pair-confirm-third", 27813)
+        join_uri = second.create_join_code()
+        try:
+            def paired(_join, method, path, body=None):
+                if method == "GET":
+                    return {"ok": True, "bundle": second.federation_public_bundle()}
+                accepted = second.accept_federation_join(
+                    body["token"], body["bundle"], body["transaction"]
+                )
+                return {"ok": True, "transaction_id": accepted["transaction_id"],
+                        "bundle": accepted["bundle"]}
+
+            with mock.patch.object(lun_cluster, "bootstrap_request", side_effect=paired):
+                lun_cluster.federation_add_peer(first, join_uri)
+            first_id = first.load_config()["node_id"]
+            second_id = second.load_config()["node_id"]
+            confirmation = first.db.connection.execute(
+                "SELECT 1 FROM federation_events WHERE author_id=? AND type='member.upsert' "
+                "AND entity_key=?",
+                (first_id, f"member:{second_id}"),
+            ).fetchone()
+            self.assertIsNotNone(confirmation)
+            third.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            self.assertIsNotNone(third.db.connection.execute(
+                "SELECT 1 FROM federation_keys WHERE node_id=? AND revoked_at=0", (second_id,)
+            ).fetchone())
+        finally:
+            first.close()
+            second.close()
+            third.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_federation_user_events_converge_delete_and_keep_stable_device_key(self) -> None:
         first = self._federation_cluster("users-first", 27901)
         second = self._federation_cluster("users-second", 27902)

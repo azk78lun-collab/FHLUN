@@ -3657,13 +3657,41 @@ class Cluster:
         if not re.fullmatch(r"[0-9a-f]{32}", node_id) or node_id == self.load_config().get("node_id"):
             raise ClusterError("联邦成员身份无效")
         plan = self.import_federation_bundle(bundle, allow_foreign_single=True)
-        root, identity = str(plan["root_certificate"]), str(plan["identity_certificate"])
-        status = {**status, "node_id": node_id}
-        payload = self.federation_member_payload(status, root, identity)
+        confirmation = self.confirm_federation_member(bundle, remark)
+        return {"node_id": node_id, "event": confirmation.get("event"),
+                "confirmed": confirmation["created"], "accepted": plan["accepted"]}
+
+    def confirm_federation_member(self, bundle: dict[str, Any], remark: str = "") -> dict[str, Any]:
+        """Sign local trust once so a newly paired member can propagate to existing peers."""
+        status = bundle.get("status") if isinstance(bundle.get("status"), dict) else {}
+        node_id = str(bundle.get("node_id", status.get("node_id", "")))
+        local_id = str(self.load_config().get("node_id", ""))
+        if not re.fullmatch(r"[0-9a-f]{32}", node_id) or node_id == local_id:
+            raise ClusterError("联邦成员身份无效")
+        key = self.db.connection.execute(
+            "SELECT root_certificate,identity_certificate,revoked_at FROM federation_keys WHERE node_id=?",
+            (node_id,),
+        ).fetchone()
+        if not key or int(key["revoked_at"]):
+            raise ClusterError("联邦成员未受信或已撤销")
+        root, identity = str(key["root_certificate"]), str(key["identity_certificate"])
+        existing = self.db.connection.execute(
+            "SELECT payload FROM federation_events WHERE author_id=? AND type='member.upsert' "
+            "AND entity_key=? ORDER BY author_seq DESC LIMIT 1",
+            (local_id, f"member:{node_id}"),
+        ).fetchone()
+        if existing:
+            with contextlib.suppress(json.JSONDecodeError):
+                previous = json.loads(str(existing["payload"]))
+                if previous.get("root_certificate") == root \
+                        and previous.get("identity_certificate") == identity:
+                    return {"created": False, "event": None}
+        confirmed_status = {**status, "node_id": node_id}
         if remark:
-            payload["status"]["remark"] = safe_label(remark)
-        event = self.create_event("member.upsert", f"member:{node_id}", payload)
-        return {"node_id": node_id, "event": event}
+            confirmed_status["remark"] = safe_label(remark)
+        payload = self.federation_member_payload(confirmed_status, root, identity)
+        return {"created": True,
+                "event": self.create_event("member.upsert", f"member:{node_id}", payload)}
 
     def _encrypt_backup_payload(self, plaintext: bytes, target: Path, password: str) -> Path:
         if len(password) < 8:
@@ -4315,6 +4343,7 @@ def federation_add_peer(cluster: Cluster, join_uri: str, remark: str = "") -> di
         registered = cluster.import_federation_bundle(
             recovery["bundle"], pinned_identity_fingerprint=join["fingerprint"], allow_foreign_single=False
         )
+        cluster.confirm_federation_member(recovery["bundle"], remark)
         cluster.save_outgoing_join_transaction(join["token"], transaction, recovery["bundle"], "committed")
         cluster.db.audit("federation.add-peer.recovered", str(join["node_id"]), remark)
         return {"node_id": registered["node_id"], "accepted": registered["accepted"],
@@ -4340,6 +4369,7 @@ def federation_add_peer(cluster: Cluster, join_uri: str, remark: str = "") -> di
         registered = cluster.import_federation_bundle(
             remote_bundle, pinned_identity_fingerprint=join["fingerprint"], allow_foreign_single=False
         )
+        cluster.confirm_federation_member(remote_bundle, remark)
     except ClusterError as exc:
         initial_error = str(exc)
         try:
@@ -4353,6 +4383,7 @@ def federation_add_peer(cluster: Cluster, join_uri: str, remark: str = "") -> di
             registered = cluster.import_federation_bundle(
                 remote_bundle, pinned_identity_fingerprint=join["fingerprint"], allow_foreign_single=False
             )
+            cluster.confirm_federation_member(remote_bundle, remark)
         except ClusterError as recovery_error:
             cluster.save_outgoing_join_transaction(
                 join["token"], transaction, remote_bundle, "remote-committed-local-pending"
