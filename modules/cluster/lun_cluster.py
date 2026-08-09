@@ -45,6 +45,7 @@ from typing import Any, Iterable
 
 VERSION = "0.2.0"
 API_VERSION = 3
+RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
 MAX_BODY = 4 * 1024 * 1024
 ROLE_TRANSFER_CHUNK = 512 * 1024
@@ -4267,6 +4268,8 @@ def serve(cluster: Cluster) -> None:
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+    if server.restart_requested:  # type: ignore[attr-defined]
+        raise SystemExit(RESTART_EXIT_CODE)
 
 
 def bootstrap_request(join: dict[str, Any], method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:

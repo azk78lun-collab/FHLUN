@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.9.5'
+contains "$SCRIPT" '当前版本：V26.8.9.6'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'
 contains "$SCRIPT" 'subscription_only_enabled(){'
@@ -110,5 +110,6 @@ CLUSTER_SERVICE=$(section "$SCRIPT" cluster_install_service)
 if printf '%s\n' "$CLUSTER_SERVICE" | grep -Eiq 'heartbeat|timer|cron|while.*sync'; then
   fail 'cluster service adds a fixed heartbeat/sync timer'
 fi
+printf '%s\n' "$CLUSTER_SERVICE" | grep -Fq 'Restart=always' || fail 'cluster service does not survive an in-process update restart'
 
 printf 'ok - Lun federation Shell integration\n'

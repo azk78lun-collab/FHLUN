@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.9.5"
+echo "当前版本：V26.8.9.6"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4157,7 +4157,7 @@ Type=simple
 User=root
 Environment=LUN_SCRIPT=/usr/bin/lun
 ExecStart=$python_bin $agent_py --root $HOME/lun serve
-Restart=on-failure
+Restart=always
 RestartSec=3s
 PrivateTmp=yes
 UMask=0077

@@ -1183,6 +1183,40 @@ class ClusterTestCase(unittest.TestCase):
         catchup.assert_called_once_with()
         self.assertEqual(started.count("initial_subscription_catchup"), 1)
 
+    def test_serve_restart_request_exits_for_service_supervisor(self) -> None:
+        self.cluster.save_config({"enabled": True, "role": "master", "node_id": "a" * 32,
+                                  "cluster_id": "b" * 32, "bind": "127.0.0.1",
+                                  "internal_port": 27702, "public_port": 27702})
+
+        class FakeServer:
+            def __init__(self, *_args):
+                self.socket = object()
+                self.restart_requested = False
+
+            def serve_forever(self, **_kwargs):
+                self.restart_requested = True
+
+            def server_close(self):
+                return None
+
+        class FakeThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                return None
+
+        context = mock.Mock()
+        context.wrap_socket.return_value = object()
+        with mock.patch.object(lun_cluster, "ThreadingClusterServer", FakeServer), \
+                mock.patch.object(lun_cluster, "server_context", return_value=context), \
+                mock.patch.object(lun_cluster.threading, "Thread", FakeThread), \
+                mock.patch.object(lun_cluster.signal, "signal"):
+            with self.assertRaises(SystemExit) as raised:
+                lun_cluster.serve(self.cluster)
+        self.assertEqual(raised.exception.code, lun_cluster.RESTART_EXIT_CODE)
+
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_pairing_invalid_final_bundle_keeps_signed_recoverable_transaction(self) -> None:
         first = self._federation_cluster("transaction-first", 27801)
