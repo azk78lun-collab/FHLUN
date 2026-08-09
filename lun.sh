@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.9.2"
+echo "当前版本：V26.8.9.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4577,6 +4577,8 @@ cluster_refresh_profiles >/dev/null 2>&1 || true
 
 cluster_install(){
 [ "$(id -u 2>/dev/null)" = 0 ] || { red_line "分布式集群安装需要 root。"; return 1; }
+cluster_migrate=${1:-no}
+cluster_existing_internal=$(cluster_config_value internal_port 2>/dev/null)
 { pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
 red_line "分布式集群只支持 systemd 或 OpenRC。"
 return 1
@@ -4604,8 +4606,15 @@ IFS= read -r cluster_input_port
 [ -n "$cluster_input_port" ] && cluster_default_port=$cluster_input_port
 port_valid "$cluster_default_port" || { red_line "通信端口无效。"; return 1; }
 [ "$cluster_default_port" = 443 ] && { red_line "分布式集群默认禁止使用热门端口 443，请换一个高位 TCP 端口。"; return 1; }
-port_reserved "$cluster_default_port" && { red_line "端口已被风火轮协议或订阅占用。"; return 1; }
-port_in_use "$cluster_default_port" && { red_line "端口已被其他服务占用。"; return 1; }
+cluster_reuse_existing=no
+if [ "$cluster_migrate" = yes ] && cluster_legacy_present \
+&& [ -n "$cluster_existing_internal" ] && [ "$cluster_default_port" = "$cluster_existing_internal" ]; then
+cluster_reuse_existing=yes
+fi
+port_reserved "$cluster_default_port" && [ "$cluster_reuse_existing" != yes ] \
+&& { red_line "端口已被风火轮协议或订阅占用。"; return 1; }
+port_in_use "$cluster_default_port" && [ "$cluster_reuse_existing" != yes ] \
+&& { red_line "端口已被其他服务占用。"; return 1; }
 cluster_default_public=$(client_port "$cluster_default_port")
 if is_nat_mode && [ "$cluster_default_public" = "$cluster_default_port" ]; then
 cluster_mapped=no
@@ -4618,7 +4627,6 @@ yellow_line "请在服务商面板新增 公网 TCP 端口 → $cluster_default_
 return 1
 }
 fi
-cluster_migrate=${1:-no}
 cluster_install_txn=$(mktemp -d "$HOME/lun/.cluster-install.XXXXXX" 2>/dev/null) || {
 red_line "无法创建联邦启用事务快照。"
 return 1

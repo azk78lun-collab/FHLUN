@@ -11,10 +11,12 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.9.2'
+contains "$SCRIPT" '当前版本：V26.8.9.3'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'
 contains "$SCRIPT" 'subscription_only_enabled(){'
+contains "$SCRIPT" 'cluster_existing_internal=$(cluster_config_value internal_port'
+contains "$SCRIPT" '[ "$cluster_reuse_existing" != yes ]'
 
 MENU=$(section "$SCRIPT" cluster_federation_menu)
 printf '%s\n' "$MENU" | grep -Fq '生成加入地址' || fail 'federation menu missing join address'
