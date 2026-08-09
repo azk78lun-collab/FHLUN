@@ -1273,6 +1273,40 @@ class ClusterTestCase(unittest.TestCase):
             third.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_federation_profile_tokens_converge_and_old_urls_are_removed(self) -> None:
+        first = self._federation_cluster("profile-first", 27821)
+        second = self._federation_cluster("profile-second", 27822)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            second.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            original = {cluster.load_config()["node_id"]: cluster.profiles()[0]["token"]
+                        for cluster in (first, second)}
+            self.assertEqual(len(set(original.values())), 2)
+            for cluster in (first, second):
+                token = original[cluster.load_config()["node_id"]]
+                for directory in (cluster.cache / token, cluster.root.parent / "weblun" / token):
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / "jhsub.txt").write_text("old", encoding="utf-8")
+                cluster.refresh_profiles()
+            first_bundle = first.federation_public_bundle()
+            second_bundle = second.federation_public_bundle()
+            first.import_federation_bundle(second_bundle)
+            second.import_federation_bundle(first_bundle)
+            current = {cluster.load_config()["node_id"]: cluster.profiles()[0]["token"]
+                       for cluster in (first, second)}
+            self.assertEqual(len(set(current.values())), 1)
+            for cluster in (first, second):
+                node_id = cluster.load_config()["node_id"]
+                if original[node_id] != current[node_id]:
+                    self.assertFalse((cluster.cache / original[node_id]).exists())
+                    self.assertFalse((cluster.root.parent / "weblun" / original[node_id]).exists())
+            self.assertEqual(first.publish_local_profile_events()["events"], 0)
+            self.assertEqual(second.publish_local_profile_events()["events"], 0)
+        finally:
+            first.close()
+            second.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_federation_user_events_converge_delete_and_keep_stable_device_key(self) -> None:
         first = self._federation_cluster("users-first", 27901)
         second = self._federation_cluster("users-second", 27902)

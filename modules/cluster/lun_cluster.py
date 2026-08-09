@@ -1247,25 +1247,56 @@ class Cluster:
                        token: str = "") -> sqlite3.Row:
         now = utc_now()
         name = safe_label(name)
+        profile_key = safe_slug(profile_key)
+        if token and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+            raise ClusterError("订阅 token 无效")
         row = self.db.connection.execute("SELECT * FROM profiles WHERE name=?", (name,)).fetchone()
         if row is None and token:
             row = self.db.connection.execute("SELECT * FROM profiles WHERE token=?", (token,)).fetchone()
         if row:
+            profile_token = token or str(row["token"])
+            conflict = self.db.connection.execute(
+                "SELECT id FROM profiles WHERE token=? AND id<>?", (profile_token, row["id"])
+            ).fetchone()
+            if conflict:
+                raise ClusterError("订阅 token 已由其他档案使用")
+            old_token = str(row["token"])
             with self.db.connection:
                 self.db.connection.execute(
-                    "UPDATE profiles SET name=?,selector=?,profile_key=?,enabled=1,updated_at=? WHERE id=?",
-                    (name, selector, safe_slug(profile_key), now, row["id"]),
+                    "UPDATE profiles SET name=?,token=?,selector=?,profile_key=?,enabled=1,updated_at=? WHERE id=?",
+                    (name, profile_token, selector, profile_key, now, row["id"]),
                 )
+            if old_token != profile_token:
+                shutil.rmtree(self.cache / old_token, ignore_errors=True)
+                shutil.rmtree(self.root.parent / "weblun" / old_token, ignore_errors=True)
             return self.db.connection.execute("SELECT * FROM profiles WHERE id=?", (row["id"],)).fetchone()
         profile_token = token or b64url(secrets.token_bytes(24))
-        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", profile_token):
-            raise ClusterError("订阅 token 无效")
         with self.db.connection:
             self.db.connection.execute(
                 "INSERT INTO profiles(name,token,selector,profile_key,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (name, profile_token, selector, safe_slug(profile_key), now, now),
+                (name, profile_token, selector, profile_key, now, now),
             )
         return self.db.connection.execute("SELECT * FROM profiles WHERE name=?", (name,)).fetchone()
+
+    @staticmethod
+    def federation_profile_entity_key(selector: str, profile_key: str) -> str:
+        identity = safe_slug(profile_key) + "\0" + selector
+        return "profile:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def publish_local_profile_events(self) -> dict[str, int]:
+        if not self.is_federation():
+            return {"profiles": 0, "events": 0}
+        profiles = self.db.connection.execute(
+            "SELECT name,token,selector,profile_key FROM profiles WHERE enabled=1 ORDER BY id"
+        ).fetchall()
+        events = 0
+        for profile in profiles:
+            payload = {key: str(profile[key]) for key in ("name", "token", "selector", "profile_key")}
+            entity_key = self.federation_profile_entity_key(payload["selector"], payload["profile_key"])
+            events += int(self._create_event_if_changed("profile.upsert", entity_key, payload) is not None)
+        self.db.audit("federation.profiles.publish", str(self.load_config().get("node_id", "")),
+                      f"profiles={len(profiles)} events={events}")
+        return {"profiles": len(profiles), "events": events}
 
     def profiles(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.connection.execute(
@@ -1293,6 +1324,7 @@ class Cluster:
             "SELECT DISTINCT country_code FROM nodes WHERE country_code<>'ZZ' ORDER BY country_code"
         ):
             self.ensure_profile(f"{row['country_code']} 地区", f"region:{row['country_code']}")
+        self.publish_local_profile_events()
         webroot = self.root.parent / "weblun"
         result: list[dict[str, Any]] = []
         all_profiles = self.db.connection.execute("SELECT * FROM profiles ORDER BY id").fetchall()
@@ -2474,6 +2506,17 @@ class Cluster:
         raise ClusterError("unsupported federation user event")
 
     def _validate_event_payload(self, event_type: str, entity_key: str, payload: dict[str, Any]) -> None:
+        if event_type == "profile.upsert":
+            name = safe_label(str(payload.get("name", "")))
+            token = str(payload.get("token", ""))
+            selector = str(payload.get("selector", ""))
+            profile_key = str(payload.get("profile_key", ""))
+            if not name or len(selector) > 4096 or not selector \
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token) \
+                    or not profile_key or safe_slug(profile_key) != profile_key \
+                    or entity_key != self.federation_profile_entity_key(selector, profile_key):
+                raise ClusterError("federation profile event is invalid")
+            return
         if event_type in FEDERATION_USER_EVENT_TYPES:
             self._validate_federation_user_event(event_type, entity_key, payload)
 
@@ -2486,7 +2529,8 @@ class Cluster:
         if current and bool(current["deleted"]) and not deleted:
             return None
         if current and str(current["type"]) == event_type and bool(current["deleted"]) == deleted \
-                and hmac.compare_digest(str(current["payload"]), json_dumps(payload)):
+                and hmac.compare_digest(str(current["payload"]).encode("utf-8"),
+                                        json_dumps(payload).encode("utf-8")):
             return None
         return self.create_event(event_type, entity_key, payload)
 
@@ -2887,7 +2931,8 @@ class Cluster:
         elif event["type"] == "profile.upsert":
             name, token = safe_label(str(payload.get("name", ""))), str(payload.get("token", ""))
             if name and token:
-                self.ensure_profile(name, str(payload.get("selector", "all")), token, str(payload.get("profile_key", token)))
+                self.ensure_profile(name, str(payload.get("selector", "all")),
+                                    str(payload.get("profile_key", "legacy")), token)
 
     def federation_manifest(self) -> dict[str, Any]:
         heads = self.db.connection.execute("SELECT author_id,author_seq,event_hash,lamport FROM federation_heads ORDER BY author_id").fetchall()

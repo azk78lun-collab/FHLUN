@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.9.4'
+contains "$SCRIPT" '当前版本：V26.8.9.5'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'
 contains "$SCRIPT" 'subscription_only_enabled(){'
