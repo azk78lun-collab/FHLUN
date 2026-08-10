@@ -186,6 +186,23 @@ class ClusterTestCase(unittest.TestCase):
             "德国-法兰克福",
         )
 
+    def test_revoked_member_is_hidden_without_deleting_its_tombstone(self) -> None:
+        retired, active = "a" * 32, "b" * 32
+        self._add_node(retired, "ZZ")
+        self._add_node(active, "ZZ")
+        with self.cluster.db.connection:
+            self.cluster.db.connection.execute(
+                "UPDATE nodes SET endpoint_host='161.33.24.201',state='revoked' WHERE id=?", (retired,)
+            )
+            self.cluster.db.connection.execute(
+                "UPDATE nodes SET endpoint_host='161.33.24.201',state='online' WHERE id=?", (active,)
+            )
+        self.assertEqual([row["id"] for row in self.cluster.nodes()], [active])
+        self.assertEqual(self.cluster.identity_place(self.cluster.node(active)), "未设置地区")
+        self.assertIsNotNone(self.cluster.db.connection.execute(
+            "SELECT 1 FROM nodes WHERE id=? AND state='revoked'", (retired,)
+        ).fetchone())
+
     def test_master_nodes_view_refreshes_its_own_runtime_version(self) -> None:
         node_id = "a" * 32
         self.cluster.save_config({
@@ -797,6 +814,34 @@ class ClusterTestCase(unittest.TestCase):
         finally:
             for item in clusters:
                 item.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_local_location_metadata_is_self_signed_and_updates_peer(self) -> None:
+        first = self._federation_cluster("metadata-first", 24101)
+        second = self._federation_cluster("metadata-second", 24102)
+        try:
+            second_bundle = second.federation_public_bundle()
+            first.federation_register_peer(second_bundle)
+            second.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            second_id = str(second.load_config()["node_id"])
+            second.set_location(second_id, "JP", "日本", "日本-大阪2")
+            second.apply_local_identity(
+                int(second.node(second_id)["server_number"]),
+                {"country_code": "JP", "country": "日本", "region": "日本-大阪2"},
+                "日本-大阪2",
+            )
+            event = second.publish_local_node_metadata()
+            self.assertTrue(first.ingest_event(event))
+            self.assertEqual(first.node(second_id)["region"], "日本-大阪2")
+            self.assertEqual(first.identity_place(first.node(second_id)), "日本-大阪2")
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "节点自身签名"):
+                first.create_event(
+                    "node.metadata", f"node:{second_id}",
+                    {"node_id": second_id, "status": second.local_status()},
+                )
+        finally:
+            first.close()
+            second.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_federation_numbers_usage_revoke_and_private_free_backup(self) -> None:

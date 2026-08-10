@@ -623,7 +623,7 @@ class Cluster:
 
     def place_labels(self) -> dict[str, str]:
         rows = self.db.connection.execute(
-            "SELECT * FROM nodes ORDER BY server_number,id"
+            "SELECT * FROM nodes WHERE state NOT IN ('revoked','removed') ORDER BY server_number,id"
         ).fetchall()
         return numbered_place_labels(rows)
 
@@ -1006,7 +1006,9 @@ class Cluster:
         config = self.load_config()
         if config.get("role") == "master" and re.fullmatch(r"[0-9a-f]{32}", str(config.get("node_id", ""))):
             self.upsert_node(self.local_status(), role="master")
-        rows = self.db.connection.execute("SELECT * FROM nodes ORDER BY server_number,id").fetchall()
+        rows = self.db.connection.execute(
+            "SELECT * FROM nodes WHERE state NOT IN ('revoked','removed') ORDER BY server_number,id"
+        ).fetchall()
         trusted: set[str] = set()
         if self.is_federation():
             trusted = {str(row[0]) for row in self.db.connection.execute(
@@ -2400,6 +2402,18 @@ class Cluster:
                 "server_number": int(status.get("server_number", self.load_config().get("server_number", 1))),
                 "legacy_number": bool(legacy_number)}
 
+    def publish_local_node_metadata(self) -> dict[str, Any]:
+        if not self.is_federation():
+            raise ClusterError("当前不是联邦模式")
+        status = self.local_status()
+        node_id = str(status.get("node_id", ""))
+        if not re.fullmatch(r"[0-9a-f]{32}", node_id):
+            raise ClusterError("本机联邦身份无效")
+        self.upsert_node(status, role="federation")
+        return self.create_event(
+            "node.metadata", f"node:{node_id}", {"node_id": node_id, "status": status}
+        )
+
     def _sign_federation(self, content: bytes) -> str:
         key = self.pki / "federation-root.key"
         if not key.is_file():
@@ -2882,6 +2896,11 @@ class Cluster:
             raise ClusterError("联邦事件载荷无效") from exc
         if isinstance(payload, dict):
             self._validate_event_payload(str(event["type"]), str(event["entity_key"]), payload)
+        if event["type"] == "node.metadata" and isinstance(payload, dict) \
+                and isinstance(payload.get("status"), dict):
+            node_id = str(payload.get("node_id", ""))
+            if event["entity_key"] != f"node:{node_id}" or event["author_id"] != node_id:
+                raise ClusterError("节点元数据必须由节点自身签名")
         if not isinstance(payload, dict) or not self._verify_federation_signature(
             self._event_certificate(str(event["author_id"]), int(event["author_seq"])),
             canonical_event_fields(event), str(event["signature"])
@@ -2945,6 +2964,11 @@ class Cluster:
                 requested = int(payload.get("server_number", 0) or 0)
                 self.upsert_node({**status, "server_number": requested or status.get("server_number", 0)}, role="federation")
                 self._record_number_claim(event, member_id, payload)
+        elif event["type"] == "node.metadata":
+            status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+            node_id = str(payload.get("node_id", ""))
+            if status.get("node_id") == node_id and re.fullmatch(r"[0-9a-f]{32}", node_id):
+                self.upsert_node(status, role="federation")
         elif event["type"] in {"member.revoke", "revocation.proof"}:
             pass
         elif event["type"] == "usage.absolute":
@@ -3508,6 +3532,10 @@ class Cluster:
                 if not isinstance(payload, dict):
                     raise ClusterError("bundle 事件载荷必须是对象")
                 self._validate_event_payload(str(event["type"]), str(event["entity_key"]), payload)
+                if event["type"] == "node.metadata" and isinstance(payload.get("status"), dict):
+                    node_id = str(payload.get("node_id", ""))
+                    if event["entity_key"] != f"node:{node_id}" or author != node_id:
+                        raise ClusterError("节点元数据必须由节点自身签名")
                 if event["type"] == "member.upsert":
                     status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
                     member_id = str(status.get("node_id", ""))
@@ -4115,7 +4143,13 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
                 self._reply(200, {"ok": True, "vote": vote})
             elif parsed.path == "/v1/federation/events" and self.cluster.is_federation():
                 events = body.get("events") if isinstance(body.get("events"), list) else []
-                self._reply(200, {"ok": True, "accepted": self.cluster.federation_import_events(events)})
+                accepted = self.cluster.federation_import_events(events)
+                refreshed = 0
+                if accepted and any(str(event.get("type", "")) in {
+                        "member.upsert", "member.revoke", "revocation.proof", "node.metadata"
+                } for event in events if isinstance(event, dict)):
+                    refreshed = len(self.cluster.refresh_profiles())
+                self._reply(200, {"ok": True, "accepted": accepted, "refreshed": refreshed})
             elif parsed.path == "/v1/federation/snapshot" and self.cluster.is_federation():
                 snapshot = body.get("snapshot") if isinstance(body.get("snapshot"), dict) else {}
                 status = snapshot.get("status") if isinstance(snapshot.get("status"), dict) else {}
@@ -4689,17 +4723,37 @@ def sync_node(cluster: Cluster, node_id: str, profile: str = "legacy") -> dict[s
         raise
 
 
-def push_node_identity(cluster: Cluster, node_id: str) -> dict[str, Any]:
+def broadcast_federation_events(cluster: Cluster) -> dict[str, Any]:
+    delivered: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    for row in cluster.trusted_federation_nodes():
+        node_id = str(row["id"])
+        try:
+            delivered[node_id] = federation_sync(
+                cluster, node_id, attempts=2, coordinate_failures=False
+            )
+        except ClusterError as exc:
+            failures[node_id] = str(exc)[-1000:]
+    return {"delivered": delivered, "failures": failures}
+
+
+def push_node_identity(cluster: Cluster, node_id: str, *, propagate: bool = False) -> dict[str, Any]:
     row = cluster.node(node_id)
     location = {key: row[key] for key in ("country_code", "country", "region", "city", "provider")}
     place = cluster.identity_place(row)
-    if row["role"] == "master":
+    local_id = str(cluster.load_config().get("node_id", ""))
+    if str(row["id"]) == local_id:
         identity = cluster.apply_identity_transaction(int(row["server_number"]), location, place)
         cluster.record_local_snapshot()
+        metadata = cluster.publish_local_node_metadata() if cluster.is_federation() and propagate else None
+        propagation = broadcast_federation_events(cluster) if metadata else {}
+        publication = push_snapshot(cluster) if metadata else {}
         cluster.mark_identity_synced(cluster.node(str(row["id"])))
-        return {"identity": identity, "snapshot": cluster.local_snapshot()}
+        return {"identity": identity, "snapshot": cluster.local_snapshot(), "metadata": metadata,
+                "propagation": propagation, "publication": publication}
     result = send_action(cluster, row["id"], "identity.apply", {
         "server_number": int(row["server_number"]), "location": location, "place": place,
+        "publish": bool(propagate),
     })
     payload = result.get("result") if isinstance(result.get("result"), dict) else {}
     remote_identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
@@ -4708,6 +4762,9 @@ def push_node_identity(cluster: Cluster, node_id: str) -> dict[str, Any]:
     snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else None
     if snapshot:
         cluster.record_snapshot(snapshot)
+    if cluster.is_federation() and propagate:
+        federation_sync(cluster, str(row["id"]), attempts=2, coordinate_failures=False)
+        result["propagation"] = broadcast_federation_events(cluster)
     cluster.mark_identity_synced(cluster.node(str(row["id"])))
     return result
 
@@ -5174,7 +5231,10 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         if server_number < 1 or location is None:
             raise ClusterError("服务器身份数据无效")
         identity = cluster.apply_identity_transaction(server_number, location, place)
-        return {"identity": identity, "snapshot": cluster.local_snapshot()}
+        metadata = cluster.publish_local_node_metadata() if cluster.is_federation() and bool(payload.get("publish")) else None
+        publication = push_snapshot(cluster) if metadata else {}
+        return {"identity": identity, "snapshot": cluster.local_snapshot(), "metadata": metadata,
+                "publication": publication}
     if action == "status.refresh":
         return cluster.local_status()
     if action == "subscription.refresh":
@@ -5775,6 +5835,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "remove-peer":
             row = cluster.node(args.node_id)
             result = cluster.revoke_member(str(row["id"]), args.reason)
+            result["propagation"] = broadcast_federation_events(cluster)
+            result["refreshed"] = len(cluster.refresh_profiles())
             print("联邦成员已撤销：" + short_id(str(row["id"])))
         elif args.command == "init-child":
             result = cluster.init_child(args.host, args.port, args.public_port, args.remark)
@@ -5894,12 +5956,16 @@ def main(argv: list[str] | None = None) -> int:
             country = args.country or COUNTRY_NAMES_ZH.get(country_code, row["country"])
             provider = args.provider or row["provider"]
             cluster.set_location(row["id"], country_code, country, args.region, args.city, provider)
-            push_node_identity(cluster, row["id"])
+            identity = push_node_identity(cluster, row["id"], propagate=cluster.is_federation())
             result = dict(cluster.node(row["id"]))
+            result["propagation"] = identity.get("propagation", {})
             print("节点地区已更新。")
         elif args.command == "locate":
             result = cluster.geolocate(args.node_id)
-            push_node_identity(cluster, cluster.node(args.node_id)["id"])
+            identity = push_node_identity(
+                cluster, cluster.node(args.node_id)["id"], propagate=cluster.is_federation()
+            )
+            result["propagation"] = identity.get("propagation", {})
             print("自动地区识别完成。")
         elif args.command == "assign-user":
             node_ids = [item for item in args.nodes.split(",") if item]
