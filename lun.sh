@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.9.8"
+echo "当前版本：V26.8.10.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -5003,7 +5003,7 @@ return 1
 }
 
 cluster_update_all_ui(){
-ui_title "Lun 一键更新全部集群服务器"
+ui_title "Lun 一键更新所有 VPS 代理脚本"
 cluster_show_nodes || return 1
 yellow_line "本机先从官方 main 检查一次更新；随后复用本机脚本，通过 mTLS 推送给全部已信任 API v3 成员。"
 yellow_line "远端服务器不再分别访问 GitHub；脚本和联动程序均执行语法、SHA-256 与原子替换校验。"
@@ -5230,6 +5230,7 @@ ui_pause
 }
 
 cluster_sync_ui(){
+cluster_cmd endpoint-reconcile || yellow_line "未能确认本机公网 IP；本次继续同步已有联邦事件。"
 printf "节点 ID（输入 all 同步全部，输入 0 返回）："
 IFS= read -r cluster_node_id
 [ "$cluster_node_id" = 0 ] && return
@@ -5266,7 +5267,7 @@ PY
 [ -n "$cluster_join_node" ] || { rm -f "$cluster_join_result"; red_line "加入结果缺少成员身份，请重试。"; return 1; }
 cluster_install_service && cluster_service_restart || true
 apply_lun_firewall_rules || true
-yellow_line "成员已接纳，正在自动广播信任、刷新订阅并重载各成员……"
+yellow_line "成员已接纳，正在有界并行广播信任、动态生效并发布新订阅……"
 if cluster_cmd finalize-peer --node-id "$cluster_join_node"; then
 green_line "成员已加入联邦；全部在线成员已自动同步，无需其它操作。"
 else
@@ -5387,7 +5388,7 @@ echo "10. CDN 优选池同步"
 echo "11. 联邦数据备份"
 echo "12. 本机完整身份备份 / 恢复"
 echo "13. 状态 / 修复"
-echo "14. 一键更新全部"
+echo "14. 一键更新所有 VPS 代理脚本"
 echo "15. 移除 / 撤销成员"
 echo "16. 停用本机联邦"
 echo " 0. 返回"
@@ -5405,7 +5406,7 @@ case "$cluster_choice" in
 9) cluster_location_ui; ui_pause ;;
 10) cluster_cdn_sync_ui; ui_pause ;;
 11|12) cluster_backup_ui ;;
-13) cluster_cmd status; cluster_install_service; cluster_service_restart; restart_subscription_service; apply_lun_firewall_rules; ui_pause ;;
+13) cluster_cmd endpoint-reconcile || true; cluster_cmd status; cluster_install_service; cluster_service_restart; restart_subscription_service; apply_lun_firewall_rules; ui_pause ;;
 14) cluster_update_all_ui; ui_pause ;;
 15) cluster_remove_member_ui; ui_pause ;;
 16) cluster_disable_ui; ui_pause ;;
@@ -11096,7 +11097,7 @@ cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
 mkdir -p "$cdnopt_dir" || return 1
 rm -f "$cdnopt_tmp"
-if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 1.1.0 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
+if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.0 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
 return 0
 fi
 if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
@@ -11139,7 +11140,7 @@ red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
 return 1
 }
 cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
-[ "$cdnopt_version" = 1.1.0 ] || {
+[ "$cdnopt_version" = 2.0.0 ] || {
 rm -f "$cdnopt_tmp"
 red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
 return 1
@@ -11180,10 +11181,9 @@ apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
 
 cdnopt_run(){
 ui_title "Lun 一键优选 CDN 节点"
-echo "CM IP 提供候选库；真实测速由您打开的电脑/手机浏览器执行。"
-echo "网页默认剔除延迟 >150 ms 或带宽 <80 Mbps 的 IP；两个门槛都可在开始前手动修改。"
-echo "测速表会实时显示等待、延迟测速、延迟完成、带宽测速及最终结果。"
-yellow_line "VPS 到优选 IP 的 ping 不代表您本地线路，因此 VPS 不伪装成最终带宽测试。"
+echo "BestCF 聚合库提供默认候选；客户端线路与本机 VPS 分别测试、分别排行。"
+echo "网页支持切换原始库、手工导入、筛选排序、CSV、跨榜选择及替换预览。"
+yellow_line "客户端榜代表您当前电脑/手机网络；VPS 榜只代表服务器出口，两者不会被隐藏加权。"
 cdnopt_prompt_count || return $?
 cdnopt_top=$CDNOPT_TOP_COUNT
 cdnopt_install_python || return 1
@@ -11210,11 +11210,13 @@ if [ -n "${LUN_CDNOPT_CANDIDATE_FILE:-}" ]; then
 python3 "$(cdnopt_agent)" serve \
 --port "$cdnopt_internal" --public-host "$cdnopt_host" --public-port "$cdnopt_public" \
 --result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
+--current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512 \
 --source-file "$LUN_CDNOPT_CANDIDATE_FILE"
 else
 python3 "$(cdnopt_agent)" serve \
 --port "$cdnopt_internal" --public-host "$cdnopt_host" --public-port "$cdnopt_public" \
---result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80
+--result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
+--current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512
 fi
 cdnopt_rc=$?
 cdnopt_cleanup_session

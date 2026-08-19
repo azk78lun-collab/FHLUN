@@ -222,10 +222,10 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.8.3' "$SCRIPT"
+grep -q '当前版本：V26.8.10.2' "$SCRIPT"
 grep -q '^lun_update_target(){' "$SCRIPT"
 grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
-grep -q '一键更新全部集群服务器' "$SCRIPT"
+grep -q '一键更新所有 VPS 代理脚本' "$SCRIPT"
 grep -q 'cluster_cmd update-all --script-payload' "$SCRIPT"
 grep -q '当前是同端口 CDN，不需要 Origin Rule' "$SCRIPT"
 grep -q '一键全配置（CDN / 域名证书 / 隧道 / 端口回源）' "$SCRIPT"
@@ -242,9 +242,9 @@ grep -q 'python3 .* tunnel-deploy' "$SCRIPT"
 grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"
-grep -q '8. %s服务器联动 / 节点集群%s' "$SCRIPT"
+grep -q '8. %s分布式服务器集群%s' "$SCRIPT"
 grep -q '9. %s使用说明 / 协议特点%s' "$SCRIPT"
-grep -q '6. %s刷新并查看聚合订阅%s' "$SCRIPT"
+grep -q '7. %s刷新并查看聚合订阅%s' "$SCRIPT"
 grep -q '4444-80' "$SCRIPT"
 grep -q 'Lun Cloudflare 端口回源操作' "$SCRIPT"
 grep -q 'cluster-service-control' "$SCRIPT"
@@ -273,8 +273,11 @@ grep -q '^lun_menu_screen(){' "$SCRIPT"
 grep -q 'banner_cols=${LUN_BANNER_TEST_COLS:-$(tput cols' "$SCRIPT"
 ! grep -q ' _      _   _ _   _            ___' "$SCRIPT"
 ! grep -q 'F I R E W H E E L // MULTI-PROTOCOL' "$SCRIPT"
-grep -q '主 VPS / 子 VPS 角色互换' "$SCRIPT"
-grep -q 'switch-master --node-id' "$SCRIPT"
+if grep -q '主 VPS / 子 VPS 角色互换' "$SCRIPT"; then
+  echo "legacy cluster role switch is still visible" >&2
+  exit 1
+fi
+! grep -q 'switch-master --node-id' "$SCRIPT"
 ! grep -q 'sxname' "$SCRIPT"
 ! grep -q '\$hostname\$node_name_suffix' "$SCRIPT"
 grep -q 'multiuser_clear_legacy_subscription_autostart' "$SCRIPT"
@@ -292,7 +295,7 @@ grep -q 'visit-filter --mode standard' "$SCRIPT"
 final_cip_line=$(grep -n '^cip$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
 final_cf_line=$(grep -n '^cloudflare_origin_finalize_pending || true$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
 final_oneclick_line=$(grep -n '^if ! oneclick_full_complete; then$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
-final_push_line=$(grep -n '^cluster_push_event >/dev/null 2>&1 || true$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
+final_push_line=$(grep -n '^cluster_push_event$' "$SCRIPT" | tail -n 1 | cut -d: -f1)
 [[ $final_cip_line -lt $final_cf_line && $final_cf_line -lt $final_oneclick_line && $final_oneclick_line -lt $final_push_line ]]
 
 extract_shell_function() {
@@ -378,6 +381,7 @@ service_test_home=$(mktemp -d)
 HOME=$service_test_home
 mkdir -p "$HOME/lun"
 multiuser_enabled() { return 0; }
+subscription_agent_enabled() { return 0; }
 multiuser_clear_legacy_subscription_autostart() { :; }
 multiuser_config_value() { printf '443\n'; }
 valid_port_value() { return 0; }
@@ -409,7 +413,10 @@ HOME=$original_home
 
 eval "$(extract_shell_function cluster_show_subscription_links)"
 cluster_refresh_profiles() { :; }
+cluster_refresh_profiles_async() { :; }
 multiuser_enabled() { return 1; }
+subscription_agent_enabled() { return 1; }
+subscription_direct_domain() { :; }
 client_port() { [[ $1 == 443 ]] && printf '52581\n' || printf '%s\n' "$1"; }
 cluster_cmd() {
   [[ $* == "--json profiles" ]] || return 1

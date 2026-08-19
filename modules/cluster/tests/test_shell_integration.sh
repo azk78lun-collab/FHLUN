@@ -11,7 +11,8 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.9.7'
+contains "$SCRIPT" '当前版本：V26.8.10.2'
+contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'
 contains "$SCRIPT" 'subscription_only_enabled(){'
@@ -21,6 +22,7 @@ contains "$SCRIPT" '[ "$cluster_reuse_existing" != yes ]'
 MENU=$(section "$SCRIPT" cluster_federation_menu)
 printf '%s\n' "$MENU" | grep -Fq '生成加入地址' || fail 'federation menu missing join address'
 printf '%s\n' "$MENU" | grep -Fq '刷新并查看聚合订阅' || fail 'federation menu missing aggregate refresh'
+printf '%s\n' "$MENU" | grep -Fq '一键更新所有 VPS 代理脚本' || fail 'federation menu update label is unclear'
 if printf '%s\n' "$MENU" | grep -Eq '角色互换|switch-master'; then
   fail 'federation menu still exposes legacy roles'
 fi

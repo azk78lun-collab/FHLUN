@@ -54,6 +54,26 @@ class ClusterTestCase(unittest.TestCase):
         with self.assertRaisesRegex(lun_cluster.ClusterError, "过期"):
             lun_cluster.parse_join_uri(expired)
 
+    def test_public_ip_detection_requires_two_matching_https_sources(self) -> None:
+        values = {
+            "icanhazip": "34.89.100.236\n",
+            "api64": "34.89.100.236",
+            "amazonaws": "35.212.163.79\n",
+        }
+
+        def fetch(url: str, _timeout: int) -> str:
+            return next(value for marker, value in values.items() if marker in url)
+
+        result = lun_cluster.detect_public_ip("35.189.127.5", fetcher=fetch)
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["ip"], "34.89.100.236")
+        values["api64"] = "35.212.163.79"
+        values.pop("amazonaws")
+        result = lun_cluster.detect_public_ip("35.189.127.5", fetcher=fetch)
+        self.assertFalse(result["confirmed"])
+        with self.assertRaisesRegex(lun_cluster.ClusterError, "公网 IP"):
+            lun_cluster.normalize_public_ip("10.0.0.1")
+
     def test_join_token_is_one_time(self) -> None:
         digest = lun_cluster.hashlib.sha256(b"secret-token-value-that-is-long-enough").hexdigest()
         with self.cluster.db.connection:
@@ -185,6 +205,84 @@ class ClusterTestCase(unittest.TestCase):
             lun_cluster.chinese_place({"country_code": "DE", "region": "德国-法兰克福"}),
             "德国-法兰克福",
         )
+        self.assertEqual(
+            lun_cluster.chinese_place({"country_code": "GB", "city": "London"}),
+            "英国-伦敦",
+        )
+
+    def test_federation_relay_is_bounded_and_batch_idempotent(self) -> None:
+        source = "a" * 32
+        targets = [f"{index:032x}" for index in range(1, 4)]
+        for node_id in targets:
+            self._add_node(node_id, "GB")
+        payload = {
+            "batch_id": "b" * 32,
+            "deadline": lun_cluster.utc_now() + 60,
+            "node_ids": targets,
+        }
+        delivered = {node_id: {"received": 1} for node_id in targets}
+        with mock.patch.object(
+                lun_cluster, "parallel_federation_sync", return_value=(delivered, {})) as sync:
+            first = lun_cluster.federation_relay(self.cluster, payload, source)
+            second = lun_cluster.federation_relay(self.cluster, payload, source)
+        self.assertEqual(first["delivered"], targets)
+        self.assertTrue(second["replayed"])
+        sync.assert_called_once()
+        with self.assertRaisesRegex(lun_cluster.ClusterError, "最多分发"):
+            lun_cluster.federation_relay(self.cluster, {
+                **payload, "batch_id": "c" * 32,
+                "node_ids": targets * 4,
+            }, source)
+
+    def test_event_broadcast_uses_one_bounded_relay_layer(self) -> None:
+        nodes = [{"id": f"{index:032x}"} for index in range(1, 26)]
+        cluster = mock.Mock()
+        cluster.trusted_federation_nodes.return_value = nodes
+        direct = {row["id"]: {"received": 1} for row in nodes[:lun_cluster.FEDERATION_FANOUT]}
+        relay_payloads: dict[str, dict] = {}
+
+        def relay(_cluster, node_ids, _action, payload_for, **_kwargs):
+            results = {}
+            for node_id in node_ids:
+                payload = payload_for(node_id)
+                relay_payloads[node_id] = payload
+                results[node_id] = {"result": {"delivered": payload["node_ids"], "failures": {}}}
+            return results, {}
+
+        with mock.patch.object(lun_cluster, "parallel_federation_sync", return_value=(direct, {})) as sync, \
+                mock.patch.object(lun_cluster, "parallel_federation_action", side_effect=relay):
+            result = lun_cluster.broadcast_federation_events(cluster)
+        self.assertEqual(sync.call_count, 1)
+        self.assertEqual(set(result["delivered"]), {row["id"] for row in nodes})
+        self.assertTrue(relay_payloads)
+        self.assertTrue(all(len(payload["node_ids"]) <= lun_cluster.FEDERATION_FANOUT
+                            for payload in relay_payloads.values()))
+        self.assertTrue(all(payload["deadline"] <= lun_cluster.utc_now() + lun_cluster.FEDERATION_FANOUT_TTL
+                            for payload in relay_payloads.values()))
+
+    def test_event_broadcast_falls_back_when_a_relay_fails(self) -> None:
+        nodes = [{"id": f"{index:032x}"} for index in range(1, 16)]
+        cluster = mock.Mock()
+        cluster.trusted_federation_nodes.return_value = nodes
+        roots = {row["id"]: {"received": 1} for row in nodes[:lun_cluster.FEDERATION_FANOUT]}
+        sync_results = [(roots, {}), ({nodes[10]["id"]: {"received": 1}}, {})]
+
+        def relay(_cluster, node_ids, _action, payload_for, **_kwargs):
+            results, failures = {}, {}
+            for node_id in node_ids:
+                payload = payload_for(node_id)
+                if node_id == nodes[0]["id"]:
+                    failures[node_id] = "relay timeout"
+                else:
+                    results[node_id] = {"result": {"delivered": payload["node_ids"], "failures": {}}}
+            return results, failures
+
+        with mock.patch.object(lun_cluster, "parallel_federation_sync", side_effect=sync_results) as sync, \
+                mock.patch.object(lun_cluster, "parallel_federation_action",
+                                  side_effect=relay):
+            result = lun_cluster.broadcast_federation_events(cluster)
+        self.assertEqual(sync.call_count, 2)
+        self.assertEqual(set(result["delivered"]), {row["id"] for row in nodes})
 
     def test_revoked_member_is_hidden_without_deleting_its_tombstone(self) -> None:
         retired, active = "a" * 32, "b" * 32
@@ -608,7 +706,7 @@ class ClusterTestCase(unittest.TestCase):
         script_payload, agent_payload = self._update_payloads()
         calls: list[tuple[str, str]] = []
 
-        def fake_send(_cluster, node_id, action, payload, timeout=900):
+        def fake_send(_cluster, node_id, action, payload, timeout=900, **_kwargs):
             calls.append((node_id, action))
             if action == "status.refresh":
                 return {"result": {
@@ -671,7 +769,7 @@ class ClusterTestCase(unittest.TestCase):
             remote_id = second.load_config()["node_id"]
             calls: list[tuple[str, str]] = []
 
-            def fake_send(_cluster, node_id, action, payload, timeout=900):
+            def fake_send(_cluster, node_id, action, payload, timeout=900, **_kwargs):
                 calls.append((node_id, action))
                 if action == "status.refresh":
                     return {"result": second.local_status()}
@@ -715,6 +813,7 @@ class ClusterTestCase(unittest.TestCase):
             )
         self.assertFalse(result["complete"])
         self.assertIn("handshake timeout", result["failures"]["2"])
+        self.assertEqual(result["nodes"]["2"]["status"], "failed")
         self.assertEqual(self.cluster.node(child_id)["state"], "unreachable")
 
     def test_cluster_update_installs_master_last_when_requested(self) -> None:
@@ -842,6 +941,84 @@ class ClusterTestCase(unittest.TestCase):
         finally:
             first.close()
             second.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_endpoint_reconcile_changes_only_host_and_creates_self_signed_event(self) -> None:
+        cluster = self._federation_cluster("endpoint-change", 24201)
+        try:
+            before = cluster.load_config()
+            before_id = before["node_id"]
+            result = cluster.reconcile_public_endpoint("34.89.100.236")
+            after = cluster.load_config()
+            self.assertTrue(result["changed"])
+            self.assertEqual(after["public_host"], "34.89.100.236")
+            for key in ("node_id", "public_port", "internal_port", "server_number"):
+                self.assertEqual(after[key], before[key])
+            self.assertEqual(result["event"]["author_id"], before_id)
+            self.assertEqual(result["event"]["type"], "node.metadata")
+            self.assertEqual(cluster.node(before_id)["endpoint_host"], "34.89.100.236")
+        finally:
+            cluster.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_endpoint_reconcile_no_change_has_zero_broadcast_and_failure_rolls_back(self) -> None:
+        cluster = self._federation_cluster("endpoint-stable", 24202)
+        try:
+            config = cluster.load_config()
+            config["public_host"] = "34.89.100.236"
+            cluster.save_config(config)
+            cluster.upsert_node(cluster.local_status(), role="federation")
+            detection = {"confirmed": True, "ip": "34.89.100.236", "observations": {},
+                         "errors": {}, "checked_at": lun_cluster.utc_now()}
+            with mock.patch.object(lun_cluster, "broadcast_federation_events") as broadcast, \
+                    mock.patch.object(lun_cluster, "push_snapshot") as publish:
+                result = lun_cluster.reconcile_federation_endpoint(cluster, detection=detection)
+            self.assertFalse(result["changed"])
+            broadcast.assert_not_called()
+            publish.assert_not_called()
+
+            peer_id = "f" * 32
+            cluster.db.set_setting("federation.endpoint.pending", json.dumps({peer_id: "offline"}))
+            cluster.mark_endpoint_synced(peer_id)
+            endpoint = cluster.endpoint_status()
+            self.assertNotIn(peer_id, endpoint["pending"])
+            self.assertIn(peer_id, endpoint["successful"])
+
+            with mock.patch.object(cluster, "publish_local_node_metadata",
+                                   side_effect=lun_cluster.ClusterError("sign failed")):
+                with self.assertRaisesRegex(lun_cluster.ClusterError, "sign failed"):
+                    cluster.reconcile_public_endpoint("35.212.163.79")
+            self.assertEqual(cluster.load_config()["public_host"], "34.89.100.236")
+            self.assertEqual(cluster.node(config["node_id"])["endpoint_host"], "34.89.100.236")
+        finally:
+            cluster.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_two_changed_members_converge_through_a_stable_member(self) -> None:
+        london = self._federation_cluster("endpoint-london", 24211)
+        oregon = self._federation_cluster("endpoint-oregon", 24212)
+        stable = self._federation_cluster("endpoint-stable-peer", 24213)
+        clusters = (london, oregon, stable)
+        try:
+            london.federation_register_peer(oregon.federation_public_bundle())
+            london.federation_register_peer(stable.federation_public_bundle())
+            baseline = london.federation_public_bundle()
+            oregon.import_federation_bundle(baseline, allow_cluster_adopt=True)
+            stable.import_federation_bundle(baseline, allow_cluster_adopt=True)
+            london_event = london.reconcile_public_endpoint("34.89.100.236")["event"]
+            oregon_event = oregon.reconcile_public_endpoint("35.212.163.79")["event"]
+            stable.federation_import_events([london_event, oregon_event])
+            shared = stable.federation_events_since({})
+            london.federation_import_events(shared)
+            oregon.federation_import_events(shared)
+            london_id = london.load_config()["node_id"]
+            oregon_id = oregon.load_config()["node_id"]
+            for receiver in clusters:
+                self.assertEqual(receiver.node(london_id)["endpoint_host"], "34.89.100.236")
+                self.assertEqual(receiver.node(oregon_id)["endpoint_host"], "35.212.163.79")
+        finally:
+            for item in clusters:
+                item.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_federation_numbers_usage_revoke_and_private_free_backup(self) -> None:
@@ -1214,7 +1391,7 @@ class ClusterTestCase(unittest.TestCase):
             token = first.profiles()[0]["token"]
             calls: list[str] = []
 
-            def fake_sync(_cluster, node_id):
+            def fake_sync(_cluster, node_id, **_kwargs):
                 calls.append(node_id)
                 if node_id == second.load_config()["node_id"]:
                     raise lun_cluster.ClusterError("offline")
@@ -1248,7 +1425,8 @@ class ClusterTestCase(unittest.TestCase):
             third.close()
 
     def test_serve_starts_subscription_catchup_only_once(self) -> None:
-        self.cluster.save_config({"enabled": True, "role": "master", "node_id": "a" * 32,
+        self.cluster.save_config({"enabled": True, "role": "federation", "mode": "federation",
+                                  "node_id": "a" * 32,
                                   "cluster_id": "b" * 32, "bind": "127.0.0.1",
                                   "internal_port": 27701, "public_port": 27701})
         started: list[str] = []
@@ -1271,7 +1449,7 @@ class ClusterTestCase(unittest.TestCase):
 
             def start(self):
                 started.append(self.target.__name__)
-                if self.target.__name__ == "initial_subscription_catchup":
+                if self.target.__name__ == "initial_federation_maintenance":
                     self.target()
 
         context = mock.Mock()
@@ -1280,10 +1458,13 @@ class ClusterTestCase(unittest.TestCase):
                 mock.patch.object(lun_cluster, "server_context", return_value=context), \
                 mock.patch.object(lun_cluster.threading, "Thread", FakeThread), \
                 mock.patch.object(lun_cluster.signal, "signal"), \
+                mock.patch.object(lun_cluster, "reconcile_federation_endpoint",
+                                  return_value={"changed": False}) as reconcile, \
                 mock.patch.object(self.cluster, "subscription_catchup", return_value={}) as catchup:
             lun_cluster.serve(self.cluster)
+        reconcile.assert_called_once_with(self.cluster)
         catchup.assert_called_once_with()
-        self.assertEqual(started.count("initial_subscription_catchup"), 1)
+        self.assertEqual(started.count("initial_federation_maintenance"), 1)
 
     def test_serve_restart_request_exits_for_service_supervisor(self) -> None:
         self.cluster.save_config({"enabled": True, "role": "master", "node_id": "a" * 32,
@@ -1832,9 +2013,9 @@ class ClusterTestCase(unittest.TestCase):
             self.assertTrue(response["proof"]["revoked"])
             self.assertTrue(first.verify_membership_status_proof(response["proof"], first_id, nonce))
 
-            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
-                                                 cadata=second.federation_root_certificate())
-            context.check_hostname = False
+            context = lun_cluster.federation_client_context(
+                cadata=second.federation_root_certificate()
+            )
             connection = lun_cluster.http.client.HTTPSConnection(
                 "127.0.0.1", second_port, context=context, timeout=5
             )
