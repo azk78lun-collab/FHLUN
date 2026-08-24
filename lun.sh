@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.10.5"
+echo "当前版本：V26.8.10.6"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4009,7 +4009,18 @@ except (OSError, ValueError):
     rows = []
 print("编号  状态                    地区                 地址")
 for row in sorted(rows, key=lambda item: int(item.get("server_number") or 999999)):
-    host = str(row.get("endpoint_host") or "-")
+    hosts = row.get("endpoint_hosts") if isinstance(row.get("endpoint_hosts"), list) else []
+    hosts = [str(item) for item in hosts if item]
+    primary = str(row.get("endpoint_host") or "")
+    if primary and primary not in hosts:
+        hosts.append(primary)
+    def host_rank(value):
+        import ipaddress
+        try:
+            return (0 if ipaddress.ip_address(value).version == 4 else 1, value)
+        except ValueError:
+            return (2, value)
+    hosts = sorted(set(hosts), key=host_rank) or ["-"]
     raw = str(row.get("state") or row.get("status") or "unknown")
     if row.get("trusted") is not True:
         label = "待重新配对/未信任"
@@ -4019,7 +4030,8 @@ for row in sorted(rows, key=lambda item: int(item.get("server_number") or 999999
     number = f"{number:02d}" if number and number < 100 else str(number or "-")
     region = str(row.get("region") or row.get("country") or "未设置地区")
     port = row.get("public_port") or row.get("endpoint_port") or "-"
-    print(f"{number:<5} {label:<22} {region:<20} {host}:{port}")
+    addresses = " / ".join(f"[{host}]:{port}" if ":" in host else f"{host}:{port}" for host in hosts)
+    print(f"{number:<5} {label:<22} {region:<20} {addresses}")
 PY
 rm -f "$cluster_nodes_json"
 }

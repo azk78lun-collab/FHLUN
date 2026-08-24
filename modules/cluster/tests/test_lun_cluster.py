@@ -74,6 +74,23 @@ class ClusterTestCase(unittest.TestCase):
         with self.assertRaisesRegex(lun_cluster.ClusterError, "公网 IP"):
             lun_cluster.normalize_public_ip("10.0.0.1")
 
+    def test_public_hosts_detect_both_families_and_prefer_ipv4(self) -> None:
+        def fetch(url: str, _timeout: int) -> str:
+            return "2001:4860:4860::8888" if any(
+                marker in url for marker in ("ipv6.", "api6.", "v6.ident")
+            ) else "8.8.8.8"
+
+        result = lun_cluster.detect_public_hosts(fetcher=fetch)
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["ip"], "8.8.8.8")
+        self.assertEqual(result["ips"], ["8.8.8.8", "2001:4860:4860::8888"])
+        self.assertEqual(
+            lun_cluster.order_public_hosts(
+                ["2001:4860:4860::8888", "8.8.8.8", "8.8.8.8"]
+            ),
+            ["8.8.8.8", "2001:4860:4860::8888"],
+        )
+
     def test_join_token_is_one_time(self) -> None:
         digest = lun_cluster.hashlib.sha256(b"secret-token-value-that-is-long-enough").hexdigest()
         with self.cluster.db.connection:
@@ -209,6 +226,26 @@ class ClusterTestCase(unittest.TestCase):
             lun_cluster.chinese_place({"country_code": "GB", "city": "London"}),
             "英国-伦敦",
         )
+
+    def test_node_list_shows_dual_stack_with_ipv4_first(self) -> None:
+        node_id = "d" * 32
+        self.cluster.upsert_node({
+            "node_id": node_id,
+            "public_host": "2001:4860:4860::8888",
+            "public_hosts": ["2001:4860:4860::8888", "8.8.8.8"],
+            "public_port": 34567,
+            "internal_port": 34567,
+            "location": {"country_code": "US", "region": "美国"},
+        })
+        row = self.cluster.nodes()[0]
+        self.assertEqual(row["endpoint_host"], "8.8.8.8")
+        self.assertEqual(row["endpoint_hosts"], ["8.8.8.8", "2001:4860:4860::8888"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            lun_cluster.print_nodes([row])
+        address = "8.8.8.8:34567 / [2001:4860:4860::8888]:34567"
+        self.assertIn(address, output.getvalue())
+        self.assertGreater(lun_cluster.ThreadingClusterServer.request_queue_size, 5)
 
     def test_federation_relay_is_bounded_and_batch_idempotent(self) -> None:
         source = "a" * 32

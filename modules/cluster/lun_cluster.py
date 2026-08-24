@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
@@ -60,6 +60,19 @@ PUBLIC_IP_SOURCES = (
     ("ipify", "https://api64.ipify.org"),
     ("amazon", "https://checkip.amazonaws.com"),
 )
+PUBLIC_IP_FAMILY_SOURCES = {
+    4: (
+        ("icanhazip-v4", "https://ipv4.icanhazip.com"),
+        ("ipify-v4", "https://api.ipify.org"),
+        ("amazon-v4", "https://checkip.amazonaws.com"),
+    ),
+    6: (
+        ("icanhazip-v6", "https://ipv6.icanhazip.com"),
+        ("ipify-v6", "https://api6.ipify.org"),
+        ("ident-v6", "https://v6.ident.me"),
+    ),
+}
+TLS_HANDSHAKE_TIMEOUT = 8
 BACKUP_MAGIC = b"LUNCLUSTER1\0"
 BACKUP_KDF_ITERATIONS = 300_000
 SUBSCRIPTION_FILES = ("jhsub.txt", "clmi.yaml", "sbox.json")
@@ -332,6 +345,73 @@ def detect_public_ip(current_host: str = "", *,
     }
 
 
+def order_public_hosts(values: Iterable[Any], primary: str = "") -> list[str]:
+    """Return unique public addresses with IPv4 first, then IPv6 and domains."""
+    hosts: list[str] = []
+    for value in [primary, *values]:
+        text = str(value or "").strip().strip("[]")
+        if not text:
+            continue
+        try:
+            text = normalize_public_ip(text)
+        except ClusterError:
+            try:
+                text = normalize_host(text)
+            except ClusterError:
+                continue
+        if text not in hosts:
+            hosts.append(text)
+
+    def rank(host: str) -> tuple[int, str]:
+        with contextlib.suppress(ValueError):
+            return (0 if ipaddress.ip_address(host).version == 4 else 1, host)
+        return (2, host)
+
+    return sorted(hosts, key=rank)
+
+
+def detect_public_hosts(*, fetcher: Callable[[str, int], str] | None = None) -> dict[str, Any]:
+    """Cross-check each address family independently and prefer IPv4 for transport."""
+    fetch = fetcher or _fetch_public_ip
+    observations: dict[str, str] = {}
+    errors: dict[str, str] = {}
+
+    def probe(family: int, item: tuple[str, str]) -> tuple[str, str]:
+        name, url = item
+        value = normalize_public_ip(fetch(url, 4))
+        if ipaddress.ip_address(value).version != family:
+            raise ClusterError(f"探测结果不是 IPv{family}")
+        return name, value
+
+    source_count = sum(len(items) for items in PUBLIC_IP_FAMILY_SOURCES.values())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=source_count) as executor:
+        futures = {
+            executor.submit(probe, family, item): item[0]
+            for family, items in PUBLIC_IP_FAMILY_SOURCES.items() for item in items
+        }
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                source, value = future.result()
+                observations[source] = value
+            except Exception as exc:
+                errors[name] = str(exc)[-300:]
+    confirmed: list[str] = []
+    for family in (4, 6):
+        counts: dict[str, int] = {}
+        for value in observations.values():
+            if ipaddress.ip_address(value).version == family:
+                counts[value] = counts.get(value, 0) + 1
+        ranked = sorted(counts, key=lambda value: (-counts[value], value))
+        if ranked and counts[ranked[0]] >= 2:
+            confirmed.append(ranked[0])
+    hosts = order_public_hosts(confirmed)
+    return {
+        "confirmed": bool(hosts), "ip": hosts[0] if hosts else "", "ips": hosts,
+        "observations": observations, "errors": errors, "checked_at": utc_now(),
+    }
+
+
 def safe_slug(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_-]+", "-", value.strip()).strip("-")
     return value[:48] or "group"
@@ -441,6 +521,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS nodes(
               id TEXT PRIMARY KEY,role TEXT NOT NULL DEFAULT 'child',endpoint_host TEXT NOT NULL,
+              endpoint_hosts TEXT NOT NULL DEFAULT '[]',
               endpoint_port INTEGER NOT NULL,internal_port INTEGER NOT NULL,remark TEXT NOT NULL DEFAULT '',
               server_number INTEGER NOT NULL DEFAULT 0,
               expected_uuid TEXT NOT NULL DEFAULT '',country_code TEXT NOT NULL DEFAULT 'ZZ',
@@ -537,6 +618,8 @@ class Database:
         node_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(nodes)")}
         if "server_number" not in node_columns:
             self.connection.execute("ALTER TABLE nodes ADD COLUMN server_number INTEGER NOT NULL DEFAULT 0")
+        if "endpoint_hosts" not in node_columns:
+            self.connection.execute("ALTER TABLE nodes ADD COLUMN endpoint_hosts TEXT NOT NULL DEFAULT '[]'")
         key_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(federation_keys)")}
         for definition in (
             "root_fingerprint TEXT NOT NULL DEFAULT ''",
@@ -967,6 +1050,9 @@ class Cluster:
         if not re.fullmatch(r"[0-9a-f]{32}", node_id):
             raise ClusterError("节点状态缺少有效 node_id")
         host = normalize_host(status.get("public_host", ""))
+        raw_hosts = status.get("public_hosts") if isinstance(status.get("public_hosts"), list) else []
+        hosts = order_public_hosts(raw_hosts, host)
+        host = hosts[0] if hosts else host
         port = int(status.get("public_port", 0))
         internal = int(status.get("internal_port", port))
         if not valid_port(port) or not valid_port(internal):
@@ -987,10 +1073,11 @@ class Cluster:
         with self.db.connection:
             self.db.connection.execute(
                 """INSERT INTO nodes(
-                id,role,endpoint_host,endpoint_port,internal_port,remark,server_number,expected_uuid,country_code,
+                id,role,endpoint_host,endpoint_hosts,endpoint_port,internal_port,remark,server_number,expected_uuid,country_code,
                 country,region,city,provider,state,last_seen,last_success,snapshot_at,lun_version,
-                api_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                api_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET role=excluded.role,endpoint_host=excluded.endpoint_host,
+                endpoint_hosts=excluded.endpoint_hosts,
                 endpoint_port=excluded.endpoint_port,internal_port=excluded.internal_port,
                 remark=excluded.remark,server_number=excluded.server_number,expected_uuid=excluded.expected_uuid,
                 country_code=CASE WHEN nodes.location_manual=1 THEN nodes.country_code ELSE excluded.country_code END,
@@ -1001,7 +1088,7 @@ class Cluster:
                 state='online',last_seen=excluded.last_seen,last_success=excluded.last_success,
                 lun_version=excluded.lun_version,api_version=excluded.api_version,updated_at=excluded.updated_at""",
                 (
-                    node_id, role, host, port, internal, values["remark"], server_number, values["expected_uuid"],
+                    node_id, role, host, json_dumps(hosts), port, internal, values["remark"], server_number, values["expected_uuid"],
                     values["country_code"], values["country"], values["region"], values["city"],
                     values["provider"], "online", now, now, int(status.get("snapshot_at", 0)),
                     safe_label(status.get("lun_version", ""), 32), int(status.get("api_version", API_VERSION)),
@@ -1085,11 +1172,21 @@ class Cluster:
                 "SELECT n.id FROM nodes n JOIN federation_keys k ON k.node_id=n.id "
                 "WHERE k.revoked_at=0 AND n.state NOT IN ('legacy-unverified','revoked','removed')"
             )}
-        return [
-            {**dict(row), "number": int(row["server_number"]),
-             **({"trusted": str(row["id"]) in trusted} if self.is_federation() else {})}
-            for row in rows
-        ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                stored_hosts = json.loads(str(item.get("endpoint_hosts") or "[]"))
+            except json.JSONDecodeError:
+                stored_hosts = []
+            item["endpoint_hosts"] = order_public_hosts(
+                stored_hosts if isinstance(stored_hosts, list) else [], item.get("endpoint_host", "")
+            )
+            item["number"] = int(row["server_number"])
+            if self.is_federation():
+                item["trusted"] = str(row["id"]) in trusted
+            result.append(item)
+        return result
 
     def trusted_federation_nodes(self, *, include_self: bool = False) -> list[sqlite3.Row]:
         if not self.is_federation():
@@ -1286,6 +1383,10 @@ class Cluster:
         return {
             "node_id": config.get("node_id", ""), "cluster_id": config.get("cluster_id", ""),
             "role": config.get("role", "disabled"), "public_host": config.get("public_host", ""),
+            "public_hosts": order_public_hosts(
+                config.get("public_hosts", []) if isinstance(config.get("public_hosts"), list) else [],
+                str(config.get("public_host", "")),
+            ),
             "public_port": int(config.get("public_port", 0)),
             "internal_port": int(config.get("internal_port", 0)), "remark": config.get("remark", ""),
             "paired": bool(config.get("paired")), "api_version": API_VERSION,
@@ -2525,16 +2626,22 @@ class Cluster:
         successful[node_id] = utc_now()
         self.db.set_setting("federation.endpoint.success", json_dumps(successful))
 
-    def reconcile_public_endpoint(self, public_ip: str) -> dict[str, Any]:
+    def reconcile_public_endpoint(self, public_ip: str,
+                                  public_hosts: Iterable[Any] | None = None) -> dict[str, Any]:
         if not self.is_federation():
             raise ClusterError("当前不是联邦模式")
         new_host = normalize_public_ip(public_ip)
         config = self.load_config()
         old_host = str(config.get("public_host", ""))
+        old_hosts = order_public_hosts(
+            config.get("public_hosts", []) if isinstance(config.get("public_hosts"), list) else [], old_host
+        )
+        new_hosts = order_public_hosts(public_hosts or [], new_host)
+        new_host = new_hosts[0]
         with contextlib.suppress(ValueError, ClusterError):
-            if normalize_public_ip(old_host) == new_host:
+            if normalize_public_ip(old_host) == new_host and old_hosts == new_hosts:
                 return {"changed": False, "old_host": old_host, "new_host": new_host,
-                        "event": None}
+                        "old_hosts": old_hosts, "new_hosts": new_hosts, "event": None}
         try:
             ipaddress.ip_address(old_host.strip().strip("[]"))
         except ValueError:
@@ -2542,6 +2649,7 @@ class Cluster:
         original = json.loads(json.dumps(config))
         original_status = self.local_status()
         config["public_host"] = new_host
+        config["public_hosts"] = new_hosts
         try:
             self.save_config(config)
             event = self.publish_local_node_metadata()
@@ -2554,7 +2662,7 @@ class Cluster:
         self.db.audit("federation.endpoint.changed", str(config.get("node_id", "")),
                       f"{old_host}->{new_host}")
         return {"changed": True, "old_host": old_host, "new_host": new_host,
-                "event": event}
+                "old_hosts": old_hosts, "new_hosts": new_hosts, "event": event}
 
     def _sign_federation(self, content: bytes) -> str:
         key = self.pki / "federation-root.key"
@@ -3587,17 +3695,38 @@ class Cluster:
         local_id = str(self.load_config().get("node_id", ""))
         checked = 0
         failures: dict[str, str] = {}
-        for peer in self.trusted_federation_nodes():
-            peer_id = str(peer["id"])
+        peers = [dict(row) for row in self.trusted_federation_nodes()]
+        responses: dict[str, tuple[str, Any]] = {}
+
+        def fetch(peer: dict[str, Any]) -> tuple[str, Any]:
             nonce = secrets.token_urlsafe(24)
-            verified_revoked = False
             try:
                 if query is None:
-                    response = membership_status_request(self, dict(peer), local_id, nonce)
-                    proof = response.get("proof") if isinstance(response.get("proof"), dict) else {}
+                    response = membership_status_request(self, peer, local_id, nonce, timeout=4)
                 else:
-                    response = query(dict(peer), nonce)
-                    proof = response.get("proof") if isinstance(response, dict) and isinstance(response.get("proof"), dict) else response
+                    response = query(peer, nonce)
+                return nonce, response
+            except (ClusterError, OSError, ssl.SSLError) as exc:
+                return nonce, exc
+
+        if peers:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(peers))) as executor:
+                futures = {executor.submit(fetch, peer): str(peer["id"]) for peer in peers}
+                for future in concurrent.futures.as_completed(futures):
+                    responses[futures[future]] = future.result()
+
+        for peer in peers:
+            peer_id = str(peer["id"])
+            nonce, response = responses.get(
+                peer_id, ("", ClusterError("membership-status unavailable"))
+            )
+            if isinstance(response, Exception):
+                failures[peer_id] = response.__class__.__name__
+                continue
+            verified_revoked = False
+            try:
+                proof = response.get("proof") if isinstance(response, dict) \
+                    and isinstance(response.get("proof"), dict) else response
                 if not isinstance(proof, dict):
                     raise ClusterError("membership-status response has no proof")
                 if str(proof.get("signer", "")) != peer_id:
@@ -3622,7 +3751,7 @@ class Cluster:
             "revoked_at,revoked_after_seq,revocation_event_id FROM federation_keys ORDER BY node_id"
         ).fetchall()]
         roster = [dict(row) for row in self.db.connection.execute(
-            "SELECT id,endpoint_host,endpoint_port,internal_port,remark,server_number,country_code,country,region,city,provider,state FROM nodes ORDER BY server_number,id"
+            "SELECT id,endpoint_host,endpoint_hosts,endpoint_port,internal_port,remark,server_number,country_code,country,region,city,provider,state FROM nodes ORDER BY server_number,id"
         ).fetchall()]
         bundle = {"format": 3, "api_version": API_VERSION, "cluster_id": config.get("cluster_id", ""),
                   "node_id": config.get("node_id", ""), "status": self.local_status(),
@@ -4120,12 +4249,17 @@ def print_nodes(rows: list[dict[str, Any]]) -> None:
     values: list[tuple[str, ...]] = []
     place_labels = numbered_place_labels(rows)
     for row in rows:
+        hosts = order_public_hosts(
+            row.get("endpoint_hosts", []) if isinstance(row.get("endpoint_hosts"), list) else [],
+            str(row.get("endpoint_host", "")),
+        )
+        addresses = " / ".join(f"{uri_host(host)}:{row['endpoint_port']}" for host in hosts)
         values.append((
             f"{int(row.get('number', len(values) + 1)):02d}", STATE_NAMES_ZH.get(row["state"], "异常"),
             {"master": "主机", "child": "子机", "federation": "对等节点",
              "legacy-candidate": "未验证候选"}.get(str(row["role"]), "未知"),
             place_labels.get(str(row.get("id", "")), chinese_place(row)),
-            f"{uri_host(row['endpoint_host'])}:{row['endpoint_port']}", row["remark"] or "-",
+            addresses or "-", row["remark"] or "-",
             iso_time(row["snapshot_at"]),
         ))
     widths = [display_width(item) for item in headers]
@@ -4444,6 +4578,37 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
 class ThreadingClusterServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
+
+    def __init__(self, server_address: tuple[str, int], handler: type[http.server.BaseHTTPRequestHandler],
+                 tls_context: ssl.SSLContext | None = None):
+        host, port = server_address
+        self.tls_context = tls_context
+        self.dual_stack = host in {"", "0.0.0.0", "::"} and socket.has_ipv6
+        if self.dual_stack:
+            self.address_family = socket.AF_INET6
+            server_address = ("::", port)
+        super().__init__(server_address, handler)
+
+    def server_bind(self) -> None:
+        if self.address_family == socket.AF_INET6:
+            with contextlib.suppress(OSError):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+    def process_request_thread(self, request: socket.socket,
+                               client_address: tuple[Any, ...]) -> None:
+        if self.tls_context is None:
+            super().process_request_thread(request, client_address)
+            return
+        tls_request: ssl.SSLSocket | None = None
+        try:
+            request.settimeout(TLS_HANDSHAKE_TIMEOUT)
+            tls_request = self.tls_context.wrap_socket(request, server_side=True)
+            tls_request.settimeout(None)
+            super().process_request_thread(tls_request, client_address)
+        except (OSError, ssl.SSLError, TimeoutError):
+            self.shutdown_request(tls_request or request)
 
 
 def allow_legacy_federation_ca(context: ssl.SSLContext) -> ssl.SSLContext:
@@ -4517,10 +4682,9 @@ def serve(cluster: Cluster) -> None:
     # A re-pair may change node.crt while the old TLS listener is still alive.
     # The compatibility fingerprint is only needed until this fresh process starts.
     (cluster.pki / "node-serving.crt").unlink(missing_ok=True)
-    server = ThreadingClusterServer((bind, port), ClusterHandler)
+    server = ThreadingClusterServer((bind, port), ClusterHandler, server_context(cluster))
     server.cluster = cluster  # type: ignore[attr-defined]
     server.restart_requested = False  # type: ignore[attr-defined]
-    server.socket = server_context(cluster).wrap_socket(server.socket, server_side=True)
     stopping = threading.Event()
 
     def stop(*_: Any) -> None:
@@ -5146,7 +5310,7 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
                                   detection: dict[str, Any] | None = None) -> dict[str, Any]:
     config = cluster.load_config()
     current = str(config.get("public_host", ""))
-    observed = detection if detection is not None else detect_public_ip(current)
+    observed = detection if detection is not None else detect_public_hosts()
     checked_at = int(observed.get("checked_at", utc_now()))
     cluster.db.set_setting("federation.endpoint.last_checked", str(checked_at))
     actual = str(observed.get("ip", "")) if observed.get("confirmed") else ""
@@ -5159,7 +5323,8 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
         return {"changed": False, "confirmed": False, "detection": observed,
                 "endpoint": cluster.endpoint_status(actual)}
     with FileLock(cluster.lock_path, timeout=5):
-        local = cluster.reconcile_public_endpoint(actual)
+        detected_hosts = observed.get("ips") if isinstance(observed.get("ips"), list) else [actual]
+        local = cluster.reconcile_public_endpoint(actual, detected_hosts)
     if not local["changed"]:
         return {"changed": False, "confirmed": True, "detection": observed,
                 "endpoint": cluster.endpoint_status(actual)}
