@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 SCRIPT="$ROOT/lun.sh"
 
 bash -n "$SCRIPT"
-[[ $(python3 -B "$ROOT/modules/cdnopt/lun_cdn_optimizer.py" --version) == 2.0.2 ]]
+[[ $(python3 -B "$ROOT/modules/cdnopt/lun_cdn_optimizer.py" --version) == 2.0.3 ]]
 grep -q '3. 一键优选 CDN 节点（按需下载，浏览器实测）' "$SCRIPT"
 grep -q 'cdnopt_download_agent ||' "$SCRIPT"
 grep -q 'firewall_append_file tcp "$fw_root/cdnopt_port"' "$SCRIPT"

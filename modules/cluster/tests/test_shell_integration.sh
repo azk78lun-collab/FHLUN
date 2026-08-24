@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.10.4'
+contains "$SCRIPT" '当前版本：V26.8.10.5'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'

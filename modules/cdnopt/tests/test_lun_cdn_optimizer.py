@@ -28,12 +28,14 @@ class FakeResponse:
 
 class OptimizerTests(unittest.TestCase):
     def test_version_and_page_expose_two_independent_boards(self):
-        self.assertEqual(MOD.VERSION, "2.0.2")
+        self.assertEqual(MOD.VERSION, "2.0.3")
         for marker in ('id="clientRows"', 'id="vpsRows"', 'id="preview"', 'id="manual"', '一键双向优选'):
             self.assertIn(marker, MOD.PAGE)
         self.assertIn("不做隐藏加权", MOD.PAGE)
         self.assertIn("state.client.filter", MOD.PAGE)
         self.assertIn('class="keep-ip"', MOD.PAGE)
+        self.assertIn('class="remove-ip"', MOD.PAGE)
+        self.assertIn("state.selected.delete", MOD.PAGE)
         self.assertIn("页面连接 IP", MOD.PAGE)
         self.assertIn("client_ip:state.clientIp", MOD.PAGE)
         self.assertNotIn("speed.cloudflare.com/meta", MOD.PAGE)
