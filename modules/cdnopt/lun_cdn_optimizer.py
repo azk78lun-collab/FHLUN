@@ -32,7 +32,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-VERSION = "2.0.0"
+VERSION = "2.0.2"
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATES = 4096
@@ -110,32 +110,32 @@ def _parse_candidate_lines(text, limit=MAX_CANDIDATES, seed=None, default_source
         if not line or line.startswith("#"):
             continue
         value, _, raw_label = line.partition("#")
-        value = value.strip().split()[0] if value.strip() else ""
         label = _source_label(raw_label, default_source)
-        if not value:
-            continue
-        try:
-            if "/" in value:
-                network = ipaddress.ip_network(value, strict=False)
-                if not network.network_address.is_global:
+        for value in re.split(r"[\s,，;；]+", value.strip()):
+            if not value:
+                continue
+            try:
+                if "/" in value:
+                    network = ipaddress.ip_network(value, strict=False)
+                    if not network.network_address.is_global:
+                        continue
+                    networks.append((network, label, 0))
                     continue
-                networks.append((network, label, 0))
-                continue
-            if "-" in value and not value.startswith("["):
-                left, right = value.split("-", 1)
-                start = _global_ip(left.strip())
-                end = _global_ip(right.strip())
-                if start.version != end.version or int(start) > int(end):
+                if "-" in value and not value.startswith("["):
+                    left, right = value.split("-", 1)
+                    start = _global_ip(left.strip())
+                    end = _global_ip(right.strip())
+                    if start.version != end.version or int(start) > int(end):
+                        continue
+                    ranges.append((start, end, label, 0))
                     continue
-                ranges.append((start, end, label, 0))
+                host, port = _split_endpoint(value)
+                address = _global_ip(host)
+                if port and not 1 <= port <= 65535:
+                    continue
+                direct.append((address, label, port))
+            except (ValueError, ipaddress.AddressValueError):
                 continue
-            host, port = _split_endpoint(value)
-            address = _global_ip(host)
-            if port and not 1 <= port <= 65535:
-                continue
-            direct.append((address, label, port))
-        except (ValueError, ipaddress.AddressValueError):
-            continue
     if not direct and not networks and not ranges:
         raise ValueError("候选内容中没有可用的公网 IP、CIDR 或 IP 区间")
 
@@ -462,17 +462,17 @@ PAGE = r'''<!doctype html>
 <title>Lun 一键优选 IP 2.0</title>
 <style>
 :root{color-scheme:dark;--bg:#080a0d;--surface:#101419;--surface2:#151a20;--line:#2a3139;--text:#edf2f4;--muted:#95a0a8;--cyan:#18c7c2;--orange:#ff9a28;--green:#35cf78;--red:#ff646e;--yellow:#f5c84c}
-*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Microsoft YaHei UI","Noto Sans CJK SC",sans-serif}.wrap{max-width:1500px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;padding:10px 0 18px;border-bottom:1px solid var(--line)}.top>div{min-width:0}h1{font-size:24px;margin:0;letter-spacing:.02em}.brand{color:var(--cyan)}.version{color:var(--muted);font:12px ui-monospace,monospace}.sub{color:var(--muted);margin-top:5px;overflow-wrap:anywhere}.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:14px 0}.metric{background:var(--surface);padding:12px 14px;min-width:0}.metric label{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.panel{border:1px solid var(--line);background:var(--surface);margin-top:12px;min-width:0;max-width:100%}.panel-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:11px 13px;border-bottom:1px solid var(--line);background:var(--surface2)}.panel-head h2{font-size:15px;margin:0}.panel-body{padding:12px}.formgrid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:10px}.field label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}select,input,textarea{width:100%;border:1px solid #343d47;background:#090c10;color:var(--text);padding:8px;border-radius:3px;font:inherit}textarea{min-height:100px;resize:vertical;font-family:ui-monospace,monospace}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row>*{width:auto}button{border:1px solid #3b4651;background:#202831;color:var(--text);padding:8px 13px;border-radius:3px;font-weight:700;cursor:pointer}button.primary{background:#087f7c;border-color:#14bcb7}button.orange{background:#9a5410;border-color:#d8781b}button.danger{background:#5d2228;border-color:#9d3640}button:disabled{opacity:.45;cursor:not-allowed}.notice{padding:9px 11px;border:1px solid #6f5d1e;background:#211d0c;color:#ffe49a;margin-top:10px;overflow-wrap:anywhere}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--yellow)}.muted{color:var(--muted)}.progress{height:7px;background:#050608;margin-top:8px;overflow:hidden}.bar{height:100%;background:linear-gradient(90deg,var(--cyan),var(--orange));width:0;transition:width .2s}.dual{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;min-width:0}.tools{display:flex;gap:7px;flex-wrap:wrap;min-width:0}.tools input,.tools select{width:auto;min-width:100px;max-width:100%;padding:6px}.tablebox{overflow:auto;max-height:520px;min-width:0;max-width:100%}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}th,td{padding:8px;border-bottom:1px solid #242b32;text-align:left}th{position:sticky;top:0;background:#171d23;color:#aeb8bf;font-size:12px;z-index:1}tbody tr:hover{background:#151b20}td.ip{font-family:ui-monospace,monospace}.status{font-size:12px}.pill{display:inline-block;padding:1px 6px;border:1px solid #37624b;color:var(--green)}.selected-row{background:#10231b}.empty{text-align:center;color:var(--muted);padding:24px}.preview{display:none}.preview.show{display:block}.diff{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.diff>div{background:#0b0f13;border:1px solid var(--line);padding:10px;min-height:72px}.diff code{display:block;color:var(--muted);word-break:break-all}.foot{color:var(--muted);font-size:12px;padding:18px 0}.foot a{color:var(--cyan)}details{margin-top:10px}summary{cursor:pointer;color:var(--cyan)}.check{accent-color:var(--green)}
+*{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Microsoft YaHei UI","Noto Sans CJK SC",sans-serif}.wrap{max-width:1500px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;padding:10px 0 18px;border-bottom:1px solid var(--line)}.top>div{min-width:0}h1{font-size:24px;margin:0;letter-spacing:.02em}.brand{color:var(--cyan)}.version{color:var(--muted);font:12px ui-monospace,monospace}.sub{color:var(--muted);margin-top:5px;overflow-wrap:anywhere}.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:14px 0}.metric{background:var(--surface);padding:12px 14px;min-width:0}.metric label{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.panel{border:1px solid var(--line);background:var(--surface);margin-top:12px;min-width:0;max-width:100%}.panel-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:11px 13px;border-bottom:1px solid var(--line);background:var(--surface2)}.panel-head h2{font-size:15px;margin:0}.panel-body{padding:12px}.formgrid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:10px}.field label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}select,input,textarea{width:100%;border:1px solid #343d47;background:#090c10;color:var(--text);padding:8px;border-radius:3px;font:inherit}textarea{min-height:100px;resize:vertical;font-family:ui-monospace,monospace}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row>*{width:auto}button{border:1px solid #3b4651;background:#202831;color:var(--text);padding:8px 13px;border-radius:3px;font-weight:700;cursor:pointer}button.primary{background:#087f7c;border-color:#14bcb7}button.orange{background:#9a5410;border-color:#d8781b}button.danger{background:#5d2228;border-color:#9d3640}button:disabled{opacity:.45;cursor:not-allowed}.notice{padding:9px 11px;border:1px solid #6f5d1e;background:#211d0c;color:#ffe49a;margin-top:10px;overflow-wrap:anywhere}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--yellow)}.muted{color:var(--muted)}.progress{height:7px;background:#050608;margin-top:8px;overflow:hidden}.bar{height:100%;background:linear-gradient(90deg,var(--cyan),var(--orange));width:0;transition:width .2s}.dual{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;min-width:0}.tools{display:flex;gap:7px;flex-wrap:wrap;min-width:0}.tools input,.tools select{width:auto;min-width:100px;max-width:100%;padding:6px}.tablebox{overflow:auto;max-height:520px;min-width:0;max-width:100%}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}th,td{padding:8px;border-bottom:1px solid #242b32;text-align:left}th{position:sticky;top:0;background:#171d23;color:#aeb8bf;font-size:12px;z-index:1}tbody tr:hover{background:#151b20}td.ip{font-family:ui-monospace,monospace}.status{font-size:12px}.pill{display:inline-block;padding:1px 6px;border:1px solid #37624b;color:var(--green)}.selected-row{background:#10231b}.empty{text-align:center;color:var(--muted);padding:24px}.preview{display:none}.preview.show{display:block}.diff{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.diff>div{background:#0b0f13;border:1px solid var(--line);padding:10px;min-height:72px}.diff-item{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:5px}.diff-item code{color:var(--muted);word-break:break-all}.diff-item button{padding:2px 8px;font-size:12px;white-space:nowrap}.foot{color:var(--muted);font-size:12px;padding:18px 0}.foot a{color:var(--cyan)}details{margin-top:10px}summary{cursor:pointer;color:var(--cyan)}.check{accent-color:var(--green)}
 @media(max-width:1000px){.dual{grid-template-columns:1fr}.formgrid{grid-template-columns:1fr 1fr}.grid4{grid-template-columns:1fr 1fr}}
 @media(max-width:600px){.wrap{padding:9px}.top{align-items:flex-start;flex-direction:column}.top>div{width:100%}.sub{max-width:100%;white-space:normal}.formgrid{grid-template-columns:1fr}.grid4{grid-template-columns:1fr}.diff{grid-template-columns:1fr}.panel-body{padding:8px}th,td{padding:7px 6px}}
 </style></head><body><main class="wrap">
 <header class="top"><div><h1><span class="brand">Lun</span> 一键优选 IP 2.0</h1><div class="sub">客户端线路与 VPS 出口分别测试、分别排行；应用前先检查替换差异。</div></div><div class="version" id="version">正在建立会话…</div></header>
-<section class="grid4"><div class="metric"><label>客户端网络</label><strong id="clientNet">检测中</strong></div><div class="metric"><label>客户端 IP / 地区</label><strong id="clientIp">检测中</strong></div><div class="metric"><label>VPS 测试出口</label><strong id="vpsIdentity">当前 Lun 服务器</strong></div><div class="metric"><label>候选库状态</label><strong id="sourceState">载入中</strong></div></section>
+<section class="grid4"><div class="metric"><label>客户端连接 IP</label><strong id="clientNet">读取中</strong></div><div class="metric"><label>实际测速 IP / 地区</label><strong id="clientIp">等待客户端测试</strong></div><div class="metric"><label>VPS 测试出口</label><strong id="vpsIdentity">当前 Lun 服务器</strong></div><div class="metric"><label>候选库状态</label><strong id="sourceState">载入中</strong></div></section>
 <div id="networkNotice" class="notice" style="display:none"></div>
 <section class="panel"><div class="panel-head"><h2>候选 IP 与测试参数</h2><span class="muted" id="candidateSummary">-</span></div><div class="panel-body">
 <div class="formgrid"><div class="field"><label>IP 库</label><select id="source"></select></div><div class="field"><label>候选数量（1–4096）</label><input id="limit" type="number" min="1" max="4096" value="512"></div><div class="field"><label>测试端口</label><select id="port"><option value="-1">自动 / 当前 Lun 端口</option><option value="0">随机 HTTPS 端口</option><option>443</option><option>2053</option><option>2083</option><option>2087</option><option>2096</option><option>8443</option></select></div><div class="field"><label>默认选择数量</label><input id="top" type="number" min="1" max="50" value="5"></div></div>
 <div class="row" style="margin-top:9px"><button id="refresh">刷新 IP 库</button><button id="manualToggle">手工导入</button><span class="muted" id="sourceMeta"></span></div>
-<div id="manualBox" style="display:none;margin-top:9px"><textarea id="manual" placeholder="支持 IP、IP:端口#备注、[IPv6]:端口#备注、CIDR 和 IP起点-IP终点；不接受远程 URL。"></textarea><button id="manualLoad" style="margin-top:6px">载入手工候选</button></div>
+<div id="manualBox" style="display:none;margin-top:9px"><textarea id="manual" placeholder="支持 Lun 的空格/逗号/换行分隔 IP，也支持 IP:端口#备注、[IPv6]:端口#备注、CIDR 和 IP起点-IP终点；不接受远程 URL。"></textarea><button id="manualLoad" style="margin-top:6px">载入手工候选</button></div>
 <details><summary>高级测试参数与流量估算</summary><div class="formgrid" style="margin-top:9px"><div class="field"><label>最大延迟 ms</label><input id="latencyMax" type="number" min="1" max="3000" value="150"></div><div class="field"><label>最低带宽 Mbps</label><input id="speedMin" type="number" min="0.1" max="10000" value="80"></div><div class="field"><label>客户端并发 1–32</label><input id="clientConcurrency" type="number" min="1" max="32" value="16"></div><div class="field"><label>VPS 并发 1–16</label><input id="vpsConcurrency" type="number" min="1" max="16" value="8"></div><div class="field"><label>单次超时 ms</label><input id="timeoutMs" type="number" min="100" max="10000" value="800"></div><div class="field"><label>带宽复测候选 1–100</label><input id="speedLimit" type="number" min="1" max="100" value="20"></div><div class="field"><label>单项下载 MB</label><input id="downloadMb" type="number" min="0.1" max="20" step="0.1" value="5"></div><div class="field"><label>带宽超时秒</label><input id="speedTimeout" type="number" min="2" max="30" value="8"></div></div><div class="notice" id="traffic">默认最多约消耗：客户端 100 MB + VPS 100 MB。</div></details>
 </div></section>
 <section class="panel"><div class="panel-head"><h2>双向测试控制台</h2><div class="row"><button class="primary" id="start">一键双向优选</button><button id="stop" disabled>停止测试</button><button class="danger" id="cancel">取消并关闭</button></div></div><div class="panel-body"><div id="globalStatus">等待开始。</div><div class="dual"><div><div class="muted" id="clientStatus">客户端：等待</div><div class="progress"><div class="bar" id="clientBar"></div></div></div><div><div class="muted" id="vpsStatus">VPS：等待</div><div class="progress"><div class="bar" id="vpsBar"></div></div></div></div></div></section>
@@ -480,11 +480,11 @@ PAGE = r'''<!doctype html>
 <section class="panel"><div class="panel-head"><h2>客户端榜</h2><span class="muted">用户当前网络 → Cloudflare</span></div><div class="panel-body"><div class="tools"><input id="clientSearch" placeholder="筛选 IP / 来源 / COLO"><select id="clientFamily"><option value="">全部地址</option><option>IPv4</option><option>IPv6</option></select><select id="clientSort"><option value="speed">带宽优先</option><option value="latency">延迟优先</option></select><button data-action="all" data-list="client">全选</button><button data-action="invert" data-list="client">反选</button><button data-action="csv" data-list="client">CSV</button></div></div><div class="tablebox"><table><thead><tr><th>选</th><th>IP</th><th>类型</th><th>来源</th><th>端口</th><th>COLO</th><th>延迟</th><th>失败率</th><th>带宽</th><th>状态</th><th>操作</th></tr></thead><tbody id="clientRows"><tr><td colspan="11" class="empty">尚未测试</td></tr></tbody></table></div></section>
 <section class="panel"><div class="panel-head"><h2>VPS 榜</h2><span class="muted">Lun 服务器 → Cloudflare</span></div><div class="panel-body"><div class="tools"><input id="vpsSearch" placeholder="筛选 IP / 来源 / COLO"><select id="vpsFamily"><option value="">全部地址</option><option>IPv4</option><option>IPv6</option></select><select id="vpsSort"><option value="speed">带宽优先</option><option value="latency">延迟优先</option></select><button data-action="all" data-list="vps">全选</button><button data-action="invert" data-list="vps">反选</button><button data-action="csv" data-list="vps">CSV</button></div></div><div class="tablebox"><table><thead><tr><th>选</th><th>IP</th><th>类型</th><th>来源</th><th>端口</th><th>COLO</th><th>延迟</th><th>失败率</th><th>带宽</th><th>状态</th><th>操作</th></tr></thead><tbody id="vpsRows"><tr><td colspan="11" class="empty">尚未测试</td></tr></tbody></table></div></section>
 </div>
-<section class="panel"><div class="panel-head"><h2>应用到 Lun</h2><div class="row"><button id="copy">复制已选 IP</button><button id="reset">清空选择</button><button class="orange" id="preview">预览替换</button></div></div><div class="panel-body"><div>当前已选择 <strong class="ok" id="selectedCount">0</strong> 个地址；客户端榜与 VPS榜中的同一 IP 只写入一次。</div><div id="previewBox" class="preview"><div class="diff" style="margin-top:10px"><div><strong class="ok">新增</strong><div id="diffAdd"></div></div><div><strong>保留</strong><div id="diffKeep"></div></div><div><strong class="bad">删除</strong><div id="diffRemove"></div></div></div><div class="notice">确认后将替换现有优选池并返回 SSH 重建订阅。</div><button class="primary" id="apply">确认替换并应用</button></div></div></section>
+<section class="panel"><div class="panel-head"><h2>应用到 Lun</h2><div class="row"><button id="copy">复制最终 IP</button><button id="reset">清空选择</button><button class="orange" id="preview">预览替换</button></div></div><div class="panel-body"><div>最终列表共 <strong class="ok" id="selectedCount">0</strong> 个地址；“删除”中的旧 IP 可点击右侧“保留”移回保留区。</div><div id="previewBox" class="preview"><div class="diff" style="margin-top:10px"><div><strong class="ok">新增</strong><div id="diffAdd"></div></div><div><strong>保留</strong><div id="diffKeep"></div></div><div><strong class="bad">删除</strong><div id="diffRemove"></div></div></div><div class="notice">确认后将替换现有优选池并返回 SSH 重建订阅。</div><button class="primary" id="apply">确认替换并应用</button></div></div></section>
 <footer class="foot">候选数据默认来自 <a href="https://github.com/DustinWin/BestCF" target="_blank" rel="noopener">DustinWin/BestCF</a>，VPS 测速使用 <a href="https://github.com/cloudflare/speedtest" target="_blank" rel="noopener">Cloudflare Speedtest</a> 端点；客户端探测兼容 BestCF/HiDNS 方案。测试结果只代表当时线路质量。</footer>
 </main><script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
-const state={cfg:null,candidates:[],client:[],vps:[],vpsRows:[],selected:new Set(),cancelled:false,controllers:new Set(),preview:null,helper:null,defaulted:false};
+const state={cfg:null,candidates:[],client:[],vps:[],vpsRows:[],selected:new Set(),retained:new Set(),cancelled:false,controllers:new Set(),preview:null,helper:null,clientIp:null,clientMeta:null,defaulted:false};
 const helpers=['bestcf.cmliussss.hidns.vip','ns.psb.kdns.fr'];
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const route=s=>location.pathname.replace(/\/$/,'')+'/'+s;
@@ -496,31 +496,33 @@ async function pool(items,concurrency,fn,onProgress){let next=0,done=0;async fun
 function settings(){return{limit:num('#limit',1,4096),top:num('#top',1,50),port:num('#port',-1,65535),latencyMax:num('#latencyMax',1,3000),speedMin:num('#speedMin',.1,10000),clientConcurrency:num('#clientConcurrency',1,32),vpsConcurrency:num('#vpsConcurrency',1,16),timeoutMs:num('#timeoutMs',100,10000),speedLimit:num('#speedLimit',1,100),downloadBytes:Math.round(num('#downloadMb',.1,20)*1e6),speedTimeout:num('#speedTimeout',2,30)}}
 function updateTraffic(){try{const s=settings(),mb=(s.speedLimit*s.downloadBytes/1e6).toFixed(0);$('#traffic').textContent=`预计上限：客户端约 ${mb} MB + VPS约 ${mb} MB；实际仅对低延迟候选测速。`}catch(e){}}
 function sourceText(meta){const t=meta.fetched_at?new Date(meta.fetched_at*1000).toLocaleString():'未知';return `${meta.name||'-'} · ${meta.cached?'缓存':'实时'} · ${t}`}
-function updateCandidates(data){state.candidates=data.candidates||[];state.client=[];state.vps=[];state.vpsRows=[];state.selected.clear();state.defaulted=false;state.preview=null;$('#previewBox').classList.remove('show');$('#candidateSummary').textContent=`${state.candidates.length} 个候选` ;$('#sourceState').textContent=data.source.cached?'使用最近缓存':'实时数据';$('#sourceState').className=data.source.cached?'warn':'ok';$('#sourceMeta').textContent=sourceText(data.source);renderAll()}
+function updateCandidates(data){state.candidates=data.candidates||[];state.client=[];state.vps=[];state.vpsRows=[];state.selected.clear();state.retained.clear();state.clientIp=null;state.clientMeta=null;state.defaulted=false;state.preview=null;$('#clientIp').textContent='等待客户端测试';$('#networkNotice').textContent=`页面连接 IP：${state.cfg.client_ip||'未知'}。开始后会显示实际测速出口；只有该 IP 完成的结果才会进入客户端榜。`;$('#previewBox').classList.remove('show');$('#candidateSummary').textContent=`${state.candidates.length} 个候选` ;$('#sourceState').textContent=data.source.cached?'使用最近缓存':'实时数据';$('#sourceState').className=data.source.cached?'warn':'ok';$('#sourceMeta').textContent=sourceText(data.source);renderAll()}
 async function refresh(manual=''){try{setGlobal('正在刷新候选库…');const d=await post('import',manual?{manual,limit:settings().limit}:{source_key:$('#source').value,limit:settings().limit});updateCandidates(d);setGlobal(`已载入 ${d.candidates.length} 个候选。`,'ok')}catch(e){setGlobal(e.message,'bad')}}
 function setGlobal(text,cls=''){const el=$('#globalStatus');el.textContent=text;el.className=cls}
 function encodeIp(ip){return ip.includes(':')?ip.toLowerCase().replaceAll(':','-'):ip.split('.').map(x=>(+x).toString(16).padStart(2,'0')).join('').toUpperCase()}
 function candidatePort(c){const selected=settings().port;return c.port||(selected===-1?state.cfg.test_port:selected)||443}
 function probeUrl(c,helper,path,extra={}){const q=new URLSearchParams({_t:Date.now(),...extra});return `https://${encodeIp(c.ip)}.${helper}:${candidatePort(c)}/${path}?${q}`}
-async function chooseHelper(){const c=state.candidates[0];if(!c)throw Error('没有候选 IP');for(const helper of helpers){try{const r=await abortable(probeUrl(c,helper,'ip.json'),3000);if(r.ok){state.helper=helper;localStorage.setItem('lun-cdnopt-helper',helper);return helper}}catch(e){}}throw Error('客户端探测域名均不可用，可继续使用 VPS 榜')}
-async function clientLatency(c,s){let ok=0,failed=0,values=[],meta={};for(let i=0;i<3;i++){if(state.cancelled)throw Error('cancelled');const started=performance.now();try{const r=await abortable(probeUrl(c,state.helper,'ip.json'),Math.max(2500,s.timeoutMs*4));if(!r.ok)throw Error('HTTP');meta=await r.json();values.push(performance.now()-started);ok++}catch(e){failed++}}if(!ok)throw Error('全部失败');values.sort((a,b)=>a-b);return{...c,port:candidatePort(c),latency_ms:values[Math.floor(values.length/2)],loss_pct:failed/3*100,speed_mbps:0,colo:meta.colo||'',country:meta.country||'',status:'延迟完成'}}
+function metaIp(meta){return String(meta?.ip||meta?.clientIp||meta?.client_ip||'').trim()}
+function showClientIdentity(meta){const ip=metaIp(meta);if(!ip)throw Error('探测未返回客户端 IP');if(state.clientIp&&state.clientIp!==ip)throw Error(`客户端测速出口已从 ${state.clientIp} 变为 ${ip}`);state.clientIp=ip;state.clientMeta=meta;const place=[meta.country,meta.region,meta.city,meta.colo].filter(Boolean).join(' / ')||'地区未知';$('#clientIp').textContent=`${ip} / ${place}`;const pageIp=state.cfg.client_ip,org=meta.asOrganization||meta.org||'';$('#networkNotice').style.display='block';if(pageIp&&pageIp!==ip){$('#networkNotice').textContent=`页面连接 IP 是 ${pageIp}，实际测速 IP 是 ${ip}（可能使用了代理或分流）。客户端榜只计入由 ${ip} 完成的结果。`}else{$('#networkNotice').textContent=`客户端测速 IP 已确认为 ${ip}${org?` · ${org}`:''}；客户端榜只计入该出口的结果。`}return ip}
+async function chooseHelper(){const c=state.candidates[0];if(!c)throw Error('没有候选 IP');for(const helper of helpers){try{const r=await abortable(probeUrl(c,helper,'ip.json'),3000);if(r.ok){const meta=await r.json();showClientIdentity(meta);state.helper=helper;localStorage.setItem('lun-cdnopt-helper',helper);return helper}}catch(e){}}throw Error('客户端测速线路连接失败；客户端榜未生成结果，VPS 榜仍可单独使用')}
+async function clientLatency(c,s){let ok=0,failed=0,values=[],meta={};for(let i=0;i<3;i++){if(state.cancelled)throw Error('cancelled');const started=performance.now();try{const r=await abortable(probeUrl(c,state.helper,'ip.json'),Math.max(2500,s.timeoutMs*4));if(!r.ok)throw Error('HTTP');meta=await r.json();showClientIdentity(meta);values.push(performance.now()-started);ok++}catch(e){failed++}}if(!ok)throw Error('全部失败');values.sort((a,b)=>a-b);return{...c,port:candidatePort(c),latency_ms:values[Math.floor(values.length/2)],loss_pct:failed/3*100,speed_mbps:0,colo:meta.colo||'',country:meta.country||'',status:'延迟完成'}}
 async function clientSpeed(row,s){const started=performance.now();let bytes=0;const r=await abortable(probeUrl(row,state.helper,'__down',{bytes:s.downloadBytes}),s.speedTimeout*1000);if(!r.ok)throw Error('HTTP');if(r.body?.getReader){const reader=r.body.getReader();while(true){const p=await reader.read();if(p.done)break;bytes+=p.value.byteLength}}else bytes=(await r.arrayBuffer()).byteLength;return{...row,speed_mbps:bytes*8/Math.max(.001,(performance.now()-started)/1000)/1e6,status:'完成'}}
-async function runClient(s){$('#clientStatus').textContent='客户端：选择可用探测线路…';try{const cached=localStorage.getItem('lun-cdnopt-helper');if(cached&&helpers.includes(cached))helpers.splice(helpers.indexOf(cached),1),helpers.unshift(cached);await chooseHelper()}catch(e){$('#clientStatus').innerHTML=`客户端：<span class="warn">${esc(e.message)}</span>`;return}const rows=new Map(state.candidates.map(c=>[c.ip,{...c,port:candidatePort(c),status:'等待'}]));state.client=[];const latency=[];await pool(state.candidates,s.clientConcurrency,async c=>{rows.set(c.ip,{...rows.get(c.ip),status:'延迟测试'});try{const r=await clientLatency(c,s);latency.push(r);rows.set(c.ip,r)}catch(e){rows.set(c.ip,{...rows.get(c.ip),status:'失败',loss_pct:100})}},(d,t)=>{$('#clientBar').style.width=`${d/t*70}%`;$('#clientStatus').textContent=`客户端：延迟 ${d}/${t}`;if(d%10===0||d===t){state.client=[...rows.values()];renderList('client')}});if(state.cancelled)return;const finalists=latency.filter(x=>x.latency_ms<=s.latencyMax).sort((a,b)=>a.latency_ms-b.latency_ms).slice(0,s.speedLimit);await pool(finalists,Math.min(6,s.clientConcurrency),async row=>{rows.set(row.ip,{...row,status:'带宽测试'});try{rows.set(row.ip,await clientSpeed(row,s))}catch(e){rows.set(row.ip,{...row,status:'失败'})}},(d,t)=>{$('#clientBar').style.width=`${70+d/t*30}%`;$('#clientStatus').textContent=`客户端：带宽 ${d}/${t}`;state.client=[...rows.values()];renderList('client')});state.client=[...rows.values()].filter(x=>x.speed_mbps>0).sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms);await post('client-results',{measurements:state.client});if(!state.defaulted){state.client.filter(x=>x.latency_ms<=s.latencyMax&&x.speed_mbps>=s.speedMin).slice(0,s.top).forEach(x=>state.selected.add(x.ip));state.defaulted=true}$('#clientBar').style.width='100%';$('#clientStatus').textContent=`客户端：完成，${state.client.length} 个带宽结果`;renderAll()}
+async function runClient(s){$('#clientStatus').textContent='客户端：选择可用测速线路…';try{const cached=localStorage.getItem('lun-cdnopt-helper');if(cached&&helpers.includes(cached))helpers.splice(helpers.indexOf(cached),1),helpers.unshift(cached);await chooseHelper()}catch(e){$('#clientIp').textContent='测速线路连接失败';$('#clientStatus').innerHTML=`客户端：<span class="warn">${esc(e.message)}</span>`;return}const rows=new Map(state.candidates.map(c=>[c.ip,{...c,port:candidatePort(c),status:'等待'}]));state.client=[];const latency=[];await pool(state.candidates,s.clientConcurrency,async c=>{rows.set(c.ip,{...rows.get(c.ip),status:'延迟测试'});try{const r=await clientLatency(c,s);latency.push(r);rows.set(c.ip,r)}catch(e){rows.set(c.ip,{...rows.get(c.ip),status:'失败',loss_pct:100})}},(d,t)=>{$('#clientBar').style.width=`${d/t*70}%`;$('#clientStatus').textContent=`客户端：延迟 ${d}/${t}`;if(d%10===0||d===t){state.client=[...rows.values()];renderList('client')}});if(state.cancelled)return;const finalists=latency.filter(x=>x.latency_ms<=s.latencyMax).sort((a,b)=>a.latency_ms-b.latency_ms).slice(0,s.speedLimit);await pool(finalists,Math.min(6,s.clientConcurrency),async row=>{rows.set(row.ip,{...row,status:'带宽测试'});try{rows.set(row.ip,await clientSpeed(row,s))}catch(e){rows.set(row.ip,{...row,status:'失败'})}},(d,t)=>{$('#clientBar').style.width=`${70+d/t*30}%`;$('#clientStatus').textContent=`客户端：带宽 ${d}/${t}`;state.client=[...rows.values()];renderList('client')});state.client=[...rows.values()].filter(x=>x.speed_mbps>0).sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client});if(!state.defaulted){state.client.filter(x=>x.latency_ms<=s.latencyMax&&x.speed_mbps>=s.speedMin).slice(0,s.top).forEach(x=>state.selected.add(x.ip));state.defaulted=true}$('#clientBar').style.width='100%';$('#clientStatus').textContent=`客户端：完成，${state.client.length} 个带宽结果（出口 ${state.clientIp}）`;renderAll()}
 async function runVps(s){await post('vps-test/start',{port:s.port===-1?state.cfg.test_port:s.port,concurrency:s.vpsConcurrency,timeout_ms:s.timeoutMs,latency_max:s.latencyMax,speed_limit:s.speedLimit,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});while(!state.cancelled){const d=await api('vps-test/status');state.vps=d.results||[];state.vpsRows=d.rows||[];const pct=d.total?d.done/d.total*100:0;$('#vpsBar').style.width=`${pct}%`;$('#vpsStatus').textContent=`VPS：${d.stage} ${d.done}/${d.total}`;renderList('vps');if(['complete','failed','cancelled'].includes(d.state)){if(d.state==='failed')$('#vpsStatus').innerHTML=`VPS：<span class="bad">${esc(d.error||'失败')}</span>`;else if(d.state==='complete'){$('#vpsBar').style.width='100%';$('#vpsStatus').textContent=`VPS：完成，${state.vps.length} 个带宽结果`}return}await new Promise(r=>setTimeout(r,450))}}
-async function start(){let s;try{s=settings()}catch(e){setGlobal(e.message,'bad');return}state.cancelled=false;state.controllers.forEach(c=>c.abort());state.controllers.clear();state.client=[];state.vps=[];state.vpsRows=[];state.selected.clear();state.preview=null;state.defaulted=false;$('#previewBox').classList.remove('show');$('#start').disabled=true;$('#stop').disabled=false;setGlobal('双向测试运行中；两个榜单独立计算，不做隐藏加权。');const results=await Promise.allSettled([runClient(s),runVps(s)]);if(!state.cancelled){const failures=results.filter(x=>x.status==='rejected');if(failures.length===2)setGlobal('客户端和 VPS 测试均失败，请检查网络与端口。','bad');else if(failures.length)setGlobal('一侧测试失败，另一侧结果仍可选择。','warn');else setGlobal('双向测试完成，可跨榜选择并预览替换。','ok')}$('#start').disabled=false;$('#stop').disabled=true;renderAll()}
+async function start(){let s;try{s=settings()}catch(e){setGlobal(e.message,'bad');return}state.cancelled=false;state.controllers.forEach(c=>c.abort());state.controllers.clear();state.client=[];state.vps=[];state.vpsRows=[];state.selected.clear();state.retained.clear();state.clientIp=null;state.clientMeta=null;state.preview=null;state.defaulted=false;$('#clientIp').textContent='正在确认实际测速出口…';$('#previewBox').classList.remove('show');$('#start').disabled=true;$('#stop').disabled=false;setGlobal('双向测试运行中；两个榜单独立计算，不做隐藏加权。');const results=await Promise.allSettled([runClient(s),runVps(s)]);if(!state.cancelled){const failures=results.filter(x=>x.status==='rejected');if(failures.length===2)setGlobal('客户端和 VPS 测试均失败，请检查网络与端口。','bad');else if(failures.length)setGlobal('一侧测试失败，另一侧结果仍可选择。','warn');else setGlobal('双向测试完成，可跨榜选择并预览替换。','ok')}$('#start').disabled=false;$('#stop').disabled=true;renderAll()}
 async function stop(){state.cancelled=true;state.controllers.forEach(c=>c.abort());state.controllers.clear();try{await post('vps-test/cancel',{})}catch(e){}$('#stop').disabled=true;$('#start').disabled=false;setGlobal('测试已停止；已有成功结果仍可使用。','warn')}
 function visibleRows(kind){const source=kind==='client'?state.client:(state.vps.length?state.vps:state.vpsRows);const search=$(`#${kind}Search`).value.toLowerCase(),family=$(`#${kind}Family`).value,sort=$(`#${kind}Sort`).value;return source.filter(x=>(!family||x.ip_type===family)&&(!search||`${x.ip} ${x.source} ${x.colo} ${x.country}`.toLowerCase().includes(search))).sort((a,b)=>sort==='latency'?(a.latency_ms||1e9)-(b.latency_ms||1e9):((b.speed_mbps||0)-(a.speed_mbps||0)||(a.latency_ms||1e9)-(b.latency_ms||1e9)))}
 function renderList(kind){const rows=visibleRows(kind),body=$(`#${kind}Rows`);if(!rows.length){body.innerHTML='<tr><td colspan="11" class="empty">暂无结果</td></tr>';return}body.innerHTML=rows.map(x=>{const checked=state.selected.has(x.ip),success=x.speed_mbps>0;return `<tr class="${checked?'selected-row':''}"><td><input class="check result-check" data-ip="${esc(x.ip)}" type="checkbox" ${checked?'checked':''} ${success?'':'disabled'}></td><td class="ip">${esc(x.ip)}</td><td>${esc(x.ip_type)}</td><td title="${esc(x.source)}">${esc(x.source)}</td><td>${x.port||'-'}</td><td>${esc(x.colo||'-')}</td><td>${x.latency_ms?x.latency_ms.toFixed(0)+' ms':'-'}</td><td>${Number.isFinite(x.loss_pct)?x.loss_pct.toFixed(0)+'%':'-'}</td><td>${x.speed_mbps?x.speed_mbps.toFixed(1)+' Mbps':'-'}</td><td class="status">${success?'<span class="pill">成功</span>':esc(x.status||'-')}</td><td><button class="retry" data-kind="${kind}" data-ip="${esc(x.ip)}">重测</button></td></tr>`}).join('');body.querySelectorAll('.result-check').forEach(el=>el.onchange=()=>{el.checked?state.selected.add(el.dataset.ip):state.selected.delete(el.dataset.ip);state.preview=null;$('#previewBox').classList.remove('show');renderAll()});body.querySelectorAll('.retry').forEach(el=>el.onclick=()=>retryOne(el.dataset.kind,el.dataset.ip,el))}
-async function retryOne(kind,ip,button){const s=settings(),candidate=state.candidates.find(x=>x.ip===ip);if(!candidate)return;button.disabled=true;button.textContent='测试中';try{let result;if(kind==='client'){if(!state.helper)await chooseHelper();const latency=await clientLatency(candidate,s);result=await clientSpeed(latency,s);state.client=[...state.client.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms);await post('client-results',{measurements:state.client})}else{const d=await post('vps-test/retry',{ip,port:candidatePort(candidate),timeout_ms:s.timeoutMs,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});result=d.result;state.vps=[...state.vps.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms)}setGlobal(`${kind==='client'?'客户端':'VPS'}单项重测完成：${ip}`,'ok');state.preview=null;$('#previewBox').classList.remove('show')}catch(e){setGlobal(`单项重测失败：${e.message}`,'bad')}renderAll()}
-function renderAll(){renderList('client');renderList('vps');$('#selectedCount').textContent=state.selected.size}
+async function retryOne(kind,ip,button){const s=settings(),candidate=state.candidates.find(x=>x.ip===ip);if(!candidate)return;button.disabled=true;button.textContent='测试中';try{let result;if(kind==='client'){if(!state.helper)await chooseHelper();const latency=await clientLatency(candidate,s);result=await clientSpeed(latency,s);state.client=[...state.client.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client})}else{const d=await post('vps-test/retry',{ip,port:candidatePort(candidate),timeout_ms:s.timeoutMs,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});result=d.result;state.vps=[...state.vps.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms)}setGlobal(`${kind==='client'?'客户端':'VPS'}单项重测完成：${ip}`,'ok');state.preview=null;$('#previewBox').classList.remove('show')}catch(e){setGlobal(`单项重测失败：${e.message}`,'bad')}renderAll()}
+function finalIps(){return new Set([...state.selected,...state.retained])}
+function renderAll(){renderList('client');renderList('vps');$('#selectedCount').textContent=finalIps().size}
 function listAction(kind,action){const rows=visibleRows(kind).filter(x=>x.speed_mbps>0);if(action==='all')rows.forEach(x=>state.selected.add(x.ip));if(action==='invert')rows.forEach(x=>state.selected.has(x.ip)?state.selected.delete(x.ip):state.selected.add(x.ip));if(action==='csv'){const head='IP,类型,来源,端口,COLO,延迟ms,失败率%,带宽Mbps\n';const body=rows.map(x=>[x.ip,x.ip_type,`"${String(x.source).replaceAll('"','""')}"`,x.port,x.colo,x.latency_ms,x.loss_pct,x.speed_mbps].join(',')).join('\n');download(`${kind}-results.csv`,head+body)}state.preview=null;$('#previewBox').classList.remove('show');renderAll()}
 function download(name,text){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/csv;charset=utf-8'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
-function showDiff(id,items){$(id).innerHTML=items.length?items.map(x=>`<code>${esc(x)}</code>`).join(''):'<span class="muted">无</span>'}
-async function preview(){try{const d=await post('preview',{selected:[...state.selected]});state.preview=d;showDiff('#diffAdd',d.added);showDiff('#diffKeep',d.kept);showDiff('#diffRemove',d.removed);$('#previewBox').classList.add('show')}catch(e){setGlobal(e.message,'bad')}}
-async function apply(){if(!state.preview)return;$('#apply').disabled=true;try{const d=await post('apply',{selected:[...state.selected],digest:state.preview.digest});setGlobal(`已应用 ${d.selected.length} 个 IP，请返回 SSH 查看订阅重建。`,'ok')}catch(e){setGlobal(e.message,'bad');$('#apply').disabled=false}}
-async function detectNetwork(){try{const r=await fetch('https://speed.cloudflare.com/meta',{cache:'no-store'}),d=await r.json(),org=String(d.asOrganization||'');$('#clientNet').textContent=org||d.asn||'已连接';$('#clientIp').textContent=`${d.clientIp||'-'} / ${d.country||'-'} / ${d.colo||'-'}`;if(d.country&&d.country!=='CN'){$('#networkNotice').style.display='block';$('#networkNotice').textContent='当前浏览器不是中国大陆网络或正在使用代理。客户端榜仍可测试，但不阻塞操作；也可以只采用 VPS 榜。'}else if(state.cfg.source.key==='bestcf-general'){const lower=org.toLowerCase();let key='';if(/cmcc|china mobile|移动/.test(lower))key='bestcf-cmcc';else if(/cucc|china unicom|联通/.test(lower))key='bestcf-cucc';else if(/ctcc|china telecom|电信/.test(lower))key='bestcf-ctcc';if(key&&$('#source').querySelector(`option[value="${key}"]`)){$('#source').value=key;await refresh()}}}catch(e){$('#clientNet').textContent='无法识别';$('#clientIp').textContent='未知；不影响 VPS 榜';$('#networkNotice').style.display='block';$('#networkNotice').textContent='无法识别客户端网络，已继续开放测试。客户端探测失败时可只使用 VPS 榜。'}}
-async function init(){try{const d=await api('config');state.cfg=d;state.candidates=d.candidates;$('#version').textContent=`模块 ${d.version} · 15分钟临时会话`;$('#vpsIdentity').textContent=`${d.vps.ip} / ${d.vps.region}`;$('#source').innerHTML=d.sources.map(x=>`<option value="${esc(x.key)}" ${x.key===d.source.key?'selected':''}>${esc(x.name)}</option>`).join('');$('#limit').value=d.defaults.candidate_limit;$('#top').value=d.top_count;$('#latencyMax').value=d.latency_max;$('#speedMin').value=d.speed_min;$('#port').querySelector('option[value="-1"]').textContent=`自动 / 当前 Lun 端口（${d.test_port}）`;$('#sourceMeta').textContent=sourceText(d.source);$('#sourceState').textContent=d.source.cached?'使用最近缓存':'实时数据';$('#sourceState').className=d.source.cached?'warn':'ok';$('#candidateSummary').textContent=`${d.candidates.length} 个候选`;renderAll();updateTraffic();detectNetwork();setGlobal('候选库已就绪，可调整参数后开始双向测试。','ok')}catch(e){setGlobal(`会话载入失败：${e.message}`,'bad')}}
-$('#refresh').onclick=()=>refresh();$('#manualToggle').onclick=()=>{$('#manualBox').style.display=$('#manualBox').style.display==='none'?'block':'none'};$('#manualLoad').onclick=()=>refresh($('#manual').value);$('#start').onclick=start;$('#stop').onclick=stop;$('#cancel').onclick=async()=>{await stop();try{await post('cancel',{})}catch(e){}setGlobal('已取消，可关闭页面。','warn')};$('#preview').onclick=preview;$('#apply').onclick=apply;$('#copy').onclick=()=>navigator.clipboard.writeText([...state.selected].join('\n')).then(()=>setGlobal('已复制选中 IP。','ok')).catch(()=>setGlobal('浏览器拒绝剪贴板，请使用 CSV。','warn'));$('#reset').onclick=()=>{state.selected.clear();state.preview=null;$('#previewBox').classList.remove('show');renderAll()};
+function showDiff(id,items,kind=''){const root=$(id);root.innerHTML=items.length?items.map(x=>{let action='';if(kind==='remove')action=`<button class="keep-ip" data-ip="${esc(x)}">保留</button>`;else if(kind==='keep'&&state.retained.has(x))action=`<button class="unkeep-ip" data-ip="${esc(x)}">取消</button>`;return `<div class="diff-item"><code>${esc(x)}</code>${action}</div>`}).join(''):'<span class="muted">无</span>';root.querySelectorAll('.keep-ip').forEach(b=>b.onclick=async()=>{state.retained.add(b.dataset.ip);await preview()});root.querySelectorAll('.unkeep-ip').forEach(b=>b.onclick=async()=>{state.retained.delete(b.dataset.ip);await preview()})}
+async function preview(){try{const d=await post('preview',{selected:[...state.selected],retained:[...state.retained]});state.preview=d;showDiff('#diffAdd',d.added);showDiff('#diffKeep',d.kept,'keep');showDiff('#diffRemove',d.removed,'remove');$('#previewBox').classList.add('show');renderAll()}catch(e){setGlobal(e.message,'bad')}}
+async function apply(){if(!state.preview)return;$('#apply').disabled=true;try{const d=await post('apply',{selected:[...state.selected],retained:[...state.retained],digest:state.preview.digest});setGlobal(`已应用 ${d.selected.length} 个 IP，请返回 SSH 查看订阅重建。`,'ok')}catch(e){setGlobal(e.message,'bad');$('#apply').disabled=false}}
+async function init(){try{const d=await api('config');state.cfg=d;state.candidates=d.candidates;$('#version').textContent=`模块 ${d.version} · 15分钟临时会话`;$('#clientNet').textContent=d.client_ip||'未知';$('#vpsIdentity').textContent=`${d.vps.ip} / ${d.vps.region}`;$('#source').innerHTML=d.sources.map(x=>`<option value="${esc(x.key)}" ${x.key===d.source.key?'selected':''}>${esc(x.name)}</option>`).join('');$('#limit').value=d.defaults.candidate_limit;$('#top').value=d.top_count;$('#latencyMax').value=d.latency_max;$('#speedMin').value=d.speed_min;$('#port').querySelector('option[value="-1"]').textContent=`自动 / 当前 Lun 端口（${d.test_port}）`;$('#sourceMeta').textContent=sourceText(d.source);$('#sourceState').textContent=d.source.cached?'使用最近缓存':'实时数据';$('#sourceState').className=d.source.cached?'warn':'ok';$('#candidateSummary').textContent=`${d.candidates.length} 个候选`;$('#networkNotice').style.display='block';$('#networkNotice').textContent=`页面连接 IP：${d.client_ip||'未知'}。点击“一键双向优选”后会显示实际测速出口；只有该 IP 完成的结果才会进入客户端榜。`;renderAll();updateTraffic();setGlobal('候选库已就绪，可调整参数后开始双向测试。','ok')}catch(e){setGlobal(`会话载入失败：${e.message}`,'bad')}}
+$('#refresh').onclick=()=>refresh();$('#manualToggle').onclick=()=>{$('#manualBox').style.display=$('#manualBox').style.display==='none'?'block':'none'};$('#manualLoad').onclick=()=>refresh($('#manual').value);$('#start').onclick=start;$('#stop').onclick=stop;$('#cancel').onclick=async()=>{await stop();try{await post('cancel',{})}catch(e){}setGlobal('已取消，可关闭页面。','warn')};$('#preview').onclick=preview;$('#apply').onclick=apply;$('#copy').onclick=()=>navigator.clipboard.writeText([...finalIps()].join('\n')).then(()=>setGlobal('已复制最终 IP。','ok')).catch(()=>setGlobal('浏览器拒绝剪贴板，请使用 CSV。','warn'));$('#reset').onclick=()=>{state.selected.clear();state.retained.clear();state.preview=null;$('#previewBox').classList.remove('show');renderAll()};
 $$('[data-action]').forEach(b=>b.onclick=()=>listAction(b.dataset.list,b.dataset.action));['clientSearch','clientFamily','clientSort','vpsSearch','vpsFamily','vpsSort'].forEach(id=>$(`#${id}`).oninput=()=>renderList(id.startsWith('client')?'client':'vps'));['speedLimit','downloadMb'].forEach(id=>$(`#${id}`).oninput=updateTraffic);init();
 </script></body></html>'''
 
@@ -556,8 +558,8 @@ class OptimizerHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-            "connect-src 'self' https://speed.cloudflare.com "
-            "https://*.bestcf.cmliussss.hidns.vip:* https://*.ns.psb.kdns.fr:*",
+            "connect-src 'self' https://*.bestcf.cmliussss.hidns.vip:* "
+            "https://*.ns.psb.kdns.fr:*",
         )
         self.end_headers()
 
@@ -595,6 +597,7 @@ class OptimizerHandler(BaseHTTPRequestHandler):
                 "latency_max": self.server.latency_max,
                 "speed_min": self.server.speed_min,
                 "test_port": self.server.test_port,
+                "client_ip": str(self.client_address[0]),
                 "vps": dict(self.server.vps_meta),
                 "defaults": {"candidate_limit": self.server.candidate_limit, "client_concurrency": 16,
                              "vps_concurrency": 8, "speed_limit": 20, "download_bytes": 5_000_000,
@@ -673,11 +676,16 @@ class OptimizerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"candidates": candidates, "source": meta})
 
     def _client_results(self, request):
+        try:
+            client_ip = str(_global_ip(str(request.get("client_ip", "")).strip()))
+        except ValueError as error:
+            raise ValueError("客户端测速结果缺少有效的实际出口 IP") from error
         results = _validate_measurements(request.get("measurements", []), self.server.candidates, "client")
         with self.server.lock:
             self.server.client_results = results
+            self.server.client_test_ip = client_ip
             self.server.preview = None
-        self._send_json(200, {"ok": True, "results": results})
+        self._send_json(200, {"ok": True, "client_ip": client_ip, "results": results})
 
     def _vps_start(self, request):
         if self.server.vps_job and self.server.vps_job.snapshot()["state"] in ("queued", "running"):
@@ -732,10 +740,15 @@ class OptimizerHandler(BaseHTTPRequestHandler):
             self.server.preview = None
         self._send_json(200, {"ok": True, "result": row})
 
-    def _validated_selection(self, raw_selected):
+    def _validated_selection(self, raw_selected, raw_retained=None):
         if not isinstance(raw_selected, list):
             raise ValueError("选择结果必须是数组")
+        if raw_retained is None:
+            raw_retained = []
+        if not isinstance(raw_retained, list):
+            raise ValueError("保留结果必须是数组")
         selected = []
+        retained = []
         allowed = {item["ip"] for item in self.server.candidates}
         successful = {item["ip"] for item in self.server.client_results}
         successful.update(item["ip"] for item in self.server.vps_retry_results)
@@ -750,25 +763,42 @@ class OptimizerHandler(BaseHTTPRequestHandler):
                 raise ValueError(f"{address} 不属于本次已成功测试的候选")
             if address not in selected:
                 selected.append(address)
-        if not selected or len(selected) > MAX_SELECTED:
-            raise ValueError(f"请选择 1-{MAX_SELECTED} 个已成功测试的 IP")
-        return selected
+        current = set(self.server.current_ips)
+        for raw in raw_retained:
+            try:
+                address = str(ipaddress.ip_address(str(raw).strip()))
+            except ValueError as error:
+                raise ValueError("保留结果中包含无效 IP") from error
+            if address not in current:
+                raise ValueError(f"{address} 不属于当前优选池，不能作为保留项")
+            if address not in retained:
+                retained.append(address)
+        final = selected + [item for item in retained if item not in selected]
+        if not final or len(final) > MAX_SELECTED:
+            raise ValueError(f"请选择或保留 1-{MAX_SELECTED} 个 IP")
+        return selected, retained, final
 
     def _preview(self, request):
-        selected = self._validated_selection(request.get("selected", []))
+        selected, retained, final = self._validated_selection(
+            request.get("selected", []), request.get("retained", [])
+        )
         current = list(self.server.current_ips)
         preview = {
-            "selected": selected,
-            "added": [item for item in selected if item not in current],
-            "kept": [item for item in selected if item in current],
-            "removed": [item for item in current if item not in selected],
+            "selected": final,
+            "tested": selected,
+            "retained": retained,
+            "added": [item for item in final if item not in current],
+            "kept": [item for item in final if item in current],
+            "removed": [item for item in current if item not in final],
         }
-        preview["digest"] = _preview_digest(self.server.preview_secret, selected)
+        preview["digest"] = _preview_digest(self.server.preview_secret, final)
         self.server.preview = preview
         self._send_json(200, preview)
 
     def _apply(self, request):
-        selected = self._validated_selection(request.get("selected", []))
+        _, _, selected = self._validated_selection(
+            request.get("selected", []), request.get("retained", [])
+        )
         expected = _preview_digest(self.server.preview_secret, selected)
         if not self.server.preview or not hmac.compare_digest(str(request.get("digest", "")), expected):
             raise ValueError("选择已变化，请重新查看替换预览")
@@ -778,11 +808,12 @@ class OptimizerHandler(BaseHTTPRequestHandler):
         retry_map = {item["ip"]: item for item in self.server.vps_retry_results}
         vps_results = [item for item in vps_results if item["ip"] not in retry_map] + list(retry_map.values())
         vps_map = {item["ip"]: item for item in vps_results}
-        rows = [{"ip": ip, "source": candidate_map[ip]["source"],
+        rows = [{"ip": ip, "source": candidate_map.get(ip, {"source": "原优选池"})["source"],
                  "client": client_map.get(ip), "vps": vps_map.get(ip)} for ip in selected]
         result = {
             "version": VERSION, "created_at": int(time.time()), "source": self.server.source_meta,
             "selected": rows, "previous": self.server.current_ips,
+            "client_test_ip": self.server.client_test_ip,
         }
         _atomic_json(self.server.result_file, result)
         self.server.applied = True
@@ -823,6 +854,7 @@ def serve(args):
     server.applied = False
     server.verbose = args.verbose
     server.client_results = []
+    server.client_test_ip = None
     server.vps_retry_results = []
     server.vps_job = None
     server.vps_meta = {"ip": args.public_host, "region": args.server_place or "未设置地区"}
