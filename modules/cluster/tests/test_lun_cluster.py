@@ -1383,6 +1383,166 @@ class ClusterTestCase(unittest.TestCase):
         self.assertEqual(payload["result"], ["1.1.1.1", "2.2.2.2"])
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_duplicate_signed_snapshot_does_not_create_event_storm(self) -> None:
+        source = self._federation_cluster("snapshot-source", 27481)
+        receiver = self._federation_cluster("snapshot-receiver", 27482)
+        try:
+            receiver.federation_register_peer(source.federation_public_bundle())
+            (source.root / "jhsub.txt").write_text("vless://fresh\n", encoding="utf-8")
+            snapshot = source.federation_snapshot()
+            receiver.record_federation_snapshot(snapshot)
+            receiver.record_federation_snapshot(snapshot)
+            source_id = source.load_config()["node_id"]
+            events = receiver.db.connection.execute(
+                "SELECT COUNT(*) FROM federation_events WHERE type='snapshot.head' AND entity_key=?",
+                (f"snapshot:{source_id}:legacy",),
+            ).fetchone()[0]
+            self.assertEqual(events, 1)
+            self.assertEqual(
+                receiver.db.setting(f"federation.snapshot.hash.{source_id}.legacy"),
+                snapshot["federation_signature"]["content_sha256"],
+            )
+        finally:
+            source.close()
+            receiver.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_health_rounds_revoke_only_after_spaced_failures_and_clean_subscriptions(self) -> None:
+        first = self._federation_cluster('health-round-first', 27881)
+        second = self._federation_cluster('health-round-second', 27882)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            node_id = second.load_config()['node_id']
+            (first.root / 'jhsub.txt').write_text('vless://user@1.1.1.1:443#live\n', encoding='utf-8')
+            (second.root / 'jhsub.txt').write_text('vless://user@8.8.8.8:443#retired\n', encoding='utf-8')
+            first.record_local_snapshot()
+            snapshot = second.federation_snapshot()
+            first.record_federation_snapshot(snapshot)
+            profile = first.refresh_profiles()[0]
+            public = first.root.parent / 'weblun' / profile['token'] / 'jhsub.txt'
+            self.assertIn('8.8.8.8', public.read_text())
+            now = lun_cluster.utc_now()
+            with mock.patch.object(lun_cluster, 'probe_federation_member',
+                                   side_effect=lun_cluster.FederationTransportError('offline')), \
+                    mock.patch.object(lun_cluster, 'broadcast_federation_events') as broadcast:
+                for at in (now - 40, now - 20):
+                    with mock.patch.object(lun_cluster, 'utc_now', return_value=at):
+                        result = lun_cluster.federation_health_round(first)
+                    self.assertFalse(result['revoked'])
+                    self.assertEqual(first.node(node_id)['state'], 'suspect')
+                # Receiving an old relayed snapshot must not claim live health.
+                first.record_federation_snapshot(snapshot)
+                self.assertEqual(first.node(node_id)['state'], 'suspect')
+                with mock.patch.object(lun_cluster, 'utc_now', return_value=now):
+                    result = lun_cluster.federation_health_round(first)
+                self.assertEqual(result['revoked'], [node_id])
+                self.assertEqual(first.node(node_id)['state'], 'revoked')
+                self.assertNotIn(node_id, [node['id'] for node in first.nodes()])
+                self.assertNotIn('8.8.8.8', public.read_text())
+                self.assertIn('1.1.1.1', public.read_text())
+                count = first.db.connection.execute('SELECT COUNT(*) FROM federation_events').fetchone()[0]
+                lun_cluster.federation_health_round(first)
+                self.assertEqual(first.db.connection.execute('SELECT COUNT(*) FROM federation_events').fetchone()[0], count)
+                broadcast.assert_not_called()  # no remaining peer in a two-node cluster
+            with self.assertRaises(lun_cluster.ClusterError):
+                first.record_federation_snapshot(snapshot)
+        finally:
+            first.close()
+            second.close()
+
+    def test_health_probe_falls_back_to_ipv6_and_checks_node_identity(self) -> None:
+        node = {'id': 'a' * 32, 'endpoint_host': '8.8.8.8',
+                'endpoint_hosts': '["2001:4860:4860::8888","8.8.8.8"]', 'endpoint_port': 12345}
+        with mock.patch.object(lun_cluster, 'mutual_request', side_effect=[
+            lun_cluster.FederationTransportError('v4 offline'), {'status': {'node_id': node['id']}}
+        ]) as request:
+            status = lun_cluster.probe_federation_member(self.cluster, node)
+        self.assertEqual(status['node_id'], node['id'])
+        self.assertEqual([call.args[1] for call in request.call_args_list], ['8.8.8.8', '2001:4860:4860::8888'])
+        with mock.patch.object(lun_cluster, 'mutual_request', return_value={'status': {'node_id': 'b' * 32}}):
+            with self.assertRaisesRegex(lun_cluster.ClusterError, 'identity mismatch'):
+                lun_cluster.probe_federation_member(self.cluster, node)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL is required')
+    def test_health_recovery_clears_failures_without_broadcast(self) -> None:
+        first = self._federation_cluster('health-recover-first', 27883)
+        second = self._federation_cluster('health-recover-second', 27884)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            node_id = second.load_config()['node_id']
+            first.record_transport_failure(node_id, when=lun_cluster.utc_now() - 40)
+            first.record_transport_failure(node_id, when=lun_cluster.utc_now() - 20)
+            with mock.patch.object(lun_cluster, 'probe_federation_member', return_value={}), \
+                    mock.patch.object(first, '_coordinate_after_failures') as coordinate, \
+                    mock.patch.object(lun_cluster, 'broadcast_federation_events') as broadcast:
+                result = lun_cluster.federation_health_round(first)
+            self.assertEqual(result['suspect'], [])
+            self.assertEqual(first.node(node_id)['state'], 'online')
+            self.assertEqual(first.db.connection.execute('SELECT COUNT(*) FROM federation_failures').fetchone()[0], 0)
+            coordinate.assert_not_called()
+            broadcast.assert_not_called()
+            with mock.patch.object(lun_cluster, 'utc_now', return_value=lun_cluster.utc_now() + lun_cluster.HEALTH_STALE_AFTER + 1):
+                self.assertEqual(next(n for n in first.nodes() if n['id'] == node_id)['state'], 'unknown')
+        finally:
+            first.close()
+            second.close()
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL is required')
+    def test_daily_health_window_retains_three_daily_failures(self) -> None:
+        first = self._federation_cluster('health-daily-first', 27891)
+        second = self._federation_cluster('health-daily-second', 27892)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            node_id = second.load_config()['node_id']
+            now = lun_cluster.utc_now()
+            first.record_transport_failure(node_id, when=now - 2 * lun_cluster.HEALTH_CHECK_INTERVAL)
+            first.record_transport_failure(node_id, when=now - lun_cluster.HEALTH_CHECK_INTERVAL)
+            result = first.record_transport_failure(node_id, when=now)
+            self.assertEqual(result['failures'], 3)
+            self.assertTrue(result['needs_probe'])
+            self.assertLessEqual(result['failure_times'][-1] - result['failure_times'][0],
+                                 lun_cluster.HEALTH_FAILURE_WINDOW)
+        finally:
+            first.close()
+            second.close()
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL is required')
+    def test_health_removal_delivery_is_persistent_bounded_and_refreshes_receiver(self) -> None:
+        first = self._federation_cluster('health-delivery-first', 27885)
+        second = self._federation_cluster('health-delivery-second', 27886)
+        third = self._federation_cluster('health-delivery-third', 27887)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            first.federation_register_peer(third.federation_public_bundle())
+            second.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            target, receiver = third.load_config()['node_id'], second.load_config()['node_id']
+            # Drive the real revocation code with a pre-established quorum.
+            with mock.patch.object(first, '_probe_verdict', return_value={
+                'candidate_id': target, 'revocable': True, 'unreachable_votes': 2,
+                'required': 2, 'vote_ids': [],
+            }):
+                first.finalize_suspect(target)
+            self.assertIn(receiver, json.loads(first.db.setting('federation.health.pending')))
+            with mock.patch.object(lun_cluster, 'probe_federation_member', return_value={}), \
+                    mock.patch.object(lun_cluster, 'parallel_federation_sync', return_value=({}, {receiver: 'timeout'})) as send:
+                result = lun_cluster.federation_health_round(first)
+                self.assertEqual(result['pending_delivery'], [receiver])
+                lun_cluster.federation_health_round(first)
+                self.assertEqual(send.call_count, 1)
+            with mock.patch.object(second, 'refresh_profiles', return_value=[]) as refresh:
+                second.federation_import_events(first.federation_events_since(second.federation_manifest()))
+                refresh.assert_called_once()
+            self.assertEqual(second.node(target)['state'], 'revoked')
+            first.db.set_setting('federation.health.next_delivery', 0)
+            with mock.patch.object(lun_cluster, 'probe_federation_member', return_value={}), \
+                    mock.patch.object(lun_cluster, 'parallel_federation_sync', return_value=({receiver: {}}, {})):
+                self.assertEqual(lun_cluster.federation_health_round(first)['pending_delivery'], [])
+        finally:
+            first.close()
+            second.close()
+            third.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_identity_restore_rejects_data_backup_and_restores_identity(self) -> None:
         source = self._federation_cluster("identity-source", 27501)
         target = self._federation_cluster("identity-target", 27502)
@@ -1434,7 +1594,12 @@ class ClusterTestCase(unittest.TestCase):
                     raise lun_cluster.ClusterError("offline")
                 return {"received": 4}
 
+            third_id = third.load_config()["node_id"]
             with mock.patch.object(lun_cluster, "federation_sync", side_effect=fake_sync), \
+                    mock.patch.object(
+                        lun_cluster, "fetch_federation_snapshots",
+                        return_value=({third_id: {"status": {"node_id": third_id}}}, {}),
+                    ) as fetch_snapshots, \
                     mock.patch.object(first, "refresh_profiles", return_value=[{"id": 1}]) as refresh:
                 result = first.subscription_access(token, now=1000)
                 debounced = first.subscription_access(token, now=1020)
@@ -1446,6 +1611,8 @@ class ClusterTestCase(unittest.TestCase):
             self.assertEqual(set(calls), {
                 second.load_config()["node_id"], third.load_config()["node_id"],
             })
+            fetch_snapshots.assert_called_once_with(first, dict.fromkeys([third_id]).keys(), timeout=8)
+            self.assertEqual(result["snapshots"], [third_id])
             refresh.assert_called_once_with()
             settings = [tuple(row) for row in first.db.connection.execute(
                 "SELECT key,value FROM settings WHERE key LIKE 'subscription.access.%'"
@@ -1497,11 +1664,15 @@ class ClusterTestCase(unittest.TestCase):
                 mock.patch.object(lun_cluster.signal, "signal"), \
                 mock.patch.object(lun_cluster, "reconcile_federation_endpoint",
                                   return_value={"changed": False}) as reconcile, \
-                mock.patch.object(self.cluster, "subscription_catchup", return_value={}) as catchup:
+                mock.patch.object(self.cluster, "subscription_catchup", return_value={}) as catchup, \
+                mock.patch.object(lun_cluster, "push_snapshot", return_value={}) as publish:
             lun_cluster.serve(self.cluster)
         reconcile.assert_called_once_with(self.cluster)
         catchup.assert_called_once_with()
+        publish.assert_called_once_with(self.cluster)
         self.assertEqual(started.count("initial_federation_maintenance"), 1)
+        self.assertEqual(started.count("health_loop"), 1)
+        self.assertEqual(started.count("delivery_loop"), 1)
 
     def test_serve_restart_request_exits_for_service_supervisor(self) -> None:
         self.cluster.save_config({"enabled": True, "role": "master", "node_id": "a" * 32,

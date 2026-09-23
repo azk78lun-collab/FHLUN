@@ -11,7 +11,9 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.10.5'
+contains "$SCRIPT" '当前版本：V26.8.10.10'
+contains "$SCRIPT" '自动巡检：每天一次'
+contains "$SCRIPT" '"suspect": "疑似离线"'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
 contains "$SCRIPT" '分布式服务器集群'
 contains "$SCRIPT" 'subscription_agent_enabled(){'
@@ -46,6 +48,9 @@ PUSH=$(section "$SCRIPT" cluster_push_event)
 printf '%s\n' "$PUSH" | grep -Fq 'cluster_cmd push' || fail 'rebuild publication missing push'
 printf '%s\n' "$PUSH" | grep -Fq ') >/dev/null 2>&1 &' || fail 'snapshot publication blocks caller'
 contains "$SCRIPT" 'cluster_push_event'
+REFRESH_OUTPUTS=$(section "$SCRIPT" refresh_subscription_outputs)
+printf '%s\n' "$REFRESH_OUTPUTS" | grep -Fq 'cip || return 1' || fail 'subscription refresh does not rebuild local outputs first'
+printf '%s\n' "$REFRESH_OUTPUTS" | grep -Fq 'cluster_push_event' || fail 'subscription refresh does not publish the rebuilt snapshot'
 
 JOIN=$(section "$SCRIPT" cluster_join_ui)
 printf '%s\n' "$JOIN" | grep -Fq 'cluster_cmd --json add-peer' || fail 'one-paste join does not capture the new member identity'

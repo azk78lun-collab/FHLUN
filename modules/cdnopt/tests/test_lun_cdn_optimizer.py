@@ -28,7 +28,7 @@ class FakeResponse:
 
 class OptimizerTests(unittest.TestCase):
     def test_version_and_page_expose_two_independent_boards(self):
-        self.assertEqual(MOD.VERSION, "2.0.3")
+        self.assertEqual(MOD.VERSION, "2.0.4")
         for marker in ('id="clientRows"', 'id="vpsRows"', 'id="preview"', 'id="manual"', '一键双向优选'):
             self.assertIn(marker, MOD.PAGE)
         self.assertIn("不做隐藏加权", MOD.PAGE)
@@ -38,6 +38,11 @@ class OptimizerTests(unittest.TestCase):
         self.assertIn("state.selected.delete", MOD.PAGE)
         self.assertIn("页面连接 IP", MOD.PAGE)
         self.assertIn("client_ip:state.clientIp", MOD.PAGE)
+        self.assertIn("directProbeUrl", MOD.PAGE)
+        self.assertIn("测速辅助域名被网络或浏览器拦截", MOD.PAGE)
+        self.assertIn("切换 IP 库或重新测试不会丢失已勾选项", MOD.PAGE)
+        self.assertIn("pool(finalists,s.clientConcurrency", MOD.PAGE)
+        self.assertNotIn("state.selected.clear();state.retained.clear();state.clientIp", MOD.PAGE)
         self.assertNotIn("speed.cloudflare.com/meta", MOD.PAGE)
         self.assertNotIn("无法识别客户端网络", MOD.PAGE)
 
@@ -141,9 +146,11 @@ broken
         server.candidate_limit, server.cache_dir, server.result_file, server.seed = 512, str(Path(target).parent), str(target), 1
         server.cancelled = server.applied = server.verbose = False
         server.client_results, server.vps_retry_results, server.vps_job = [], [], None
+        server.client_result_history, server.vps_result_history = {}, {}
         server.client_test_ip = None
         server.vps_meta = {"ip": "127.0.0.1", "region": "测试"}
         server.preview_secret, server.preview, server.lock = b"x" * 32, None, threading.RLock()
+        server.candidate_history = {item["ip"]: item for item in server.candidates}
         return server
 
     @staticmethod
@@ -210,6 +217,30 @@ broken
                 headers={"Content-Type": "application/json"}, method="POST")
             with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(request, timeout=3)
             self.assertEqual(error.exception.code, 400)
+            server.shutdown(); thread.join(timeout=3); server.server_close()
+
+    def test_client_latency_only_result_can_be_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp) / "result.json")
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}/test-token"
+            self._post(base, "client-results", {"client_ip": "8.8.4.4", "measurements": [
+                {"ip": "8.8.8.8", "latency_ms": 30, "speed_mbps": 0, "loss_pct": 0}]})
+            preview = self._post(base, "preview", {"selected": ["8.8.8.8"]})
+            self.assertEqual(preview["selected"], ["8.8.8.8"])
+            server.shutdown(); thread.join(timeout=3); server.server_close()
+
+    def test_tested_selection_survives_candidate_library_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = self._server(Path(tmp) / "result.json")
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}/test-token"
+            self._post(base, "client-results", {"client_ip": "8.8.4.4", "measurements": [
+                {"ip": "8.8.8.8", "latency_ms": 30, "speed_mbps": 120, "loss_pct": 0}]})
+            imported = self._post(base, "import", {"manual": "9.9.9.9", "limit": 10})
+            self.assertEqual(imported["candidates"][0]["ip"], "9.9.9.9")
+            preview = self._post(base, "preview", {"selected": ["8.8.8.8"]})
+            self.assertEqual(preview["selected"], ["8.8.8.8"])
             server.shutdown(); thread.join(timeout=3); server.server_close()
 
     def test_preview_rejects_untested_candidate(self):

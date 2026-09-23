@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.2.2"
+VERSION = "0.2.4"
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
@@ -55,6 +55,11 @@ ROLE_TRANSFER_MAX = 32 * 1024 * 1024
 ROLE_TRANSFER_TTL = 15 * 60
 FEDERATION_FANOUT = 10
 FEDERATION_FANOUT_TTL = 180
+HEALTH_CHECK_INTERVAL = 24 * 60 * 60
+HEALTH_CHECK_TIMEOUT = 4
+HEALTH_DELIVERY_RETRY = 60
+HEALTH_FAILURE_WINDOW = HEALTH_CHECK_INTERVAL * 3 + 60
+HEALTH_STALE_AFTER = HEALTH_CHECK_INTERVAL * 2 + 60
 PUBLIC_IP_SOURCES = (
     ("icanhazip", "https://icanhazip.com"),
     ("ipify", "https://api64.ipify.org"),
@@ -103,7 +108,8 @@ CITY_NAMES_ZH = {
     "tokyo": "东京",
 }
 PLACE_LABEL_ALIASES_ZH = {"日本-箕面": "日本-大阪", "箕面": "大阪"}
-STATE_NAMES_ZH = {"online": "在线", "unreachable": "离线", "unknown": "未连接"}
+STATE_NAMES_ZH = {"online": "在线", "unreachable": "离线", "unknown": "待检测",
+                  "suspect": "疑似离线", "revoked": "已撤销", "removed": "已移除"}
 PROXY_OUTBOUND_TYPES = {
     "vless", "vmess", "shadowsocks", "anytls", "tuic", "hysteria2", "socks", "naive"
 }
@@ -1085,7 +1091,9 @@ class Cluster:
                 region=CASE WHEN nodes.location_manual=1 THEN nodes.region ELSE excluded.region END,
                 city=CASE WHEN nodes.location_manual=1 THEN nodes.city ELSE excluded.city END,
                 provider=CASE WHEN nodes.location_manual=1 THEN nodes.provider ELSE excluded.provider END,
-                state='online',last_seen=excluded.last_seen,last_success=excluded.last_success,
+                state=CASE WHEN nodes.state IN ('revoked','removed') OR ? THEN nodes.state ELSE 'online' END,
+                last_seen=excluded.last_seen,
+                last_success=CASE WHEN ? THEN nodes.last_success ELSE excluded.last_success END,
                 lun_version=excluded.lun_version,api_version=excluded.api_version,updated_at=excluded.updated_at""",
                 (
                     node_id, role, host, json_dumps(hosts), port, internal, values["remark"], server_number, values["expected_uuid"],
@@ -1093,6 +1101,8 @@ class Cluster:
                     values["provider"], "online", now, now, int(status.get("snapshot_at", 0)),
                     safe_label(status.get("lun_version", ""), 32), int(status.get("api_version", API_VERSION)),
                     now, now,
+                    int(role == 'federation' and node_id != self.load_config().get('node_id')),
+                    int(role == 'federation' and node_id != self.load_config().get('node_id')),
                 ),
             )
 
@@ -1185,6 +1195,9 @@ class Cluster:
             item["number"] = int(row["server_number"])
             if self.is_federation():
                 item["trusted"] = str(row["id"]) in trusted
+                if row['id'] != config.get('node_id') and row['state'] == 'online' \
+                        and int(row['last_success']) < utc_now() - HEALTH_STALE_AFTER:
+                    item['state'] = 'unknown'
             result.append(item)
         return result
 
@@ -1429,8 +1442,8 @@ class Cluster:
                     (node_id, profile_key, filename, content, hashlib.sha256(content).hexdigest(), now),
                 )
             self.db.connection.execute(
-                "UPDATE nodes SET snapshot_at=?,state='online',last_seen=?,last_success=?,updated_at=? WHERE id=?",
-                (now, now, now, now, node_id),
+                "UPDATE nodes SET snapshot_at=?,last_seen=?,updated_at=? WHERE id=?",
+                (now, now, now, node_id),
             )
         self.db.audit("snapshot.record", node_id, profile_key)
 
@@ -1501,6 +1514,14 @@ class Cluster:
 
     def refresh_profiles(self, profile_key: str = "legacy",
                          sync_master_state: bool = True) -> list[dict[str, Any]]:
+        # A stale concurrent refresh must not overwrite removal results.
+        with FileLock(self.module / '.profiles.lock', timeout=30):
+            result = self._refresh_profiles(profile_key, sync_master_state)
+            self.db.set_setting('federation.subscriptions.dirty', '0')
+            return result
+
+    def _refresh_profiles(self, profile_key: str,
+                          sync_master_state: bool) -> list[dict[str, Any]]:
         config = self.load_config()
         if config.get("role") == "master" and sync_master_state:
             self.record_local_snapshot(profile_key)
@@ -1567,6 +1588,15 @@ class Cluster:
         failures.update(sync_failures)
         for node_id in sync_failures:
             self.db.audit("subscription.access.sync-failed", node_id, "parallel-sync")
+        snapshots: dict[str, dict[str, Any]] = {}
+        if self.is_federation() and synced:
+            snapshots, snapshot_failures = fetch_federation_snapshots(
+                self, synced.keys(), timeout=8
+            )
+            failures.update({f"snapshot:{node_id}": detail
+                             for node_id, detail in snapshot_failures.items()})
+            for node_id in snapshot_failures:
+                self.db.audit("subscription.access.snapshot-failed", node_id, "parallel-fetch")
         try:
             applied = self.apply_federation_users(refresh=False) if self.is_federation() else {}
         except (ClusterError, OSError, sqlite3.Error):
@@ -1574,7 +1604,7 @@ class Cluster:
             failures["local-user-apply"] = "pending"
         refreshed = self.refresh_profiles()
         return {"debounced": False, "received": received, "failures": failures,
-                "refreshed": len(refreshed), "users": applied}
+                "snapshots": sorted(snapshots), "refreshed": len(refreshed), "users": applied}
 
     def subscription_access(self, token: str, *, now: int | None = None) -> dict[str, Any]:
         now = int(now or utc_now())
@@ -1725,7 +1755,7 @@ class Cluster:
         return 10 * gib
 
     def _selected_nodes(self, selector: str, profile_key: str) -> list[sqlite3.Row]:
-        clauses = ["s.profile_key=?"]
+        clauses = ["s.profile_key=?", "n.state NOT IN ('revoked','removed')"]
         params: list[Any] = [profile_key]
         if self.is_federation():
             clauses.append("EXISTS(SELECT 1 FROM federation_keys fk WHERE fk.node_id=n.id AND fk.revoked_at=0)")
@@ -3190,6 +3220,7 @@ class Cluster:
                      event["event_id"], event["event_id"], utc_now(), node_id),
                 )
                 self.db.connection.execute("UPDATE nodes SET state='revoked',updated_at=? WHERE id=?", (utc_now(), node_id))
+            self.db.set_setting('federation.subscriptions.dirty', '1')
         if current and int(current["deleted"]) and permanent_prefix:
             if not incoming_tombstone or self._event_sort_key(event) <= (
                     int(current["lamport"]), str(current["author_id"]), str(current["event_id"])):
@@ -3251,6 +3282,11 @@ class Cluster:
         count = 0
         for event in ordered:
             count += int(self.ingest_event(event))
+        if self.db.setting('federation.subscriptions.dirty') == '1':
+            # This applies to GET catch-up as well as POST delivery: do not leave
+            # already published subscription files containing a retired member.
+            self.federation_trust_bundle()
+            self.refresh_profiles()
         if any(str(event.get("type", "")) in FEDERATION_USER_EVENT_TYPES for event in event_list):
             try:
                 self.apply_federation_users(refresh=False)
@@ -3287,24 +3323,36 @@ class Cluster:
             raise ClusterError("订阅快照签名时间无效") from exc
         profile_key = safe_slug(str(signed.get("profile_key", "legacy")))
         clock_key = f"federation.snapshot.time.{node_id}.{profile_key}"
+        hash_key = f"federation.snapshot.hash.{node_id}.{profile_key}"
         latest = int(self.db.setting(clock_key, "0") or 0)
         if latest and created_at < latest:
             raise ClusterError("已拒绝回放旧版订阅快照")
+        if digest == self.db.setting(hash_key, ""):
+            self.upsert_node(status, role="federation")
+            self.db.set_setting(clock_key, str(max(latest, created_at)))
+            return
         self.record_snapshot(snapshot, role="federation")
         self.db.set_setting(clock_key, str(created_at))
-        self.create_event("snapshot.head", f"snapshot:{node_id}:{signed['profile_key']}", {"node_id": node_id, **signed})
+        self.db.set_setting(hash_key, digest)
+        self._create_event_if_changed(
+            "snapshot.head", f"snapshot:{node_id}:{signed['profile_key']}",
+            {"node_id": node_id, **signed},
+        )
 
     def record_transport_failure(self, candidate_id: str, reporter_id: str | None = None, when: int | None = None) -> dict[str, Any]:
         reporter_id = reporter_id or str(self.load_config().get("node_id", ""))
         when = int(when or utc_now())
         with self.db.connection:
             self.db.connection.execute("INSERT OR IGNORE INTO federation_failures(candidate_id,reporter_id,failed_at) VALUES(?,?,?)", (candidate_id, reporter_id, when))
-            self.db.connection.execute("DELETE FROM federation_failures WHERE failed_at<?", (when - 60,))
-            self.db.connection.execute("UPDATE nodes SET state='suspect',last_failure=?,updated_at=? WHERE id=?", (when, when, candidate_id))
+            self.db.connection.execute("DELETE FROM federation_failures WHERE failed_at<?", (when - HEALTH_FAILURE_WINDOW,))
+            self.db.connection.execute(
+                "UPDATE nodes SET state='suspect',last_failure=?,updated_at=? WHERE id=? AND state NOT IN ('revoked','removed')",
+                (when, when, candidate_id),
+            )
         rows = self.db.connection.execute(
             "SELECT failed_at FROM federation_failures WHERE candidate_id=? AND reporter_id=? AND failed_at>=? "
             "ORDER BY failed_at",
-            (candidate_id, reporter_id, when - 60),
+            (candidate_id, reporter_id, when - HEALTH_FAILURE_WINDOW),
         ).fetchall()
         failure_times = [int(row[0]) for row in rows]
         # Retries inside one request are transport resilience, not independent
@@ -3345,9 +3393,8 @@ class Cluster:
             raise ClusterError("probe candidate is not an active trusted member")
         reachable = False
         try:
-            response = mutual_request(self, str(node["endpoint_host"]), int(node["endpoint_port"]),
-                                      "GET", "/v1/status", timeout=10)
-            reachable = str(response.get("status", {}).get("node_id", "")) == candidate_id
+            probe_federation_member(self, node)
+            reachable = True
         except (ClusterError, OSError, ssl.SSLError):
             reachable = False
         if reachable:
@@ -3355,20 +3402,23 @@ class Cluster:
         return self.create_probe_vote(candidate_id, reachable, nonce=nonce)
 
     def _coordinate_after_failures(self, candidate_id: str, failure_times: list[int]) -> dict[str, Any]:
-        if len(failure_times) < 3 or max(failure_times) - min(failure_times) > 60:
+        if len(failure_times) < 3 or max(failure_times) - min(failure_times) > HEALTH_FAILURE_WINDOW:
             return {"candidate_id": candidate_id, "state": "suspect", "revoked": False,
                     "reason": "three failures within 60 seconds are required"}
         local_id = str(self.load_config().get("node_id", ""))
-        for observed_at in failure_times[-3:]:
-            vote = self.create_probe_vote(candidate_id, False, observed_at=observed_at,
+        # Failure timestamps are retained for the daily evidence window.  Probe
+        # votes themselves must be fresh; old signed observations are rejected
+        # by replay protection after 60 seconds.
+        for _ in failure_times[-3:]:
+            vote = self.create_probe_vote(candidate_id, False, observed_at=utc_now(),
                                           nonce=secrets.token_hex(16))
             with contextlib.suppress(ClusterError):
                 self.record_probe_vote(vote)
         if self._active_federation_count() > 2:
-            for voter in self.trusted_federation_nodes():
-                voter_id = str(voter["id"])
-                if voter_id in {candidate_id, local_id}:
-                    continue
+            voters = [dict(voter) for voter in self.trusted_federation_nodes()
+                      if str(voter['id']) not in {candidate_id, local_id}]
+
+            def witness(voter: dict[str, Any]) -> dict[str, Any]:
                 nonce = secrets.token_hex(16)
                 try:
                     response = mutual_request(
@@ -3376,12 +3426,28 @@ class Cluster:
                         "/v1/federation/probe", {"candidate_id": candidate_id, "nonce": nonce}, timeout=20,
                     )
                     vote = response.get("vote") if isinstance(response.get("vote"), dict) else {}
-                    if vote.get("nonce") != nonce:
-                        raise ClusterError("probe vote is not bound to the request nonce")
+                    if vote.get("nonce") != nonce or vote.get("voter_id") != voter['id'] \
+                            or vote.get("candidate_id") != candidate_id:
+                        raise ClusterError("probe vote is not bound to the request identity and nonce")
+                    return vote
+                except (ClusterError, OSError, ssl.SSLError):
+                    return {}
+                finally:
+                    self.close()
+
+            # Sequential dead witnesses could expire every vote before quorum.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(FEDERATION_FANOUT, len(voters))) as pool:
+                votes = list(pool.map(witness, voters))
+            # Any authenticated recovery vetoes automatic removal for this round.
+            votes.sort(key=lambda vote: not bool(vote.get('reachable')))
+            for vote in votes:
+                if not vote:
+                    continue
+                try:
                     verdict = self.record_probe_vote(vote)
                     if bool(vote.get("reachable")):
                         return {**verdict, "revoked": False, "recovered": True}
-                except (ClusterError, OSError, ssl.SSLError):
+                except ClusterError:
                     continue
         return self.finalize_suspect(candidate_id)
 
@@ -3504,6 +3570,8 @@ class Cluster:
         return self._probe_verdict(str(vote["candidate_id"]))
 
     def finalize_suspect(self, candidate_id: str) -> dict[str, Any]:
+        if self.node(candidate_id)['state'] in {'revoked', 'removed'}:
+            return {'candidate_id': candidate_id, 'revoked': False, 'already_revoked': True}
         verdict = self._probe_verdict(candidate_id)
         if not verdict["revocable"]:
             return {**verdict, "revoked": False}
@@ -3513,6 +3581,13 @@ class Cluster:
             "required": verdict["required"], "vote_ids": verdict["vote_ids"],
             "revoked_after_seq": int(head[0] if head else 0),
         })
+        pending = json.loads(self.db.setting('federation.health.pending', '[]'))
+        pending = sorted(set(pending) | {str(node['id']) for node in self.trusted_federation_nodes()})
+        self.db.set_setting('federation.health.pending', json_dumps(pending))
+        self.db.set_setting('federation.health.next_delivery', '0')
+        self.federation_trust_bundle()
+        self.refresh_profiles()
+        self.db.audit('federation.health.revoked', candidate_id, json_dumps(verdict))
         return {**verdict, "revoked": True, "proof": event}
 
     def revoke_member(self, node_id: str, reason: str = "manual") -> dict[str, Any]:
@@ -4644,7 +4719,11 @@ def federation_server_context(cluster: Cluster, *, dynamic: bool = True) -> ssl.
             # The callback runs after ClientHello but before client-certificate
             # verification, so newly signed member roots take effect without a
             # process restart or a brief federation outage.
-            tls_socket.context = federation_server_context(cluster, dynamic=False)
+            try:
+                tls_socket.context = federation_server_context(cluster, dynamic=False)
+            finally:
+                # A rejected TLS client never enters the HTTP handler's cleanup.
+                cluster.close()
 
         context.set_servername_callback(reload_trust)
     return context
@@ -4686,6 +4765,7 @@ def serve(cluster: Cluster) -> None:
     server.cluster = cluster  # type: ignore[attr-defined]
     server.restart_requested = False  # type: ignore[attr-defined]
     stopping = threading.Event()
+    maintenance_ready = threading.Event()
 
     def stop(*_: Any) -> None:
         stopping.set()
@@ -4704,10 +4784,16 @@ def serve(cluster: Cluster) -> None:
     threading.Thread(target=watch_restart, daemon=True).start()
 
     def initial_federation_maintenance() -> None:
-        with contextlib.suppress(ClusterError, OSError, sqlite3.Error):
-            if cluster.is_federation():
-                reconcile_federation_endpoint(cluster)
-            cluster.subscription_catchup()
+        try:
+            with contextlib.suppress(ClusterError, OSError, sqlite3.Error):
+                if cluster.is_federation():
+                    reconcile_federation_endpoint(cluster)
+                cluster.subscription_catchup()
+                if cluster.is_federation():
+                    push_snapshot(cluster)
+        finally:
+            cluster.close()
+            maintenance_ready.set()
 
     threading.Thread(target=initial_federation_maintenance, daemon=True).start()
 
@@ -4719,9 +4805,45 @@ def serve(cluster: Cluster) -> None:
                 return
 
     threading.Thread(target=usage_loop, daemon=True).start()
+
+    def health_loop() -> None:
+        while not maintenance_ready.wait(1):
+            if stopping.is_set():
+                return
+        while not stopping.is_set():
+            started = time.monotonic()
+            try:
+                if cluster.is_federation():
+                    federation_health_round(cluster)
+            except (ClusterError, OSError, sqlite3.Error) as exc:
+                sys.stderr.write(f"federation health check failed: {exc}\n")
+            finally:
+                cluster.close()
+            if stopping.wait(max(1, HEALTH_CHECK_INTERVAL - (time.monotonic() - started))):
+                return
+
+    def delivery_loop() -> None:
+        while not maintenance_ready.wait(1):
+            if stopping.is_set():
+                return
+        while not stopping.is_set():
+            try:
+                if cluster.is_federation():
+                    deliver_pending_health_revocations(cluster)
+            except (ClusterError, OSError, sqlite3.Error) as exc:
+                sys.stderr.write(f"federation revocation delivery failed: {exc}\n")
+            finally:
+                cluster.close()
+            if stopping.wait(HEALTH_DELIVERY_RETRY):
+                return
+
+    if cluster.is_federation():
+        threading.Thread(target=health_loop, daemon=True).start()
+        threading.Thread(target=delivery_loop, daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        stopping.set()
         server.server_close()
     if server.restart_requested:  # type: ignore[attr-defined]
         raise SystemExit(RESTART_EXIT_CODE)
@@ -4793,6 +4915,88 @@ def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: st
     if response.status >= 400 or not result.get("ok"):
         raise ClusterError(result.get("error") or f"远端返回 HTTP {response.status}")
     return result
+
+
+def probe_federation_member(cluster: Cluster, node: Any) -> dict[str, Any]:
+    """Probe the authenticated control plane, trying IPv4 then available IPv6."""
+    try:
+        hosts = json.loads(str(node['endpoint_hosts'] or '[]'))
+    except (ValueError, TypeError):
+        hosts = []
+    hosts = order_public_hosts(hosts if isinstance(hosts, list) else [], str(node['endpoint_host']))
+    last_error: Exception | None = None
+    for host in hosts:
+        try:
+            response = mutual_request(cluster, host, int(node['endpoint_port']),
+                                      'GET', '/v1/status', timeout=HEALTH_CHECK_TIMEOUT)
+            status = response.get('status', {})
+            if not isinstance(status, dict) or status.get('node_id') != node['id']:
+                raise ClusterError('health response identity mismatch')
+            return status
+        except (ClusterError, OSError, ssl.SSLError) as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    raise ClusterError('health endpoint is missing')
+
+
+def deliver_pending_health_revocations(cluster: Cluster, *, broadcast: bool = False) -> dict[str, Any]:
+    """Retry only already-signed removals; this is not another health probe."""
+    pending = set(json.loads(cluster.db.setting('federation.health.pending', '[]')))
+    pending.intersection_update(str(row['id']) for row in cluster.trusted_federation_nodes())
+    delivery: dict[str, Any] = {}
+    if pending and utc_now() >= int(cluster.db.setting('federation.health.next_delivery', '0')):
+        if broadcast:
+            delivery = broadcast_federation_events(cluster)
+        else:
+            delivered, failures = parallel_federation_sync(cluster, sorted(pending),
+                                                         attempts=1, coordinate_failures=False, timeout=8)
+            delivery = {'delivered': delivered, 'failures': failures}
+        pending.difference_update(delivery.get('delivered', {}))
+        cluster.db.set_setting('federation.health.next_delivery', utc_now() + HEALTH_DELIVERY_RETRY)
+    cluster.db.set_setting('federation.health.pending', json_dumps(sorted(pending)))
+    return {'pending_delivery': sorted(pending), 'delivery': delivery}
+
+
+def federation_health_round(cluster: Cluster) -> dict[str, Any]:
+    """One bounded probe round; only real, spaced failures can trigger quorum."""
+    if not cluster.is_federation() or not cluster.load_config().get('enabled'):
+        return {'checked': 0, 'revoked': []}
+    if cluster.db.setting('federation.subscriptions.dirty') == '1':
+        cluster.federation_trust_bundle()
+        cluster.refresh_profiles()
+    nodes = [dict(row) for row in cluster.trusted_federation_nodes()]
+
+    def check(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        node_id = str(node['id'])
+        try:
+            probe_federation_member(cluster, node)
+            return node_id, cluster.record_transport_success(node_id)
+        except (ClusterError, OSError, ssl.SSLError) as exc:
+            result = cluster.record_transport_failure(node_id)
+            return node_id, {**result, 'error': str(exc)[-500:]}
+        finally:
+            cluster.close()
+
+    results: dict[str, dict[str, Any]] = {}
+    if nodes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(FEDERATION_FANOUT, len(nodes))) as pool:
+            results = dict(pool.map(check, nodes))
+    revoked: list[str] = []
+    for node_id, result in results.items():
+        if result.get('needs_probe') and cluster.node(node_id)['state'] == 'suspect':
+            verdict = cluster._coordinate_after_failures(node_id, result['failure_times'][-3:])
+            result['verdict'] = verdict
+            if verdict.get('revoked'):
+                revoked.append(node_id)
+    # Only removal events need fan-out. Healthy rounds generate no events and
+    # never rebuild subscriptions. Failed deliveries survive process restarts.
+    delivery_status = deliver_pending_health_revocations(cluster, broadcast=bool(revoked))
+    summary = {'checked': len(results), 'checked_at': utc_now(), 'revoked': revoked,
+               'suspect': [node_id for node_id in results if cluster.node(node_id)['state'] == 'suspect'],
+               'pending_delivery': delivery_status['pending_delivery']}
+    cluster.db.set_setting('federation.health.last', json_dumps(summary))
+    return {**summary, 'nodes': results, 'delivery': delivery_status['delivery']}
 
 
 def membership_status_request(cluster: Cluster, peer: dict[str, Any], node_id: str,
@@ -6753,11 +6957,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             result = {"config": cluster.load_config(), "nodes": cluster.nodes(),
                       "endpoint": cluster.endpoint_status(),
+                      "health": json.loads(cluster.db.setting('federation.health.last', '{}')),
                       "database": cluster.db.connection.execute("PRAGMA integrity_check").fetchone()[0]}
             if not args.json:
                 print(f"角色：{result['config'].get('role', 'disabled')}")
                 print(f"节点 ID：{result['config'].get('node_id', '-')}")
                 print(f"数据库：{result['database']}")
+                print(f"自动巡检：每天一次；最近完成 {iso_time(result['health'].get('checked_at'))}")
+                print(f"撤销通知待补齐：{len(result['health'].get('pending_delivery', []))} 台")
                 endpoint = result["endpoint"]
                 print(f"实际公网 IP：{endpoint.get('actual_ip') or '未确认'}")
                 print(f"联邦公布 IP：{endpoint.get('advertised_ip') or '-'}")

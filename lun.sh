@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.10.6"
+echo "当前版本：V26.8.10.10"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4002,7 +4002,7 @@ return
 fi
 python3 - "$cluster_nodes_json" <<'PY'
 import json, sys
-state = {"online": "在线", "unreachable": "离线", "unknown": "未知", "revoked": "已撤销"}
+state = {"online": "在线", "unreachable": "离线", "unknown": "待检测", "suspect": "疑似离线", "revoked": "已撤销"}
 try:
     rows = json.load(open(sys.argv[1], encoding="utf-8"))
 except (OSError, ValueError):
@@ -4569,6 +4569,11 @@ cluster_enabled || return 0
 cluster_cmd push >/dev/null 2>&1 || true
 cluster_cmd refresh-profiles >/dev/null 2>&1 || true
 ) >/dev/null 2>&1 &
+}
+
+refresh_subscription_outputs(){
+cip || return 1
+cluster_push_event
 }
 
 cluster_refresh_profiles(){
@@ -5386,6 +5391,7 @@ cluster_federation_menu(){
 while :; do
 ui_title "Lun 分布式服务器集群"
 cluster_show_nodes
+echo "自动巡检：每天一次；连续失败并经成员复核后，自动剔除并同步订阅。"
 ui_dash
 echo " 1. 服务器总览"
 echo " 2. 生成加入地址"
@@ -9263,7 +9269,7 @@ sub=y
 subid=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
 subpt=$(cat "$HOME/lun/subport.log" 2>/dev/null)
 fi
-cip
+refresh_subscription_outputs
 }
 
 refresh_identity_subscriptions(){
@@ -11109,7 +11115,7 @@ cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
 mkdir -p "$cdnopt_dir" || return 1
 rm -f "$cdnopt_tmp"
-if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.3 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
+if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.4 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
 return 0
 fi
 if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
@@ -11152,7 +11158,7 @@ red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
 return 1
 }
 cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
-[ "$cdnopt_version" = 2.0.3 ] || {
+[ "$cdnopt_version" = 2.0.4 ] || {
 rm -f "$cdnopt_tmp"
 red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
 return 1
@@ -14260,15 +14266,15 @@ echo "未检测到可用内核，当前按首次安装继续。"
 fi
 echo
 elif [ "$1" = "list" ]; then
-cip
+refresh_subscription_outputs
 exit
 elif [ "$1" = "upx" ]; then
 for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/x"*) kill "$(basename "$P")" 2>/dev/null ;; esac; done
-upxray && xrestart && echo "Xray内核更新完成" && sleep 2 && cip
+upxray && xrestart && echo "Xray内核更新完成" && sleep 2 && refresh_subscription_outputs
 exit
 elif [ "$1" = "ups" ]; then
 for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/s"*) kill "$(basename "$P")" 2>/dev/null ;; esac; done
-upsingbox && sbrestart && echo "Sing-box内核更新完成" && sleep 2 && cip
+upsingbox && sbrestart && echo "Sing-box内核更新完成" && sleep 2 && refresh_subscription_outputs
 exit
 elif [ "$1" = "res" ]; then
 for P in /proc/[0-9]*; do
@@ -14303,7 +14309,7 @@ sleep 5
 echo "重启完成"
 apply_lun_firewall_rules || true
 sleep 3
-cip
+refresh_subscription_outputs
 exit
 fi
 _lun_proc_running2=no
