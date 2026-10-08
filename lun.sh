@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.10.11"
+echo "当前版本：V26.8.10.12"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -5504,10 +5504,11 @@ done
 }
 
 cluster_menu(){
-if ! cluster_installed; then
+if ! cluster_installed || [ "$(cluster_role 2>/dev/null)" = disabled ]; then
 ui_title "Lun 分布式服务器集群"
 echo "可选模块；不开启时不会安装联邦服务或开放通信端口。"
 echo "成员之间通过专用 TCP + 双向 TLS 按需通信；不使用 SSH，也不开放任意 Shell。"
+[ "$(cluster_role 2>/dev/null)" != disabled ] || yellow_line "旧身份已退出集群；重新开启将创建新身份和新编号，保留现有代理和本机数据。"
 echo " 1. 一键开启本机联邦身份"
 echo " 0. 返回"
 printf "请选择 [0-1]："

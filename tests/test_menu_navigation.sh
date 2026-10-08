@@ -28,6 +28,22 @@ load_function() {
 record() { calls+="$*"$'\n'; }
 
 (
+  load_function cluster_menu
+  cluster_installed() { return 0; }
+  cluster_role() { printf 'disabled\n'; }
+  cluster_is_federation() { [[ $calls == $'install\n' ]]; }
+  cluster_legacy_present() { return 1; }
+  cluster_install() { record install; }
+  cluster_federation_menu() { record menu; }
+  calls=
+  output=$(cluster_menu <<< '0')
+  [[ $output == *'一键开启本机联邦身份'* ]]
+  [[ $output != *'配置无效'* && -z $calls ]]
+  cluster_menu <<< '1' >/dev/null
+  [[ $calls == $'install\nmenu\n' ]]
+)
+
+(
   load_function visit_monitor_ui
   visit_monitor_enabled() { return 1; }
   visit_monitor_activity_ui() { record activity; }
