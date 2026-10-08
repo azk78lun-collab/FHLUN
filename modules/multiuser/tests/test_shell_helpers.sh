@@ -222,7 +222,7 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.10.10' "$SCRIPT"
+grep -q '当前版本：V26.8.10.11' "$SCRIPT"
 grep -q '^lun_update_target(){' "$SCRIPT"
 grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
 grep -q '一键更新所有 VPS 代理脚本' "$SCRIPT"
@@ -243,8 +243,8 @@ grep -q 'apk add --no-cache bash busybox-extras curl gcompat' "$SCRIPT"
 grep -q 'apt install -y busybox coreutils curl util-linux' "$SCRIPT"
 grep -q '7. %s网站访问监控%s' "$SCRIPT"
 grep -q '8. %s分布式服务器集群%s' "$SCRIPT"
-grep -q '9. %s使用说明 / 协议特点%s' "$SCRIPT"
-grep -q '7. %s刷新并查看聚合订阅%s' "$SCRIPT"
+grep -q '9. 使用说明 / 协议特点' "$SCRIPT"
+grep -q '3. %s刷新并查看聚合订阅%s' "$SCRIPT"
 grep -q '4444-80' "$SCRIPT"
 grep -q 'Lun Cloudflare 端口回源操作' "$SCRIPT"
 grep -q 'cluster-service-control' "$SCRIPT"
@@ -286,7 +286,7 @@ grep -q 'multiuser_clear_legacy_subscription_autostart' "$SCRIPT"
 ! grep -q '启用 / 修改保留时间' "$SCRIPT"
 grep -q '今日智能活动（过滤并合并）' "$SCRIPT"
 grep -q '今日原始连接明细' "$SCRIPT"
-grep -q '这里记录的是代理连接，不是浏览器点击历史' "$SCRIPT"
+grep -q '记录代理连接，不是浏览历史' "$SCRIPT"
 grep -q 'visit-recent --days 1 --limit 100 --view smart --noise auto' "$SCRIPT"
 grep -q 'visit-filter --mode standard' "$SCRIPT"
 ! grep -q '今日最近访问' "$SCRIPT"
@@ -430,5 +430,28 @@ cluster_links=$(cluster_show_subscription_links)
 [[ $cluster_links == *'http://77.90.28.162:52581/test-token/jhsub.txt'* ]]
 rm -rf "$HOME"
 HOME=$original_home
+
+# 清空记录仅接受显式回车；取消、其他文字和输入中断均不得执行清空。
+(
+  eval "$(extract_shell_function visit_monitor_maintenance_ui)"
+  LUN_RED= LUN_RESET=
+  ui_title() { :; }
+  visit_monitor_status_ui() { :; }
+  yellow_line() { :; }
+  red_line() { :; }
+  ui_pause() { :; }
+  clear_calls=0
+  multiuser_cmd() {
+    [[ $* == 'visit-clear --confirm CLEAR' ]]
+    clear_calls=$((clear_calls + 1))
+  }
+  visit_monitor_maintenance_ui <<< $'3\n\n0' > /dev/null
+  [[ $clear_calls -eq 1 ]]
+  clear_calls=0
+  visit_monitor_maintenance_ui <<< $'3\n0\n0' > /dev/null
+  visit_monitor_maintenance_ui <<< $'3\nwrong\n0' > /dev/null
+  visit_monitor_maintenance_ui < <(printf '3\n') > /dev/null
+  [[ $clear_calls -eq 0 ]]
+)
 
 echo "multi-user shell helper tests passed"

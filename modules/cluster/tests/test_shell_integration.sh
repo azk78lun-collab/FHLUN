@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.8.10.10'
+contains "$SCRIPT" '当前版本：V26.8.10.11'
 contains "$SCRIPT" '自动巡检：每天一次'
 contains "$SCRIPT" '"suspect": "疑似离线"'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
@@ -22,9 +22,14 @@ contains "$SCRIPT" 'cluster_existing_internal=$(cluster_config_value internal_po
 contains "$SCRIPT" '[ "$cluster_reuse_existing" != yes ]'
 
 MENU=$(section "$SCRIPT" cluster_federation_menu)
-printf '%s\n' "$MENU" | grep -Fq '生成加入地址' || fail 'federation menu missing join address'
+printf '%s\n' "$MENU" | grep -Fq '添加服务器' || fail 'federation menu missing add server entry'
 printf '%s\n' "$MENU" | grep -Fq '刷新并查看聚合订阅' || fail 'federation menu missing aggregate refresh'
-printf '%s\n' "$MENU" | grep -Fq '一键更新所有 VPS 代理脚本' || fail 'federation menu update label is unclear'
+printf '%s\n' "$MENU" | grep -Fq 'cluster_maintenance_ui' || fail 'federation menu missing maintenance entry'
+MAINTENANCE=$(section "$SCRIPT" cluster_maintenance_ui)
+printf '%s\n' "$MAINTENANCE" | grep -Fq '一键更新所有 VPS 代理脚本' || fail 'update label is unclear'
+printf '%s\n' "$MAINTENANCE" | grep -Fq 'cluster_cdn_sync_ui' || fail 'CDN sync is not in maintenance'
+ADD_SERVER=$(section "$SCRIPT" cluster_add_server_ui)
+printf '%s\n' "$ADD_SERVER" | grep -Fq 'federation-join-code' || fail 'join address creation is inaccessible'
 if printf '%s\n' "$MENU" | grep -Eq '角色互换|switch-master'; then
   fail 'federation menu still exposes legacy roles'
 fi

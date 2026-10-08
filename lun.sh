@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.10.10"
+echo "当前版本：V26.8.10.11"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -5022,10 +5022,21 @@ return 1
 cluster_update_all_ui(){
 ui_title "Lun 一键更新所有 VPS 代理脚本"
 cluster_show_nodes || return 1
-yellow_line "本机先从官方 main 检查一次更新；随后复用本机脚本，通过 mTLS 推送给全部已信任 API v3 成员。"
+echo " 1. 下发本机当前版本（默认，适合已审查的预览版）"
+echo " 2. 先从 GitHub 更新本机，再下发"
+echo " 0. 返回"
+printf "更新来源 [回车为 1，输入 0 返回]："
+IFS= read -r cluster_update_origin || return 2
+case "$cluster_update_origin" in
+""|1) cluster_update_origin=local ;;
+2) cluster_update_origin=official ;;
+0) return 2 ;;
+*) red_line "请输入 1 或 2，或输入 0 返回。"; return 1 ;;
+esac
+yellow_line "通过 mTLS 下发同一份本机脚本；默认不访问 GitHub，不会覆盖尚未发布的本机版本。"
 yellow_line "远端服务器不再分别访问 GitHub；脚本和联动程序均执行语法、SHA-256 与原子替换校验。"
 printf "排除的服务器编号（多个用空格或逗号分隔；回车不排除；输入 0 返回）："
-IFS= read -r cluster_update_exclude
+IFS= read -r cluster_update_exclude || return 2
 [ "$cluster_update_exclude" = 0 ] && return 2
 cluster_auto_exclude=$(cluster_untrusted_member_numbers | tr '\n' ',' | sed 's/,$//')
 if [ -n "$cluster_auto_exclude" ]; then
@@ -5033,7 +5044,7 @@ yellow_line "以下旧/撤销/禁止连接记录将自动排除：$cluster_auto_
 cluster_update_exclude="${cluster_update_exclude:+$cluster_update_exclude,}$cluster_auto_exclude"
 fi
 
-if ! update_lun_script; then
+if [ "$cluster_update_origin" = official ] && ! update_lun_script; then
 red_line "本机主脚本未能更新，已停止集群推送。"
 return 1
 fi
@@ -5208,9 +5219,9 @@ ui_pause
 }
 
 cluster_batch_action_ui(){
-ui_title "Lun 批量配置（金丝雀）"
+ui_title "Lun 批量操作"
 cluster_show_nodes
-yellow_line "第一台为金丝雀；只有它成功后才会继续，其余最多 3 台并行。"
+yellow_line "先在第一台试运行，成功后继续处理其余服务器（最多 3 台并行）；失败停止并回滚。"
 printf "成员节点 ID（多个用空格或逗号分隔，输入 0 返回）："
 IFS= read -r cluster_node_ids
 [ "$cluster_node_ids" = 0 ] && return
@@ -5387,47 +5398,105 @@ green_line "本机联邦控制面已停用；单用户订阅已恢复为原 Busy
 fi
 }
 
+cluster_server_management_ui(){
+while :; do
+ui_title "Lun 服务器管理"
+cluster_show_nodes
+echo " 1. 配置单台服务器"
+echo " 2. 批量操作（先试一台）"
+echo " 3. 修改地区"
+echo " 4. 移除 / 撤销成员"
+echo " 0. 返回"
+printf "请选择 [0-4]（输入 0 返回）："
+IFS= read -r cluster_manage_choice || return
+case "$cluster_manage_choice" in
+1) cluster_node_action_ui ;;
+2) cluster_batch_action_ui ;;
+3) cluster_location_ui; ui_pause ;;
+4) cluster_remove_member_ui; ui_pause ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+cluster_add_server_ui(){
+while :; do
+ui_title "Lun 添加服务器"
+echo " 1. 生成本机加入地址，交给其它成员"
+echo " 2. 粘贴加入地址，添加成员"
+echo " 0. 返回"
+printf "请选择 [0-2]（输入 0 返回）："
+IFS= read -r cluster_add_choice || return
+case "$cluster_add_choice" in
+1) cluster_cmd federation-join-code; ui_pause ;;
+2) cluster_join_ui; ui_pause ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+cluster_maintenance_ui(){
+while :; do
+ui_title "Lun 更新与维护"
+echo " 1. 一键更新所有 VPS 代理脚本"
+echo " 2. 同步 CDN 优选池"
+echo " 3. 状态 / 修复"
+echo " 4. 备份 / 恢复"
+echo " 0. 返回"
+printf "请选择 [0-4]（输入 0 返回）："
+IFS= read -r cluster_maintenance_choice || return
+case "$cluster_maintenance_choice" in
+1) cluster_update_all_ui; ui_pause ;;
+2) cluster_cdn_sync_ui; ui_pause ;;
+3) cluster_cmd endpoint-reconcile || true; cluster_cmd status; cluster_install_service; cluster_service_restart; restart_subscription_service; apply_lun_firewall_rules; ui_pause ;;
+4) cluster_backup_ui ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+cluster_settings_ui(){
+while :; do
+ui_title "Lun 集群设置"
+echo " 1. 用户 / 服务器授权"
+echo " 2. 停用本机集群（不卸载代理）"
+echo " 0. 返回"
+printf "请选择 [0-2]（输入 0 返回）："
+IFS= read -r cluster_settings_choice || return
+case "$cluster_settings_choice" in
+1) cluster_assignment_ui ;;
+2) cluster_disable_ui; ui_pause; cluster_enabled || return ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
 cluster_federation_menu(){
 while :; do
 ui_title "Lun 分布式服务器集群"
 cluster_show_nodes
 echo "自动巡检：每天一次；连续失败并经成员复核后，自动剔除并同步订阅。"
 ui_dash
-echo " 1. 服务器总览"
-echo " 2. 生成加入地址"
-echo " 3. 加入成员"
-echo " 4. 配置单台"
-echo " 5. 批量金丝雀"
-echo " 6. 立即按需同步"
-printf " 7. %s刷新并查看聚合订阅%s\n" "$LUN_GREEN" "$LUN_RESET"
-echo " 8. 用户 / 服务器授权"
-echo " 9. 地区设置"
-echo "10. CDN 优选池同步"
-echo "11. 联邦数据备份"
-echo "12. 本机完整身份备份 / 恢复"
-echo "13. 状态 / 修复"
-echo "14. 一键更新所有 VPS 代理脚本"
-echo "15. 移除 / 撤销成员"
-echo "16. 停用本机联邦"
+echo " 1. 服务器管理"
+echo " 2. 添加服务器"
+printf " 3. %s刷新并查看聚合订阅%s\n" "$LUN_CYAN" "$LUN_RESET"
+echo " 4. 同步成员状态"
+printf " 5. %s更新与维护%s\n" "$LUN_YELLOW" "$LUN_RESET"
+echo " 6. 集群设置"
 echo " 0. 返回"
-printf "请选择 [0-16]："
-IFS= read -r cluster_choice
-case "$cluster_choice" in
-1) cluster_show_nodes; ui_pause ;;
-2) cluster_cmd federation-join-code; ui_pause ;;
-3) cluster_join_ui; ui_pause ;;
-4) cluster_node_action_ui; ui_pause ;;
-5) cluster_batch_action_ui ;;
-6) cluster_sync_ui; ui_pause ;;
-7) cluster_show_subscription_links; ui_pause ;;
-8) cluster_assignment_ui ;;
-9) cluster_location_ui; ui_pause ;;
-10) cluster_cdn_sync_ui; ui_pause ;;
-11|12) cluster_backup_ui ;;
-13) cluster_cmd endpoint-reconcile || true; cluster_cmd status; cluster_install_service; cluster_service_restart; restart_subscription_service; apply_lun_firewall_rules; ui_pause ;;
-14) cluster_update_all_ui; ui_pause ;;
-15) cluster_remove_member_ui; ui_pause ;;
-16) cluster_disable_ui; ui_pause ;;
+printf "请选择 [0-6]（输入 0 返回）："
+IFS= read -r cluster_menu_choice || return
+case "$cluster_menu_choice" in
+1) cluster_server_management_ui ;;
+2) cluster_add_server_ui ;;
+3) cluster_show_subscription_links; ui_pause ;;
+4) cluster_sync_ui; ui_pause ;;
+5) cluster_maintenance_ui ;;
+6) cluster_settings_ui; cluster_enabled || return ;;
 0|"") return ;;
 *) echo "输入错误。" ;;
 esac
@@ -8874,15 +8943,15 @@ ui_dash
 }
 
 lun_menu_options(){
-echo " 1. 安装 / 协议管理"
-printf " 2. %s节点订阅分享%s\n" "$LUN_GREEN" "$LUN_RESET"
-echo " 3. 入口网络管理"
-echo " 4. 服务与更新"
-echo " 5. 高级设置"
-printf " 6. %s多用户管理%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 7. %s网站访问监控%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 8. %s分布式服务器集群%s\n" "$LUN_GREEN" "$LUN_RESET"
-printf " 9. %s使用说明 / 协议特点%s\n" "$LUN_YELLOW" "$LUN_RESET"
+printf " 1. %s安装 / 协议管理%s\n" "$LUN_CYAN" "$LUN_RESET"
+printf " 2. %s节点订阅分享%s\n" "$LUN_CYAN" "$LUN_RESET"
+printf " 3. %s入口网络管理%s\n" "$LUN_CYAN" "$LUN_RESET"
+printf " 4. %s服务与更新%s\n" "$LUN_YELLOW" "$LUN_RESET"
+printf " 5. %s高级设置%s\n" "$LUN_YELLOW" "$LUN_RESET"
+printf " 6. %s多用户管理%s\n" "$LUN_WHITE" "$LUN_RESET"
+printf " 7. %s网站访问监控%s\n" "$LUN_WHITE" "$LUN_RESET"
+printf " 8. %s分布式服务器集群%s\n" "$LUN_WHITE" "$LUN_RESET"
+echo " 9. 使用说明 / 协议特点"
 echo " 0. 退出"
 }
 
@@ -13877,47 +13946,127 @@ multiuser_cmd "$@" || return 1
 green_line "存储设置已保存。"
 }
 
+visit_monitor_activity_ui(){
+while :; do
+ui_title "Lun 代理活动查询"
+echo " 1. 今日智能活动（过滤并合并）"
+echo " 2. 今日原始连接明细"
+echo " 3. 按用户 / 设备 / 域名筛选"
+echo " 0. 返回"
+printf "请选择 [0-3]（输入 0 返回）："
+IFS= read -r visit_activity_choice || return 0
+case "$visit_activity_choice" in
+1) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100 --view smart --noise auto; ui_pause ;;
+2) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100 --view raw --noise show; ui_pause ;;
+3) multiuser_visit_filter_ui ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+visit_monitor_statistics_ui(){
+while :; do
+ui_title "Lun 网站监控统计汇总"
+echo " 1. 七天热门域名（过滤后）"
+echo " 2. 七天用户 / 设备活动汇总"
+echo " 0. 返回"
+printf "请选择 [0-2]（输入 0 返回）："
+IFS= read -r visit_statistics_choice || return 0
+case "$visit_statistics_choice" in
+1) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group domain --noise auto; ui_pause ;;
+2) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group user --noise auto; ui_pause ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+visit_monitor_control_ui(){
+while :; do
+ui_title "Lun 开启 / 停用网站监控"
+echo " 1. 一键开启 / 修复监控"
+echo " 2. 停用监控（保留已有记录）"
+echo " 0. 返回"
+printf "请选择 [0-2]（输入 0 返回）："
+IFS= read -r visit_control_choice || return 0
+case "$visit_control_choice" in
+1) visit_monitor_enable; ui_pause ;;
+2) visit_monitor_disable; ui_pause ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+visit_monitor_settings_ui(){
+while :; do
+ui_title "Lun 网站监控设置"
+echo " 1. 过滤与合并设置"
+echo " 2. 存储设置（明细 / 汇总保留期限）"
+echo " 0. 返回"
+printf "请选择 [0-2]（输入 0 返回）："
+IFS= read -r visit_settings_choice || return 0
+case "$visit_settings_choice" in
+1) visit_monitor_filter_ui ;;
+2) visit_monitor_storage_ui; ui_pause ;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+visit_monitor_maintenance_ui(){
+while :; do
+ui_title "Lun 网站监控维护与清理"
+echo " 1. 运行状态 / 自检"
+echo " 2. 立即采集"
+echo " 3. 清空全部连接记录"
+echo " 0. 返回"
+printf "请选择 [0-3]（输入 0 返回）："
+IFS= read -r visit_maintenance_choice || return 0
+case "$visit_maintenance_choice" in
+1) visit_monitor_status_ui; ui_pause ;;
+2) multiuser_cmd visit-collect; ui_pause ;;
+3)
+printf "%s此操作不可恢复。回车确认清空数据库访问记录和原始日志（输入 0 返回）：%s" "$LUN_RED" "$LUN_RESET"
+IFS= read -r mu_visit_clear || return 0
+[ "$mu_visit_clear" = 0 ] && continue
+[ -z "$mu_visit_clear" ] || { red_line "请直接回车确认，或输入 0 返回。"; ui_pause; continue; }
+multiuser_cmd visit-clear --confirm CLEAR
+ui_pause
+;;
+0|"") return ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
 visit_monitor_ui(){
 while :; do
 ui_title "Lun 网站访问监控"
-visit_monitor_status_ui
-yellow_line "这里记录的是代理连接，不是浏览器点击历史；不记录网页路径、查询参数或传输内容。"
-echo " 1. 一键开启 / 修复监控"
-echo " 2. 运行状态 / 自检"
-echo " 3. 今日智能活动（过滤并合并）"
-echo " 4. 今日原始连接明细"
-echo " 5. 七天热门域名（过滤后）"
-echo " 6. 七天用户 / 设备活动汇总"
-echo " 7. 按用户 / 设备 / 域名筛选"
-echo " 8. 过滤与合并设置"
-echo " 9. 立即采集"
-echo "10. 存储设置"
-echo "11. 清空全部连接记录"
-echo "12. 停用监控（保留已有记录）"
+if visit_monitor_enabled; then
+green_line "监控状态：已开启；原始明细与智能活动均可查询。"
+else
+echo "监控状态：未开启；已有记录仍可查询。"
+fi
+echo "记录代理连接，不是浏览历史；不记录网页路径、查询参数或传输内容。"
+echo " 1. 活动查询"
+echo " 2. 统计汇总"
+echo " 3. 开启 / 停用监控"
+printf " 4. %s监控设置%s\n" "$LUN_YELLOW" "$LUN_RESET"
+echo " 5. 维护与清理"
 echo " 0. 返回"
-printf "请选择 [0-12]（输入 0 返回）："
-IFS= read -r mu_choice
-case "$mu_choice" in
-1) visit_monitor_enable; ui_pause ;;
-2) visit_monitor_status_ui; ui_pause ;;
-3) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100 --view smart --noise auto; ui_pause ;;
-4) multiuser_visit_refresh; multiuser_cmd visit-recent --days 1 --limit 100 --view raw --noise show; ui_pause ;;
-5) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group domain --noise auto; ui_pause ;;
-6) multiuser_visit_refresh; multiuser_cmd visit-top --days 7 --limit 50 --group user --noise auto; ui_pause ;;
-7) multiuser_visit_filter_ui ;;
-8) visit_monitor_filter_ui ;;
-9) multiuser_cmd visit-collect; ui_pause ;;
-10) visit_monitor_storage_ui; ui_pause ;;
-11)
-printf "%s此操作不可恢复。输入 CLEAR 清空数据库访问记录和原始日志（输入 0 返回）：%s" "$LUN_RED" "$LUN_RESET"
-IFS= read -r mu_visit_clear
-[ "$mu_visit_clear" = 0 ] && continue
-multiuser_cmd visit-clear --confirm "$mu_visit_clear"
-ui_pause
-;;
-12) visit_monitor_disable; ui_pause ;;
+printf "请选择 [0-5]（输入 0 返回）："
+IFS= read -r visit_menu_choice || return 0
+case "$visit_menu_choice" in
+1) visit_monitor_activity_ui ;;
+2) visit_monitor_statistics_ui ;;
+3) visit_monitor_control_ui ;;
+4) visit_monitor_settings_ui ;;
+5) visit_monitor_maintenance_ui ;;
 0|"") return ;;
-*) echo "输入错误。" ;;
+*) red_line "输入错误。" ;;
 esac
 done
 }
