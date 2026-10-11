@@ -13,7 +13,7 @@ done
 for suite in modules/multiuser/tests modules/cluster/tests modules/cdnopt/tests tests; do
   python3 -B -m unittest discover -s "$suite" -p 'test_*.py' -v
 done
-for test in tests/test_menu_navigation.sh tests/test_banner.sh \
+for test in tests/test_startup_interpreter.sh tests/test_menu_navigation.sh tests/test_banner.sh \
     modules/cluster/tests/test_shell_integration.sh modules/cdnopt/tests/test_shell_integration.sh \
     modules/multiuser/tests/test_firewall_helpers.sh modules/multiuser/tests/test_nat_hopping.sh \
     modules/multiuser/tests/test_security_transaction.sh modules/multiuser/tests/test_bandwidth_ownership.sh \
