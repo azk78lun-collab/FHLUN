@@ -65,3 +65,28 @@ Linux 仍未完成验收：Windows 默认符号链接被模拟为复制，启用
 初次部署漏测直接执行入口：主脚本仍声明 `/bin/sh`，新 NAT 保护函数使用 Bash 数组及 here-string，Ubuntu dash 因而在菜单加载阶段报 `Syntax error: redirection unexpected`。`bash -n` 无法发现解释器选择错误。
 
 已仅将主脚本首行改为 `#!/usr/bin/env bash`，甲骨文实测其余行逐字节不变。新增 `tests/test_startup_interpreter.sh`，通过内核实际选择解释器的可执行文件验证 Bash 专用语法，并接入离线检查入口；本地入口及菜单回归通过。随后使用甲骨文真实 SSH PTY、sudo 登录环境直接执行 `/usr/bin/lun`，确认完整主菜单出现、预期模块标签存在，输入 `0` 正常退出且无语法错误。未推送 GitHub，未更新其他 VPS。
+
+## 自动续期与 HTTPS 订阅恢复：V26.10.11.2
+
+用户报告的聚合订阅失败不是成员未同步：聚合文件仍有 58 条有效节点，但服务已回落为 HTTP，客户端仍请求 HTTPS，产生 `WRONG_VERSION_NUMBER`。本机证书在 2026-09-27 过期；旧 ACME cron 有执行记录，却仍使用与 Nginx TCP 80 占用冲突的 standalone 配置，错误输出被丢弃，并且只登记 Nginx 安装路径，Lun 使用静态导入副本。
+
+- 每日 cron 改用 Lun 续期入口，加互斥锁、总时限、轮转日志和最近状态记录。到期前按 ACME 的续期时间签发，不每天重复申请。
+- 匹配且兼容的 Nginx 站点优先使用原生验证；已有 challenge location 时直接采用 standalone，避免 acme.sh 插入重复 location。甲骨文首次原生验证失败后保留所有服务正常状态，补齐兼容检测后通过 standalone 签发。
+- standalone 只暂停能映射到已知 systemd/OpenRC 服务的占用者，不强杀未知进程；记录恢复清单，成功、失败或超时均恢复原服务。恢复失败保留清单供重试，不假报成功。
+- ACME 保存的 pre/post/reload hooks 在以后自动续期时继续生效。验证结束先归还 TCP 80，再事务部署新证书；Lun 和旧 ACME 登记的 Nginx 路径同时更新。
+- 部署校验证书、私钥、域名、有效期、代理核心配置与运行服务。备份证书、元数据、订阅配置及文件权限/归属；失败回滚。只重载原来运行的服务，不启动原本关闭的核心。
+- 匹配域名且公开可信的证书恢复订阅 HTTPS；只修改 scheme 和证书路径，保留端口、域名、UUID、Token 及其他配置。每日失败部署可重试，但不会覆盖用户后来手动导入的非 ACME 证书模式。
+- 修复 IPv4 域名检测的 awk 兼容问题，避免旧版 mawk 将正常 A 记录显示为未设置。
+
+### 实际验收
+
+- `161.33.1.16` 已签发并安装 Let’s Encrypt YE2 证书，有效至 **2027-01-09 11:39:04 UTC**；Lun、ACME staging、Nginx 三处序列号一致。
+- 原 `oracle1.1223344.xyz:27260/.../jhsub.txt` 外部默认 TLS 校验通过，GET 返回 200、74,473 字节、58 条有效节点（55 VLESS、2 TUIC、1 Hysteria2）。无需更换订阅 Token。
+- Nginx 80/8443、Xray 2053/8880、订阅 27260、集群 32784 均保持；Nginx 配置和 Xray 配置哈希一致，服务正常。仅 Xray、Nginx、订阅服务因证书部署按需重载/重启。
+- 每日续期入口实际运行成功，状态 `0`，下次 ACME 续期时间为 2026-12-09；没有遗留端口租用、防火墙验证标记或证书事务目录。私钥权限为 600。
+- 真实 SSH PTY 直接运行 Lun，显示 `V26.10.11.2`，完整菜单正常，输入 0 正常退出。
+- 本地及甲骨文原生 Linux 的新增证书生命周期测试通过，覆盖端口归还、未知占用拒绝、恢复失败可重试、重复 cron、错误密钥拒绝、服务/订阅失败回滚、HTTPS 恢复、每日失败记录及手动证书保护。
+- 原生 Linux 离线回归：多用户 57、集群 80、CDN 16、Cloudflare/网络隔离 3，共 156 项 Python 检查通过；因未安装 Node 跳过的 2 项浏览器检查在本机补验通过。11 组 Shell 全部通过，包括此前 Windows 无法验收的原生符号链接用例。修正集群 Shell 测试遗留的旧版本号断言后补跑全部 Shell；未因测试给 VPS 安装 Node。
+- 初始回滚快照：`/root/lun-deploy-backups/acme-20261011-123539`；实际签发前快照：`/root/lun-deploy-backups/acme-20261011-123717`。快照仅 root 可读写。
+
+本轮未推送 GitHub，未修改其他 VPS。

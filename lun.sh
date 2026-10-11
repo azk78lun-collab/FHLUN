@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.10.11.1"
+echo "当前版本：V26.10.11.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1979,7 +1979,7 @@ host=$1
 {
 command -v dig >/dev/null 2>&1 && dig +short A "$host" 2>/dev/null
 getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}'
-} | awk '/^[0-9]+(\.[0-9]+){3}$/' | sort -u
+} | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u
 }
 
 resolve_domain_ipv6(){
@@ -2066,11 +2066,105 @@ apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
 }
 
 reload_runtime_after_cert(){
+local saved=$1 manager service
+while IFS='|' read -r manager service; do
+case "$manager:$service" in
+systemd:nginx) nginx -t >/dev/null 2>&1 && systemctl reload-or-restart nginx || return 1 ;;
+systemd:xr|systemd:sb|systemd:lun-agent) systemctl restart "$service" || return 1 ;;
+openrc:nginx) nginx -t >/dev/null 2>&1 && rc-service nginx restart || return 1 ;;
+openrc:xray|openrc:sing-box|openrc:lun-agent) rc-service "$service" restart || return 1 ;;
+*) return 1 ;;
+esac
+done < "$saved"
+}
+
+acme_http_owner_service(){
+local pid=$1 service exe
 if pidof systemd >/dev/null 2>&1; then
-systemctl try-restart xr sb >/dev/null 2>&1 || true
+for service in nginx apache2 httpd caddy xr sb; do
+grep -Eq "/$service\\.service(/|$)" "/proc/$pid/cgroup" 2>/dev/null && { printf 'systemd|%s\n' "$service"; return; }
+done
 elif command -v rc-service >/dev/null 2>&1; then
-rc-service xray status >/dev/null 2>&1 && rc-service xray restart >/dev/null 2>&1 || true
-rc-service sing-box status >/dev/null 2>&1 && rc-service sing-box restart >/dev/null 2>&1 || true
+exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
+case "$exe" in
+*/nginx) service=nginx ;;
+*/apache2) service=apache2 ;;
+*/httpd) service=httpd ;;
+*/caddy) service=caddy ;;
+"$HOME/lun/xray") service=xray ;;
+"$HOME/lun/sing-box") service=sing-box ;;
+*) return 1 ;;
+esac
+rc-service "$service" status >/dev/null 2>&1 && { printf 'openrc|%s\n' "$service"; return; }
+fi
+return 1
+}
+
+acme_http_post(){
+local lease="$HOME/lun/.acme-http80" manager service failed=no
+if [ -f "$lease/services" ]; then
+while IFS='|' read -r manager service; do
+case "$manager:$service" in
+systemd:nginx|systemd:apache2|systemd:httpd|systemd:caddy|systemd:xr|systemd:sb)
+systemctl start "$service" || failed=yes ;;
+openrc:nginx|openrc:apache2|openrc:httpd|openrc:caddy|openrc:xray|openrc:sing-box)
+rc-service "$service" start || failed=yes ;;
+*) failed=yes ;;
+esac
+done < "$lease/services"
+[ "$failed" = no ] || { red_line "TCP 80 原服务恢复失败，状态保留在 $lease，请立即检查。"; return 1; }
+rm -f "$lease/services"
+rmdir "$lease" || return 1
+fi
+acme_challenge_firewall_close
+}
+
+acme_http_pre(){
+local method=${1:-standalone} lease="$HOME/lun/.acme-http80" owners pids pid identity manager service
+case "$method" in nginx|standalone) ;; *) return 1 ;; esac
+if [ "$method" = standalone ]; then
+command -v ss >/dev/null 2>&1 || { red_line "缺少 ss，无法安全确认 TCP 80 的占用者。"; return 1; }
+owners=$(ss -lntp 2>/dev/null | awk '$4 ~ /(^|\]|:)80$/ {print}')
+if [ -n "$owners" ]; then
+mkdir -m 700 "$lease" 2>/dev/null || { red_line "已有 TCP 80 租用事务，请先执行 lun cert-http-post 恢复。"; return 1; }
+: > "$lease/services"
+pids=$(printf '%s\n' "$owners" | grep -Eo 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+[ -n "$pids" ] || { rm -f "$lease/services"; rmdir "$lease"; red_line "无法识别 TCP 80 占用进程，未强制结束任何进程。"; return 1; }
+for pid in $pids; do
+identity=$(acme_http_owner_service "$pid") || {
+rm -f "$lease/services"; rmdir "$lease"
+red_line "TCP 80 由无法安全恢复的进程 $pid 占用，已拒绝强制结束。"
+return 1
+}
+grep -Fxq "$identity" "$lease/services" || printf '%s\n' "$identity" >> "$lease/services"
+done
+while IFS='|' read -r manager service; do
+yellow_line "证书验证临时借用 TCP 80：暂停 $service，结束后自动恢复。"
+[ "$service" != nginx ] || nginx -t >/dev/null 2>&1 || { acme_http_post; red_line "Nginx 配置无效，已拒绝暂停。"; return 1; }
+case "$manager" in
+systemd) systemctl stop "$service" || { acme_http_post; return 1; } ;;
+openrc) rc-service "$service" stop || { acme_http_post; return 1; } ;;
+esac
+done < "$lease/services"
+if ss -lnt 2>/dev/null | awk '$4 ~ /(^|\]|:)80$/ {found=1} END{exit !found}'; then
+acme_http_post
+red_line "TCP 80 仍被占用，已恢复原服务并停止申请。"
+return 1
+fi
+fi
+fi
+acme_challenge_firewall_open
+}
+
+acme_http_method(){
+local subject=$1 config
+if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1 && \
+config=$(nginx -T 2>&1) && printf '%s\n' "$config" | grep -F "$subject" >/dev/null && \
+! printf '%s\n' "$config" | grep -E '^[[:space:]]*location[^\{]*/\.well-known/acme-challenge' >/dev/null; then
+printf 'nginx\n'
+else
+# acme.sh --nginx injects its own challenge location; existing locations would conflict.
+printf 'standalone\n'
 fi
 }
 
@@ -2080,25 +2174,191 @@ stage_subject=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.
 printf '%s/lun/acme-live/%s\n' "$HOME" "$stage_subject"
 }
 
+ensure_lun_acme_cron(){
+local cli tmp
+command -v crontab >/dev/null 2>&1 || { red_line "缺少 crontab，无法设置每日自动续期。"; return 1; }
+if [ "$(id -u)" = 0 ]; then cli=/usr/bin/lun; else cli="$HOME/bin/lun"; fi
+tmp=$(mktemp) || return 1
+crontab -l > "$tmp" 2>/dev/null || : > "$tmp"
+python3 - "$tmp" "$HOME" "$cli" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]); home=sys.argv[2]; cli=sys.argv[3]
+lines=[s for s in p.read_text().splitlines() if not (
+ ('cert-renew-cron' in s and (cli in s or '/usr/bin/lun' in s)) or
+ ('--cron' in s and (home+'/.acme.sh/acme.sh' in s or '~/.acme.sh/acme.sh' in s)))]
+lines.append('0 0 * * * "'+cli+'" cert-renew-cron >/dev/null 2>&1')
+p.write_text('\n'.join(lines)+'\n')
+PY
+crontab "$tmp"; local rc=$?
+rm -f "$tmp"
+return "$rc"
+}
+
+acme_renew_cron(){
+(
+umask 077
+local log="$HOME/lun/acme_renew.log" rc=0 subject mode stage
+mkdir -p "$HOME/lun"
+exec 9> "$HOME/lun/.acme-renew.lock"
+flock -n 9 || exit 0
+[ ! -f "$log" ] || [ "$(wc -c < "$log")" -lt 1048576 ] || mv -f "$log" "$log.1"
+trap 'acme_http_post || exit 1' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+timeout 900 "$HOME/.acme.sh/acme.sh" --cron --home "$HOME/.acme.sh" >> "$log" 2>&1 || rc=$?
+# Retry a previously failed deployment even if ACME does not issue again today.
+subject=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
+mode=$(cat "$HOME/lun/cert_mode" 2>/dev/null)
+case "$mode" in domain|dns|ip)
+stage=$(acme_stage_dir "$subject")
+if [ -s "$stage/cert.crt" ] && [ -s "$stage/private.key" ] && \
+{ ! cmp -s "$stage/cert.crt" "$HOME/lun/cert.crt" || \
+[ "$(multiuser_config_value scheme)" = http ]; }; then
+deploy_acme_cert "$subject" "$mode" >> "$log" 2>&1 || rc=1
+fi
+;; esac
+acme_http_post >> "$log" 2>&1 || rc=1
+printf '%s status=%s\n' "$(date -u +%FT%TZ)" "$rc" > "$HOME/lun/acme_renew.status"
+exit "$rc"
+)
+}
+
+acme_preserve_nginx_target(){
+local subject=$1 stage=$2
+python3 - "$HOME/.acme.sh/${subject}_ecc/${subject}.conf" "$stage/nginx-targets.json" <<'PY'
+import pathlib,shlex,json,sys,os
+conf=pathlib.Path(sys.argv[1]); target=pathlib.Path(sys.argv[2])
+if target.exists() or not conf.is_file(): raise SystemExit(0)
+values={}
+for line in conf.read_text().splitlines():
+ key,sep,value=line.partition('=')
+ if sep and key in ('Le_RealKeyPath','Le_RealFullChainPath'):
+  parsed=shlex.split(value); values[key]=parsed[0] if parsed else ''
+paths=[values.get('Le_RealKeyPath',''),values.get('Le_RealFullChainPath','')]
+if all(p and pathlib.Path(p).is_file() and pathlib.Path(p).resolve().is_relative_to('/etc/nginx') for p in paths):
+ target.write_text(json.dumps(paths)+'\n'); os.chmod(target,0o600)
+PY
+}
+
 deploy_acme_cert(){
-subject=$1
-mode=$2
-stage=$(acme_stage_dir "$subject") || return 1
+(
+umask 077
+local subject=$1 mode=$2 stage txn service failed=no
+stage=$(acme_stage_dir "$subject") || exit 1
 [ -s "$stage/cert.crt" ] && [ -s "$stage/private.key" ] || return 1
 openssl x509 -in "$stage/cert.crt" -noout -checkend 0 >/dev/null 2>&1 || return 1
 cert_key_matches "$stage/cert.crt" "$stage/private.key" || return 1
 cert_covers_domain "$stage/cert.crt" "$subject" || return 1
-cp "$stage/private.key" "$HOME/lun/private.key.new" || return 1
-cp "$stage/cert.crt" "$HOME/lun/cert.crt.new" || { rm -f "$HOME/lun/private.key.new"; return 1; }
-chmod 600 "$HOME/lun/private.key.new"
-chmod 644 "$HOME/lun/cert.crt.new"
-mv -f "$HOME/lun/private.key.new" "$HOME/lun/private.key"
-mv -f "$HOME/lun/cert.crt.new" "$HOME/lun/cert.crt"
+exec 8> "$HOME/lun/.cert-deploy.lock"
+flock -w 30 8 || exit 1
+txn=$(mktemp -d "$HOME/lun/.cert-deploy.XXXXXX") || exit 1
+: > "$txn/services"
+if pidof systemd >/dev/null 2>&1; then
+for service in nginx xr sb lun-agent; do
+systemctl is-active --quiet "$service" && printf 'systemd|%s\n' "$service" >> "$txn/services"
+done
+elif command -v rc-service >/dev/null 2>&1; then
+for service in nginx xray sing-box lun-agent; do
+rc-service "$service" status >/dev/null 2>&1 && printf 'openrc|%s\n' "$service" >> "$txn/services"
+done
+fi
+acme_cert_transaction snapshot "$txn" "$stage" || { rm -rf "$txn"; exit 1; }
+trap 'if [ "$failed" != committed ]; then if acme_cert_transaction restore "$txn" "$stage" && reload_runtime_after_cert "$txn/services"; then red_line "证书部署或服务验证失败，已恢复部署前证书与订阅配置。"; else red_line "证书回滚未完成，请检查保留的事务快照：$txn"; exit 1; fi; fi; rm -rf "$txn"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+acme_cert_transaction install "$txn" "$stage" || exit 1
 printf '%s\n' "$mode" > "$HOME/lun/cert_mode"
 printf '%s\n' "$subject" > "$HOME/lun/cert_subject"
 rm -f "$HOME/lun/cert_source"
-cert_hash_update || return 1
-reload_runtime_after_cert
+cert_hash_update || exit 1
+[ ! -s "$HOME/lun/xr.json" ] || "$HOME/lun/xray" run -test -c "$HOME/lun/xr.json" >/dev/null 2>&1 || exit 1
+[ ! -s "$HOME/lun/sb.json" ] || "$HOME/lun/sing-box" check -c "$HOME/lun/sb.json" >/dev/null 2>&1 || exit 1
+if [ -s "$stage/nginx-targets.json" ]; then nginx -t >/dev/null 2>&1 || exit 1; fi
+local sub_host sub_config="$HOME/lun/modules/multiuser/config.json"
+sub_host=$(multiuser_config_value public_host)
+if [ -s "$sub_config" ] && [ -n "$sub_host" ] && cert_publicly_trusted_for_domain "$HOME/lun/cert.crt" "$sub_host"; then
+python3 - "$sub_config" "$HOME/lun" <<'PY'
+import json,pathlib,os,sys
+p=pathlib.Path(sys.argv[1]); c=json.loads(p.read_text()); root=pathlib.Path(sys.argv[2])
+c.update(scheme='https',certificate=str(root/'cert.crt'),private_key=str(root/'private.key'))
+temporary=p.with_suffix('.cert-new'); temporary.write_text(json.dumps(c,ensure_ascii=False,indent=2)+'\n')
+os.chmod(temporary,0o600); os.replace(temporary,p)
+PY
+fi
+reload_runtime_after_cert "$txn/services" || exit 1
+if grep -q '|lun-agent$' "$txn/services"; then
+acme_subscription_ready || exit 1
+fi
+failed=committed
+green_line "证书已更新到 Lun、现有 Nginx 及订阅服务；原端口和订阅 Token 不变。"
+)
+}
+
+acme_cert_transaction(){
+python3 - "$HOME/lun" "$1" "$2" "$3" <<'PY'
+import pathlib,json,shutil,os,tempfile,sys
+root=pathlib.Path(sys.argv[1]); action=sys.argv[2]; txn=pathlib.Path(sys.argv[3]); stage=pathlib.Path(sys.argv[4])
+targets=[]
+if (stage/'nginx-targets.json').exists():
+ targets=json.loads((stage/'nginx-targets.json').read_text())
+ if len(targets)!=2 or not all(pathlib.Path(p).is_absolute() and pathlib.Path(p).resolve().is_relative_to('/etc/nginx') for p in targets):
+  raise ValueError('Unsafe Nginx certificate target')
+manifest=txn/'manifest.json'
+def atomic_copy(source,target):
+ target=pathlib.Path(target); previous=target.stat() if target.exists() else None
+ mode=previous.st_mode&0o777 if previous else (0o600 if target.name.endswith('.key') else 0o644)
+ fd,name=tempfile.mkstemp(prefix='.lun-cert-',dir=target.parent); os.close(fd)
+ try:
+  shutil.copyfile(source,name); os.chmod(name,mode)
+  if previous and hasattr(os,'chown'): os.chown(name,previous.st_uid,previous.st_gid)
+  os.replace(name,target)
+ finally:
+  if os.path.exists(name): os.unlink(name)
+if action=='snapshot':
+ paths=[root/n for n in ('cert.crt','private.key','cert_mode','cert_subject','cert_source','SHA256.txt','modules/multiuser/config.json')]
+ paths.extend(pathlib.Path(p) for p in targets)
+ rows=[]
+ for i,p in enumerate(paths):
+  if p.is_symlink(): raise ValueError('Certificate targets must not be symbolic links')
+  row={'path':str(p),'existed':p.exists(),'backup':str(i)}
+  if p.exists():
+   info=p.stat(); row.update(mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid)
+  rows.append(row)
+  if p.exists(): shutil.copy2(p,txn/str(i))
+ manifest.write_text(json.dumps(rows))
+elif action=='restore':
+ for row in json.loads(manifest.read_text()):
+  p=pathlib.Path(row['path'])
+  if row['existed']:
+   atomic_copy(txn/row['backup'],p); os.chmod(p,row['mode'])
+   if hasattr(os,'chown'): os.chown(p,row['uid'],row['gid'])
+  else: p.unlink(missing_ok=True)
+elif action=='install':
+ atomic_copy(stage/'private.key',root/'private.key'); atomic_copy(stage/'cert.crt',root/'cert.crt')
+ os.chmod(root/'private.key',0o600)
+ if targets:
+  atomic_copy(stage/'private.key',targets[0]); atomic_copy(stage/'cert.crt',targets[1])
+else: raise ValueError('Unknown transaction action')
+PY
+}
+
+acme_subscription_ready(){
+python3 - "$HOME/lun/modules/multiuser/config.json" <<'PY'
+import json,socket,ssl,http.client,sys,time
+c=json.load(open(sys.argv[1])); last=None
+for attempt in range(10):
+ try:
+  raw=socket.create_connection(('127.0.0.1',int(c['port'])),timeout=3)
+  with raw:
+   connection=ssl.create_default_context().wrap_socket(raw,server_hostname=c['public_host']) if c['scheme']=='https' else raw
+   with connection:
+    connection.sendall(('HEAD /'+c['legacy_token']+'/jhsub.txt HTTP/1.1\r\nHost: '+c['public_host']+'\r\nConnection: close\r\n\r\n').encode())
+    response=http.client.HTTPResponse(connection); response.begin()
+    if response.status!=200: raise ValueError('Subscription HTTP status '+str(response.status))
+  break
+ except (OSError,ValueError) as exc: last=exc; time.sleep(0.3)
+else: raise SystemExit('Subscription health check failed: '+str(last))
+PY
 }
 
 install_acme_cert(){
@@ -2108,13 +2368,15 @@ acme="$HOME/.acme.sh/acme.sh"
 stage=$(acme_stage_dir "$subject") || return 1
 mkdir -p "$stage" || return 1
 chmod 700 "$stage"
-rm -f "$stage/private.key" "$stage/cert.crt"
-reload_cmd="if command -v lun >/dev/null 2>&1; then lun cert-deploy '$subject' '$mode' >/dev/null 2>&1 || true; fi"
+acme_preserve_nginx_target "$subject" "$stage" || return 1
+local cli
+if [ "$(id -u)" = 0 ]; then cli=/usr/bin/lun; else cli="$HOME/bin/lun"; fi
+reload_cmd="if [ \"\${LUN_ACME_INITIAL:-}\" != 1 ] && [ -x '$cli' ]; then '$cli' cert-deploy '$subject' '$mode'; fi"
 "$acme" --install-cert -d "$subject" --ecc \
 --key-file "$stage/private.key" \
 --fullchain-file "$stage/cert.crt" \
 --reloadcmd "$reload_cmd" >/dev/null 2>&1 || return 1
-deploy_acme_cert "$subject" "$mode"
+deploy_acme_cert "$subject" "$mode" && ensure_lun_acme_cron
 }
 
 acme_issued_artifacts_valid(){
@@ -2165,10 +2427,20 @@ local_public_ips | sed -n 1p
 }
 
 issue_acme_cert(){
-mode=$1
-subject=$2
+(
+local mode=$1 subject=$2 acme acme_log cli method rc force=() http_args=() pre_hook post_hook
 [ -z "$subject" ] && return 1
+printf '%s' "$subject" | grep -Eq '^[A-Za-z0-9.:_-]+$' || return 1
 ensure_acme_sh || return 1
+umask 077
+exec 9> "$HOME/lun/.acme-renew.lock"
+flock -w 30 9 || { red_line "已有证书申请/续期任务运行，请稍后重试。"; exit 1; }
+trap 'acme_http_post || exit 1' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+export LUN_ACME_INITIAL=1
+[ "${ACME_FORCE:-no}" != yes ] || force=(--force)
+if [ "$(id -u)" = 0 ]; then cli=/usr/bin/lun; else cli="$HOME/bin/lun"; fi
 acme="$HOME/.acme.sh/acme.sh"
 acme_log="$HOME/lun/acme_issue.log"
 : > "$acme_log"
@@ -2191,14 +2463,22 @@ if is_nat_mode && [ "$acme_listen" != --listen-v6 ] && [ "$(client_port 80)" != 
 echo "NAT VPS 的公网 TCP 80 未映射到内网 80，HTTP-01 无法验证。请保存 Cloudflare Token 后改用 DNS-01。"
 return 1
 fi
-if command -v ss >/dev/null 2>&1 && ss -lnt 2>/dev/null | awk '$4 ~ /(^|\]|:)80$/ {found=1} END{exit !found}'; then
-echo "TCP 80 已被占用，acme.sh standalone 无法启动。请先释放 80 端口，或改用 DNS API 证书。"
-return 1
+method=$(acme_http_method "$subject")
+if [ "$method" = nginx ]; then
+green_line "复用现有 Nginx 完成 HTTP-01 验证，不停止网站服务。"
+http_args=(--nginx)
+else
+http_args=(--standalone)
+[ -z "$acme_listen" ] || http_args+=("$acme_listen")
 fi
-echo "开始申请证书，验证监听：${acme_listen:-系统默认（IPv4/IPv6）}"
-acme_challenge_firewall_open
-if ! "$acme" --issue --server letsencrypt --keylength ec-256 -d "$subject" --standalone $acme_listen > "$acme_log" 2>&1; then
-acme_challenge_firewall_close
+pre_hook="[ \"\${LUN_ACME_INITIAL:-}\" = 1 ] || '$cli' cert-http-pre '$method'"
+post_hook="[ \"\${LUN_ACME_INITIAL:-}\" = 1 ] || '$cli' cert-http-post"
+acme_http_pre "$method" || return 1
+rc=0
+timeout 900 "$acme" --issue --server letsencrypt --keylength ec-256 -d "$subject" \
+"${http_args[@]}" "${force[@]}" --pre-hook "$pre_hook" --post-hook "$post_hook" > "$acme_log" 2>&1 || rc=$?
+acme_http_post || return 1
+if [ "$rc" != 0 ]; then
 if acme_issued_artifacts_valid "$subject"; then
 yellow_line "acme.sh 返回了兼容性警告，但签发产物校验有效，继续安装。"
 else
@@ -2208,13 +2488,13 @@ echo "完整日志：$acme_log"
 return 1
 fi
 fi
-acme_challenge_firewall_close
 ;;
 dns)
 [ -s "$HOME/lun/cert.env" ] && . "$HOME/lun/cert.env"
 [ -z "$acme_dns" ] && [ -s "$HOME/lun/acme_dns" ] && acme_dns=$(cat "$HOME/lun/acme_dns" 2>/dev/null)
 [ -n "$acme_dns" ] || return 1
-if ! "$acme" --issue --server letsencrypt --keylength ec-256 -d "$subject" --dns "$acme_dns" > "$acme_log" 2>&1; then
+if ! timeout 900 "$acme" --issue --server letsencrypt --keylength ec-256 -d "$subject" --dns "$acme_dns" \
+"${force[@]}" --pre-hook true --post-hook true > "$acme_log" 2>&1; then
 if acme_issued_artifacts_valid "$subject"; then
 yellow_line "acme.sh 返回了兼容性警告，但签发产物校验有效，继续安装。"
 else
@@ -2230,17 +2510,18 @@ ip_subject=$subject
 ip_subject=$(printf '%s' "$ip_subject" | sed 's/^\[//; s/\]$//')
 is_ip_literal "$ip_subject" || return 1
 case "$ip_subject" in *:*) acme_listen=--listen-v6 ;; *) acme_listen= ;; esac
-if command -v ss >/dev/null 2>&1 && ss -lnt 2>/dev/null | awk '$4 ~ /(^|\]|:)80$/ {found=1} END{exit !found}'; then
-echo "TCP 80 已被占用，IP 证书的 HTTP-01 验证无法启动。"
-return 1
-fi
 if is_nat_mode && [ -z "$acme_listen" ] && [ "$(client_port 80)" != 80 ]; then
 echo "NAT VPS 的公网 TCP 80 未映射到内网 80，IPv4 地址证书无法完成 HTTP-01 验证；优先使用直连 IPv6 或域名 DNS-01。"
 return 1
 fi
-acme_challenge_firewall_open
-if ! "$acme" --issue --server letsencrypt --keylength ec-256 --certificate-profile shortlived --days 4 -d "$ip_subject" --standalone $acme_listen > "$acme_log" 2>&1; then
-acme_challenge_firewall_close
+pre_hook="[ \"\${LUN_ACME_INITIAL:-}\" = 1 ] || '$cli' cert-http-pre standalone"
+post_hook="[ \"\${LUN_ACME_INITIAL:-}\" = 1 ] || '$cli' cert-http-post"
+acme_http_pre standalone || return 1
+rc=0
+timeout 900 "$acme" --issue --server letsencrypt --keylength ec-256 --certificate-profile shortlived --days 4 \
+-d "$ip_subject" --standalone $acme_listen "${force[@]}" --pre-hook "$pre_hook" --post-hook "$post_hook" > "$acme_log" 2>&1 || rc=$?
+acme_http_post || return 1
+if [ "$rc" != 0 ]; then
 if acme_issued_artifacts_valid "$ip_subject"; then
 yellow_line "acme.sh 无法解析短证书日期，但 Let’s Encrypt 签发产物校验有效，继续安装。"
 else
@@ -2250,12 +2531,12 @@ echo "完整日志：$acme_log"
 return 1
 fi
 fi
-acme_challenge_firewall_close
 subject="$ip_subject"
 ;;
 *) return 1 ;;
 esac
 install_acme_cert "$subject" "$mode"
+)
 }
 
 prepare_runtime_cert(){
@@ -12560,7 +12841,7 @@ red_line "IP 证书申请失败，现有证书未改动。"
 fi
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
-5) subject=$(cat "$HOME/lun/cert_subject" 2>/dev/null); if [ -n "$subject" ] && [ -x "$HOME/.acme.sh/acme.sh" ]; then "$HOME/.acme.sh/acme.sh" --renew -d "$subject" --ecc --force && install_acme_cert "$subject" "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" && echo "续期完成。"; else echo "当前没有可续期的 ACME 证书。"; fi; LUN_MENU_ACTION=list; ui_pause; return ;;
+5) subject=$(cat "$HOME/lun/cert_subject" 2>/dev/null); if [ -n "$subject" ] && [ -x "$HOME/.acme.sh/acme.sh" ]; then mode=$(cat "$HOME/lun/cert_mode" 2>/dev/null); [ "$mode" != ca ] || mode=domain; ACME_FORCE=yes issue_acme_cert "$mode" "$subject" && echo "续期完成。"; else echo "当前没有可续期的 ACME 证书。"; fi; LUN_MENU_ACTION=list; ui_pause; return ;;
 6) rm -f "$HOME/lun/cert.env" "$HOME/lun/acme_dns"; echo "DNS API 凭据已清除。"; ui_pause ;;
 7)
 find_certificates
@@ -14483,7 +14764,16 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "cert-deploy" ]; then
+if [ "$1" = "cert-http-pre" ]; then
+acme_http_pre "$2"
+exit $?
+elif [ "$1" = "cert-http-post" ]; then
+acme_http_post
+exit $?
+elif [ "$1" = "cert-renew-cron" ]; then
+acme_renew_cron
+exit $?
+elif [ "$1" = "cert-deploy" ]; then
 [ "$(cat "$HOME/lun/cert_subject" 2>/dev/null)" = "$2" ] || exit 0
 [ "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" = "$3" ] || exit 0
 deploy_acme_cert "$2" "$3"
