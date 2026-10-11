@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 PROTOCOLS = (
     "vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"
 )
@@ -1635,20 +1635,72 @@ class Agent:
             os.chmod(stage / "module-config.json", 0o600)
             if self.generated.exists():
                 shutil.copytree(self.generated, stage / "generated")
-            atomic_write(stage / "state.json", json.dumps({"tokens": list(tokens), "files": files}))
+            atomic_write(stage / "state.json", json.dumps({
+                "tokens": list(tokens), "files": files, "services": self._security_service_states(),
+            }))
             os.replace(stage, self.security_pending)
+
+    def _security_service_states(self) -> dict[str, dict[str, Any]]:
+        if Path("/run/systemd/system").exists() and shutil.which("systemctl"):
+            manager, names = "systemd", {"xray": "xr", "singbox": "sb"}
+        elif shutil.which("rc-service"):
+            manager, names = "openrc", {"xray": "xray", "singbox": "sing-box"}
+        else:
+            return {}
+        states = {}
+        for core, filename in (("xray", "xr.json"), ("singbox", "sb.json")):
+            if not (self.root / filename).exists():
+                continue
+            command = (["systemctl", "is-active", names[core]] if manager == "systemd"
+                       else ["rc-service", names[core], "status"])
+            result = self._run(command, check=False)
+            if result.returncode not in ({0, 3, 4} if manager == "systemd" else {0, 1, 3}):
+                raise AgentError(f"无法记录 {core} 原服务状态，未修改用户")
+            states[core] = {"manager": manager, "active": result.returncode == 0}
+        return states
+
+    def _restore_security_services(self, changed: dict[str, bool], states: dict[str, Any]) -> None:
+        if not states:
+            self.restart_cores(changed)
+            return
+        errors = []
+        # Stop previously inactive cores first, even if another core cannot restart.
+        for core in ("xray", "singbox"):
+            before = states.get(core)
+            if not changed.get(core) or not before or before.get("active"):
+                continue
+            command = (["systemctl", "stop", "xr" if core == "xray" else "sb"]
+                       if before["manager"] == "systemd" else
+                       ["rc-service", "xray" if core == "xray" else "sing-box", "stop"])
+            try:
+                self._run(command)
+            except AgentError as exc:
+                errors.append(str(exc))
+        restart = {core: bool(touched and states.get(core, {}).get("active", True))
+                   for core, touched in changed.items()}
+        try:
+            self.restart_cores(restart)
+        except AgentError as exc:
+            errors.append(str(exc))
+        if errors:
+            raise AgentError("原核心服务状态恢复失败：" + "；".join(errors))
 
     def _security_commit_locked(self) -> None:
         state = json.loads((self.security_pending / "state.json").read_text(encoding="utf-8"))
         state["committed"] = True
         atomic_write(self.security_pending / "state.json", json.dumps(state))
         self._replace_security_backups()
+        # Installation/visit rollback files can also contain the revoked credentials.
+        # A future installation creates fresh preinstall files before changing anything.
+        for backup in self.backups.glob("preinstall-*"):
+            if backup.is_file():
+                backup.unlink()
         for token in state["tokens"]:
             target = self.generated / token
             if re.fullmatch(r"[A-Za-z0-9_-]+", token) and target.exists():
                 shutil.rmtree(target)
-        for filename in ("previous-xr.json", "previous-sb.json"):
-            (self.generated / filename).unlink(missing_ok=True)
+        for backup in self.generated.glob("previous-*.json"):
+            backup.unlink(missing_ok=True)
         shutil.rmtree(self.security_pending)
 
     def security_commit(self) -> None:
@@ -1688,7 +1740,7 @@ class Agent:
         shutil.rmtree(self.generated, ignore_errors=True)
         if (pending / "generated").exists():
             shutil.copytree(pending / "generated", self.generated)
-        self.restart_cores(changed)
+        self._restore_security_services(changed, state.get("services", {}))
         shutil.rmtree(pending)
 
     def security_rollback(self) -> None:

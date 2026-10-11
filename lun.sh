@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.8.10.12"
+echo "当前版本：V26.10.11.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -7514,89 +7514,6 @@ unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an por
 [ -n "${warp:-}" ] && wap=yes || wap=
 }
 
-prompt_port(){
-label=$1
-var=$2
-printf "请输入 %s 端口，回车随机：" "$label"
-IFS= read -r val
-eval "export $var=\"\$val\""
-}
-
-pick_protocols(){
-echo "选择要启用的协议，可输入多个编号，例如：1 4 8"
-echo " 1. VLESS TCP Reality Vision"
-echo " 2. VLESS XHTTP Reality ENC"
-echo " 3. VLESS XHTTP ENC"
-echo " 4. VLESS WS ENC"
-echo " 5. Shadowsocks-2022"
-echo " 6. AnyTLS"
-echo " 7. Any-Reality"
-echo " 8. VMess WS"
-echo " 9. Socks5"
-echo "10. Hysteria2"
-echo "11. TUIC"
-echo "12. VLESS XHTTP TLS UDP"
-echo "13. VLESS XHTTP TLS TCP/UDP"
-echo "14. NaiveProxy H2/H3（需公开可信证书）"
-printf "协议编号："
-IFS= read -r picks
-[ -z "$picks" ] && picks=1
-for pick in $picks; do
-case "$pick" in
-1) prompt_port "VLESS TCP Reality" vlpt ;;
-2) prompt_port "VLESS XHTTP Reality" xhpt ;;
-3) prompt_port "VLESS XHTTP" vxpt ;;
-4) prompt_port "VLESS WS" vwpt ;;
-5) prompt_port "Shadowsocks-2022" sspt ;;
-6) prompt_port "AnyTLS" anpt ;;
-7) prompt_port "Any-Reality" arpt ;;
-8) prompt_port "VMess WS" vmpt ;;
-9) prompt_port "Socks5" sopt ;;
-10) prompt_port "Hysteria2" hypt ;;
-11) prompt_port "TUIC" tupt ;;
-12) prompt_port "VLESS XHTTP TLS UDP" xupt ;;
-13) prompt_port "VLESS XHTTP TLS TCP/UDP" xcpt ;;
-14) prompt_port "NaiveProxy H2/H3" nvpt ;;
-*) echo "忽略未知协议编号：$pick" ;;
-esac
-done
-printf "是否启用 Argo 隧道？输入 vmpt/vwpt，回车不启用："
-IFS= read -r menu_argo
-case "$menu_argo" in vmpt|vwpt) export argo="$menu_argo" ;; esac
-printf "服务器管理备注（不加入节点名称），回车不设置："
-IFS= read -r menu_name
-[ -n "$menu_name" ] && export name="$menu_name"
-refresh_protocol_flags
-}
-
-configure_addym_menu(){
-while :; do
-echo "自定义普通节点客户端地址 addym"
-echo "说明：只改普通节点 address/server/add，不改 Reality SNI、WS/XHTTP Host、Argo 地址。"
-printf "请输入域名或 IP；输入 del 清除；回车保留当前值；0 返回："
-IFS= read -r menu_addym
-[ "$menu_addym" = "0" ] && return 2
-[ "$menu_addym" = "del" ] || [ "$menu_addym" = "none" ] && { addym=del; addout=off; load_addym_config; echo "addym 已清除。"; continue; }
-if [ -n "$menu_addym" ] && ! valid_addym "$menu_addym"; then
-echo "addym 格式不正确，不要带协议、端口或路径。"
-continue
-fi
-[ -n "$menu_addym" ] && addym="$menu_addym"
-echo "输出模式：1. off  2. replace  3. both"
-printf "请选择，回车默认 replace，0 返回："
-IFS= read -r menu_addout
-[ "$menu_addout" = "0" ] && return 2
-case "$menu_addout" in
-1) addout=off ;;
-2) [ -n "$addym" ] && addout=replace ;;
-3) addout=both ;;
-*) [ -n "$addym" ] && addout=replace ;;
-esac
-load_addym_config
-echo "addym/addout 设置已保存。"
-return 0
-done
-}
 
 lun_version_is_older(){
 awk -v candidate="$1" -v current="$2" 'BEGIN {
@@ -7721,38 +7638,6 @@ green_line "生效入口：$target"
 yellow_line "新版本将在下次运行 lun 时完全生效。"
 }
 
-lun_menu(){
-while :; do
-green_line "================================================================================"
-yellow_line "  Lun 风火轮多协议交互面板"
-green_line "================================================================================"
-cyan_line " 1. 安装 Lun / 新建协议"
-cyan_line " 2. 增删改协议变量组 (rep)"
-cyan_line " 3. 查看节点与订阅 (list)"
-cyan_line " 4. 设置自定义节点地址 addym/addout"
-cyan_line " 5. 重启 Lun 进程"
-cyan_line " 6. 更新 Xray 内核"
-cyan_line " 7. 更新 Sing-box 内核"
-cyan_line " 8. 更新本机 Lun 脚本"
-cyan_line " 9. 卸载 Lun"
-cyan_line " 0. 退出"
-printf "请输入数字【0-9】（%s回车退出%s）：" "$LUN_YELLOW" "$LUN_RESET"
-IFS= read -r menu_choice
-case "$menu_choice" in
-1) pick_protocols; LUN_MENU_ACTION=install; break ;;
-2) pick_protocols; LUN_MENU_ACTION=rep; break ;;
-3) LUN_MENU_ACTION=list; break ;;
-4) configure_addym_menu; [ -f "$HOME/lun/uuid" ] && LUN_MENU_ACTION=list || LUN_MENU_ACTION=exit; break ;;
-5) LUN_MENU_ACTION=res; break ;;
-6) LUN_MENU_ACTION=upx; break ;;
-7) LUN_MENU_ACTION=ups; break ;;
-8) update_lun_script; ui_pause ;;
-9) LUN_MENU_ACTION=del; break ;;
-0|"") exit ;;
-*) echo "输入错误，请重新选择。" ;;
-esac
-done
-}
 
 ui_line(){ printf '%s\n' "================================================================================"; }
 ui_dash(){ printf '%s\n' "--------------------------------------------------------------------------------"; }
@@ -11296,7 +11181,7 @@ cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
 mkdir -p "$cdnopt_dir" || return 1
 rm -f "$cdnopt_tmp"
-if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.4 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
+if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.5 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
 return 0
 fi
 if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
@@ -11339,7 +11224,7 @@ red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
 return 1
 }
 cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
-[ "$cdnopt_version" = 2.0.4 ] || {
+[ "$cdnopt_version" = 2.0.5 ] || {
 rm -f "$cdnopt_tmp"
 red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
 return 1
@@ -13503,13 +13388,24 @@ return 1
 }
 
 multiuser_security_transaction(){
-local mu_security_visit=no
-visit_monitor_enabled && mu_security_visit=yes
+local mu_security_visit=no mu_security_agent=no mu_security_autostart=no
+if ! grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null; then
+multiuser_download_agent || { red_line "安全操作需要新版多用户程序，更新失败，未修改用户。"; return 1; }
+grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null || {
+red_line "多用户程序版本过旧，未修改用户；请先更新模块后重试。"
+return 1
+ }
+fi
+lun_service_running lun-agent && mu_security_agent=yes
+lun_service_running lun-visit-monitor && mu_security_visit=yes
+lun_service_enabled lun-agent && mu_security_autostart=yes
 multiuser_service_stop
 visit_monitor_service_stop
 if multiuser_cmd --defer-security-commit "$@"; then
 if multiuser_service_start; then
 if multiuser_cmd security-commit; then
+[ "$mu_security_agent" = yes ] || multiuser_service_stop
+[ "$mu_security_autostart" = yes ] || lun_service_disable_autostart lun-agent
 [ "$mu_security_visit" != yes ] || visit_monitor_service_start || yellow_line "网站监控重启失败，请进入监控自检。"
 green_line "安全操作已生效，旧凭据与备份已清理。"
 if cluster_enabled && cluster_is_federation; then
@@ -13523,13 +13419,42 @@ return 1
 fi
 fi
 multiuser_service_stop
-if multiuser_cmd security-rollback && multiuser_service_start; then
+if multiuser_cmd security-rollback && { [ "$mu_security_agent" != yes ] || multiuser_service_start; }; then
+[ "$mu_security_autostart" = yes ] || lun_service_disable_autostart lun-agent
 green_line "本次安全操作已完整回滚，原凭据和订阅保持不变。"
 else
 red_line "安全操作回滚未完成，请立即检查核心服务和多用户诊断。"
 fi
 [ "$mu_security_visit" != yes ] || visit_monitor_service_start || yellow_line "网站监控重启失败，请进入监控自检。"
 return 1
+}
+
+lun_service_running(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-active --quiet "$1"
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service "$1" status >/dev/null 2>&1
+else
+return 1
+fi
+}
+
+lun_service_enabled(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-enabled --quiet "$1"
+elif command -v rc-update >/dev/null 2>&1; then
+rc-update show default 2>/dev/null | grep -qw "$1"
+else
+return 1
+fi
+}
+
+lun_service_disable_autostart(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl disable "$1" >/dev/null 2>&1 || yellow_line "原服务自启动状态未能恢复：$1"
+elif command -v rc-update >/dev/null 2>&1; then
+rc-update del "$1" default >/dev/null 2>&1 || yellow_line "原服务自启动状态未能恢复：$1"
+fi
 }
 
 multiuser_quota_g(){
@@ -13704,75 +13629,142 @@ command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1
 }
 
 multiuser_bandwidth_write_runner(){
+local mu_bw_runner
 mu_bw_runner=$(multiuser_bandwidth_runner)
-mu_bw_config=$(multiuser_bandwidth_config)
-cat > "$mu_bw_runner" <<EOF
+cat > "$mu_bw_runner" <<'EOF'
 #!/bin/sh
 set -u
-CONFIG="$mu_bw_config"
-[ -r "\$CONFIG" ] || { echo "动态公平带宽配置不存在" >&2; exit 1; }
-. "\$CONFIG"
-case "\${RATE_MBIT:-}" in ''|*[!0-9]*) echo "总带宽必须是整数 Mbit/s" >&2; exit 1 ;; esac
-[ "\$RATE_MBIT" -ge 1 ] 2>/dev/null && [ "\$RATE_MBIT" -le 100000 ] 2>/dev/null || { echo "总带宽范围应为 1-100000 Mbit/s" >&2; exit 1; }
-IFACE=\${INTERFACE:-auto}
-if [ "\$IFACE" = auto ]; then
-IFACE=\$(ip -4 route show default 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
-[ -n "\$IFACE" ] || IFACE=\$(ip -6 route show default 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
+CONFIG="$(dirname "$0")/bandwidth.conf"
+OWNED="${CONFIG}.owned"
+HANDLE=f1a0:
+OLD_IFACE= OLD_KIND= OLD_RATE= OLD_LIVE=no
+root_info(){
+tc qdisc show dev "$1" 2>/dev/null | awk '$4=="root" {print $2, $3; exit}'
+ }
+private_queue(){
+case "$(root_info "$1")" in "cake $HANDLE"|"htb $HANDLE") return 0 ;; *) return 1 ;; esac
+ }
+default_queue(){
+case "$(root_info "$1")" in "noqueue 0:"|"mq 0:"|"pfifo_fast 0:"|"fq_codel 0:"|"fq 0:") return 0 ;; *) return 1 ;; esac
+ }
+clear_private(){
+if private_queue "$1"; then
+tc qdisc del dev "$1" root handle "$HANDLE"
+elif default_queue "$1"; then
+return 0
+else
+echo "队列不属于 Lun，未删除：$1" >&2
+return 1
 fi
-case "\$IFACE" in ''|*[!A-Za-z0-9_.:-]*) echo "无法识别出口网卡" >&2; exit 1 ;; esac
-ip link show dev "\$IFACE" >/dev/null 2>&1 || { echo "出口网卡不存在：\$IFACE" >&2; exit 1; }
-MODE_FILE="\${CONFIG}.mode"
-case "\${1:-status}" in
+ }
+build_queue(){
+iface=$1 rate=$2 kind=${3:-auto}
+if [ "$kind" != htb ] && tc qdisc replace dev "$iface" root handle "$HANDLE" cake bandwidth "${rate}mbit" besteffort dual-dsthost 2>/dev/null; then
+NEW_KIND=cake
+return 0
+fi
+[ "$kind" != cake ] || return 1
+tc qdisc replace dev "$iface" root handle "$HANDLE" htb default 10 2>/dev/null &&
+tc class replace dev "$iface" parent "$HANDLE" classid f1a0:10 htb rate "${rate}mbit" ceil "${rate}mbit" 2>/dev/null &&
+tc qdisc replace dev "$iface" parent f1a0:10 handle f1a1: fq_codel 2>/dev/null || return 1
+NEW_KIND=htb
+ }
+rollback_queue(){
+if [ "$OLD_LIVE" = yes ] && [ "$OLD_IFACE" = "$IFACE" ]; then
+private_queue "$IFACE" && build_queue "$OLD_IFACE" "$OLD_RATE" "$OLD_KIND"
+else
+clear_private "$IFACE" || return 1
+if [ "$OLD_LIVE" = yes ] && [ "$OLD_IFACE" != "$IFACE" ]; then
+private_queue "$OLD_IFACE" || default_queue "$OLD_IFACE" || return 1
+build_queue "$OLD_IFACE" "$OLD_RATE" "$OLD_KIND" || return 1
+fi
+fi
+ }
+if [ -r "$OWNED" ]; then
+. "$OWNED"
+case "$OLD_IFACE" in ''|*[!A-Za-z0-9_.:-]*) echo "Lun 队列记录无效" >&2; exit 1 ;; esac
+case "$OLD_KIND" in cake|htb) ;; *) exit 1 ;; esac
+case "$OLD_RATE" in ''|*[!0-9]*) exit 1 ;; esac
+[ "$(root_info "$OLD_IFACE")" != "$OLD_KIND $HANDLE" ] || OLD_LIVE=yes
+fi
+case "${1:-status}" in
 apply)
-modprobe sch_cake >/dev/null 2>&1 || true
-if tc qdisc replace dev "\$IFACE" root cake bandwidth "\${RATE_MBIT}mbit" besteffort dual-dsthost 2>/dev/null; then
-printf '%s\n' cake > "\$MODE_FILE"
-echo "已启用 CAKE：\$IFACE / \${RATE_MBIT} Mbit/s"
-exit 0
+REQUEST_CONFIG=${2:-$CONFIG}
+[ -r "$REQUEST_CONFIG" ] || { echo "动态公平带宽配置不存在" >&2; exit 1; }
+. "$REQUEST_CONFIG"
+case "${RATE_MBIT:-}" in ''|*[!0-9]*) echo "总带宽必须是整数 Mbit/s" >&2; exit 1 ;; esac
+[ "$RATE_MBIT" -ge 1 ] 2>/dev/null && [ "$RATE_MBIT" -le 100000 ] 2>/dev/null || exit 1
+IFACE=${INTERFACE:-auto}
+if [ "$IFACE" = auto ]; then
+IFACE=$(ip -4 route show default 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+[ -n "$IFACE" ] || IFACE=$(ip -6 route show default 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 fi
-tc qdisc del dev "\$IFACE" root >/dev/null 2>&1 || true
-if tc qdisc add dev "\$IFACE" root handle 1: htb default 10 2>/dev/null && \
-tc class add dev "\$IFACE" parent 1: classid 1:10 htb rate "\${RATE_MBIT}mbit" ceil "\${RATE_MBIT}mbit" 2>/dev/null && \
-tc qdisc add dev "\$IFACE" parent 1:10 handle 10: fq_codel 2>/dev/null; then
-printf '%s\n' htb-fq_codel > "\$MODE_FILE"
-echo "已启用 HTB + FQ-CoDel：\$IFACE / \${RATE_MBIT} Mbit/s"
-exit 0
-fi
-tc qdisc del dev "\$IFACE" root >/dev/null 2>&1 || true
-rm -f "\$MODE_FILE"
-echo "CAKE 与 HTB + FQ-CoDel 均启用失败，已恢复系统默认队列" >&2
+case "$IFACE" in ''|*[!A-Za-z0-9_.:-]*) echo "无法识别出口网卡" >&2; exit 1 ;; esac
+ip link show dev "$IFACE" >/dev/null 2>&1 || { echo "出口网卡不存在：$IFACE" >&2; exit 1; }
+if ! default_queue "$IFACE" && ! { [ "$OLD_LIVE" = yes ] && [ "$OLD_IFACE" = "$IFACE" ]; }; then
+echo "发现其他程序或旧版未标记的自定义队列，未覆盖：$IFACE" >&2
 exit 1
+fi
+modprobe sch_cake >/dev/null 2>&1 || true
+if ! build_queue "$IFACE" "$RATE_MBIT"; then
+rollback_queue || echo "Lun 队列回滚未完成，请立即检查" >&2
+echo "公平队列应用失败；旧配置未提交" >&2
+exit 1
+fi
+if [ "$OLD_LIVE" = yes ] && [ "$OLD_IFACE" != "$IFACE" ]; then
+if ! clear_private "$OLD_IFACE"; then
+rollback_queue || echo "Lun 队列回滚未完成，请立即检查" >&2
+exit 1
+fi
+fi
+TEMP="${OWNED}.tmp.$$"
+if ! { umask 077; printf 'OLD_IFACE=%s\nOLD_KIND=%s\nOLD_RATE=%s\n' "$IFACE" "$NEW_KIND" "$RATE_MBIT" > "$TEMP"; } ||
+! mv "$TEMP" "$OWNED"; then
+rm -f "$TEMP"
+rollback_queue || echo "Lun 队列回滚未完成，请立即检查" >&2
+exit 1
+fi
+printf '%s\n' "$NEW_KIND" > "${CONFIG}.mode" 2>/dev/null || true
+echo "已启用 Lun 公平队列：$IFACE / ${RATE_MBIT} Mbit/s"
 ;;
 clear)
-tc qdisc del dev "\$IFACE" root >/dev/null 2>&1 || true
-rm -f "\$MODE_FILE"
-echo "动态公平带宽已关闭：\$IFACE"
+if [ -r "$OWNED" ]; then
+if [ "$OLD_LIVE" = yes ]; then
+clear_private "$OLD_IFACE" || exit 1
+else
+echo "原 Lun 队列已不存在或被其他程序修改，未删除当前队列：$OLD_IFACE"
+fi
+rm -f "$OWNED" "${CONFIG}.mode"
+elif [ -r "${CONFIG}.mode" ]; then
+echo "旧版队列没有所有权标记，未自动删除；请核对后手动处理" >&2
+exit 1
+fi
+echo "动态公平带宽已关闭；只清理 Lun 所拥有的队列"
 ;;
 status)
-echo "出口网卡：\$IFACE"
-echo "总下载上限：\$RATE_MBIT Mbit/s"
-if command -v python3 >/dev/null 2>&1 && tc -j -s qdisc show dev "\$IFACE" >/dev/null 2>&1; then
-tc -j -s qdisc show dev "\$IFACE" | python3 -c '
+if [ -z "$OLD_IFACE" ]; then
+echo "未启用带所有权标记的 Lun 公平队列"
+exit 0
+fi
+IFACE=$OLD_IFACE
+echo "出口网卡：$IFACE"
+echo "总下载上限：$OLD_RATE Mbit/s"
+[ "$OLD_LIVE" = yes ] && echo "队列归属：Lun（已启用）" || echo "队列归属：未接管 / 已被其他程序修改"
+if command -v python3 >/dev/null 2>&1; then
+tc -j -s qdisc show dev "$IFACE" | python3 -c '
 import json, sys
 items = json.load(sys.stdin)
-root = next((item for item in items if item.get("root")), items[0] if items else {})
-kind = root.get("kind", "")
-labels = {
-    "cake": "CAKE 公平队列（已启用）",
-    "htb": "HTB 总量整形 + FQ-CoDel 公平队列（已启用）",
-    "fq_codel": "系统默认 FQ-CoDel（动态公平带宽未启用）",
-}
-print("调度算法：" + labels.get(kind, "未启用或无法识别"))
+root = next((item for item in items if item.get("root")), {})
+labels = {"cake": "CAKE 公平队列", "htb": "HTB 总量整形 + FQ-CoDel 公平队列"}
+print("调度算法：" + labels.get(root.get("kind"), "系统默认 / 其他队列"))
 print("累计发送：{} 字节 / {} 个数据包".format(int(root.get("bytes", 0)), int(root.get("packets", 0))))
 print("丢弃数据包：{}".format(int(root.get("drops", 0))))
 print("触发带宽整形：{} 次".format(int(root.get("overlimits", 0))))
 print("当前排队：{} 字节".format(int(root.get("backlog", 0))))
 ' 2>/dev/null || echo "调度状态：暂时无法读取"
-else
-echo "调度状态：当前系统不支持中文统计解析"
 fi
 ;;
-*) echo "用法：\$0 apply|clear|status" >&2; exit 2 ;;
+*) echo "用法：$0 apply [候选配置]|clear|status" >&2; exit 2 ;;
 esac
 EOF
 chmod 700 "$mu_bw_runner"
@@ -13834,40 +13826,76 @@ printf "出口网卡 [默认 %s，auto 自动识别]：" "$mu_bw_old_iface"
 IFS= read -r mu_bw_iface
 [ -n "$mu_bw_iface" ] || mu_bw_iface=$mu_bw_old_iface
 case "$mu_bw_iface" in *[!A-Za-z0-9_.:-]*|"") red_line "出口网卡名称无效。"; return 1 ;; esac
-cat > "$mu_bw_config" <<EOF
+mu_bw_candidate=$(mktemp "${mu_bw_config}.candidate.XXXXXX") || return 1
+mu_bw_previous=$(mktemp "${mu_bw_config}.previous.XXXXXX") || { rm -f "$mu_bw_candidate"; return 1; }
+mu_bw_had_config=no
+mu_bw_had_owner=no
+if [ -r "$mu_bw_config" ]; then
+cp -p "$mu_bw_config" "$mu_bw_previous" || { rm -f "$mu_bw_candidate" "$mu_bw_previous"; return 1; }
+mu_bw_had_config=yes
+fi
+[ ! -r "${mu_bw_config}.owned" ] || mu_bw_had_owner=yes
+if ! cat > "$mu_bw_candidate" <<EOF
 RATE_MBIT=$mu_bw_rate
 INTERFACE=$mu_bw_iface
 EOF
-chmod 600 "$mu_bw_config"
-multiuser_bandwidth_write_runner || return 1
-multiuser_bandwidth_install_service || return 1
-if pidof systemd >/dev/null 2>&1; then
-systemctl enable lun-fair-bandwidth >/dev/null 2>&1
-systemctl restart lun-fair-bandwidth || { red_line "动态公平带宽启动失败，已恢复系统默认队列。"; return 1; }
-else
-rc-update add lun-fair-bandwidth default >/dev/null 2>&1 || true
-rc-service lun-fair-bandwidth restart || { red_line "动态公平带宽启动失败，已恢复系统默认队列。"; return 1; }
+then
+rm -f "$mu_bw_candidate" "$mu_bw_previous"
+return 1
 fi
+chmod 600 "$mu_bw_candidate" || { rm -f "$mu_bw_candidate" "$mu_bw_previous"; return 1; }
+mu_bw_runner=$(multiuser_bandwidth_runner)
+if ! multiuser_bandwidth_write_runner || ! multiuser_bandwidth_install_service || ! "$mu_bw_runner" apply "$mu_bw_candidate"; then
+rm -f "$mu_bw_candidate" "$mu_bw_previous"
+red_line "动态公平带宽未启用，旧配置和其他队列保持不变。"
+return 1
+fi
+mu_bw_started=no
+if mv "$mu_bw_candidate" "$mu_bw_config"; then
+if pidof systemd >/dev/null 2>&1; then
+systemctl enable lun-fair-bandwidth >/dev/null 2>&1 && systemctl start lun-fair-bandwidth && mu_bw_started=yes
+else
+rc-update add lun-fair-bandwidth default >/dev/null 2>&1 && rc-service lun-fair-bandwidth start && mu_bw_started=yes
+fi
+fi
+if [ "$mu_bw_started" != yes ]; then
+if [ "$mu_bw_had_owner" = yes ] && [ "$mu_bw_had_config" = yes ]; then
+"$mu_bw_runner" apply "$mu_bw_previous" || red_line "旧 Lun 队列恢复失败，请立即检查。"
+else
+"$mu_bw_runner" clear || red_line "新 Lun 队列清理失败，请立即检查。"
+fi
+if [ "$mu_bw_had_config" = yes ]; then cp -p "$mu_bw_previous" "$mu_bw_config"; else rm -f "$mu_bw_config"; fi
+rm -f "$mu_bw_candidate" "$mu_bw_previous"
+red_line "带宽服务启动失败，已尝试恢复应用前配置。"
+return 1
+fi
+rm -f "$mu_bw_previous"
 green_line "动态公平带宽已启用：全机下载上限 ${mu_bw_rate} Mbit/s，空闲连接可借用剩余带宽。"
 }
 
 multiuser_bandwidth_disable(){
 mu_bw_runner=$(multiuser_bandwidth_runner)
+if [ -r "$(multiuser_bandwidth_config)" ] || [ -r "$(multiuser_bandwidth_config).owned" ]; then
+multiuser_bandwidth_write_runner || return 1
+fi
 if pidof systemd >/dev/null 2>&1; then
 systemctl disable --now lun-fair-bandwidth >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-fair-bandwidth stop >/dev/null 2>&1 || true
 rc-update del lun-fair-bandwidth default >/dev/null 2>&1 || true
 fi
-[ -x "$mu_bw_runner" ] && "$mu_bw_runner" clear >/dev/null 2>&1 || true
-green_line "动态公平带宽已关闭，出口队列已恢复系统默认设置。"
+if [ -x "$mu_bw_runner" ] && ! "$mu_bw_runner" clear; then
+yellow_line "未清理无法证明归属的旧队列；其他程序队列保持不变。"
+return 1
+fi
+green_line "动态公平带宽已关闭，仅移除 Lun 自己的队列。"
 }
 
 multiuser_bandwidth_remove(){
 multiuser_bandwidth_disable >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/lun-fair-bandwidth.service /etc/init.d/lun-fair-bandwidth
 pidof systemd >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
-rm -f "$(multiuser_bandwidth_runner)" "$(multiuser_bandwidth_config)" "$(multiuser_bandwidth_config).mode"
+rm -f "$(multiuser_bandwidth_runner)" "$(multiuser_bandwidth_config)" "$(multiuser_bandwidth_config).mode" "$(multiuser_bandwidth_config).owned"
 }
 
 multiuser_bandwidth_ui(){

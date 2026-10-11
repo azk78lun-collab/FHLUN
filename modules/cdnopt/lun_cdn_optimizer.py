@@ -32,7 +32,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATES = 4096
@@ -284,13 +284,26 @@ def _validate_measurements(measurements, candidates, path_name):
         minimum_speed = 0 if path_name == "client" else 0.000001
         if not 0 < latency <= 60000 or not minimum_speed <= speed <= 100000 or not 0 <= loss <= 100:
             continue
-        seen.add(address)
         candidate = allowed[address]
+        direct_only = path_name == "client" and bool(raw.get("direct_only"))
+        try:
+            test_port = int(raw.get("port") or candidate.get("port") or 443)
+            requested_port = int(raw.get("requested_port") or test_port)
+        except (ValueError, TypeError):
+            continue
+        if not 1 <= requested_port <= 65535 or not 1 <= test_port <= 65535:
+            continue
+        if direct_only and (test_port != 80 or speed != 0):
+            continue
+        seen.add(address)
         accepted.append({
             "ip": address,
             "ip_type": candidate["ip_type"],
             "source": candidate["source"],
-            "port": int(raw.get("port") or candidate.get("port") or 443),
+            "port": test_port,
+            "requested_port": requested_port,
+            "direct_only": direct_only,
+            "probe_protocol": "http" if direct_only else "https",
             "latency_ms": round(latency, 1),
             "speed_mbps": round(speed, 2),
             "loss_pct": round(loss, 1),
@@ -302,14 +315,40 @@ def _validate_measurements(measurements, candidates, path_name):
     return accepted
 
 
-def _tls_request(address, port, path, timeout, read_limit=0):
+def _tls_request(address, port, path, timeout, read_limit=0, *, cancel_event=None):
     started = time.monotonic()
+    deadline = started + timeout
     raw = tls = response = None
+    stopped, expired = threading.Event(), threading.Event()
+
+    def remaining():
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("cancelled")
+        left = deadline - time.monotonic()
+        if expired.is_set() or left <= 0:
+            raise TimeoutError("测速总耗时超过限制")
+        return left
+
+    def watch_deadline():
+        while not stopped.wait(0.05):
+            if time.monotonic() >= deadline or (cancel_event is not None and cancel_event.is_set()):
+                expired.set()
+                connection = tls or raw
+                if connection is not None:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                return
+
+    watchdog = threading.Thread(target=watch_deadline, name="cdn-deadline", daemon=True)
+    watchdog.start()
     try:
-        raw = socket.create_connection((address, port), timeout=timeout)
+        raw = socket.create_connection((address, port), timeout=remaining())
+        raw.settimeout(remaining())
         context = ssl.create_default_context()
         tls = context.wrap_socket(raw, server_hostname="speed.cloudflare.com")
-        tls.settimeout(timeout)
+        tls.settimeout(remaining())
         request = (
             f"GET {path} HTTP/1.1\r\nHost: speed.cloudflare.com\r\n"
             "User-Agent: Lun-CDN-Optimizer/2\r\nAccept: */*\r\nConnection: close\r\n\r\n"
@@ -317,13 +356,27 @@ def _tls_request(address, port, path, timeout, read_limit=0):
         tls.sendall(request)
         response = http.client.HTTPResponse(tls)
         response.begin()
+        remaining()
         header_elapsed = time.monotonic() - started
         if response.status != 200:
             raise OSError(f"HTTP {response.status}")
-        body = response.read(read_limit) if read_limit else b""
+        chunks, size = [], 0
+        while size < read_limit:
+            tls.settimeout(remaining())
+            chunk = response.read1(min(65536, read_limit - size))
+            remaining()
+            if not chunk:
+                if response.length:
+                    raise OSError("测速下载正文不完整")
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        body = b"".join(chunks)
         headers = {key.lower(): value for key, value in response.getheaders()}
         return header_elapsed, body, headers
     finally:
+        stopped.set()
+        watchdog.join(timeout=0.2)
         if response is not None:
             response.close()
         if tls is not None:
@@ -338,7 +391,8 @@ def _vps_probe_latency(candidate, port, timeout, attempts, cancel_event):
     for _ in range(attempts):
         if cancel_event.is_set():
             raise InterruptedError("cancelled")
-        elapsed, _, headers = _tls_request(candidate["ip"], port, "/__down?bytes=0", timeout)
+        elapsed, _, headers = _tls_request(candidate["ip"], port, "/__down?bytes=0", timeout,
+                                          cancel_event=cancel_event)
         values.append(elapsed * 1000)
     ray = headers.get("cf-ray", "")
     colo = ray.rsplit("-", 1)[-1] if "-" in ray else ""
@@ -350,7 +404,8 @@ def _vps_probe_speed(candidate, port, timeout, download_bytes, cancel_event):
         raise InterruptedError("cancelled")
     started = time.monotonic()
     _, body, headers = _tls_request(
-        candidate["ip"], port, f"/__down?bytes={download_bytes}", timeout, download_bytes
+        candidate["ip"], port, f"/__down?bytes={download_bytes}", timeout, download_bytes,
+        cancel_event=cancel_event,
     )
     elapsed = max(0.001, time.monotonic() - started)
     ray = headers.get("cf-ray", "")
@@ -493,7 +548,15 @@ const route=s=>location.pathname.replace(/\/$/,'')+'/'+s;
 const num=(id,min,max)=>{const n=Number($(id).value);if(!Number.isFinite(n)||n<min||n>max)throw Error(`${id} 参数超出范围`);return n};
 async function api(path,opt={}){const r=await fetch(route(path),{cache:'no-store',...opt});let d={};try{d=await r.json()}catch(e){}if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);return d}
 function post(path,data={}){return api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
-function abortable(url,ms,opt={}){const c=new AbortController(),timer=setTimeout(()=>c.abort(),ms);state.controllers.add(c);return fetch(url,{...opt,cache:'no-store',signal:c.signal}).finally(()=>{clearTimeout(timer);state.controllers.delete(c)})}
+async function abortable(url,ms,opt={},consume=null){
+  const c=new AbortController(),timer=setTimeout(()=>c.abort(),ms);state.controllers.add(c);
+  try{
+    const response=await fetch(url,{...opt,cache:'no-store',signal:c.signal});
+    const result=consume?await consume(response,c.signal):response;
+    if(c.signal.aborted)throw new DOMException('测试已取消或超时','AbortError');
+    return result;
+  }finally{clearTimeout(timer);state.controllers.delete(c);c.abort()}
+}
 async function pool(items,concurrency,fn,onProgress){let next=0,done=0;async function worker(){while(!state.cancelled){const i=next++;if(i>=items.length)return;await fn(items[i],i).catch(()=>{});done++;onProgress?.(done,items.length)}}await Promise.all(Array.from({length:Math.min(concurrency,items.length)},worker))}
 function settings(){return{limit:num('#limit',1,4096),top:num('#top',1,50),port:num('#port',-1,65535),latencyMax:num('#latencyMax',1,3000),speedMin:num('#speedMin',.1,10000),clientConcurrency:num('#clientConcurrency',1,32),vpsConcurrency:num('#vpsConcurrency',1,16),timeoutMs:num('#timeoutMs',100,10000),speedLimit:num('#speedLimit',1,100),downloadBytes:Math.round(num('#downloadMb',.1,20)*1e6),speedTimeout:num('#speedTimeout',2,30)}}
 function updateTraffic(){try{const s=settings(),mb=(s.speedLimit*s.downloadBytes/1e6).toFixed(0);$('#traffic').textContent=`预计上限：客户端约 ${mb} MB + VPS约 ${mb} MB；实际仅对低延迟候选测速。`}catch(e){}}
@@ -507,18 +570,56 @@ function probeUrl(c,helper,path,extra={}){const q=new URLSearchParams({_t:Date.n
 function directProbeUrl(c){const host=c.ip.includes(':')?`[${c.ip}]`:c.ip;return `http://${host}:80/cdn-cgi/trace?_t=${Date.now()}`}
 function metaIp(meta){return String(meta?.ip||meta?.clientIp||meta?.client_ip||'').trim()}
 function showClientIdentity(meta){const ip=metaIp(meta);if(!ip)throw Error('探测未返回客户端 IP');if(state.helperIp&&state.helperIp!==ip)throw Error(`客户端测速出口已从 ${state.helperIp} 变为 ${ip}`);state.helperIp=ip;state.clientIp=ip;state.clientMeta=meta;const place=[meta.country,meta.region,meta.city,meta.colo].filter(Boolean).join(' / ')||'地区未知';$('#clientIp').textContent=`${ip} / ${place}`;const pageIp=state.cfg.client_ip,org=meta.asOrganization||meta.org||'';$('#networkNotice').style.display='block';if(pageIp&&pageIp!==ip){$('#networkNotice').textContent=`页面连接 IP 是 ${pageIp}，实际测速出口是 ${ip}（浏览器可能使用代理或分流）。客户端榜记录 ${ip} 的线路结果。`}else{$('#networkNotice').textContent=`客户端测速出口已确认为 ${ip}${org?` · ${org}`:''}；客户端榜记录该出口的线路结果。`}return ip}
-async function chooseHelper(s){if(!state.candidates.length)throw Error('没有候选 IP');const preferred=localStorage.getItem('lun-cdnopt-helper'),ordered=preferred&&helpers.includes(preferred)?[preferred,...helpers.filter(x=>x!==preferred)]:helpers;const saved=new Set([...(state.cfg.current_ips||[]),...state.selected]);const candidates=[...state.candidates].sort((a,b)=>Number(saved.has(b.ip))-Number(saved.has(a.ip))).slice(0,Math.min(32,state.candidates.length));const attempts=[];for(const c of candidates)for(const helper of ordered)attempts.push({c,helper});for(let i=0;i<attempts.length;i+=s.clientConcurrency){const results=await Promise.allSettled(attempts.slice(i,i+s.clientConcurrency).map(async x=>{const r=await abortable(probeUrl(x.c,x.helper,'ip.json'),Math.max(1800,s.timeoutMs*3));if(!r.ok)throw Error('HTTP');return{...x,meta:await r.json()}})),winner=results.find(x=>x.status==='fulfilled')?.value;if(winner){showClientIdentity(winner.meta);state.helper=winner.helper;localStorage.setItem('lun-cdnopt-helper',winner.helper);return winner.helper}}throw Error('测速辅助域名被网络或浏览器拦截，已自动改用候选 IP 直连延迟测试')}
+async function chooseHelper(s){if(!state.candidates.length)throw Error('没有候选 IP');const preferred=localStorage.getItem('lun-cdnopt-helper'),ordered=preferred&&helpers.includes(preferred)?[preferred,...helpers.filter(x=>x!==preferred)]:helpers;const saved=new Set([...(state.cfg.current_ips||[]),...state.selected]);const candidates=[...state.candidates].sort((a,b)=>Number(saved.has(b.ip))-Number(saved.has(a.ip))).slice(0,Math.min(32,state.candidates.length));const attempts=[];for(const c of candidates)for(const helper of ordered)attempts.push({c,helper});for(let i=0;i<attempts.length;i+=s.clientConcurrency){if(state.cancelled)throw Error('cancelled');const results=await Promise.allSettled(attempts.slice(i,i+s.clientConcurrency).map(async x=>{const meta=await abortable(probeUrl(x.c,x.helper,'ip.json'),Math.max(1800,s.timeoutMs*3),{},async r=>{if(!r.ok)throw Error('HTTP');return r.json()});return{...x,meta}})),winner=results.find(x=>x.status==='fulfilled')?.value;if(winner){showClientIdentity(winner.meta);state.helper=winner.helper;localStorage.setItem('lun-cdnopt-helper',winner.helper);return winner.helper}}throw Error('测速辅助域名被网络或浏览器拦截，已自动改用候选 IP 直连延迟测试')}
 async function directLatency(c,ms){const started=performance.now();await abortable(directProbeUrl(c),ms,{mode:'no-cors',credentials:'omit',redirect:'manual'});return performance.now()-started}
-async function helperLatency(c,s){const ordered=state.helper?[state.helper,...helpers.filter(x=>x!==state.helper)]:helpers;for(const helper of ordered){try{const started=performance.now(),r=await abortable(probeUrl(c,helper,'ip.json'),Math.max(1800,s.timeoutMs*3));if(!r.ok)throw Error('HTTP');const meta=await r.json();showClientIdentity(meta);return{elapsed:performance.now()-started,meta,helper}}catch(e){}}throw Error('helper unavailable')}
-async function clientLatency(c,s){let ok=0,helperOk=0,failed=0,values=[],meta={},helper='';for(let i=0;i<3;i++){if(state.cancelled)throw Error('cancelled');try{if(state.helper){const hit=await helperLatency(c,s);values.push(hit.elapsed);meta=hit.meta;helper=hit.helper;helperOk++}else{values.push(await directLatency(c,Math.max(1200,s.timeoutMs*2)))}ok++}catch(e){try{values.push(await directLatency(c,Math.max(1200,s.timeoutMs*2)));ok++}catch(inner){failed++}}}if(!ok)throw Error('全部失败');values.sort((a,b)=>a-b);const directOnly=!helperOk;return{...c,port:candidatePort(c),latency_ms:values[Math.floor(values.length/2)],loss_pct:failed/3*100,speed_mbps:0,colo:meta.colo||'',country:meta.country||'',helper,direct_only:directOnly,status:directOnly?'直连可用·带宽未测':'延迟完成'}}
-async function clientSpeed(row,s){const helper=row.helper||state.helper;if(!helper)throw Error('没有可用带宽线路');const started=performance.now();let bytes=0;const r=await abortable(probeUrl(row,helper,'__down',{bytes:s.downloadBytes}),s.speedTimeout*1000);if(!r.ok)throw Error('HTTP');if(r.body?.getReader){const reader=r.body.getReader();while(true){const p=await reader.read();if(p.done)break;bytes+=p.value.byteLength}}else bytes=(await r.arrayBuffer()).byteLength;return{...row,speed_mbps:bytes*8/Math.max(.001,(performance.now()-started)/1000)/1e6,status:'完成'}}
-async function runClient(s){$('#clientStatus').textContent='客户端：并发检查测速线路…';state.clientIp=state.cfg.client_ip||state.clientIp;try{await chooseHelper(s)}catch(e){$('#clientStatus').innerHTML=`客户端：<span class="warn">${esc(e.message)}</span>`}const rows=new Map(state.candidates.map(c=>[c.ip,{...c,port:candidatePort(c),status:'等待'}]));state.client=[];const latency=[];await pool(state.candidates,s.clientConcurrency,async c=>{rows.set(c.ip,{...rows.get(c.ip),status:'延迟测试'});try{const r=await clientLatency(c,s);latency.push(r);rows.set(c.ip,r)}catch(e){rows.set(c.ip,{...rows.get(c.ip),status:'失败',loss_pct:100})}},(d,t)=>{$('#clientBar').style.width=`${d/t*70}%`;$('#clientStatus').textContent=`客户端：并发 ${s.clientConcurrency} · 延迟 ${d}/${t}`;if(d%10===0||d===t){state.client=[...rows.values()];renderList('client')}});if(state.cancelled)return;if(!latency.length)throw Error('浏览器未能直连任何候选 IP；请检查系统代理、广告拦截或本地防火墙');const finalists=latency.filter(x=>!x.direct_only&&x.latency_ms<=s.latencyMax).sort((a,b)=>a.latency_ms-b.latency_ms).slice(0,s.speedLimit);await pool(finalists,s.clientConcurrency,async row=>{rows.set(row.ip,{...row,status:'带宽测试'});try{rows.set(row.ip,await clientSpeed(row,s))}catch(e){rows.set(row.ip,{...row,status:'直连可用·带宽未测',speed_mbps:0})}},(d,t)=>{$('#clientBar').style.width=`${70+(t?d/t*30:30)}%`;$('#clientStatus').textContent=`客户端：并发 ${s.clientConcurrency} · 带宽 ${d}/${t}`;state.client=[...rows.values()];renderList('client')});state.client=[...rows.values()].filter(x=>x.latency_ms>0&&x.status!=='失败').sort((a,b)=>(b.speed_mbps||0)-(a.speed_mbps||0)||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client});if(!state.defaulted){const fast=state.client.filter(x=>x.latency_ms<=s.latencyMax&&x.speed_mbps>=s.speedMin),usable=fast.length?fast:state.client.filter(x=>x.latency_ms<=s.latencyMax).sort((a,b)=>a.latency_ms-b.latency_ms);usable.slice(0,s.top).forEach(x=>state.selected.add(x.ip));state.defaulted=true}const speedCount=state.client.filter(x=>x.speed_mbps>0).length,directCount=state.client.length-speedCount;$('#clientBar').style.width='100%';$('#clientStatus').textContent=`客户端：完成，带宽结果 ${speedCount} 个，直连延迟结果 ${directCount} 个（出口 ${state.clientIp}）`;renderAll()}
+async function helperLatency(c,s){const ordered=state.helper?[state.helper,...helpers.filter(x=>x!==state.helper)]:helpers;for(const helper of ordered){if(state.cancelled)throw Error('cancelled');try{const started=performance.now(),meta=await abortable(probeUrl(c,helper,'ip.json'),Math.max(1800,s.timeoutMs*3),{},async r=>{if(!r.ok)throw Error('HTTP');return r.json()});showClientIdentity(meta);return{elapsed:performance.now()-started,meta,helper}}catch(e){}}throw Error('helper unavailable')}
+async function clientLatency(c,s){
+  let values=[],directValues=[],meta={},helper='';
+  for(let i=0;i<3;i++){
+    if(state.cancelled)throw Error('cancelled');
+    try{
+      if(!state.helper)throw Error('helper unavailable');
+      const hit=await helperLatency(c,s);values.push(hit.elapsed);meta=hit.meta;helper=hit.helper;
+    }catch(e){
+      if(state.cancelled)throw e;
+      try{directValues.push(await directLatency(c,Math.max(1200,s.timeoutMs*2)))}catch(inner){}
+    }
+  }
+  const directOnly=!values.length,chosen=directOnly?directValues:values;
+  if(!chosen.length)throw Error('全部失败');
+  chosen.sort((a,b)=>a-b);
+  return{...c,requested_port:candidatePort(c),port:directOnly?80:candidatePort(c),
+    probe_protocol:directOnly?'http':'https',latency_ms:chosen[Math.floor(chosen.length/2)],
+    loss_pct:(3-chosen.length)/3*100,speed_mbps:0,colo:meta.colo||'',country:meta.country||'',
+    helper,direct_only:directOnly,status:directOnly?`HTTP 80 可达·HTTPS ${candidatePort(c)} 未验证`:'HTTPS延迟完成'};
+}
+async function clientSpeed(row,s){
+  const helper=row.helper||state.helper;if(!helper)throw Error('没有可用带宽线路');
+  const started=performance.now();let bytes=0;
+  await abortable(probeUrl(row,helper,'__down',{bytes:s.downloadBytes}),s.speedTimeout*1000,{},async(r,signal)=>{
+    if(!r.ok)throw Error('HTTP');
+    if(!r.body?.getReader)throw Error('浏览器不支持受限下载测速');
+    const reader=r.body.getReader(),cancel=()=>{reader.cancel().catch(()=>{})};
+    signal.addEventListener('abort',cancel,{once:true});
+    try{
+      while(bytes<s.downloadBytes){
+        const part=await reader.read();
+        if(signal.aborted)throw new DOMException('测试已取消或超时','AbortError');
+        if(part.done)break;
+        bytes+=Math.min(part.value.byteLength,s.downloadBytes-bytes);
+      }
+    }finally{signal.removeEventListener('abort',cancel);await reader.cancel().catch(()=>{})}
+  });
+  return{...row,speed_mbps:bytes*8/Math.max(.001,(performance.now()-started)/1000)/1e6,
+    direct_only:false,probe_protocol:'https',status:'测速完成'};
+}
+async function runClient(s){$('#clientStatus').textContent='客户端：并发检查测速线路…';state.clientIp=state.cfg.client_ip||state.clientIp;try{await chooseHelper(s)}catch(e){$('#clientStatus').innerHTML=`客户端：<span class="warn">${esc(e.message)}</span>`}const rows=new Map(state.candidates.map(c=>[c.ip,{...c,port:candidatePort(c),status:'等待'}]));state.client=[];const latency=[];await pool(state.candidates,s.clientConcurrency,async c=>{rows.set(c.ip,{...rows.get(c.ip),status:'延迟测试'});try{const r=await clientLatency(c,s);latency.push(r);rows.set(c.ip,r)}catch(e){rows.set(c.ip,{...rows.get(c.ip),status:'失败',loss_pct:100})}},(d,t)=>{$('#clientBar').style.width=`${d/t*70}%`;$('#clientStatus').textContent=`客户端：并发 ${s.clientConcurrency} · 延迟 ${d}/${t}`;if(d%10===0||d===t){state.client=[...rows.values()];renderList('client')}});if(state.cancelled)return;if(!latency.length)throw Error('浏览器未能直连任何候选 IP；请检查系统代理、广告拦截或本地防火墙');const finalists=latency.filter(x=>!x.direct_only&&x.latency_ms<=s.latencyMax).sort((a,b)=>a.latency_ms-b.latency_ms).slice(0,s.speedLimit);await pool(finalists,s.clientConcurrency,async row=>{rows.set(row.ip,{...row,status:'带宽测试'});try{rows.set(row.ip,await clientSpeed(row,s))}catch(e){rows.set(row.ip,{...row,status:'HTTPS延迟通过·带宽未测',speed_mbps:0})}},(d,t)=>{$('#clientBar').style.width=`${70+(t?d/t*30:30)}%`;$('#clientStatus').textContent=`客户端：并发 ${s.clientConcurrency} · 带宽 ${d}/${t}`;state.client=[...rows.values()];renderList('client')});state.client=[...rows.values()].filter(x=>x.latency_ms>0&&x.status!=='失败').sort((a,b)=>(b.speed_mbps||0)-(a.speed_mbps||0)||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client});if(!state.defaulted){const fast=state.client.filter(x=>x.latency_ms<=s.latencyMax&&x.speed_mbps>=s.speedMin),usable=fast.length?fast:state.client.filter(x=>x.latency_ms<=s.latencyMax).sort((a,b)=>a.latency_ms-b.latency_ms);usable.slice(0,s.top).forEach(x=>state.selected.add(x.ip));state.defaulted=true}const speedCount=state.client.filter(x=>x.speed_mbps>0).length,directCount=state.client.length-speedCount;$('#clientBar').style.width='100%';$('#clientStatus').textContent=`客户端：完成，带宽结果 ${speedCount} 个，仅延迟/HTTP探测结果 ${directCount} 个（出口 ${state.clientIp}）`;renderAll()}
 async function runVps(s){await post('vps-test/start',{port:s.port===-1?state.cfg.test_port:s.port,concurrency:s.vpsConcurrency,timeout_ms:s.timeoutMs,latency_max:s.latencyMax,speed_limit:s.speedLimit,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});while(!state.cancelled){const d=await api('vps-test/status');state.vps=d.results||[];state.vpsRows=d.rows||[];const pct=d.total?d.done/d.total*100:0;$('#vpsBar').style.width=`${pct}%`;$('#vpsStatus').textContent=`VPS：${d.stage} ${d.done}/${d.total}`;renderList('vps');if(['complete','failed','cancelled'].includes(d.state)){if(d.state==='failed')$('#vpsStatus').innerHTML=`VPS：<span class="bad">${esc(d.error||'失败')}</span>`;else if(d.state==='complete'){$('#vpsBar').style.width='100%';$('#vpsStatus').textContent=`VPS：完成，${state.vps.length} 个带宽结果`}return}await new Promise(r=>setTimeout(r,450))}}
 async function start(){let s;try{s=settings()}catch(e){setGlobal(e.message,'bad');return}state.cancelled=false;state.controllers.forEach(c=>c.abort());state.controllers.clear();state.client=[];state.vps=[];state.vpsRows=[];state.helper=null;state.helperIp=null;state.clientIp=state.cfg.client_ip||null;state.clientMeta=null;state.preview=null;$('#clientIp').textContent=state.clientIp?`${state.clientIp} / 页面连接`:'正在确认实际测速出口…';$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';$('#start').disabled=true;$('#stop').disabled=false;setGlobal(`双向测试运行中；客户端并发 ${s.clientConcurrency}，VPS 并发 ${s.vpsConcurrency}，两榜独立、不做隐藏加权。`);const results=await Promise.allSettled([runClient(s),runVps(s)]);if(!state.cancelled){const failures=results.filter(x=>x.status==='rejected');if(failures.length===2)setGlobal('客户端和 VPS 测试均失败，请检查网络与端口。','bad');else if(failures.length)setGlobal(`一侧测试失败：${failures[0].reason?.message||'未知错误'}；另一侧结果仍可选择。`,'warn');else setGlobal('双向测试完成，已勾选项保持不变，可跨榜继续选择。','ok')}$('#start').disabled=false;$('#stop').disabled=true;renderAll()}
 async function stop(){state.cancelled=true;state.controllers.forEach(c=>c.abort());state.controllers.clear();try{await post('vps-test/cancel',{})}catch(e){}$('#stop').disabled=true;$('#start').disabled=false;setGlobal('测试已停止；已有成功结果仍可使用。','warn')}
 function visibleRows(kind){const source=kind==='client'?state.client:(state.vps.length?state.vps:state.vpsRows);const search=$(`#${kind}Search`).value.toLowerCase(),family=$(`#${kind}Family`).value,sort=$(`#${kind}Sort`).value;return source.filter(x=>(!family||x.ip_type===family)&&(!search||`${x.ip} ${x.source} ${x.colo} ${x.country}`.toLowerCase().includes(search))).sort((a,b)=>sort==='latency'?(a.latency_ms||1e9)-(b.latency_ms||1e9):((b.speed_mbps||0)-(a.speed_mbps||0)||(a.latency_ms||1e9)-(b.latency_ms||1e9)))}
-function renderList(kind){const rows=visibleRows(kind),body=$(`#${kind}Rows`);if(!rows.length){body.innerHTML='<tr><td colspan="11" class="empty">暂无结果</td></tr>';return}body.innerHTML=rows.map(x=>{const checked=state.selected.has(x.ip),success=x.latency_ms>0&&x.status!=='失败',speed=x.speed_mbps>0;return `<tr class="${checked?'selected-row':''}"><td><input class="check result-check" data-ip="${esc(x.ip)}" type="checkbox" ${checked?'checked':''} ${success?'':'disabled'}></td><td class="ip">${esc(x.ip)}</td><td>${esc(x.ip_type)}</td><td title="${esc(x.source)}">${esc(x.source)}</td><td>${x.port||'-'}</td><td>${esc(x.colo||'-')}</td><td>${x.latency_ms?x.latency_ms.toFixed(0)+' ms':'-'}</td><td>${Number.isFinite(x.loss_pct)?x.loss_pct.toFixed(0)+'%':'-'}</td><td>${speed?x.speed_mbps.toFixed(1)+' Mbps':'未测'}</td><td class="status">${success?`<span class="pill">${speed?'测速成功':'直连可用'}</span>`:esc(x.status||'-')}</td><td><button class="retry" data-kind="${kind}" data-ip="${esc(x.ip)}">重测</button></td></tr>`}).join('');body.querySelectorAll('.result-check').forEach(el=>el.onchange=()=>{el.checked?state.selected.add(el.dataset.ip):state.selected.delete(el.dataset.ip);state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()});body.querySelectorAll('.retry').forEach(el=>el.onclick=()=>retryOne(el.dataset.kind,el.dataset.ip,el))}
-async function retryOne(kind,ip,button){const s=settings(),candidate=state.candidates.find(x=>x.ip===ip);if(!candidate)return;button.disabled=true;button.textContent='测试中';try{let result;if(kind==='client'){if(!state.helper)await chooseHelper(s).catch(()=>{});const latency=await clientLatency(candidate,s);result=latency.direct_only?latency:await clientSpeed(latency,s).catch(()=>({...latency,status:'直连可用·带宽未测'}));state.client=[...state.client.filter(x=>x.ip!==ip),result].sort((a,b)=>(b.speed_mbps||0)-(a.speed_mbps||0)||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client})}else{const d=await post('vps-test/retry',{ip,port:candidatePort(candidate),timeout_ms:s.timeoutMs,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});result=d.result;state.vps=[...state.vps.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms)}setGlobal(`${kind==='client'?'客户端':'VPS'}单项重测完成：${ip}`,'ok');state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none'}catch(e){setGlobal(`单项重测失败：${e.message}`,'bad')}renderAll()}
+function renderList(kind){const rows=visibleRows(kind),body=$(`#${kind}Rows`);if(!rows.length){body.innerHTML='<tr><td colspan="11" class="empty">暂无结果</td></tr>';return}body.innerHTML=rows.map(x=>{const checked=state.selected.has(x.ip),success=x.latency_ms>0&&x.status!=='失败',speed=x.speed_mbps>0;return `<tr class="${checked?'selected-row':''}"><td><input class="check result-check" data-ip="${esc(x.ip)}" type="checkbox" ${checked?'checked':''} ${success?'':'disabled'}></td><td class="ip">${esc(x.ip)}</td><td>${esc(x.ip_type)}</td><td title="${esc(x.source)}">${esc(x.source)}</td><td>${x.port||'-'}</td><td>${esc(x.colo||'-')}</td><td>${x.latency_ms?x.latency_ms.toFixed(0)+' ms':'-'}</td><td>${Number.isFinite(x.loss_pct)?x.loss_pct.toFixed(0)+'%':'-'}</td><td>${speed?x.speed_mbps.toFixed(1)+' Mbps':'未测'}</td><td class="status">${success?`<span class="pill">${x.direct_only?esc(x.status||'HTTP 80 可达·HTTPS未验证'):(speed?'测速成功':'HTTPS延迟通过')}</span>`:esc(x.status||'-')}</td><td><button class="retry" data-kind="${kind}" data-ip="${esc(x.ip)}">重测</button></td></tr>`}).join('');body.querySelectorAll('.result-check').forEach(el=>el.onchange=()=>{el.checked?state.selected.add(el.dataset.ip):state.selected.delete(el.dataset.ip);state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()});body.querySelectorAll('.retry').forEach(el=>el.onclick=()=>retryOne(el.dataset.kind,el.dataset.ip,el))}
+async function retryOne(kind,ip,button){const s=settings(),candidate=state.candidates.find(x=>x.ip===ip);if(!candidate)return;button.disabled=true;button.textContent='测试中';try{let result;if(kind==='client'){if(!state.helper)await chooseHelper(s).catch(()=>{});const latency=await clientLatency(candidate,s);result=latency.direct_only?latency:await clientSpeed(latency,s).catch(()=>({...latency,status:'HTTPS延迟通过·带宽未测'}));state.client=[...state.client.filter(x=>x.ip!==ip),result].sort((a,b)=>(b.speed_mbps||0)-(a.speed_mbps||0)||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client})}else{const d=await post('vps-test/retry',{ip,port:candidatePort(candidate),timeout_ms:s.timeoutMs,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});result=d.result;state.vps=[...state.vps.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms)}setGlobal(`${kind==='client'?'客户端':'VPS'}单项重测完成：${ip}`,'ok');state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none'}catch(e){setGlobal(`单项重测失败：${e.message}`,'bad')}renderAll()}
 function finalIps(){return new Set([...state.selected,...state.retained])}
 function renderSelected(){const root=$('#selectedIps'),ips=[...finalIps()];root.innerHTML=ips.length?ips.map(ip=>`<div class="diff-item"><code>${esc(ip)}</code><button class="remove-selected" data-ip="${esc(ip)}">取消</button></div>`).join(''):'<span class="muted">尚未选择</span>';root.querySelectorAll('.remove-selected').forEach(b=>b.onclick=()=>{state.selected.delete(b.dataset.ip);state.retained.delete(b.dataset.ip);state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()})}
 function renderAll(){renderList('client');renderList('vps');$('#selectedCount').textContent=finalIps().size;renderSelected()}

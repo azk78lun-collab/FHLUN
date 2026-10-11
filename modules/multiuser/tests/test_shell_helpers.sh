@@ -133,9 +133,13 @@ mkdir -p "$HOME/bin" "$update_test/path" "$update_test/system"
 printf '#!/usr/bin/env bash\n# V26.8.5.10\n' > "$HOME/bin/lun"
 printf '#!/usr/bin/env bash\n# V26.8.5.10\n' > "$update_test/system/lun"
 chmod +x "$HOME/bin/lun" "$update_test/system/lun"
-ln -s "$update_test/system/lun" "$update_test/path/lun"
 PATH="$update_test/path:$update_original_path"
-[[ $(lun_update_target) == "$update_test/system/lun" ]]
+if [[ ${LUN_TEST_SKIP_SYMLINK:-no} == yes ]]; then
+  printf 'SKIP: native symlink resolution (must be verified on Linux)\n'
+else
+  ln -s "$update_test/system/lun" "$update_test/path/lun"
+  [[ $(lun_update_target) == "$update_test/system/lun" ]]
+fi
 printf '#!/usr/bin/env bash\n# V26.8.8.3\nexit 0\n' > "$update_test/new-lun"
 lun_install_update_stage "$update_test/new-lun" "$update_test/system/lun"
 [[ $(lun_script_version "$update_test/system/lun") == V26.8.8.3 ]]
@@ -222,7 +226,7 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.8.10.12' "$SCRIPT"
+grep -q '当前版本：V26.10.11.1' "$SCRIPT"
 grep -q '^lun_update_target(){' "$SCRIPT"
 grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
 grep -q '一键更新所有 VPS 代理脚本' "$SCRIPT"

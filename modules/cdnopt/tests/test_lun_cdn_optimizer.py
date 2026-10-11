@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -27,8 +28,49 @@ class FakeResponse:
 
 
 class OptimizerTests(unittest.TestCase):
+    def test_browser_body_deadline_cancellation_port_labels_and_concurrency(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        result = subprocess.run([node, str(ROOT / "tests" / "test_browser_deadlines.js")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_vps_body_has_total_deadline_and_cancellation(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                interrupted, stop_reading = threading.Event(), threading.Event()
+                raw, tls, response = mock.Mock(), mock.Mock(), mock.Mock()
+                tls.shutdown.side_effect = lambda *_: stop_reading.set()
+                response.status, response.length = 200, 1024
+                response.read1.side_effect = lambda _size: (stop_reading.wait(1) and b"")
+                timer = threading.Timer(.03, interrupted.set) if cancel else None
+                if timer:
+                    timer.start()
+                started = time.monotonic()
+                with mock.patch.object(MOD.socket, "create_connection", return_value=raw), \
+                     mock.patch.object(MOD.ssl, "create_default_context") as context, \
+                     mock.patch.object(MOD.http.client, "HTTPResponse", return_value=response):
+                    context.return_value.wrap_socket.return_value = tls
+                    with self.assertRaises(InterruptedError if cancel else TimeoutError):
+                        MOD._tls_request("1.1.1.1", 443, "/__down", .08, 1024, cancel_event=interrupted)
+                if timer:
+                    timer.join()
+                self.assertLess(time.monotonic() - started, .4)
+                tls.close.assert_called_once()
+
+    def test_http_fallback_metadata_does_not_claim_https_or_bandwidth(self):
+        candidates = [{"ip": "1.1.1.1", "ip_type": "IPv4", "source": "fixture"}]
+        row = {"ip": "1.1.1.1", "port": 80, "requested_port": 8443,
+               "latency_ms": 10, "speed_mbps": 0, "direct_only": True}
+        accepted = MOD._validate_measurements([row], candidates, "client")
+        self.assertEqual(accepted[0]["probe_protocol"], "http")
+        self.assertEqual(accepted[0]["requested_port"], 8443)
+        self.assertTrue(accepted[0]["direct_only"])
+        self.assertEqual(MOD._validate_measurements([{**row, "speed_mbps": 10}], candidates, "client"), [])
+
     def test_version_and_page_expose_two_independent_boards(self):
-        self.assertEqual(MOD.VERSION, "2.0.4")
+        self.assertEqual(MOD.VERSION, "2.0.5")
         for marker in ('id="clientRows"', 'id="vpsRows"', 'id="preview"', 'id="manual"', '一键双向优选'):
             self.assertIn(marker, MOD.PAGE)
         self.assertIn("不做隐藏加权", MOD.PAGE)

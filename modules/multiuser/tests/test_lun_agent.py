@@ -914,6 +914,8 @@ rules:
 
     def test_security_mutations_roll_back_database_files_and_backups_on_validation_failure(self):
         device = self.add_user()
+        preinstall = self.agent.backups / "preinstall-xr.json"
+        preinstall.write_text(device["uuid"], encoding="utf-8")
         token_dir = self.agent.generated / device["token"]
         token_dir.mkdir(parents=True)
         (token_dir / "jhsub.txt").write_text("original", encoding="utf-8")
@@ -938,6 +940,7 @@ rules:
             self.assertEqual((token_dir / "jhsub.txt").read_text(), "original")
             self.assertEqual({path.name: path.read_bytes() for path in self.agent.backups.glob("db-*.sqlite3")}, backups)
             self.assertFalse(self.agent.security_pending.exists())
+            self.assertEqual(preinstall.read_text(), device["uuid"])
 
     def test_security_core_restart_failure_restores_old_identity(self):
         device = self.add_user()
@@ -952,8 +955,41 @@ rules:
         self.assertEqual(core.read_bytes(), original)
         self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], device["uuid"])
 
+    def test_security_rollback_restores_previously_stopped_core_service(self):
+        device = self.add_user()
+        core = self.root / "xr.json"
+        core.write_text(json.dumps({"inbounds": [{"tag": "reality-vision", "protocol": "vless",
+                                                 "settings": {"clients": [{"id": device["uuid"]}]}}]}))
+        original = core.read_bytes()
+        with mock.patch.object(self.agent, "_security_service_states", return_value={
+            "xray": {"manager": "systemd", "active": False}}), \
+             mock.patch.object(self.agent, "_validate_core"), \
+             mock.patch.object(self.agent, "_run") as run, \
+             mock.patch.object(self.agent, "restart_cores", side_effect=[
+                 lun_agent.AgentError("restart failed"), None, None]) as restart:
+            with self.assertRaisesRegex(lun_agent.AgentError, "已恢复"):
+                self.agent.rotate_device(device["id"], "phone")
+        run.assert_any_call(["systemctl", "stop", "xr"])
+        self.assertEqual(restart.call_args.args[0], {"xray": False, "singbox": False})
+        self.assertEqual(core.read_bytes(), original)
+        self.assertFalse(self.agent.security_pending.exists())
+
+    def test_security_snapshot_records_init_service_state(self):
+        def run(command, **_kwargs):
+            return lun_agent.subprocess.CompletedProcess(command, 0 if command[-1] == "xr" else 3, "", "")
+        with mock.patch.object(lun_agent.Path, "exists", return_value=True), \
+             mock.patch.object(lun_agent.shutil, "which", return_value="systemctl"), \
+             mock.patch.object(self.agent, "_run", side_effect=run):
+            states = self.agent._security_service_states()
+        self.assertEqual(states, {"xray": {"manager": "systemd", "active": True},
+                                  "singbox": {"manager": "systemd", "active": False}})
+
     def test_security_stage_survives_subscription_failure_and_can_commit_after_start(self):
         device = self.add_user()
+        preinstall = self.agent.backups / "preinstall-xr.json"
+        previous_visit = self.agent.generated / "previous-visit-xr.json"
+        preinstall.write_text(device["uuid"], encoding="utf-8")
+        previous_visit.write_text(device["uuid"], encoding="utf-8")
         old_backup = self.agent.backup_database()
         token_dir = self.agent.generated / device["token"]
         token_dir.mkdir(parents=True)
@@ -965,11 +1001,15 @@ rules:
         self.assertTrue(self.agent.security_pending.exists())
         self.agent.security_rollback()
         self.assertTrue(old_backup.exists())
+        self.assertTrue(preinstall.exists())
+        self.assertTrue(previous_visit.exists())
         self.assertFalse((self.agent.generated / rotated["token"]).exists())
         self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], device["uuid"])
         rotated = self.agent.rotate_device(device["id"], "phone")
         self.agent.security_commit()
         self.assertFalse(old_backup.exists())
+        self.assertFalse(preinstall.exists())
+        self.assertFalse(previous_visit.exists())
         self.assertFalse(token_dir.exists())
         self.assertFalse(self.agent.security_pending.exists())
         self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], rotated["uuid"])

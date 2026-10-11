@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/lun.sh"
+for helper in prompt_port pick_protocols configure_addym_menu lun_menu; do
+  [[ $(grep -c "^${helper}(){" "$SCRIPT") == 1 ]]
+done
 LUN_CYAN= LUN_YELLOW= LUN_RESET=
 ui_title() { :; }
 ui_dash() { :; }

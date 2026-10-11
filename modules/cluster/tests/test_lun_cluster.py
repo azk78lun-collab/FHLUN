@@ -693,6 +693,20 @@ class ClusterTestCase(unittest.TestCase):
                 self.cluster, {"request_id": "2" * 32, "action": "shell.run", "payload": {}}
             )
 
+    def test_action_http_replay_does_not_restart_the_service_again(self):
+        for replayed in (False, True):
+            handler = object.__new__(lun_cluster.ClusterHandler)
+            handler.server = type("Server", (), {"cluster": mock.Mock(), "restart_requested": False})()
+            handler.path = "/v1/action"
+            handler._body = mock.Mock(return_value={})
+            handler._require_peer = mock.Mock(return_value="a" * 32)
+            handler._reply = mock.Mock(return_value=True)
+            result = {"status": "success", "replayed": replayed, "result": {"restart_required": True}}
+            with mock.patch.object(lun_cluster, "execute_action", return_value=result):
+                handler.do_POST()
+            handler._reply.assert_called_once_with(200, {"ok": True, "result": result})
+            self.assertEqual(handler.server.restart_requested, not replayed)
+
     def test_action_replay_preserves_full_snapshot_result_and_never_reexecutes(self):
         self.cluster.save_config({"node_id": "a" * 32})
         request = {"request_id": "8" * 32, "action": "snapshot.create", "payload": {}}
@@ -1507,6 +1521,109 @@ class ClusterTestCase(unittest.TestCase):
             first.close()
             second.close()
 
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL is required')
+    def test_target_certificate_is_checked_before_http_request(self) -> None:
+        first = self._federation_cluster('pin-first', free_port())
+        second_port = free_port()
+        second = self._federation_cluster('pin-second', second_port)
+        third = self._federation_cluster('pin-third', free_port())
+        received = []
+        server = thread = None
+
+        class Handler(lun_cluster.http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_POST = do_GET
+
+            def log_message(self, *_):
+                pass
+
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            first.federation_register_peer(third.federation_public_bundle())
+            third.import_federation_bundle(first.federation_public_bundle(), allow_cluster_adopt=True)
+            second_id = second.load_config()['node_id']
+            third_id = third.load_config()['node_id']
+            # A trusted third member is deliberately served at the second member's address.
+            server = lun_cluster.ThreadingClusterServer(
+                ('127.0.0.1', second_port), Handler, lun_cluster.server_context(third))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            with self.assertRaisesRegex(lun_cluster.ClusterError, '身份不匹配'):
+                lun_cluster.mutual_request(first, '127.0.0.1', second_port, 'POST',
+                                           '/v1/action', {'action': 'lun.update'},
+                                           timeout=2, expected_node_id=second_id)
+            self.assertEqual(received, [])
+            self.assertTrue(lun_cluster.mutual_request(
+                first, '127.0.0.1', second_port, 'GET', '/v1/status',
+                timeout=2, expected_node_id=third_id)['ok'])
+            self.assertEqual(received, ['/v1/status'])
+        finally:
+            if server:
+                server.shutdown()
+                server.server_close()
+            if thread:
+                thread.join(timeout=3)
+            first.close()
+            second.close()
+            third.close()
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL is required')
+    def test_actions_sync_and_snapshot_delivery_use_ipv6_fallback(self) -> None:
+        first = self._federation_cluster('fallback-first', 27921)
+        second = self._federation_cluster('fallback-second', 27922)
+        try:
+            first.federation_register_peer(second.federation_public_bundle())
+            node_id = second.load_config()['node_id']
+            first.db.connection.execute(
+                'UPDATE nodes SET endpoint_host=?,endpoint_hosts=? WHERE id=?',
+                ('8.8.8.8', '["2001:4860:4860::8888","8.8.8.8"]', node_id))
+            first.db.connection.commit()
+
+            def request(_cluster, host, _port, method, path, body=None, **kwargs):
+                self.assertEqual(kwargs['expected_node_id'], node_id)
+                if host == '8.8.8.8':
+                    raise lun_cluster.FederationTransportError('IPv4 unreachable')
+                self.assertEqual(host, '2001:4860:4860::8888')
+                if path == '/v1/action':
+                    return {'ok': True, 'result': {'status': 'success', 'result': {'updated': True}}}
+                if method == 'GET':
+                    return {'ok': True, 'events': [], 'manifest': first.federation_manifest()}
+                return {'ok': True, 'accepted': 0}
+
+            with mock.patch.object(lun_cluster, 'mutual_request', side_effect=request) as transport:
+                action = lun_cluster.send_action(first, node_id, 'lun.update', {'fixture': True},
+                                                 coordinate_failures=False)
+                self.assertTrue(action['result']['updated'])
+                action_calls = transport.call_args_list[:]
+                self.assertEqual(action_calls[0].args[5], action_calls[1].args[5])
+                sync = lun_cluster.federation_sync(first, node_id, attempts=1, coordinate_failures=False)
+                self.assertEqual(sync['attempts'], 1)
+                delivered, failures = lun_cluster.deliver_federation_snapshots(first, [
+                    (node_id, {'status': {'node_id': first.load_config()['node_id']}})])
+                self.assertEqual(len(delivered), 1)
+                self.assertFalse(failures)
+                hosts = [call.args[1] for call in transport.call_args_list]
+                self.assertEqual(hosts, ['8.8.8.8', '2001:4860:4860::8888'] * 4)
+        finally:
+            first.close()
+            second.close()
+
+    def test_identity_or_api_rejection_does_not_try_another_address(self) -> None:
+        node = {'id': 'a' * 32, 'endpoint_host': '8.8.8.8',
+                'endpoint_hosts': '["2001:4860:4860::8888"]', 'endpoint_port': 12345}
+        with mock.patch.object(lun_cluster, 'mutual_request',
+                               side_effect=lun_cluster.ClusterError('identity mismatch')) as request:
+            with self.assertRaisesRegex(lun_cluster.ClusterError, 'identity mismatch'):
+                lun_cluster.member_request(self.cluster, node, 'POST', '/v1/action', {})
+        self.assertEqual(request.call_count, 1)
+
     def test_health_probe_falls_back_to_ipv6_and_checks_node_identity(self) -> None:
         node = {'id': 'a' * 32, 'endpoint_host': '8.8.8.8',
                 'endpoint_hosts': '["2001:4860:4860::8888","8.8.8.8"]', 'endpoint_port': 12345}
@@ -2085,8 +2202,9 @@ class ClusterTestCase(unittest.TestCase):
             self.assertEqual(insufficient["unreachable_votes"], 1)
             first.record_transport_success(candidate_id)
 
-            def witness(_cluster, _host, _port, method, path, body=None, timeout=30):
+            def witness(_cluster, _host, _port, method, path, body=None, timeout=30, *, expected_node_id=""):
                 self.assertEqual((method, path), ("POST", "/v1/federation/probe"))
+                self.assertEqual(expected_node_id, voter.load_config()["node_id"])
                 return {"vote": voter.create_probe_vote(candidate_id, False, nonce=body["nonce"])}
 
             with mock.patch.object(lun_cluster, "mutual_request", side_effect=witness):

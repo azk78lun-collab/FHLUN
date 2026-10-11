@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
@@ -1735,6 +1735,7 @@ class Cluster:
                 response = mutual_request(
                     self, config["controller_host"], int(config["controller_port"]),
                     "POST", "/v1/events/usage", {"report": report}, timeout=30,
+                    expected_node_id=str(config["controller_id"]),
                 )
                 totals = response.get("totals", {})
             self.db.set_setting(state_key, json_dumps({
@@ -3425,8 +3426,8 @@ class Cluster:
             def witness(voter: dict[str, Any]) -> dict[str, Any]:
                 nonce = secrets.token_hex(16)
                 try:
-                    response = mutual_request(
-                        self, str(voter["endpoint_host"]), int(voter["endpoint_port"]), "POST",
+                    response = member_request(
+                        self, voter, "POST",
                         "/v1/federation/probe", {"candidate_id": candidate_id, "nonce": nonce}, timeout=20,
                     )
                     vote = response.get("vote") if isinstance(response.get("vote"), dict) else {}
@@ -3469,7 +3470,7 @@ class Cluster:
             observed_at = base + attempt
             try:
                 if probe is None:
-                    response = mutual_request(self, str(node["endpoint_host"]), int(node["endpoint_port"]),
+                    response = member_request(self, node,
                                               "GET", "/v1/status", timeout=10)
                     if str(response.get("status", {}).get("node_id", "")) != candidate_id:
                         raise FederationTransportError("probe identity mismatch")
@@ -4573,10 +4574,12 @@ class ClusterHandler(http.server.BaseHTTPRequestHandler):
                 self._reply(200, {"ok": True, "accepted": changed, "totals": totals})
             elif parsed.path == "/v1/action":
                 result = execute_action(self.cluster, body, peer)
-                self._reply(200, {"ok": True, "result": result})
                 action_result = result.get("result") if isinstance(result.get("result"), dict) else {}
-                if action_result.get("restart_required"):
-                    self.server.restart_requested = True  # type: ignore[attr-defined]
+                try:
+                    self._reply(200, {"ok": True, "result": result})
+                finally:
+                    if action_result.get("restart_required") and not result.get("replayed"):
+                        self.server.restart_requested = True  # type: ignore[attr-defined]
             else:
                 self._reply(404, {"ok": False, "error": "not found"})
         except ClusterError as exc:
@@ -4889,8 +4892,29 @@ def bootstrap_request(join: dict[str, Any], method: str, path: str,
 
 
 def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: str,
-                   body: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
+                   body: dict[str, Any] | None = None, timeout: int = 30, *,
+                   expected_node_id: str = "") -> dict[str, Any]:
+    if not expected_node_id:
+        matches = []
+        for row in cluster.db.connection.execute("SELECT * FROM nodes WHERE endpoint_port=?", (int(port),)):
+            if host in member_endpoint_hosts(row):
+                matches.append(str(row["id"]))
+        if len(matches) != 1:
+            raise ClusterError("无法唯一确定远端成员身份，未发送请求")
+        expected_node_id = matches[0]
+    expected_fingerprint = ""
     if cluster.is_federation():
+        peer = cluster.db.connection.execute(
+            "SELECT identity_certificate,identity_fingerprint,revoked_at FROM federation_keys WHERE node_id=?",
+            (expected_node_id,),
+        ).fetchone()
+        if not peer or int(peer["revoked_at"]):
+            raise ClusterError("目标成员未受信任或已撤销，未发送请求")
+        expected_fingerprint = str(peer["identity_fingerprint"] or "")
+        if not expected_fingerprint:
+            expected_fingerprint = hashlib.sha256(
+                ssl.PEM_cert_to_DER_cert(str(peer["identity_certificate"]))
+            ).hexdigest()
         context = federation_client_context(cafile=str(cluster.federation_trust_bundle()))
         certificate, key = cluster.pki / "federation-node.crt", cluster.pki / "federation-node.key"
     else:
@@ -4903,9 +4927,22 @@ def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: st
     payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     headers = {"Content-Type": "application/json"} if payload is not None else {}
     try:
+        connection.connect()
+        if expected_fingerprint:
+            actual = hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest()
+            if not secrets.compare_digest(actual, expected_fingerprint):
+                raise ClusterError("远端证书与目标成员身份不匹配，未发送请求")
+        else:
+            certificate_info = connection.sock.getpeercert()
+            names = [value for group in certificate_info.get("subject", ())
+                     for key_name, value in group if key_name == "commonName"]
+            if names != [expected_node_id]:
+                raise ClusterError("远端证书与目标节点身份不匹配，未发送请求")
         connection.request(method, path, body=payload, headers=headers)
         response = connection.getresponse()
         data = response.read(MAX_BODY + 1)
+    except ssl.SSLCertVerificationError as exc:
+        raise ClusterError(f"远端证书验证失败，未尝试其他地址：{exc}") from exc
     except (OSError, ssl.SSLError, TimeoutError) as exc:
         raise FederationTransportError(f"federation transport failed: {exc}") from exc
     finally:
@@ -4916,32 +4953,46 @@ def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: st
         result = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ClusterError("远端返回了无效 JSON") from exc
+    if not isinstance(result, dict):
+        raise ClusterError("远端返回了无效结果对象")
     if response.status >= 400 or not result.get("ok"):
         raise ClusterError(result.get("error") or f"远端返回 HTTP {response.status}")
     return result
 
 
-def probe_federation_member(cluster: Cluster, node: Any) -> dict[str, Any]:
-    """Probe the authenticated control plane, trying IPv4 then available IPv6."""
-    try:
-        hosts = json.loads(str(node['endpoint_hosts'] or '[]'))
-    except (ValueError, TypeError):
-        hosts = []
-    hosts = order_public_hosts(hosts if isinstance(hosts, list) else [], str(node['endpoint_host']))
-    last_error: Exception | None = None
-    for host in hosts:
+def member_endpoint_hosts(node: Any) -> list[str]:
+    value = node["endpoint_hosts"] if "endpoint_hosts" in node.keys() else []
+    if isinstance(value, str):
         try:
-            response = mutual_request(cluster, host, int(node['endpoint_port']),
-                                      'GET', '/v1/status', timeout=HEALTH_CHECK_TIMEOUT)
-            status = response.get('status', {})
-            if not isinstance(status, dict) or status.get('node_id') != node['id']:
-                raise ClusterError('health response identity mismatch')
-            return status
-        except (ClusterError, OSError, ssl.SSLError) as exc:
+            value = json.loads(value or "[]")
+        except (ValueError, TypeError):
+            value = []
+    return order_public_hosts(value if isinstance(value, list) else [], str(node["endpoint_host"]))
+
+
+def member_request(cluster: Cluster, node: Any, method: str, path: str,
+                   body: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
+    if isinstance(node, str):
+        node = cluster.node(node)
+    last_error: FederationTransportError | None = None
+    for host in member_endpoint_hosts(node):
+        try:
+            return mutual_request(cluster, host, int(node["endpoint_port"]), method, path,
+                                  body, timeout=timeout, expected_node_id=str(node["id"]))
+        except FederationTransportError as exc:
             last_error = exc
     if last_error:
         raise last_error
-    raise ClusterError('health endpoint is missing')
+    raise ClusterError("成员没有可用通信地址")
+
+
+def probe_federation_member(cluster: Cluster, node: Any) -> dict[str, Any]:
+    """Probe the authenticated control plane, trying IPv4 then available IPv6."""
+    response = member_request(cluster, node, 'GET', '/v1/status', timeout=HEALTH_CHECK_TIMEOUT)
+    status = response.get('status', {})
+    if not isinstance(status, dict) or status.get('node_id') != node['id']:
+        raise ClusterError('health response identity mismatch')
+    return status
 
 
 def deliver_pending_health_revocations(cluster: Cluster, *, broadcast: bool = False) -> dict[str, Any]:
@@ -5129,16 +5180,16 @@ def federation_sync(cluster: Cluster, node_id: str, *, attempts: int = 3,
     for attempt in range(attempts):
         try:
             local_manifest = cluster.federation_manifest()
-            remote = mutual_request(
-                cluster, str(node["endpoint_host"]), int(node["endpoint_port"]), "GET",
+            remote = member_request(
+                cluster, node, "GET",
                 "/v1/federation/events?manifest=" + urllib.parse.quote(json_dumps(local_manifest)),
                 timeout=timeout,
             )
             received = cluster.federation_import_events(
                 remote.get("events", []) if isinstance(remote.get("events"), list) else []
             )
-            response = mutual_request(
-                cluster, str(node["endpoint_host"]), int(node["endpoint_port"]), "POST",
+            response = member_request(
+                cluster, node, "POST",
                 "/v1/federation/events", {"events": cluster.federation_events_since(remote.get("manifest", {}))},
                 timeout=timeout,
             )
@@ -5229,8 +5280,8 @@ def wait_for_federation_peer(cluster: Cluster, node_id: str, timeout: int = 90) 
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            response = mutual_request(
-                cluster, str(node["endpoint_host"]), int(node["endpoint_port"]),
+            response = member_request(
+                cluster, node,
                 "GET", "/v1/status", timeout=min(10, max(1, int(deadline - time.monotonic()))),
             )
             status = response.get("status") if isinstance(response.get("status"), dict) else {}
@@ -5454,7 +5505,7 @@ def sync_node(cluster: Cluster, node_id: str, profile: str = "legacy") -> dict[s
     resolved_id = str(node["id"])
     try:
         push_node_identity(cluster, resolved_id)
-        result = mutual_request(cluster, node["endpoint_host"], node["endpoint_port"], "GET",
+        result = member_request(cluster, node, "GET",
                                 "/v1/snapshot?profile=" + urllib.parse.quote(profile))
         snapshot = result["snapshot"]
         if snapshot.get("status", {}).get("node_id") != resolved_id:
@@ -5638,8 +5689,8 @@ def deliver_federation_snapshots(cluster: Cluster,
     def deliver_one(task: tuple[str, str, int, dict[str, Any], str]) -> str:
         target_id, host, port, snapshot, source = task
         try:
-            mutual_request(
-                cluster, host, port, "POST", "/v1/federation/snapshot",
+            member_request(
+                cluster, target_id, "POST", "/v1/federation/snapshot",
                 {"snapshot": snapshot, "relay": relay}, timeout=timeout,
             )
             return f"{target_id}:{source}"
@@ -5671,8 +5722,8 @@ def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
         def publish_one(peer: tuple[str, str, int]) -> tuple[str, str]:
             node_id, host, port = peer
             try:
-                mutual_request(
-                    cluster, host, port, "POST", "/v1/federation/snapshot",
+                member_request(
+                    cluster, node_id, "POST", "/v1/federation/snapshot",
                     {"snapshot": snapshot}, timeout=15,
                 )
                 return node_id, "ok"
@@ -5694,6 +5745,7 @@ def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
     return mutual_request(
         cluster, config["controller_host"], int(config["controller_port"]), "POST",
         "/v1/events/snapshot", {"snapshot": cluster.local_snapshot(profile)},
+        expected_node_id=str(config["controller_id"]),
     )
 
 
@@ -5723,8 +5775,8 @@ def wait_for_remote_role(cluster: Cluster, node: sqlite3.Row, role: str, timeout
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            result = mutual_request(
-                cluster, node["endpoint_host"], int(node["endpoint_port"]), "GET", "/v1/status", timeout=8
+            result = member_request(
+                cluster, node, "GET", "/v1/status", timeout=8
             )
             status = result.get("status") if isinstance(result.get("status"), dict) else {}
             if status.get("node_id") == node["id"] and status.get("role") == role:
@@ -6121,8 +6173,8 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
             return {"reverted": node_ids}
         for node_id in node_ids:
             node = cluster.node(node_id)
-            result = mutual_request(
-                cluster, node["endpoint_host"], node["endpoint_port"], "GET", "/v1/status", timeout=20
+            result = member_request(
+                cluster, node, "GET", "/v1/status", timeout=20
             )
             if result.get("status", {}).get("node_id") != node_id:
                 raise ClusterError(f"子 VPS {short_id(node_id)} 临时授权验证失败")
@@ -6306,8 +6358,8 @@ def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, 
     attempts = 3 if cluster.is_federation() and coordinate_failures else 1
     for attempt in range(attempts):
         try:
-            result = mutual_request(
-                cluster, node["endpoint_host"], node["endpoint_port"],
+            result = member_request(
+                cluster, node,
                 "POST", "/v1/action", request, timeout=timeout,
             )
             if cluster.is_federation():
@@ -6438,6 +6490,7 @@ def request_cluster_update(cluster: Cluster, payload: dict[str, Any]) -> dict[st
     response = mutual_request(
         cluster, config["controller_host"], int(config["controller_port"]),
         "POST", "/v1/action", request, timeout=1800,
+        expected_node_id=str(config["controller_id"]),
     )
     wrapper = response.get("result") if isinstance(response.get("result"), dict) else {}
     result = wrapper.get("result") if isinstance(wrapper.get("result"), dict) else {}
