@@ -5682,6 +5682,115 @@ rc-service ip6tables save >/dev/null 2>&1 || true
 fi
 }
 
+hy2_hop_restore_family(){
+local cmd=$1 saved=$2 chain=LUN_HY2_HOP line
+local -a rule
+while "$cmd" -t nat -C PREROUTING -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" 2>/dev/null; do
+"$cmd" -t nat -D PREROUTING -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" || return 1
+done
+"$cmd" -t nat -F "$chain" 2>/dev/null || true
+if [ -s "$saved.rules" ]; then
+"$cmd" -t nat -N "$chain" 2>/dev/null || true
+while IFS= read -r line; do
+[[ "$line" == "-A $chain "* ]] || continue
+line=${line//\"FHLUN-HY2-HOP\"/FHLUN-HY2-HOP}
+read -r -a rule <<< "$line"
+"$cmd" -t nat "${rule[@]}" || return 1
+done < "$saved.rules"
+[ ! -f "$saved.jump" ] || "$cmd" -t nat -I PREROUTING 1 -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" || return 1
+else
+"$cmd" -t nat -X "$chain" 2>/dev/null || true
+fi
+}
+
+hy2_hop_apply(){
+local ports=${1:-} target=${2:-} chain=LUN_HY2_HOP cmd item normalized= stage saved available=0 failed=0 line
+if [ -n "$ports" ]; then
+valid_port_value "$target" || { red_line "Hysteria2 跳跃目标端口无效。"; return 1; }
+for item in $ports; do
+item=${item//-/:}
+[[ "$item" =~ ^[0-9]+(:[0-9]+)?$ ]] && valid_port_value "${item%%:*}" && valid_port_value "${item##*:}" || {
+red_line "Hysteria2 跳跃端口无效：$item"; return 1;
+  }
+[ "${item%%:*}" -le "${item##*:}" ] || { red_line "Hysteria2 跳跃端口范围无效：$item"; return 1; }
+normalized="${normalized:+$normalized }$item"
+done
+fi
+mkdir -p "$HOME/lun" || return 1
+stage=$(mktemp -d "$HOME/lun/.hy2-hop.XXXXXX") || return 1
+chmod 700 "$stage"
+for item in ports target; do
+[ ! -f "$HOME/lun/hy2_hop_$item" ] || cp -p "$HOME/lun/hy2_hop_$item" "$stage/state.$item" || { rm -rf "$stage"; return 1; }
+done
+for cmd in iptables ip6tables; do
+command -v "$cmd" >/dev/null 2>&1 || continue
+"$cmd" -t nat -S PREROUTING >/dev/null 2>&1 || continue
+available=$((available + 1))
+saved="$stage/$cmd"
+if "$cmd" -t nat -S "$chain" > "$saved.rules" 2>/dev/null; then
+if grep '^\-A ' "$saved.rules" | grep -Ev -- '--comment "?FHLUN-HY2-HOP"?([[:space:]]|$)' >/dev/null; then
+red_line "$chain 存在非 Lun 规则，未覆盖。"
+failed=1
+break
+fi
+else
+rm -f "$saved.rules"
+fi
+"$cmd" -t nat -C PREROUTING -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" 2>/dev/null && touch "$saved.jump"
+touch "$saved.ready"
+if "$cmd" -t nat -S PREROUTING | grep -- '-p udp' | grep -- '-j DNAT' | grep -v 'FHLUN-HY2-HOP' >/dev/null; then
+yellow_line "$cmd 存在未标记的回源规则，已保留；本次仅管理 Lun 专属跳跃规则链。"
+fi
+if [ -z "$normalized" ]; then
+while "$cmd" -t nat -C PREROUTING -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" 2>/dev/null; do
+"$cmd" -t nat -D PREROUTING -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" || { failed=1; break; }
+done
+if [ -s "$saved.rules" ]; then
+"$cmd" -t nat -F "$chain" && "$cmd" -t nat -X "$chain" || { failed=1; break; }
+fi
+else
+"$cmd" -t nat -N "$chain" 2>/dev/null || true
+"$cmd" -t nat -F "$chain" || { failed=1; break; }
+for item in $normalized; do
+"$cmd" -t nat -A "$chain" -p udp --dport "$item" -m comment --comment FHLUN-HY2-HOP -j DNAT --to-destination ":$target" || { failed=1; break; }
+done
+[ "$failed" = 0 ] || break
+"$cmd" -t nat -C PREROUTING -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" 2>/dev/null || \
+"$cmd" -t nat -I PREROUTING 1 -p udp -m comment --comment FHLUN-HY2-HOP -j "$chain" || { failed=1; break; }
+fi
+done
+if [ "$failed" = 0 ]; then
+if [ -n "$normalized" ]; then
+if [ "$available" -gt 0 ] && \
+printf '%s\n' "$normalized" > "$HOME/lun/hy2_hop_ports.tmp" && mv "$HOME/lun/hy2_hop_ports.tmp" "$HOME/lun/hy2_hop_ports" && \
+printf '%s\n' "$target" > "$HOME/lun/hy2_hop_target.tmp" && mv "$HOME/lun/hy2_hop_target.tmp" "$HOME/lun/hy2_hop_target" && \
+chmod 600 "$HOME/lun/hy2_hop_ports" "$HOME/lun/hy2_hop_target"; then :; else
+red_line "跳跃规则或状态保存失败，正在恢复旧规则。"
+failed=1
+fi
+else
+rm -f "$HOME/lun/hy2_hop_ports" "$HOME/lun/hy2_hop_target" || failed=1
+fi
+fi
+if [ "$failed" != 0 ]; then
+for cmd in iptables ip6tables; do
+[ ! -f "$stage/$cmd.ready" ] || hy2_hop_restore_family "$cmd" "$stage/$cmd" || red_line "$cmd 的 Lun 跳跃规则回滚失败，请检查。"
+done
+for item in ports target; do
+if [ -f "$stage/state.$item" ]; then
+cp -p "$stage/state.$item" "$HOME/lun/hy2_hop_$item" || red_line "跳跃状态文件恢复失败：$item"
+else
+rm -f "$HOME/lun/hy2_hop_$item"
+fi
+done
+rm -f "$HOME/lun/hy2_hop_ports.tmp" "$HOME/lun/hy2_hop_target.tmp"
+rm -rf "$stage"
+return 1
+fi
+rm -rf "$stage"
+firewall_save_iptables
+}
+
 firewall_prune_owned(){
 local fw_desired=$1 fw_owned="$HOME/lun/firewall_rules.log" fw_keep fw_backend fw_family fw_proto fw_port fw_changed
 [ -s "$fw_owned" ] || return 0
@@ -7198,7 +7307,7 @@ for rebuild_file in \
 "$HOME/lun"/acme_* "$HOME/lun"/cert.env "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool \
 "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
 "$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
-"$HOME/lun"/warp* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm; do
+"$HOME/lun"/warp* "$HOME/lun"/hy2_hop_* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm; do
 [ -f "$rebuild_file" ] || continue
 cp -a "$rebuild_file" "$rebuild_snapshot/lun/" || return 1
 done
@@ -7225,9 +7334,11 @@ rm -f "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo
 "$HOME/lun"/acme_* "$HOME/lun"/cert.env "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool \
 "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
 "$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
-"$HOME/lun"/warp* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm \
+"$HOME/lun"/warp* "$HOME/lun"/hy2_hop_* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm \
 "$HOME/lun"/oneclick_*
 cp -a "$rebuild_snapshot/lun/." "$HOME/lun/" 2>/dev/null || true
+hy2_hop_apply "$(cat "$HOME/lun/hy2_hop_ports" 2>/dev/null)" "$(cat "$HOME/lun/hy2_hop_target" 2>/dev/null)" || \
+yellow_line "核心配置已恢复，但 Lun 跳跃规则未能恢复，请检查。"
 [ -f "$rebuild_snapshot/bashrc" ] && cp -a "$rebuild_snapshot/bashrc" "$HOME/.bashrc"
 [ -s "$rebuild_snapshot/crontab" ] && crontab "$rebuild_snapshot/crontab" >/dev/null 2>&1 || true
 if pidof systemd >/dev/null 2>&1; then
@@ -7281,6 +7392,7 @@ cleandel(){
 keep_entry=$1
 multiuser_service_stop
 visit_monitor_service_stop
+hy2_hop_apply "" "" || yellow_line "Lun 跳跃规则清理未完成，其他回源规则未修改。"
 if [ "$keep_entry" != "keep-entry" ]; then
 cluster_remove_service
 remove_lun_firewall_rules
@@ -7318,7 +7430,6 @@ rc-service "$svc" stop >/dev/null 2>&1
 rc-update del "$svc" default >/dev/null 2>&1
 done
 rm -f /etc/init.d/sing-box /etc/init.d/xray /etc/init.d/argo /etc/local.d/alpinelun.start /etc/local.d/alpinesublun.start
-iptables -t nat -F PREROUTING >/dev/null 2>&1
 netfilter-persistent save >/dev/null 2>&1
 rc-service iptables save >/dev/null 2>&1
 rc-service ip6tables save >/dev/null 2>&1
@@ -13360,7 +13471,7 @@ multiuser_cmd doctor
 multiuser_apply_changes(){
 multiuser_service_stop
 if multiuser_cmd apply; then
-multiuser_service_start || true
+multiuser_service_start || { red_line "订阅服务启动失败，本次应用未完成。"; return 1; }
 green_line "多用户配置已校验并生效。"
 if cluster_enabled && cluster_is_federation; then
 yellow_line "正在同步已授权成员的用户与订阅……"
@@ -13388,6 +13499,36 @@ else
 multiuser_service_start || true
 red_line "自动回滚未完成，请立即运行 多用户管理 → 备份/诊断。"
 fi
+return 1
+}
+
+multiuser_security_transaction(){
+local mu_security_visit=no
+visit_monitor_enabled && mu_security_visit=yes
+multiuser_service_stop
+visit_monitor_service_stop
+if multiuser_cmd --defer-security-commit "$@"; then
+if multiuser_service_start; then
+if multiuser_cmd security-commit; then
+[ "$mu_security_visit" != yes ] || visit_monitor_service_start || yellow_line "网站监控重启失败，请进入监控自检。"
+green_line "安全操作已生效，旧凭据与备份已清理。"
+if cluster_enabled && cluster_is_federation; then
+cluster_cmd sync-users || yellow_line "本机已生效，但至少一台成员暂未同步。"
+fi
+return 0
+fi
+red_line "新配置已生效，但安全清理未完成；请运行 security-commit，勿恢复旧凭据。"
+[ "$mu_security_visit" != yes ] || visit_monitor_service_start || true
+return 1
+fi
+fi
+multiuser_service_stop
+if multiuser_cmd security-rollback && multiuser_service_start; then
+green_line "本次安全操作已完整回滚，原凭据和订阅保持不变。"
+else
+red_line "安全操作回滚未完成，请立即检查核心服务和多用户诊断。"
+fi
+[ "$mu_security_visit" != yes ] || visit_monitor_service_start || yellow_line "网站监控重启失败，请进入监控自检。"
 return 1
 }
 
@@ -13466,14 +13607,14 @@ printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did
 [ "$mu_did" = 0 ] && return
 printf "%s轮换会立即撤销旧 UUID、密码、SS 密钥和订阅 token。请输入设备名称确认：%s" "$LUN_RED" "$LUN_RESET"
 IFS= read -r mu_confirm
-multiuser_cmd rotate-device --device-id "$mu_did" --confirm "$mu_confirm" && multiuser_apply_changes
+multiuser_security_transaction rotate-device --device-id "$mu_did" --confirm "$mu_confirm"
 ;;
 6)
 printf "设备 ID（输入 0 返回）："; IFS= read -r mu_did
 [ "$mu_did" = 0 ] && return
 printf "%s硬删除会清除该设备凭据、订阅及含旧凭据的自动备份。请输入设备名称确认：%s" "$LUN_RED" "$LUN_RESET"
 IFS= read -r mu_confirm
-multiuser_cmd delete-device --device-id "$mu_did" --confirm "$mu_confirm" && multiuser_apply_changes
+multiuser_security_transaction delete-device --device-id "$mu_did" --confirm "$mu_confirm"
 ;;
 7) multiuser_cmd show-user --user-id "$mu_uid" ;;
 esac
@@ -13511,7 +13652,7 @@ multiuser_transaction update-user --user-id "$mu_uid" --lifetime-quota 0 --month
 printf "%s硬删除会撤销所有凭据、订阅和含该用户的自动数据库备份。%s\n" "$LUN_RED" "$LUN_RESET"
 printf "请输入用户名称确认："
 IFS= read -r mu_confirm
-multiuser_cmd delete-user --user-id "$mu_uid" --confirm "$mu_confirm" && multiuser_apply_changes
+multiuser_security_transaction delete-user --user-id "$mu_uid" --confirm "$mu_confirm"
 ;;
 0|"") return ;;
 *) echo "已取消。" ;;
@@ -14575,20 +14716,10 @@ fi
 if [ -n "$hyjpt" ] && [ -n "$hyp" ]; then
 echo
 echo "设置Hysteria2协议的跳跃端口：$hyjpt"
-iptables -t nat -F PREROUTING >/dev/null 2>&1
-ip6tables -t nat -F PREROUTING >/dev/null 2>&1
 hyport=$(cat "$HOME/lun/port_hy2")
-for port in $hyjpt; do
-iptables -t nat -A PREROUTING -p udp --dport "$port" -j DNAT --to-destination :$hyport
-ip6tables -t nat -A PREROUTING -p udp --dport "$port" -j DNAT --to-destination :$hyport
-done
-netfilter-persistent save >/dev/null 2>&1
-if command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
-rc-update show default 2>/dev/null | grep -q 'iptables' || rc-update add iptables >/dev/null 2>&1
-rc-update show default 2>/dev/null | grep -q 'ip6tables' || rc-update add ip6tables >/dev/null 2>&1
-rc-service iptables save >/dev/null 2>&1
-rc-service ip6tables save >/dev/null 2>&1
-fi
+hy2_hop_apply "$hyjpt" "$hyport" || { rollback_rebuild; exit 1; }
+else
+hy2_hop_apply "" "" || yellow_line "旧跳跃规则未能清理，请检查 Lun 专属规则链。"
 fi
 if ! apply_lun_firewall_rules; then
 if [ "$_oneclick_rebuild_active" = yes ]; then

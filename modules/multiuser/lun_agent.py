@@ -510,6 +510,8 @@ class Agent:
         self.backups = self.module / "backups"
         self.config_path = self.module / "config.json"
         self.lock_path = self.module / ".lock"
+        self.security_pending = self.module / ".security-transaction"
+        self.defer_security_commit = False
         self.db = Database(self.data_dir / "lun.db")
         self._cluster_refresh_lock = threading.Lock()
         self._cluster_refresh_started: dict[str, float] = {}
@@ -1291,14 +1293,13 @@ class Agent:
             utc_now(),
             device_id,
         )
-        with self.db.connection:
-            self.db.connection.execute(
-                "UPDATE devices SET uuid=?,password=?,ss_password=?,token=?,legacy=0,updated_at=? WHERE id=?",
-                values,
-            )
-            self.db.audit("device.rotate", str(device_id), device["name"])
-        shutil.rmtree(self.generated / old_token, ignore_errors=True)
-        self._replace_security_backups()
+        with self.security_transaction([old_token]):
+            with self.db.connection:
+                self.db.connection.execute(
+                    "UPDATE devices SET uuid=?,password=?,ss_password=?,token=?,legacy=0,updated_at=? WHERE id=?",
+                    values,
+                )
+                self.db.audit("device.rotate", str(device_id), device["name"])
         return self.db.connection.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
 
     def delete_device(self, device_id: int, confirmation: str) -> None:
@@ -1310,11 +1311,10 @@ class Agent:
             raise AgentError("该设备由主 VPS 统一管理，请在主 VPS 修改")
         if confirmation != device["name"]:
             raise AgentError("确认名称不匹配，未删除")
-        with self.db.connection:
-            self.db.audit("device.delete", str(device_id), device["name"])
-            self.db.connection.execute("DELETE FROM devices WHERE id=?", (device_id,))
-        shutil.rmtree(self.generated / device["token"], ignore_errors=True)
-        self._replace_security_backups()
+        with self.security_transaction([device["token"]]):
+            with self.db.connection:
+                self.db.audit("device.delete", str(device_id), device["name"])
+                self.db.connection.execute("DELETE FROM devices WHERE id=?", (device_id,))
 
     def update_user(self, args: argparse.Namespace) -> None:
         row = self.db.connection.execute("SELECT * FROM users WHERE id=?", (args.user_id,)).fetchone()
@@ -1374,13 +1374,11 @@ class Agent:
             row["token"]
             for row in self.db.connection.execute("SELECT token FROM devices WHERE user_id=?", (user_id,))
         ]
-        with self.db.connection:
-            self.db.audit("user.delete", str(user_id), user["name"])
-            self.db.connection.execute("DELETE FROM users WHERE id=?", (user_id,))
-        self.db.connection.execute("VACUUM")
-        for token in tokens:
-            shutil.rmtree(self.generated / token, ignore_errors=True)
-        self._replace_security_backups()
+        with self.security_transaction(tokens):
+            with self.db.connection:
+                self.db.audit("user.delete", str(user_id), user["name"])
+                self.db.connection.execute("DELETE FROM users WHERE id=?", (user_id,))
+            self.db.connection.execute("VACUUM")
 
     def export_cluster_users(self, user_ids: list[int] | None = None) -> dict[str, Any]:
         params: list[Any] = []
@@ -1592,9 +1590,111 @@ class Agent:
         return {"users": len(users), "devices": len(keep_devices)}
 
     def _replace_security_backups(self) -> None:
+        current = self.backup_database()
         for backup in self.backups.glob("db-*.sqlite3"):
-            backup.unlink(missing_ok=True)
-        self.backup_database()
+            if backup != current:
+                backup.unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def security_transaction(self, tokens: Iterable[str]):
+        """Keep rollback material until both cores and subscription startup succeed."""
+        with FileLock(self.lock_path):
+            if self.security_pending.exists():
+                raise AgentError("存在未完成的安全操作，请先执行 security-rollback")
+            self._security_snapshot(tokens)
+            try:
+                yield
+                self.apply(locked=True)
+            except Exception as exc:
+                try:
+                    self._security_rollback_locked()
+                except Exception as rollback_exc:
+                    raise AgentError(f"安全操作失败且回滚未完成，请立即诊断：{exc}；{rollback_exc}") from exc
+                raise AgentError(f"安全操作失败，数据库、订阅和核心配置已恢复：{exc}") from exc
+            if not self.defer_security_commit:
+                self._security_commit_locked()
+
+    def _security_snapshot(self, tokens: Iterable[str]) -> None:
+        with tempfile.TemporaryDirectory(prefix=".security-stage-", dir=self.module) as temporary:
+            stage = Path(temporary)
+            destination = sqlite3.connect(stage / "before.sqlite3")
+            try:
+                self.db.connection.backup(destination)
+            finally:
+                destination.close()
+            os.chmod(stage / "before.sqlite3", 0o600)
+            files = []
+            for filename in ("xr.json", "sb.json", "subport.log", "subport_public.log",
+                             "subport_legacy.log", "subport_legacy_public.log", "subtoken.log"):
+                source = self.root / filename
+                if source.exists():
+                    shutil.copy2(source, stage / filename)
+                    os.chmod(stage / filename, 0o600)
+                    files.append(filename)
+            shutil.copy2(self.config_path, stage / "module-config.json")
+            os.chmod(stage / "module-config.json", 0o600)
+            if self.generated.exists():
+                shutil.copytree(self.generated, stage / "generated")
+            atomic_write(stage / "state.json", json.dumps({"tokens": list(tokens), "files": files}))
+            os.replace(stage, self.security_pending)
+
+    def _security_commit_locked(self) -> None:
+        state = json.loads((self.security_pending / "state.json").read_text(encoding="utf-8"))
+        state["committed"] = True
+        atomic_write(self.security_pending / "state.json", json.dumps(state))
+        self._replace_security_backups()
+        for token in state["tokens"]:
+            target = self.generated / token
+            if re.fullmatch(r"[A-Za-z0-9_-]+", token) and target.exists():
+                shutil.rmtree(target)
+        for filename in ("previous-xr.json", "previous-sb.json"):
+            (self.generated / filename).unlink(missing_ok=True)
+        shutil.rmtree(self.security_pending)
+
+    def security_commit(self) -> None:
+        with FileLock(self.lock_path):
+            if not self.security_pending.exists():
+                raise AgentError("没有待提交的安全操作")
+            self._security_commit_locked()
+
+    def _security_rollback_locked(self) -> None:
+        pending = self.security_pending
+        state = json.loads((pending / "state.json").read_text(encoding="utf-8"))
+        if state.get("committed"):
+            raise AgentError("安全操作已经提交，不能恢复旧凭据；请重试 security-commit 完成清理")
+        before = sqlite3.connect(pending / "before.sqlite3")
+        try:
+            before.backup(self.db.connection)
+        finally:
+            before.close()
+        changed = {}
+        shutil.copy2(pending / "module-config.json", self.config_path)
+        for core, filename in (("xray", "xr.json"), ("singbox", "sb.json")):
+            target = self.root / filename
+            saved = pending / filename
+            changed[core] = bool(state.get("restart_cores", {}).get(core)) or (
+                target.exists() and (not saved.exists() or target.read_bytes() != saved.read_bytes()))
+            if filename in state["files"]:
+                shutil.copy2(saved, target)
+            else:
+                target.unlink(missing_ok=True)
+        for filename in ("subport.log", "subport_public.log", "subport_legacy.log",
+                         "subport_legacy_public.log", "subtoken.log"):
+            target = self.root / filename
+            if filename in state["files"]:
+                shutil.copy2(pending / filename, target)
+            else:
+                target.unlink(missing_ok=True)
+        shutil.rmtree(self.generated, ignore_errors=True)
+        if (pending / "generated").exists():
+            shutil.copytree(pending / "generated", self.generated)
+        self.restart_cores(changed)
+        shutil.rmtree(pending)
+
+    def security_rollback(self) -> None:
+        with FileLock(self.lock_path):
+            if self.security_pending.exists():
+                self._security_rollback_locked()
 
     def month_period(self, reset_day: int, now: dt.datetime | None = None) -> str:
         current = now or dt.datetime.now(dt.timezone.utc)
@@ -1721,46 +1821,49 @@ class Agent:
         return device.get("permissions", {}).get(protocol, True)
 
     def reconcile(self, validate: bool = True) -> dict[str, bool]:
+        with FileLock(self.lock_path):
+            return self._reconcile_locked(validate)
+
+    def _reconcile_locked(self, validate: bool = True) -> dict[str, bool]:
         config = self.load_config()
         if not config.get("enabled"):
             return {"xray": False, "singbox": False}
-        with FileLock(self.lock_path):
-            devices = self.active_devices()
-            changed = {"xray": False, "singbox": False}
-            pending: list[tuple[Path, dict[str, Any], str]] = []
-            xr_path = self.root / "xr.json"
-            if xr_path.exists():
-                original = json.loads(xr_path.read_text(encoding="utf-8"))
-                updated = self._reconcile_xray(copy.deepcopy(original), devices, config)
-                if updated != original:
-                    pending.append((xr_path, updated, "xray"))
-                    changed["xray"] = True
-            sb_path = self.root / "sb.json"
-            if sb_path.exists():
-                original = json.loads(sb_path.read_text(encoding="utf-8"))
-                updated = self._reconcile_singbox(copy.deepcopy(original), devices, config)
-                if updated != original:
-                    pending.append((sb_path, updated, "singbox"))
-                    changed["singbox"] = True
-            temporary: list[tuple[Path, Path, str]] = []
-            try:
-                for target, payload, core in pending:
-                    temp = target.with_name(f".{target.stem}.multiuser.{os.getpid()}{target.suffix}")
-                    atomic_write(temp, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-                    temporary.append((target, temp, core))
-                if validate:
-                    for _, temp, core in temporary:
-                        self._validate_core(core, temp)
-                for target, temp, _ in temporary:
-                    shutil.copy2(target, self.generated / f"previous-{target.name}")
-                    os.replace(temp, target)
-            finally:
-                for _, temp, _ in temporary:
-                    temp.unlink(missing_ok=True)
-            self.render_all_subscriptions()
-            self.db.audit("config.reconcile", "cores", json.dumps(changed))
-            self.db.connection.commit()
-            return changed
+        devices = self.active_devices()
+        changed = {"xray": False, "singbox": False}
+        pending: list[tuple[Path, dict[str, Any], str]] = []
+        xr_path = self.root / "xr.json"
+        if xr_path.exists():
+            original = json.loads(xr_path.read_text(encoding="utf-8"))
+            updated = self._reconcile_xray(copy.deepcopy(original), devices, config)
+            if updated != original:
+                pending.append((xr_path, updated, "xray"))
+                changed["xray"] = True
+        sb_path = self.root / "sb.json"
+        if sb_path.exists():
+            original = json.loads(sb_path.read_text(encoding="utf-8"))
+            updated = self._reconcile_singbox(copy.deepcopy(original), devices, config)
+            if updated != original:
+                pending.append((sb_path, updated, "singbox"))
+                changed["singbox"] = True
+        temporary: list[tuple[Path, Path, str]] = []
+        try:
+            for target, payload, core in pending:
+                temp = target.with_name(f".{target.stem}.multiuser.{os.getpid()}{target.suffix}")
+                atomic_write(temp, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                temporary.append((target, temp, core))
+            if validate:
+                for _, temp, core in temporary:
+                    self._validate_core(core, temp)
+            for target, temp, _ in temporary:
+                shutil.copy2(target, self.generated / f"previous-{target.name}")
+                os.replace(temp, target)
+        finally:
+            for _, temp, _ in temporary:
+                temp.unlink(missing_ok=True)
+        self.render_all_subscriptions()
+        self.db.audit("config.reconcile", "cores", json.dumps(changed))
+        self.db.connection.commit()
+        return changed
 
     def reconcile_visit(self, validate: bool = True) -> dict[str, bool]:
         if self.multiuser_enabled():
@@ -2005,8 +2108,12 @@ class Agent:
             return
         raise AgentError("多用户模块要求 systemd 或 OpenRC；未执行不可靠的无 init 重启")
 
-    def apply(self) -> dict[str, bool]:
-        changed = self.reconcile(validate=True)
+    def apply(self, *, locked: bool = False) -> dict[str, bool]:
+        changed = self._reconcile_locked(validate=True) if locked else self.reconcile(validate=True)
+        if locked and self.security_pending.exists():
+            state = json.loads((self.security_pending / "state.json").read_text(encoding="utf-8"))
+            state["restart_cores"] = changed
+            atomic_write(self.security_pending / "state.json", json.dumps(state))
         try:
             self.restart_cores(changed)
         except AgentError as exc:
@@ -3083,10 +3190,44 @@ class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write(f"subscription {self.client_address[0]} {args[1] if len(args) > 1 else ''}\n")
 
 
-class DualStackServer(http.server.ThreadingHTTPServer):
-    address_family = socket.AF_INET6
+class SubscriptionServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
+    handshake_timeout = 8.0
+    request_timeout = 15.0
+    max_connections = 64
+    tls_context: ssl.SSLContext | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        self._connection_slots = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            if self.tls_context is not None:
+                request.settimeout(self.handshake_timeout)
+                request = self.tls_context.wrap_socket(request, server_side=True)
+            request.settimeout(self.request_timeout)
+            super().process_request_thread(request, client_address)
+        except (OSError, ssl.SSLError):
+            self.shutdown_request(request)
+        finally:
+            self._connection_slots.release()
+
+
+class DualStackServer(SubscriptionServer):
+    address_family = socket.AF_INET6
 
     def server_bind(self) -> None:
         with contextlib.suppress(OSError):
@@ -3106,7 +3247,7 @@ def serve(agent: Agent) -> None:
     else:
         agent.render_all_subscriptions()
     bind = config.get("bind", "::")
-    server_class: type[http.server.ThreadingHTTPServer] = DualStackServer if ":" in bind else http.server.ThreadingHTTPServer
+    server_class = DualStackServer if ":" in bind else SubscriptionServer
 
     def make_server(port: int, use_tls: bool, legacy_only: bool) -> http.server.ThreadingHTTPServer:
         current = server_class((bind, port), SubscriptionHandler)
@@ -3116,7 +3257,7 @@ def serve(agent: Agent) -> None:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(config["certificate"], config["private_key"])
-            current.socket = context.wrap_socket(current.socket, server_side=True)
+            current.tls_context = context
         return current
 
     server = make_server(int(config["port"]), config.get("scheme") == "https", False)
@@ -3199,6 +3340,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lun-agent")
     parser.add_argument("--root", default=os.path.expanduser("~/lun"))
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--defer-security-commit", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init")
@@ -3295,6 +3437,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("apply")
     sub.add_parser("maintenance")
     sub.add_parser("backup")
+    sub.add_parser("security-commit")
+    sub.add_parser("security-rollback")
     restore = sub.add_parser("restore-database")
     restore.add_argument("--path", required=True)
     sub.add_parser("doctor")
@@ -3350,7 +3494,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     agent = Agent(Path(args.root))
+    agent.defer_security_commit = args.defer_security_commit
     try:
+        if agent.security_pending.exists() and args.command not in {
+            "security-commit", "security-rollback", "serve", "status", "list-users", "usage", "doctor",
+            "show-user", "show-subscription", "show-local-subscription", "sync-subscription-state",
+        }:
+            raise AgentError("存在待确认的安全操作，请先提交或回滚；未执行新的变更")
         result: Any = None
         if args.command == "init":
             result = agent.initialize(args)
@@ -3373,11 +3523,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "rotate-device":
             device = agent.rotate_device(args.device_id, args.confirm)
             result = dict(device)
-            print("旧凭据与订阅 token 已撤销；新凭据如下：")
+            print("新凭据如下（等待订阅服务确认后提交）：" if args.defer_security_commit else
+                  "旧凭据与订阅 token 已撤销；新凭据如下：")
             print_device(device, agent.load_config())
         elif args.command == "delete-device":
             agent.delete_device(args.device_id, args.confirm)
-            print("设备、凭据、订阅与旧数据库备份已硬删除。")
+            print("设备配置已校验，等待订阅服务确认后清理旧数据。" if args.defer_security_commit else
+                  "设备、凭据、订阅与旧数据库备份已硬删除。")
         elif args.command == "update-user":
             agent.update_user(args)
             print("用户策略已更新。")
@@ -3386,7 +3538,14 @@ def main(argv: list[str] | None = None) -> int:
             print("协议权限已更新。")
         elif args.command == "delete-user":
             agent.delete_user(args.user_id, args.confirm)
-            print("用户、设备、订阅与旧数据库备份已硬删除。")
+            print("用户配置已校验，等待订阅服务确认后清理旧数据。" if args.defer_security_commit else
+                  "用户、设备、订阅与旧数据库备份已硬删除。")
+        elif args.command == "security-commit":
+            agent.security_commit()
+            print("安全操作已提交，旧凭据订阅与备份已清理。")
+        elif args.command == "security-rollback":
+            agent.security_rollback()
+            print("安全操作已回滚。")
         elif args.command in {"list-users", "status", "usage"}:
             result = agent.status_rows()
             if not args.json:

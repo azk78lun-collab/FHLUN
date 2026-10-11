@@ -687,10 +687,67 @@ class ClusterTestCase(unittest.TestCase):
         second = lun_cluster.execute_action(self.cluster, request)
         self.assertEqual(first["status"], "success")
         self.assertTrue(second["replayed"])
+        self.assertEqual(first["result"], second["result"])
         with self.assertRaisesRegex(lun_cluster.ClusterError, "允许列表"):
             lun_cluster.execute_action(
                 self.cluster, {"request_id": "2" * 32, "action": "shell.run", "payload": {}}
             )
+
+    def test_action_replay_preserves_full_snapshot_result_and_never_reexecutes(self):
+        self.cluster.save_config({"node_id": "a" * 32})
+        request = {"request_id": "8" * 32, "action": "snapshot.create", "payload": {}}
+        result = {"path": "/snapshot.tar.gz", "extra": "x" * 3000}
+        with mock.patch.object(lun_cluster, "_execute_action_locked", return_value=result) as operation:
+            first = lun_cluster.execute_action(self.cluster, request)
+            replay = lun_cluster.execute_action(self.cluster, request)
+        self.assertEqual(first["result"], result)
+        self.assertEqual(replay["result"], result)
+        self.assertEqual(operation.call_count, 1)
+
+    def test_action_failed_running_and_legacy_replays_are_not_successes(self):
+        self.cluster.save_config({"node_id": "a" * 32})
+        request = {"request_id": "8" * 32, "action": "snapshot.create", "payload": {}}
+        with mock.patch.object(lun_cluster, "_execute_action_locked", side_effect=lun_cluster.ClusterError("injected")) as operation:
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "injected"):
+                lun_cluster.execute_action(self.cluster, request)
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "此前操作失败"):
+                lun_cluster.execute_action(self.cluster, request)
+            self.assertEqual(operation.call_count, 1)
+        for status, expected in (("running", "仍在执行"), ("success", "历史操作结果")):
+            with self.cluster.db.connection:
+                self.cluster.db.connection.execute("UPDATE jobs SET status=?", (status,))
+            with self.assertRaisesRegex(lun_cluster.ClusterError, expected):
+                lun_cluster.execute_action(self.cluster, request)
+
+    def test_concurrent_action_requests_execute_once(self):
+        self.cluster.save_config({"node_id": "a" * 32})
+        request = {"request_id": "8" * 32, "action": "snapshot.create", "payload": {}}
+        entered, release = threading.Event(), threading.Event()
+        results = []
+
+        def operation(*_args):
+            entered.set()
+            release.wait(2)
+            return {"path": "/snapshot.tar.gz"}
+
+        def run():
+            try:
+                results.append(lun_cluster.execute_action(self.cluster, request))
+            finally:
+                self.cluster.db.close()
+
+        with mock.patch.object(lun_cluster, "_execute_action_locked", side_effect=operation) as execute:
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                with self.assertRaisesRegex(lun_cluster.ClusterError, "仍在执行"):
+                    lun_cluster.execute_action(self.cluster, request)
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertEqual(execute.call_count, 1)
+        self.assertEqual(results[0]["result"]["path"], "/snapshot.tar.gz")
 
     def test_service_control_is_fixed_and_cluster_cannot_be_stopped(self) -> None:
         script = Path(self.temporary.name) / "bin-lun"

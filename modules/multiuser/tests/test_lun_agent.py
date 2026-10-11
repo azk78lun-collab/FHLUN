@@ -912,6 +912,80 @@ rules:
         self.assertFalse(generated.exists())
         self.assertEqual(len(list(self.agent.backups.glob("db-*.sqlite3"))), 1)
 
+    def test_security_mutations_roll_back_database_files_and_backups_on_validation_failure(self):
+        device = self.add_user()
+        token_dir = self.agent.generated / device["token"]
+        token_dir.mkdir(parents=True)
+        (token_dir / "jhsub.txt").write_text("original", encoding="utf-8")
+        core = self.root / "xr.json"
+        original = {"inbounds": [{"tag": "reality-vision", "protocol": "vless",
+                                  "settings": {"clients": [{"id": device["uuid"]}]}}]}
+        core.write_text(json.dumps(original), encoding="utf-8")
+        backups = {path.name: path.read_bytes() for path in self.agent.backups.glob("db-*.sqlite3")}
+        operations = (
+            lambda: self.agent.rotate_device(device["id"], "phone"),
+            lambda: self.agent.delete_device(device["id"], "phone"),
+            lambda: self.agent.delete_user(device["user_id"], "alice"),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), \
+                 mock.patch.object(self.agent, "_validate_core", side_effect=lun_agent.AgentError("injected validation failure")):
+                with self.assertRaisesRegex(lun_agent.AgentError, "已恢复"):
+                    operation()
+            restored = self.agent.db.connection.execute("SELECT * FROM devices WHERE id=?", (device["id"],)).fetchone()
+            self.assertEqual(dict(restored), dict(device))
+            self.assertEqual(json.loads(core.read_text()), original)
+            self.assertEqual((token_dir / "jhsub.txt").read_text(), "original")
+            self.assertEqual({path.name: path.read_bytes() for path in self.agent.backups.glob("db-*.sqlite3")}, backups)
+            self.assertFalse(self.agent.security_pending.exists())
+
+    def test_security_core_restart_failure_restores_old_identity(self):
+        device = self.add_user()
+        core = self.root / "xr.json"
+        core.write_text(json.dumps({"inbounds": [{"tag": "reality-vision", "protocol": "vless",
+                                                 "settings": {"clients": [{"id": device["uuid"]}]}}]}))
+        original = core.read_bytes()
+        with mock.patch.object(self.agent, "_validate_core"), \
+             mock.patch.object(self.agent, "restart_cores", side_effect=[lun_agent.AgentError("restart failed"), None, None]):
+            with self.assertRaisesRegex(lun_agent.AgentError, "已恢复"):
+                self.agent.rotate_device(device["id"], "phone")
+        self.assertEqual(core.read_bytes(), original)
+        self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], device["uuid"])
+
+    def test_security_stage_survives_subscription_failure_and_can_commit_after_start(self):
+        device = self.add_user()
+        old_backup = self.agent.backup_database()
+        token_dir = self.agent.generated / device["token"]
+        token_dir.mkdir(parents=True)
+        (token_dir / "jhsub.txt").write_text("old subscription")
+        self.agent.defer_security_commit = True
+        rotated = self.agent.rotate_device(device["id"], "phone")
+        self.assertTrue(old_backup.exists())
+        self.assertTrue(token_dir.exists())
+        self.assertTrue(self.agent.security_pending.exists())
+        self.agent.security_rollback()
+        self.assertTrue(old_backup.exists())
+        self.assertFalse((self.agent.generated / rotated["token"]).exists())
+        self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], device["uuid"])
+        rotated = self.agent.rotate_device(device["id"], "phone")
+        self.agent.security_commit()
+        self.assertFalse(old_backup.exists())
+        self.assertFalse(token_dir.exists())
+        self.assertFalse(self.agent.security_pending.exists())
+        self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], rotated["uuid"])
+
+    def test_committed_cleanup_failure_cannot_restore_old_credentials(self):
+        device = self.add_user()
+        self.agent.defer_security_commit = True
+        rotated = self.agent.rotate_device(device["id"], "phone")
+        with mock.patch.object(self.agent, "_replace_security_backups", side_effect=OSError("disk error")):
+            with self.assertRaises(OSError):
+                self.agent.security_commit()
+        with self.assertRaisesRegex(lun_agent.AgentError, "已经提交"):
+            self.agent.security_rollback()
+        self.assertEqual(self.agent.db.connection.execute("SELECT uuid FROM devices WHERE id=?", (device["id"],)).fetchone()[0], rotated["uuid"])
+        self.agent.security_commit()
+
     def test_xray_stats_are_added_to_lifetime_and_month(self):
         device = self.add_user()
         identity = f"lun:u:{device['user_id']}:d:{device['id']}"
@@ -1062,7 +1136,7 @@ rules:
             def server_close(self):
                 pass
 
-        with mock.patch.object(lun_agent.http.server, "ThreadingHTTPServer", Server), \
+        with mock.patch.object(lun_agent, "SubscriptionServer", Server), \
              mock.patch.object(self.agent, "reconcile") as reconcile, \
              mock.patch.object(self.agent, "maintenance_once") as maintenance, \
              mock.patch.object(lun_agent.threading, "Thread") as worker:

@@ -567,7 +567,8 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS jobs(
               request_id TEXT PRIMARY KEY,node_id TEXT NOT NULL,action TEXT NOT NULL,status TEXT NOT NULL,
-              detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
+              detail TEXT NOT NULL DEFAULT '',result_json TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS audit_log(
               id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER NOT NULL,action TEXT NOT NULL,
@@ -622,6 +623,9 @@ class Database:
             """
         )
         node_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(nodes)")}
+        job_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(jobs)")}
+        if "result_json" not in job_columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT NOT NULL DEFAULT ''")
         if "server_number" not in node_columns:
             self.connection.execute("ALTER TABLE nodes ADD COLUMN server_number INTEGER NOT NULL DEFAULT 0")
         if "endpoint_hosts" not in node_columns:
@@ -5894,19 +5898,33 @@ def execute_action(cluster: Cluster, request: dict[str, Any], peer_id: str = "lo
         raise ClusterError("request_id 无效")
     existing = cluster.db.connection.execute("SELECT * FROM jobs WHERE request_id=?", (request_id,)).fetchone()
     if existing:
-        return {"request_id": request_id, "status": existing["status"], "detail": existing["detail"], "replayed": True}
+        if existing["action"] != action or existing["node_id"] != target:
+            raise ClusterError("request_id 已用于其他操作")
+        if existing["status"] == "failed":
+            raise ClusterError(f"此前操作失败，未重复执行：{existing['detail']}")
+        if existing["status"] != "success":
+            raise ClusterError("操作仍在执行或结果待核对，未重复执行")
+        if not existing["result_json"]:
+            raise ClusterError("历史操作结果不可重放，请核对执行状态；未重复执行")
+        return {"request_id": request_id, "status": "success",
+                "result": json.loads(existing["result_json"]), "replayed": True}
     payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
     now = utc_now()
     with cluster.db.connection:
-        cluster.db.connection.execute(
-            "INSERT INTO jobs(request_id,node_id,action,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+        inserted = cluster.db.connection.execute(
+            "INSERT OR IGNORE INTO jobs(request_id,node_id,action,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
             (request_id, target, action, "running", now, now),
-        )
+        ).rowcount
+    if not inserted:
+        return execute_action(cluster, request, peer_id)
     try:
         with FileLock(cluster.lock_path, timeout=5):
             result = _execute_action_locked(cluster, action, payload, request, peer_id)
         status = "success"
-        detail = json_dumps(result)[:2000]
+        result_json = json_dumps(result)
+        if len(result_json.encode("utf-8")) > MAX_BODY:
+            raise ClusterError("操作已执行，但结果超过保存限制；请核对状态，不要重复操作")
+        detail = result_json[:2000]
     except Exception as exc:
         status = "failed"
         detail = str(exc)[:2000]
@@ -5921,8 +5939,8 @@ def execute_action(cluster: Cluster, request: dict[str, Any], peer_id: str = "lo
         raise ClusterError(detail) from exc
     with cluster.db.connection:
         cluster.db.connection.execute(
-            "UPDATE jobs SET status=?,detail=?,updated_at=? WHERE request_id=?",
-            (status, detail, utc_now(), request_id),
+            "UPDATE jobs SET status=?,detail=?,result_json=?,updated_at=? WHERE request_id=?",
+            (status, detail, result_json, utc_now(), request_id),
         )
     cluster.db.audit("action.success", action, f"peer={short_id(peer_id)}")
     return {"request_id": request_id, "status": status, "result": result}
@@ -6294,7 +6312,13 @@ def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, 
             )
             if cluster.is_federation():
                 cluster.record_transport_success(str(node["id"]))
-            return result["result"]
+            action_result = result.get("result", {})
+            if not isinstance(action_result, dict) or action_result.get("status") != "success":
+                detail = action_result.get("detail", "执行中或结果待核对") if isinstance(action_result, dict) else "无效结果"
+                raise ClusterError("远程操作尚未成功：" + str(detail))
+            if "result" not in action_result:
+                raise ClusterError("远程操作未返回完整结果，请核对执行状态")
+            return action_result
         except FederationTransportError as exc:
             last_error = exc
     if cluster.is_federation() and coordinate_failures:
