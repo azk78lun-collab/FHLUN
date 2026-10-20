@@ -9,9 +9,11 @@ unset LUN_TEST_XRAY LUN_TEST_CHAIN_LIVE
 
 for file in lun.sh sap.sh saph.sh sapsbx.sh sapsbxh.sh container/nodejs/start.sh \
     mirror/fhlun-core-mirror-sync.sh modules/multiuser/build-singbox-enhanced.sh; do
+  printf 'Checking Shell syntax: %s\n' "$file"
   bash -n "$file"
 done
 for suite in modules/multiuser/tests modules/cluster/tests modules/cdnopt/tests tests; do
+  printf 'Running Python suite: %s\n' "$suite"
   python3 -B -m unittest discover -s "$suite" -p 'test_*.py' -v
 done
 for test in tests/test_startup_interpreter.sh tests/test_acme_lifecycle.sh tests/test_chain_ui.sh tests/test_menu_navigation.sh tests/test_banner.sh \
@@ -19,6 +21,7 @@ for test in tests/test_startup_interpreter.sh tests/test_acme_lifecycle.sh tests
     modules/multiuser/tests/test_firewall_helpers.sh modules/multiuser/tests/test_nat_hopping.sh \
     modules/multiuser/tests/test_security_transaction.sh modules/multiuser/tests/test_bandwidth_ownership.sh \
     modules/multiuser/tests/test_shell_helpers.sh; do
+  printf 'Running Shell suite: %s\n' "$test"
   bash -n "$test"
   bash "$test"
 done

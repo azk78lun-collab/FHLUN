@@ -9,14 +9,22 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - 日期采用 Git 提交记录中的提交日期及其时区，不从版本号推算。例如 `V26.8.10.10` 实际提交于 2026 年 9 月 23 日。
 - 版本取对应提交中的 `lun.sh`；同一版本可以包含多个修复或文档提交。合并记录不代表重复发布，也不另造版本号。
 - 本日志补充历史说明，不修改原提交、哈希或顺序。历史实现可能已被后续版本替代；当前操作以 [README](README.md) 和模块文档为准。
-- 覆盖仓库初始化至 `19c6e6e` 的全部 79 个提交，包括 5 个 PR 合并记录；之后的更新继续在顶部追加。
+- 历史补录覆盖仓库初始化至 `e1c83d2` 的全部 80 个提交，包括 5 个 PR 合并记录；之后的更新继续在顶部追加。
 
 - Dates follow the Git commit date and its recorded timezone, not the date embedded in a version string. For example, `V26.8.10.10` was committed on September 23, 2026.
 - Versions come from `lun.sh` at each commit. Several fixes or documentation changes may share a version. Merge entries are integration records, not additional releases.
 - These notes preserve the original commits, hashes and order. Later versions may supersede historical behavior; follow the current [README](README.md) and module documentation for usage.
-- The history covers all 79 commits from repository initialization through `19c6e6e`, including 5 PR merges. Future updates belong at the top.
+- The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
 
 ## 2026 年 10 月 20 日
+
+- CI 测试维护 / CI test maintenance · 脚本版本不变 / Script version unchanged: `V26.10.20.2`
+  - 中文：更新集群批量更新菜单的测试模拟，显式处理服务就绪检查，验证就绪时不重启、未就绪时先重启、重启失败不下发，以及取消或官方更新失败时无后续操作。离线检查输出当前测试文件名，便于定位后续失败。不修改代理、VPS 配置或生产更新逻辑。
+  - English: Update the batch-update menu test double to handle service-readiness checks explicitly. Verify no restart when ready, restart before distribution when stale, no distribution after restart failure, and no follow-up actions after cancellation or an official-update failure. Print test filenames during offline checks to identify future failures. Proxy configuration, VPS settings and production update logic remain unchanged.
+
+- [`e1c83d2`](https://github.com/azk78lun-collab/FHLUN/commit/e1c83d2) · `V26.10.20.2` · 文档 / Documentation
+  - 中文：新增中英文更新日志和 README 入口，补录初始化以来的提交日期、脚本版本及功能说明，保留原始 Git 历史。
+  - English: Add a bilingual changelog and README link, documenting historical commit dates, script versions and changes without rewriting Git history.
 
 - [`19c6e6e`](https://github.com/azk78lun-collab/FHLUN/commit/19c6e6e) · `V26.10.20.2`
   - 中文：修复更新或快照推送后残留的“疑似离线”。直接、身份校验成功的 mTLS 通信会清除本机旧失败状态；业务错误不再误判为掉线，较早的失败不覆盖较新的在线证据。相同内容不重复写入或重启，更新后核验实际运行版本及哈希。已在 5 台活动成员验证，每日巡检频率不变。

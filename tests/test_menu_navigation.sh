@@ -136,28 +136,52 @@ record() { calls+="$*"$'\n'; }
   lun_update_target() { printf '%s\n' "$SCRIPT"; }
   cluster_module_dir() { printf '%s\n' "$ROOT/modules/cluster"; }
   cluster_install_service() { :; }
-  cluster_service_restart() { :; }
+  cluster_service_restart() { record restart; return "$restart_rc"; }
   cluster_write_install_payload() { :; }
   cluster_push_event() { :; }
   mktemp() { command mktemp; }
-  cluster_cmd() { [[ $1 == update-all ]]; record "$*"; }
+  cluster_cmd() {
+    case "$1" in
+      service-current) record "$*"; return "$service_current_rc" ;;
+      update-all) record "$*"; return 0 ;;
+      *) printf 'unexpected cluster command: %s\n' "$*" >&2; return 1 ;;
+    esac
+  }
   update_lun_script() { official_calls=$((official_calls + 1)); return 1; }
   official_calls=0
+  service_current_rc=0
+  restart_rc=0
   calls=
-  # 本机来源即使 GitHub 不可达也继续；官方来源更新失败时不得分发。
+  # 本机来源不依赖 GitHub；当前服务就绪时不得重启。
   cluster_update_all_ui <<< $'\n\n' >/dev/null
-  [[ $official_calls -eq 0 && $calls == 'update-all --script-payload '* ]]
+  [[ $official_calls -eq 0 && $calls == $'service-current\nupdate-all --script-payload '* ]]
+
+  # 旧监听需先重启，再下发；重启失败不得继续分发。
+  service_current_rc=1
+  calls=
+  cluster_update_all_ui <<< $'\n\n' >/dev/null
+  [[ $official_calls -eq 0 && $calls == $'service-current\nrestart\nupdate-all --script-payload '* ]]
+  restart_rc=1
+  calls=
+  if cluster_update_all_ui <<< $'\n\n' >/dev/null; then
+    echo 'failed service restart unexpectedly started an update' >&2
+    exit 1
+  fi
+  [[ $calls == $'service-current\nrestart\n' ]]
+
+  # 官方来源更新失败、取消或 EOF 时，不检查服务、不重启、不分发。
   calls=
   if cluster_update_all_ui <<< $'2\n\n' >/dev/null; then
     echo 'official update failure was ignored' >&2
     exit 1
   fi
   [[ $official_calls -eq 1 && -z $calls ]]
-  if cluster_update_all_ui </dev/null >/dev/null; then
-    echo 'EOF unexpectedly started an update' >&2
-    exit 1
-  fi
-  [[ -z $calls ]]
+  cancel_rc=0
+  cluster_update_all_ui <<< '0' >/dev/null || cancel_rc=$?
+  [[ $cancel_rc -eq 2 && $official_calls -eq 1 && -z $calls ]]
+  eof_rc=0
+  cluster_update_all_ui </dev/null >/dev/null || eof_rc=$?
+  [[ $eof_rc -eq 2 && $official_calls -eq 1 && -z $calls ]]
 )
 
 printf 'ok - menu navigation and local-version distribution\n'
