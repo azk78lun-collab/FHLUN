@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.10.20.2"
+echo "当前版本：V26.10.20.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -3529,6 +3529,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
   }
 }
 EOF
+chain_preserve_existing_core_fields || return 1
 chain_inject_core || return 1
 if pidof systemd >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; then
 cat > /etc/systemd/system/xr.service <<EOF
@@ -3668,14 +3669,14 @@ installxray || return 1
 xrsbvm
 xrsbso
 warpsx
-xrsbout
+xrsbout || return 1
 hyp="hyptargo"; tup="tuptargo"; anp="anptargo"; arp="arptargo"; ssp="ssptargo"; nvp="nvptargo"
 elif [ "$xhp" != yes ] && [ "$vlp" != yes ] && [ "$vxp" != yes ] && [ "$vwp" != yes ] && [ "$xup" != yes ] && [ "$xcp" != yes ]; then
 installsb || return 1
 xrsbvm
 xrsbso
 warpsx
-xrsbout
+xrsbout || return 1
 xhp="xhptargo"; vlp="vlptargo"; vxp="vxptargo"; vwp="vwptargo"; xup="xuptargo"; xcp="xcptargo"
 else
 installsb || return 1
@@ -3683,7 +3684,7 @@ installxray || return 1
 xrsbvm
 xrsbso
 warpsx
-xrsbout
+xrsbout || return 1
 fi
 if [ -n "$argo" ] && [ -n "$vmag" ]; then
 echo
@@ -5338,15 +5339,16 @@ return 1
 cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
 if [ -s "$cluster_agent_source" ] \
 && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 \
-&& grep -q 'update-all' "$cluster_agent_source"; then
+&& grep -q 'update-all' "$cluster_agent_source" \
+&& grep -q '"chain.preflight"' "$cluster_agent_source"; then
 green_line "已复用本机通过校验的分布式集群程序。"
 elif ! cluster_download_agent; then
 red_line "分布式集群程序下载失败，且本机缓存不支持集群更新。"
 return 1
 else
 cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
-[ -s "$cluster_agent_source" ] && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 && grep -q 'update-all' "$cluster_agent_source" || {
-red_line "下载的分布式集群程序不支持集群更新，已停止推送。"
+[ -s "$cluster_agent_source" ] && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 && grep -q 'update-all' "$cluster_agent_source" && grep -q '"chain.preflight"' "$cluster_agent_source" || {
+red_line "下载的分布式集群程序不支持新版更新/链路预检，已停止推送，请确认配套模块已发布。"
 return 1
 }
 fi
@@ -5783,7 +5785,8 @@ printf "A 的独立内网端口（回车自动分配，输入 0 返回）："; I
 [ "$chain_port" = 0 ] && continue
 chain_port=${chain_port:-0}
 cluster_cmd chain-plan --entry "$chain_entry" --exit "$chain_exit" --port "$chain_port" || { ui_pause; continue; }
-yellow_line "A 增加独立端口；B 复用原 Reality 端口。NAT 需先在服务商添加映射，Lun 只自动放行本机防火墙。"
+yellow_line "自动检查两端端口池；缺少 Reality 时自动远程添加。A 另需独立链式端口；NAT 需先登记服务商映射。"
+echo "新启用的普通 Reality 节点会保留；链路失败时清理链式凭据，既有普通节点不删除。"
 echo "两台 VPS 都消耗流量；多用户额度只在 A 统计；普通节点保持原样。"
 printf "回车确认创建（输入 0 返回）："; IFS= read -r chain_confirm || return
 [ -z "$chain_confirm" ] || continue
@@ -5811,6 +5814,38 @@ ui_pause
 *) red_line "输入错误。" ;;
 esac
 done
+}
+
+chain_preserve_existing_core_fields(){
+[ "${LUN_CHAIN_PREPARE:-no}" = yes ] || return 0
+[ -d "$rebuild_snapshot/lun" ] || { red_line "缺少链路准备事务快照，已拒绝覆盖旧配置。"; return 1; }
+python3 - "$rebuild_snapshot/lun" "$HOME/lun" <<'PY'
+import json, os, shutil, sys, tempfile
+from pathlib import Path
+before, root = map(Path, sys.argv[1:])
+generated = json.loads((root / "xr.json").read_text())
+base = next(i for i in generated["inbounds"] if i.get("tag") == "reality-vision")
+if (before / "xr.json").exists():
+    original = json.loads((before / "xr.json").read_text())
+    if any(i.get("tag") == "reality-vision" for i in original.get("inbounds", [])):
+        raise RuntimeError("Reality 已存在，拒绝覆盖")
+else:
+    original = generated
+    # VMess/Socks previously served by Sing-box must not be duplicated on Xray.
+    original["inbounds"] = []
+original.setdefault("inbounds", []).append(base)
+fd, name = tempfile.mkstemp(dir=root, prefix=".chain-core-")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(original, handle, ensure_ascii=False, indent=2)
+    os.chmod(name, 0o600)
+    os.replace(name, root / "xr.json")
+finally:
+    if os.path.exists(name): os.unlink(name)
+if (before / "sb.json").exists():
+    shutil.copy2(before / "sb.json", root / "sb.json")
+    os.chmod(root / "sb.json", 0o600)
+PY
 }
 
 chain_require_empty(){
@@ -7766,7 +7801,15 @@ return 0
 }
 
 validate_rebuild(){
-validate_core_configs
+validate_core_configs || return 1
+[ "${LUN_CHAIN_PREPARE:-no}" = yes ] || return 0
+xrestart || return 1
+for chain_ready_try in 1 2 3; do
+chain_runtime_status && return 0
+sleep 1
+done
+red_line "新 Reality 服务未就绪，正在回滚自动准备。"
+return 1
 }
 
 commit_rebuild_snapshot(){
@@ -7981,6 +8024,116 @@ secondary_tmp="${secondary}.replace.$$"
 cp "$source" "$secondary_tmp" 2>/dev/null || return 0
 chmod 755 "$secondary_tmp" 2>/dev/null || { rm -f "$secondary_tmp"; return 0; }
 mv -f "$secondary_tmp" "$secondary" 2>/dev/null || rm -f "$secondary_tmp"
+}
+
+core_update_running(){
+case "$1" in xray) unit=xr; openrc=xray ;; sing-box) unit=sb; openrc=sing-box ;; *) return 1 ;; esac
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-active --quiet "$unit"
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service "$openrc" status >/dev/null 2>&1
+else
+for proc in /proc/[0-9]*; do
+[ "$(readlink -f "$proc/exe" 2>/dev/null)" = "$HOME/lun/$1" ] && return 0
+done
+return 1
+fi
+}
+
+core_update_restart(){
+case "$1" in xray) xrestart ;; sing-box) sbrestart ;; *) return 1 ;; esac
+}
+
+core_update_digest(){
+command -v python3 >/dev/null 2>&1 || return 0
+command -v curl >/dev/null 2>&1 || return 0
+curl -fsSL --connect-timeout 5 --max-time 15 -H 'Cache-Control: no-cache' \
+"https://api.github.com/repos/azk78lun-collab/FHLUN/releases/tags/lun" 2>/dev/null | \
+python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((a.get("digest", "") for a in d.get("assets", []) if a.get("name")==sys.argv[1]), ""))' "$1" 2>/dev/null
+}
+
+update_installed_core(){ (
+engine=$1
+case "$engine" in xray|sing-box) ;; *) return 1 ;; esac
+out="$HOME/lun/$engine"
+[ -x "$out" ] || { yellow_line "$engine 未安装，跳过，不新增内核。"; return 0; }
+stage=$(mktemp "$HOME/lun/.${engine}-update.XXXXXX") || return 1
+backup=
+trap 'rm -f "$stage"; [ -z "$backup" ] || rm -f "$backup"' EXIT
+yellow_line "正在检查 Lun 配套 $engine 内核……"
+asset="$engine-$cpu"
+if [ "$engine" = sing-box ] && multiuser_enabled; then asset="sing-box-multiuser-$cpu"; fi
+digest=$(core_update_digest "$asset") || digest=
+case "$digest" in sha256:*) expected_hash=${digest#sha256:} ;; *) expected_hash= ;; esac
+if [ "${#expected_hash}" = 64 ] && [ "$(sha256sum "$out" | awk '{print $1}')" = "$expected_hash" ]; then
+green_line "$engine 已是当前发布版本，无需下载或重启。"
+return 0
+fi
+download_core_asset "$asset" "$stage" "https://github.com/azk78lun-collab/FHLUN/releases/download/lun/$asset" || return 1
+if [ -n "$expected_hash" ] && [ "$(sha256sum "$stage" | awk '{print $1}')" != "$expected_hash" ]; then
+red_line "$engine 下载校验失败，保留原内核。"
+return 1
+fi
+chmod 755 "$stage" || return 1
+if cmp -s "$stage" "$out"; then
+green_line "$engine 已是当前发布版本，无需重启。"
+return 0
+fi
+if [ "$engine" = xray ]; then
+old_version=$("$out" version 2>/dev/null | awk '/^Xray/{print $2; exit}')
+new_version=$("$stage" version 2>/dev/null | awk '/^Xray/{print $2; exit}')
+else
+old_version=$("$out" version 2>/dev/null | awk '/version/{print $NF; exit}')
+new_version=$("$stage" version 2>/dev/null | awk '/version/{print $NF; exit}')
+fi
+[ -n "$new_version" ] || { red_line "$engine 下载文件不可执行，保留原内核。"; return 1; }
+case "${new_version#v}:${old_version#v}" in
+*[!0-9.:]*)
+if [ "$new_version" != "$old_version" ]; then
+yellow_line "$engine 预发布/定制版本不同（$old_version → $new_version），保留原内核，请手动核实兼容性。"
+return 0
+fi
+;;
+esac
+if [ -n "$old_version" ] && lun_version_is_older "${new_version#v}" "${old_version#v}"; then
+yellow_line "$engine 当前 $old_version 新于配套发布 $new_version，保留本机版本。"
+return 0
+fi
+config="$HOME/lun/xr.json"
+[ "$engine" = sing-box ] && config="$HOME/lun/sb.json"
+if [ -s "$config" ]; then
+if [ "$engine" = xray ]; then
+"$stage" run -test -c "$config" >/dev/null 2>&1 || { red_line "新 Xray 不兼容现有配置，未替换。"; return 1; }
+else
+"$stage" check -c "$config" >/dev/null 2>&1 || { red_line "新 Sing-box 不兼容现有配置，未替换。"; return 1; }
+fi
+fi
+was_running=no
+core_update_running "$engine" && was_running=yes
+backup=$(mktemp "$HOME/lun/.${engine}-previous.XXXXXX") || return 1
+cp -p "$out" "$backup" || return 1
+mv -f "$stage" "$out" || return 1
+if [ "$was_running" = yes ]; then
+if core_update_restart "$engine" && sleep 1 && core_update_running "$engine"; then
+:
+else
+mv -f "$backup" "$out" || { red_line "恢复内核失败，回滚文件保留：$backup"; backup=; return 1; }
+backup=
+if [ "$engine" = xray ]; then xrestart; else sbrestart; fi
+red_line "$engine 新内核启动失败，已恢复旧内核；请检查服务状态。"
+return 1
+fi
+fi
+green_line "$engine 已更新：${old_version:-未知} → $new_version（原先停止的服务不会自动启动）。"
+) }
+
+update_local_lun_bundle(){
+update_lun_script || return 1
+bundle_rc=0
+update_installed_core xray || bundle_rc=1
+update_installed_core sing-box || bundle_rc=1
+[ "$bundle_rc" = 0 ] || red_line "脚本已检查；部分内核未更新，原内核已保留或恢复，请查看上方原因。"
+return "$bundle_rc"
 }
 
 update_lun_script(){
@@ -13372,19 +13525,15 @@ ui_title "Lun 服务与更新"
 echo " 1. 重启服务"
 echo " 2. 停止服务"
 echo " 3. 查看运行日志"
-echo " 4. 更新本机 Lun 脚本"
-echo " 5. 更新 Xray 内核"
-echo " 6. 更新 Sing-box 内核"
+echo " 4. 更新本机 Lun 脚本（同时检查 Xray / Sing-box）"
 echo " 0. 返回"
-printf "请选择 [0-6]："
+printf "请选择 [0-4]（输入 0 返回）："
 IFS= read -r c
 case "$c" in
 1) LUN_MENU_ACTION=res; return ;;
 2) stop_lun_services; echo "已停止 Lun 服务。"; exit ;;
 3) log_menu ;;
-4) update_lun_script; ui_pause ;;
-5) LUN_MENU_ACTION=upx; return ;;
-6) LUN_MENU_ACTION=ups; return ;;
+4) update_local_lun_bundle; ui_pause ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -14933,7 +15082,7 @@ red_line "公开证书申请失败，现有证书未改动。日志：$HOME/lun/
 fi
 exit "$cert_cli_rc"
 elif [ "$1" = "self-update" ]; then
-update_lun_script
+update_local_lun_bundle
 exit $?
 elif [ "$1" = "cluster-refresh-identity" ]; then
 cip || exit $?

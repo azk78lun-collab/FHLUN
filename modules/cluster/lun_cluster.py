@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -138,7 +138,7 @@ ACTION_NAMES = {
     "federation.catchup", "federation.relay", "federation.snapshot",
     "chain.info", "chain.list", "chain.exit.create", "chain.describe",
     "chain.entry.create", "chain.repair", "chain.remove",
-    "chain.port",
+    "chain.port", "chain.preflight", "chain.enable-reality",
 }
 
 
@@ -6087,9 +6087,9 @@ class ChainRoutes:
         for item in re.split(r"[,\s]+", value.strip()):
             if not item:
                 continue
-            if not re.fullmatch(r"\d{1,5}(?:-\d{1,5})?", item):
+            if not re.fullmatch(r"\d{1,5}(?:[-+]\d{1,5})?", item):
                 raise ClusterError("端口池格式无效")
-            bounds = [int(part) for part in item.split("-")]
+            bounds = [int(part) for part in re.split(r"[-+]", item)]
             low, high = bounds[0], bounds[-1]
             if not valid_port(low) or not valid_port(high) or low > high:
                 raise ClusterError("端口池范围无效")
@@ -6123,9 +6123,9 @@ class ChainRoutes:
             raise ClusterError(f"NAT 内网端口 {port} 没有公网映射，请先添加 公网端口-{port}")
         return mapping[port]
 
-    def choose_port(self, port: int = 0) -> int:
-        data = self.core()
-        used = {int(item.get("port", 0)) for item in data.get("inbounds", [])}
+    def choose_port(self, port: int = 0, reserved: set[int] | None = None) -> int:
+        data = self.core() if (self.root / "xr.json").exists() else {}
+        used = {int(item.get("port", 0)) for item in data.get("inbounds", [])} | (reserved or set())
         sb = self.root / "sb.json"
         if sb.exists():
             used.update(int(item.get("listen_port", 0)) for item in json.loads(sb.read_text()).get("inbounds", []))
@@ -6142,6 +6142,8 @@ class ChainRoutes:
                 used.add(int((self.root / name).read_text().strip()))
         configured = self.root / "port_pool"
         pool = list(self.mappings()) if self.nat() else self.pool(configured.read_text()) if configured.exists() else []
+        if self.nat() and not pool:
+            raise ClusterError("NAT VPS 没有可用映射，请先在服务商添加映射，再登记 公网端口-内网端口")
         candidates = [port] if port else pool or [20000 + secrets.randbelow(40000) for _ in range(128)]
         for candidate in candidates:
             if not valid_port(candidate) or candidate in used or (not port and candidate in {22, 80, 443}):
@@ -6162,24 +6164,89 @@ class ChainRoutes:
             return candidate
         raise ClusterError("没有可用的独立链式入口端口；NAT VPS 请先增加一组未占用的端口映射")
 
+    def require_capability(self) -> None:
+        agent = self.root / "modules/multiuser/lun_agent.py"
+        if not agent.exists():
+            agent = agent.with_name("lun-agent")
+        if not agent.exists() or "lun-chain-entry-" not in agent.read_text(encoding="utf-8", errors="ignore"):
+            raise ClusterError("请先更新这台 VPS 的 Lun 主脚本和多用户模块，再启用链式代理")
+
     def info(self) -> dict[str, Any]:
+        self.require_capability()
         base = self.template(self.core())
         reality = base["streamSettings"]["realitySettings"]
         names, short_ids = reality.get("serverNames", []), reality.get("shortIds", [])
         if not names or not short_ids:
             raise ClusterError("现有 Reality 缺少 SNI 或 shortId")
         host, port = self.endpoint(int(base["port"]))
-        agent = self.root / "modules/multiuser/lun_agent.py"
-        if not agent.exists():
-            agent = agent.with_name("lun-agent")
-        if not agent.exists() or "lun-chain-entry-" not in agent.read_text(encoding="utf-8", errors="ignore"):
-            raise ClusterError("请先更新这台 VPS 的 Lun 主脚本和多用户模块，再启用链式代理")
         status = self.cluster.local_status()
         return {"node_id": status["node_id"], "host": host, "port": port,
                 "sni": str(names[0]), "sid": str(short_ids[0]),
                 "public_key": self.public_key(str(reality.get("privateKey", ""))),
                 "place": safe_label(self.cluster.identity_place(self.cluster.node(str(status["node_id"]))), 32),
                 "server_number": status["server_number"], "chain_version": 1}
+
+    def preflight(self, role: str, port: int) -> dict[str, Any]:
+        if role not in {"entry", "exit"} or (port and not valid_port(port)):
+            raise ClusterError("链路角色或端口无效")
+        self.require_capability()
+        data = self.core() if (self.root / "xr.json").exists() else {}
+        present = any(item.get("tag") == "reality-vision" for item in data.get("inbounds", []))
+        # Reserve the explicit chain entry first; a missing base Reality needs another port.
+        chain_port = self.choose_port(port) if role == "entry" else 0
+        if present:
+            result = self.info()  # Reject damaged Reality rather than overwrite it.
+            reality_port = int(self.template(data)["port"])
+        else:
+            self.require_bootstrap_capability()
+            reality_port = self.choose_port(reserved={chain_port})
+            host, public = self.endpoint(reality_port)
+            status = self.cluster.local_status()
+            result = {"node_id": status["node_id"], "host": host, "port": public,
+                      "place": safe_label(self.cluster.identity_place(self.cluster.node(status["node_id"])), 32),
+                      "server_number": status["server_number"]}
+        return {**result, "needs_reality": not present, "reality_port": reality_port,
+                "chain_port": chain_port, "chain_public_port": self.public_port(chain_port) if chain_port else 0}
+
+    @staticmethod
+    def require_bootstrap_capability() -> None:
+        script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+        if not script.is_file() or "chain_preserve_existing_core_fields(){" not in script.read_text(encoding="utf-8", errors="ignore"):
+            raise ClusterError("自动添加 Reality 需要新版 Lun 主脚本，请先同步更新目标 VPS")
+
+    def enable_reality(self, port: int) -> dict[str, Any]:
+        self.require_capability()
+        data = self.core() if (self.root / "xr.json").exists() else {}
+        if any(item.get("tag") == "reality-vision" for item in data.get("inbounds", [])):
+            return self.info()
+        self.require_bootstrap_capability()
+        chosen = self.choose_port(port)
+        # Reuse the existing transactional rebuild, retaining every currently enabled protocol.
+        fields = dict(zip(
+            ("vlpt", "vmpt", "vwpt", "hypt", "tupt", "xhpt", "vxpt", "anpt", "sspt", "arpt", "sopt", "xupt", "xcpt", "nvpt"),
+            ("port_vl_re", "port_vm_ws", "port_vw", "port_hy2", "port_tu", "port_xh", "port_vx", "port_an", "port_ss", "port_ar", "port_so", "port_xu", "port_xc", "port_nv")))
+        environment = {}
+        for variable, filename in fields.items():
+            path = self.root / filename
+            if path.exists() and path.read_text().strip():
+                environment[variable] = path.read_text().strip()
+        environment["vlpt"] = str(chosen)
+        environment["uuid"] = (self.root / "uuid").read_text().strip()
+        sni = self.root / "ym_vl_re"
+        environment["reym"] = sni.read_text().strip() if sni.exists() else "www.cloudflare.com"
+        binding = self.root / "vlvm"
+        if binding.exists():
+            variable = {"vmess": "vmpt", "vless": "vwpt"}.get(binding.read_text().strip().lower())
+            if variable in environment:
+                environment["argo"] = variable
+                for variable, filename in (("agn", "sbargoym.log"), ("agk", "sbargotoken.log")):
+                    path = self.root / filename
+                    if path.exists() and path.read_text().strip():
+                        environment[variable] = path.read_text().strip()
+        environment = validate_lun_environment(environment)
+        # chain.enable-reality already owns the action lock; do not acquire it again.
+        _execute_action_locked(self.cluster, "protocol.apply", environment, {"_chain_bootstrap": True}, "local")
+        return self.info()
 
     def rows(self) -> list[dict[str, Any]]:
         return [{"chain_id": key, **{name: row.get(name) for name in
@@ -6455,7 +6522,9 @@ class ChainRoutes:
             shutil.rmtree(temporary)
 
     def action(self, action: str, payload: dict[str, Any], peer_id: str) -> dict[str, Any]:
-        allowed = {"chain.info": set(), "chain.list": set(), "chain.port": {"port"}, "chain.exit.create": {"chain_id", "entry_id", "name"},
+        allowed = {"chain.info": set(), "chain.list": set(), "chain.port": {"port"},
+                   "chain.preflight": {"role", "port"}, "chain.enable-reality": {"port"},
+                   "chain.exit.create": {"chain_id", "entry_id", "name"},
                    "chain.describe": {"chain_id"}, "chain.entry.create": {"chain_id", "exit_id", "port", "name"},
                    "chain.repair": {"chain_id"}, "chain.remove": {"chain_id"}}
         if set(payload) != allowed[action]:
@@ -6464,6 +6533,10 @@ class ChainRoutes:
             return self.info()
         if action == "chain.list":
             return {"routes": self.rows()}
+        if action == "chain.preflight":
+            return self.preflight(str(payload["role"]), int(payload["port"]))
+        if action == "chain.enable-reality":
+            return self.enable_reality(int(payload["port"]))
         if action == "chain.port":
             selected = self.choose_port(int(payload["port"]))
             host, public = self.endpoint(selected)
@@ -6525,7 +6598,7 @@ def chain_call(cluster: Cluster, node_id: str, action: str, payload: dict[str, A
     if node_id == cluster.load_config().get("node_id"):
         result = execute_action(cluster, {"action": action, "payload": payload, "request_id": uuid.uuid4().hex})
     else:
-        timeout = 12 if action in {"chain.info", "chain.list", "chain.port"} else 30 if action == "chain.describe" else 360
+        timeout = 20 if action in {"chain.info", "chain.list", "chain.port", "chain.preflight"} else 30 if action == "chain.describe" else 960 if action == "chain.enable-reality" else 360
         result = send_action(cluster, node_id, action, payload, timeout=timeout, coordinate_failures=False)
     return _action_result_payload(result)
 
@@ -6538,16 +6611,26 @@ def chain_plan(cluster: Cluster, entry: str, exit_node: str, port: int = 0) -> d
     for node in (a, b):
         if not manager.trusted(str(node["id"])):
             raise ClusterError("只能选择已信任且未撤销的联邦成员")
-    info_a, info_b = (chain_call(cluster, str(node["id"]), "chain.info", {}) for node in (a, b))
-    selected = chain_call(cluster, str(a["id"]), "chain.port", {"port": port})
+    info_a = chain_call(cluster, str(a["id"]), "chain.preflight", {"role": "entry", "port": port})
+    info_b = chain_call(cluster, str(b["id"]), "chain.preflight", {"role": "exit", "port": 0})
     return {"entry_id": str(a["id"]), "exit_id": str(b["id"]), "entry": info_a, "exit": info_b,
-            "port": selected["port"], "public_port": selected["public_port"],
+            "port": info_a["chain_port"], "public_port": info_a["chain_public_port"],
             "name": f"[{info_a['place']}→{info_b['place']}]vless-reality-chain-tcp-{int(a['server_number']):02d}-{int(b['server_number']):02d}"}
 
 
 def chain_create(cluster: Cluster, entry: str, exit_node: str, port: int = 0,
                  progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     plan = chain_plan(cluster, entry, exit_node, port)
+    # Both nodes must have enough ports before either node is changed.
+    try:
+        for node, info in ((plan["exit_id"], plan["exit"]), (plan["entry_id"], plan["entry"])):
+            if info["needs_reality"]:
+                if progress:
+                    progress(f"正在为服务器 {info['server_number']:02d} 自动启用 Reality（端口 {info['reality_port']}）……")
+                chain_call(cluster, node, "chain.enable-reality", {"port": info["reality_port"]})
+    except Exception as exc:
+        raise ClusterError("Reality 自动准备失败，链路尚未创建；已成功启用的普通 Reality 节点保留，失败端由重建事务恢复：" + str(exc)[:250]) from exc
+    plan = chain_plan(cluster, entry, exit_node, plan["port"])
     cid = uuid.uuid4().hex
     name = plan["name"] + "-" + cid[:6]
     a, b = plan["entry_id"], plan["exit_id"]
@@ -6964,6 +7047,10 @@ def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any
         raise ClusterError("没有找到可执行的 Lun 主脚本")
     if action == "protocol.apply":
         environment = os.environ.copy()
+        if request.get("_chain_bootstrap") is True:
+            for key in LUN_ENV_FIELDS:
+                environment.pop(key, None)
+            environment["LUN_CHAIN_PREPARE"] = "yes"
         environment.update(validate_lun_environment(payload))
         if not any(key in environment for key in PORT_ENV_FIELDS):
             raise ClusterError("协议重建至少需要一个协议端口字段")
@@ -7609,6 +7696,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "chain-plan":
                     print("入口：" + str(result["entry"]["host"]) + "；内网端口：" + str(result["port"]) + "；公网端口：" + str(result["public_port"]))
                     print("出口：" + str(result["exit"]["host"]) + ":" + str(result["exit"]["port"]))
+                    for role, label in (("entry", "A"), ("exit", "B")):
+                        if result[role]["needs_reality"]:
+                            print(f"{label} 尚未启用 Reality，将自动新增内网端口 {result[role]['reality_port']}；端口池已预检。")
                     print("只转发 TCP；保留普通节点。B 故障即停止，不回落 A 直出。")
                 else:
                     print("链式节点已生成，请刷新入口 VPS 的个人订阅或集群聚合订阅。")

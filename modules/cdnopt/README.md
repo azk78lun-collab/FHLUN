@@ -12,4 +12,6 @@
 
 VPS 测速不能代表客户端线路，所以两个榜单始终独立显示。页面支持 IPv4/IPv6、端口备注、CIDR、IP 区间、筛选排序、复制和 CSV；测试端口只用于探测，不会保存到 CDN 优选池。
 
+候选不是打包在脚本里的固定旧列表：每次启动模块、切换库或点击“刷新 IP 库”都会带禁止缓存请求头重新获取。BestCF 自身约每 12 小时构建，因此“实时获取”指获取上游当前版本，并不意味着上游每秒生成新 IP。页面区分实时数据与失败回退缓存，并显示获取时间。刷新候选不会擅自替换已应用的优选池，仍需测速、预览和确认；无需再在脚本更新菜单重复下载候选。
+
 客户端探测兼容 [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel) 的 BestCF/HiDNS 方案；VPS 测速使用 [Cloudflare Speedtest](https://github.com/cloudflare/speedtest) 下载端点。本模块是独立轻量实现，没有复制第三方管理面板、广告或订阅功能。

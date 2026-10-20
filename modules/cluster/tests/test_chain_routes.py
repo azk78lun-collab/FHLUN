@@ -38,6 +38,10 @@ def base_core(port=23456):
 class ChainTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        script = Path(self.temp.name) / "lun.sh"
+        script.write_text("chain_preserve_existing_core_fields(){ :; }\n")
+        self.script_environment = mock.patch.dict(os.environ, {"LUN_SCRIPT": str(script)})
+        self.script_environment.start()
         self.aid, self.bid = "a" * 32, "b" * 32
         self.clusters = {}
         self.status = {self.aid: {"node_id": self.aid, "public_host": "8.8.8.8", "public_port": 39001,
@@ -74,6 +78,7 @@ class ChainTests(unittest.TestCase):
         self.transport.start()
 
     def tearDown(self):
+        self.script_environment.stop()
         self.transport.stop()
         for cluster in self.clusters.values():
             cluster.close()
@@ -273,6 +278,73 @@ class ChainTests(unittest.TestCase):
         with self.assertRaises(mod.ClusterError):
             mod.chain_plan(self.a, self.aid, self.aid)
         self.assertEqual(self.calls, [])
+
+    def test_preflight_missing_reality_requires_two_entry_ports_without_mutation(self):
+        self.a.root.joinpath("xr.json").write_text(json.dumps({"inbounds": []}))
+        self.a.root.joinpath("vps_mode").write_text("nat")
+        self.a.root.joinpath("port_map").write_text("45001-25001")
+        before = self.a.root.joinpath("xr.json").read_bytes()
+        with self.assertRaises(mod.ClusterError):
+            mod.chain_plan(self.a, self.aid, self.bid)
+        self.assertEqual(self.a.root.joinpath("xr.json").read_bytes(), before)
+        self.assertFalse(any(action == "chain.enable-reality" for _, action, _ in self.calls))
+        self.a.root.joinpath("port_map").write_text("45001-25001 45002-25002")
+        plan = mod.chain_plan(self.a, self.aid, self.bid, 25001)
+        self.assertTrue(plan["entry"]["needs_reality"])
+        self.assertEqual(plan["entry"]["reality_port"], 25002)
+        self.assertEqual(plan["public_port"], 45001)
+
+    def test_normal_pool_supports_lun_plus_ranges_and_exhaustion(self):
+        self.a.root.joinpath("xr.json").unlink()
+        self.a.root.joinpath("port_pool").write_text("25001+25002")
+        result = mod.ChainRoutes(self.a).preflight("entry", 25001)
+        self.assertEqual((result["chain_port"], result["reality_port"]), (25001, 25002))
+        self.a.root.joinpath("port_pool").write_text("25001")
+        with self.assertRaises(mod.ClusterError):
+            mod.ChainRoutes(self.a).preflight("entry", 25001)
+        self.a.root.joinpath("vps_mode").write_text("nat")
+        with self.assertRaisesRegex(mod.ClusterError, "没有可用映射"):
+            mod.ChainRoutes(self.a).choose_port()
+
+    def test_auto_enable_both_reality_keeps_ports_uuid_and_existing_sni(self):
+        for cluster in (self.a, self.b):
+            cluster.root.joinpath("xr.json").write_text(json.dumps({"inbounds": [], "outbounds": []}))
+            cluster.root.joinpath("port_vx").write_text("23455")
+            cluster.root.joinpath("port_vw").write_text("23454")
+            cluster.root.joinpath("ym_vl_re").write_text("existing.example.com")
+            cluster.root.joinpath("vlvm").write_text("Vless")
+            cluster.root.joinpath("sbargoym.log").write_text("tunnel.example.com")
+            cluster.root.joinpath("sbargotoken.log").write_text("fixture-local-token")
+        original = mod._execute_action_locked
+        prepared = []
+        def apply(cluster, action, payload, request, peer):
+            if action != "protocol.apply":
+                return original(cluster, action, payload, request, peer)
+            self.assertEqual(payload["vxpt"], "23455")
+            self.assertEqual(payload["uuid"], LEGACY)
+            self.assertEqual(payload["reym"], "existing.example.com")
+            self.assertEqual(payload["argo"], "vwpt")
+            self.assertEqual(payload["agn"], "tunnel.example.com")
+            self.assertEqual(payload["agk"], "fixture-local-token")
+            cluster.root.joinpath("xr.json").write_text(json.dumps(base_core(int(payload["vlpt"]))))
+            cluster.root.joinpath("port_vl_re").write_text(payload["vlpt"])
+            prepared.append(cluster)
+            return {"returncode": 0}
+        with mock.patch.object(mod, "_execute_action_locked", side_effect=apply):
+            result = self.create()
+        self.assertEqual(prepared, [self.b, self.a])
+        self.assertTrue(result["chain_id"])
+        self.assertEqual(self.a.root.joinpath("uuid").read_text(), LEGACY)
+        self.assertEqual(self.b.root.joinpath("port_vx").read_text(), "23455")
+        self.assertNotEqual(result["port"], int(self.a.root.joinpath("port_vl_re").read_text()))
+
+    def test_exit_shortage_is_detected_before_preparing_entry(self):
+        self.b.root.joinpath("xr.json").write_text(json.dumps({"inbounds": []}))
+        self.b.root.joinpath("port_pool").write_text("39002")  # federation listener owns this port
+        with self.assertRaises(mod.ClusterError):
+            self.create()
+        self.assertFalse(any(action in {"chain.enable-reality", "chain.exit.create"}
+                             for _, action, _ in self.calls))
 
     def test_corrupt_state_and_missing_reality_do_not_silently_drop_chain(self):
         manager = mod.ChainRoutes(self.a)

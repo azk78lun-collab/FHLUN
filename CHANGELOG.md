@@ -1,8 +1,8 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.10.20.2`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.10.20.3`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.10.20.2`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.10.20.3`.
 
 ## 阅读说明 Reading guide
 
@@ -18,7 +18,12 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 
 ## 2026 年 10 月 20 日
 
-- CI 测试维护 / CI test maintenance · 脚本版本不变 / Script version unchanged: `V26.10.20.2`
+- `V26.10.20.3` · 更新整合与链路自动准备 / Unified updates and automatic chain preparation
+  - 中文：本机脚本更新整合已安装 Xray/Sing-box 的配套资产检查，支持哈希跳过、配置校验及失败恢复；链式代理创建前检查两端 NAT/普通端口池，自动远程启用缺失的 Reality，保留原有核心配置。确认 CDN 候选库已按需实时读取，补充缓存与上游构建周期说明，不重复增加下载入口。
+  - English: Combine local script updates with compatible installed-core checks, digest-based skipping, configuration validation and rollback. Preflight both nodes' NAT/ordinary port pools and provision missing Reality protocols remotely while preserving existing core configuration. Confirm on-demand live CDN-source fetching and document cache fallback and upstream build intervals without adding a duplicate download entry.
+  - 验证 / Verification：原生 Linux 210 项 Python 用例（含另行补跑的 2 项真实内核测试）、13 组 Shell 测试通过；两台甲骨文灰度、新建临时联邦链路与既有订阅回归通过。/ Native Linux covered all 210 Python cases including two separately enabled real-core cases, plus 13 Shell suites. Two Oracle canaries passed temporary federated-chain creation and existing-subscription regression checks. [验收记录 / Verification report](docs/VERIFICATION_V26.10.20.3.md)。
+
+- [`d20f112`](https://github.com/azk78lun-collab/FHLUN/commit/d20f112) · CI 测试维护 / CI test maintenance · 脚本版本不变 / Script version unchanged: `V26.10.20.2`
   - 中文：更新集群批量更新菜单的测试模拟，显式处理服务就绪检查，验证就绪时不重启、未就绪时先重启、重启失败不下发，以及取消或官方更新失败时无后续操作。离线检查输出当前测试文件名，便于定位后续失败。不修改代理、VPS 配置或生产更新逻辑。
   - English: Update the batch-update menu test double to handle service-readiness checks explicitly. Verify no restart when ready, restart before distribution when stale, no distribution after restart failure, and no follow-up actions after cancellation or an official-update failure. Print test filenames during offline checks to identify future failures. Proxy configuration, VPS settings and production update logic remain unchanged.
 
