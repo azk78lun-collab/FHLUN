@@ -12,6 +12,7 @@ import argparse
 import base64
 import binascii
 import concurrent.futures
+import copy
 import contextlib
 import datetime as dt
 import getpass
@@ -43,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.2.5"
+VERSION = "0.3.0"
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
@@ -134,6 +135,9 @@ ACTION_NAMES = {
     "controller.commit", "controller.abort", "controller.reassign",
     "cdn.pool.preview", "cdn.pool.apply",
     "federation.catchup", "federation.relay", "federation.snapshot",
+    "chain.info", "chain.list", "chain.exit.create", "chain.describe",
+    "chain.entry.create", "chain.repair", "chain.remove",
+    "chain.port",
 }
 
 
@@ -1858,6 +1862,8 @@ class Cluster:
                 )
                 for raw in generic_text.splitlines():
                     line = self._prefix_generic_line(raw, prefix)
+                    if line and not ChainRoutes.name_allowed(self, urllib.parse.unquote(line.rsplit("#", 1)[-1])):
+                        continue
                     if line and line not in seen_generic:
                         generic.append(line)
                         seen_generic.add(line)
@@ -1866,6 +1872,8 @@ class Cluster:
                     rows["clmi.yaml"].decode("utf-8", errors="replace"), node
                 )
                 for name, block in self._extract_clash_blocks(clash_text, prefix):
+                    if not ChainRoutes.name_allowed(self, name):
+                        continue
                     if name not in clash_names:
                         clash_names.append(name)
                         clash_blocks.append(block)
@@ -1882,6 +1890,8 @@ class Cluster:
                             continue
                         item = json.loads(json.dumps(outbound))
                         tag = item.get("tag") or item.get("type", "node")
+                        if not ChainRoutes.name_allowed(self, tag):
+                            continue
                         if tag in seen_tags:
                             continue
                         item["tag"] = tag
@@ -3255,8 +3265,9 @@ class Cluster:
             node_id = str(payload.get("node_id", ""))
             if status.get("node_id") == node_id and re.fullmatch(r"[0-9a-f]{32}", node_id):
                 self.upsert_node(status, role="federation")
+                ChainRoutes(self).queue_peer(node_id)
         elif event["type"] in {"member.revoke", "revocation.proof"}:
-            pass
+            ChainRoutes(self).queue_peer(str(payload.get("node_id", "")))
         elif event["type"] == "usage.absolute":
             self.record_usage(str(payload.get("node_id", event["author_id"])), str(payload.get("device_uuid", "")),
                               str(payload.get("epoch", "")), int(payload.get("uplink", 0)), int(payload.get("downlink", 0)),
@@ -4837,6 +4848,7 @@ def serve(cluster: Cluster) -> None:
             try:
                 if cluster.is_federation():
                     deliver_pending_health_revocations(cluster)
+                    ChainRoutes(cluster).reconcile_pending()
             except (ClusterError, OSError, sqlite3.Error) as exc:
                 sys.stderr.write(f"federation revocation delivery failed: {exc}\n")
             finally:
@@ -5940,6 +5952,623 @@ def validate_lun_environment(payload: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+class ChainRoutes:
+    """Optional two-hop data plane. Secrets stay local; only A receives B's transit UUID."""
+
+    PREFIX = "lun-chain-"
+    TRANSIT = "lun-transit-"
+    PRIVATE = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+               "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+               "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128",
+               "fc00::/7", "fe80::/10", "ff00::/8"]
+
+    def __init__(self, cluster: Cluster):
+        self.cluster, self.root = cluster, cluster.root
+        self.path = self.root / "chain_routes.json"
+
+    @staticmethod
+    def chain_id(value: Any) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+            raise ClusterError("链路 ID 无效")
+        return value
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"version": 1, "routes": {}}
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if value.get("version") != 1 or not isinstance(value.get("routes"), dict):
+                raise ValueError("invalid chain state")
+            if len(value["routes"]) > 16:
+                raise ValueError("too many chain routes")
+            for key, row in value["routes"].items():
+                self.chain_id(key)
+                if row.get("role") not in {"entry", "exit"} or not isinstance(row.get("active"), bool):
+                    raise ValueError("invalid chain role/state")
+            return value
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise ClusterError("链式配置损坏，已拒绝忽略或回落直连") from exc
+
+    def save(self, value: dict[str, Any]) -> None:
+        atomic_write(self.path, json.dumps(value, ensure_ascii=False, indent=2) + "\n", 0o600)
+
+    def trusted(self, node_id: str) -> bool:
+        row = self.cluster.db.connection.execute(
+            "SELECT k.revoked_at FROM federation_keys k JOIN nodes n ON n.id=k.node_id "
+            "WHERE k.node_id=? AND n.state NOT IN ('legacy-unverified','revoked','removed')", (node_id,)
+        ).fetchone()
+        return bool(row and not row[0])
+
+    def require_peer(self, node_id: str) -> sqlite3.Row:
+        if not self.cluster.is_federation() or not self.trusted(node_id):
+            raise ClusterError("链式代理只允许已信任且未撤销的联邦成员")
+        if node_id == self.cluster.load_config().get("node_id"):
+            raise ClusterError("入口和出口不能是同一台服务器")
+        return self.cluster.node(node_id)
+
+    def enabled(self, row: dict[str, Any]) -> bool:
+        owner = row.get("entry_id") if row.get("role") == "entry" else row.get("exit_id")
+        return bool(row.get("active") and owner == self.cluster.load_config().get("node_id")
+                    and self.trusted(str(row.get("entry_id", ""))) and self.trusted(str(row.get("exit_id", ""))))
+
+    def core(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.root / "xr.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ClusterError("请先在这台 VPS 启用 VLESS TCP Reality") from exc
+
+    @staticmethod
+    def template(data: dict[str, Any]) -> dict[str, Any]:
+        for inbound in data.get("inbounds", []):
+            stream = inbound.get("streamSettings", {})
+            if (inbound.get("tag") == "reality-vision" and inbound.get("protocol") == "vless"
+                    and stream.get("security") == "reality" and stream.get("network", "tcp") in {"tcp", "raw"}):
+                return copy.deepcopy(inbound)
+        raise ClusterError("请先启用 VLESS TCP Reality；首版不复用 XHTTP/CDN/隧道作为中转")
+
+    @staticmethod
+    def public_key(private_key: str) -> str:
+        try:
+            raw = base64.urlsafe_b64decode(private_key + "=" * (-len(private_key) % 4))
+            if len(raw) != 32:
+                raise ValueError("invalid X25519 key")
+            # Pass the private key on stdin, never in process arguments or API results.
+            result = subprocess.run(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                                    input=bytes.fromhex("302e020100300506032b656e04220420") + raw,
+                                    capture_output=True, timeout=10)
+            if result.returncode or not result.stdout.startswith(bytes.fromhex("302a300506032b656e032100")):
+                raise ValueError("X25519 public key derivation failed")
+            return base64.urlsafe_b64encode(result.stdout[-32:]).decode().rstrip("=")
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            raise ClusterError("Reality 公钥生成失败，未返回或复制私钥") from exc
+
+    def endpoint(self, internal: int) -> tuple[str, int]:
+        config = self.cluster.load_config()
+        hosts = order_public_hosts(config.get("public_hosts", []), str(config.get("public_host", "")))
+        for host in hosts:
+            try:
+                address = ipaddress.ip_address(host.strip("[]"))
+            except ValueError:
+                continue
+            if address.is_global:
+                return str(address), internal if address.version == 6 else self.public_port(internal)
+        raise ClusterError("未登记可直连的公网 IP，请先运行集群的状态 / 修复")
+
+    def nat(self) -> bool:
+        mode = (self.root / "vps_mode").read_text().strip() if (self.root / "vps_mode").exists() else ""
+        return mode == "nat" or (mode != "normal" and (self.root / "port_map").exists())
+
+    @staticmethod
+    def pool(value: str) -> list[int]:
+        result: list[int] = []
+        for item in re.split(r"[,\s]+", value.strip()):
+            if not item:
+                continue
+            if not re.fullmatch(r"\d{1,5}(?:-\d{1,5})?", item):
+                raise ClusterError("端口池格式无效")
+            bounds = [int(part) for part in item.split("-")]
+            low, high = bounds[0], bounds[-1]
+            if not valid_port(low) or not valid_port(high) or low > high:
+                raise ClusterError("端口池范围无效")
+            result.extend(range(low, high + 1))
+        return list(dict.fromkeys(result))
+
+    def mappings(self) -> dict[int, int]:
+        result: dict[int, int] = {}
+        path = self.root / "port_map"
+        for item in path.read_text().split() if path.exists() else []:
+            if not re.fullmatch(r"\d{1,5}-\d{1,5}", item):
+                raise ClusterError("NAT 映射格式无效")
+            public, internal = map(int, item.split("-"))
+            if not valid_port(public) or not valid_port(internal):
+                raise ClusterError("NAT 映射端口无效")
+            result.setdefault(internal, public)
+        inner, outer = self.root / "inner_port_pool", self.root / "outer_port_pool"
+        if inner.exists() and outer.exists():
+            ins, outs = self.pool(inner.read_text()), self.pool(outer.read_text())
+            if len(ins) != len(outs):
+                raise ClusterError("内外端口池数量不一致")
+            for i, p in zip(ins, outs):
+                result.setdefault(i, p)
+        return result
+
+    def public_port(self, port: int) -> int:
+        if not self.nat():
+            return port
+        mapping = self.mappings()
+        if port not in mapping:
+            raise ClusterError(f"NAT 内网端口 {port} 没有公网映射，请先添加 公网端口-{port}")
+        return mapping[port]
+
+    def choose_port(self, port: int = 0) -> int:
+        data = self.core()
+        used = {int(item.get("port", 0)) for item in data.get("inbounds", [])}
+        sb = self.root / "sb.json"
+        if sb.exists():
+            used.update(int(item.get("listen_port", 0)) for item in json.loads(sb.read_text()).get("inbounds", []))
+        for path in self.root.glob("port_*"):
+            with contextlib.suppress(OSError, ValueError):
+                used.add(int(path.read_text().strip()))
+        for path, keys in ((self.cluster.config_path, ("internal_port",)),
+                           (self.root / "modules/multiuser/config.json", ("port", "ss_port", "legacy_http_port"))):
+            if path.exists():
+                cfg = json.loads(path.read_text())
+                used.update(int(cfg.get(key) or 0) for key in keys)
+        for name in ("subport.log", "cdnopt_port"):
+            with contextlib.suppress(OSError, ValueError):
+                used.add(int((self.root / name).read_text().strip()))
+        configured = self.root / "port_pool"
+        pool = list(self.mappings()) if self.nat() else self.pool(configured.read_text()) if configured.exists() else []
+        candidates = [port] if port else pool or [20000 + secrets.randbelow(40000) for _ in range(128)]
+        for candidate in candidates:
+            if not valid_port(candidate) or candidate in used or (not port and candidate in {22, 80, 443}):
+                continue
+            if pool and candidate not in pool:
+                continue
+            try:
+                family = socket.AF_INET6 if socket.has_ipv6 else socket.AF_INET
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    if family == socket.AF_INET6:
+                        probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                    probe.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", candidate))
+            except OSError:
+                continue
+            self.endpoint(candidate)
+            return candidate
+        raise ClusterError("没有可用的独立链式入口端口；NAT VPS 请先增加一组未占用的端口映射")
+
+    def info(self) -> dict[str, Any]:
+        base = self.template(self.core())
+        reality = base["streamSettings"]["realitySettings"]
+        names, short_ids = reality.get("serverNames", []), reality.get("shortIds", [])
+        if not names or not short_ids:
+            raise ClusterError("现有 Reality 缺少 SNI 或 shortId")
+        host, port = self.endpoint(int(base["port"]))
+        agent = self.root / "modules/multiuser/lun_agent.py"
+        if not agent.exists():
+            agent = agent.with_name("lun-agent")
+        if not agent.exists() or "lun-chain-entry-" not in agent.read_text(encoding="utf-8", errors="ignore"):
+            raise ClusterError("请先更新这台 VPS 的 Lun 主脚本和多用户模块，再启用链式代理")
+        status = self.cluster.local_status()
+        return {"node_id": status["node_id"], "host": host, "port": port,
+                "sni": str(names[0]), "sid": str(short_ids[0]),
+                "public_key": self.public_key(str(reality.get("privateKey", ""))),
+                "place": safe_label(self.cluster.identity_place(self.cluster.node(str(status["node_id"]))), 32),
+                "server_number": status["server_number"], "chain_version": 1}
+
+    def rows(self) -> list[dict[str, Any]]:
+        return [{"chain_id": key, **{name: row.get(name) for name in
+                 ("role", "entry_id", "exit_id", "name", "port", "created_at")}, "active": self.enabled(row)}
+                for key, row in self.load()["routes"].items()]
+
+    @staticmethod
+    def name_allowed(cluster: Cluster, name: str) -> bool:
+        match = re.search(r"\]vless-reality-chain-tcp-([0-9]+)-([0-9]+)-[0-9a-f]{6}$", name)
+        if not match:
+            return True
+        for number in match.groups():
+            row = cluster.db.connection.execute(
+                "SELECT n.id FROM nodes n JOIN federation_keys k ON k.node_id=n.id "
+                "WHERE n.server_number=? AND k.revoked_at=0 AND n.state NOT IN ('revoked','removed','legacy-unverified')",
+                (int(number),),
+            ).fetchone()
+            if not row:
+                return False
+        return True
+
+    def queue_peer(self, node_id: str) -> None:
+        if not self.path.exists():
+            return
+        local = self.cluster.load_config().get("node_id")
+        try:
+            routes = self.load()["routes"]
+        except ClusterError:
+            self.cluster.db.set_setting("chain.pending", uuid.uuid4().hex)
+            self.cluster.db.audit("chain.state.invalid", node_id)
+            return
+        if routes and (node_id == local or any(row.get("peer_id") == node_id for row in routes.values())):
+            self.cluster.db.set_setting("chain.pending", uuid.uuid4().hex)
+
+    def reconcile_pending(self) -> None:
+        pending = self.cluster.db.setting("chain.pending")
+        if not pending:
+            return
+        with FileLock(self.cluster.lock_path, timeout=5):
+            value = self.load()
+            if not value["routes"]:
+                with self.cluster.db.connection:
+                    self.cluster.db.connection.execute("DELETE FROM settings WHERE key='chain.pending' AND value=?", (pending,))
+                return
+            for row in value["routes"].values():
+                if not self.enabled(row):
+                    row["active"] = False
+            self.apply(value)
+            with self.cluster.db.connection:
+                self.cluster.db.connection.execute("DELETE FROM settings WHERE key='chain.pending' AND value=?", (pending,))
+
+    def inject_core(self) -> None:
+        original = self.core()
+        updated = self.inject(original)
+        if original != updated:
+            temporary = self.root / ".xr.chain-candidate.json"
+            try:
+                atomic_write(temporary, json.dumps(updated, ensure_ascii=False, indent=2) + "\n", 0o600)
+                checked = self.cluster._run([str(self.root / "xray"), "run", "-test", "-c", str(temporary)],
+                                            timeout=30, check=False)
+                if checked.returncode:
+                    raise ClusterError("链式 Xray 配置校验失败，未替换原配置")
+                os.replace(temporary, self.root / "xr.json")
+            finally:
+                temporary.unlink(missing_ok=True)
+        ports = {cid: int(row["port"]) for cid, row in self.load()["routes"].items()
+                 if row["role"] == "entry" and self.enabled(row)}
+        for path in self.root.glob("port_chain_*"):
+            if re.fullmatch(r"port_chain_[0-9a-f]{32}", path.name) and path.name[11:] not in ports:
+                path.unlink(missing_ok=True)
+        for cid, port in ports.items():
+            atomic_write(self.root / ("port_chain_" + cid), str(port) + "\n", 0o600)
+
+    def subscriptions(self) -> int:
+        rows = [(cid, row) for cid, row in self.load()["routes"].items()
+                if row["role"] == "entry" and self.enabled(row)]
+        # cip creates fresh base files. This hook runs before per-device rewriting and publication.
+        if not rows:
+            return 0
+        info = self.info()
+        legacy_uuid = str(uuid.UUID((self.root / "uuid").read_text().strip()))
+        generic: list[str] = []
+        proxies: list[dict[str, Any]] = []
+        clash: list[str] = []
+        names: list[str] = []
+        for cid, row in rows:
+            host, port = self.endpoint(int(row["port"]))
+            name = str(row["name"])
+            names.append(name)
+            authority = f"[{host}]" if ":" in host else host
+            query = urllib.parse.urlencode({"encryption": "none", "security": "reality", "type": "tcp",
+                       "sni": info["sni"], "fp": "chrome", "pbk": info["public_key"],
+                       "sid": info["sid"], "flow": "xtls-rprx-vision"})
+            generic.append(f"vless://{legacy_uuid}@{authority}:{port}?{query}#{urllib.parse.quote(name)}")
+            proxies.append({"type": "vless", "tag": name, "server": host, "server_port": port,
+                            "uuid": legacy_uuid, "flow": "xtls-rprx-vision", "network": "tcp",
+                            "tls": {"enabled": True, "server_name": info["sni"],
+                            "utls": {"enabled": True, "fingerprint": "chrome"},
+                            "reality": {"enabled": True, "public_key": info["public_key"], "short_id": info["sid"]}}})
+            clash.extend(["- name: " + json.dumps(name, ensure_ascii=False), "  type: vless",
+                          "  server: " + json.dumps(host), f"  port: {port}", "  uuid: " + legacy_uuid,
+                          "  network: tcp", "  tls: true", "  udp: false", "  flow: xtls-rprx-vision",
+                          "  servername: " + json.dumps(info["sni"]), "  client-fingerprint: chrome",
+                          "  reality-opts:", "    public-key: " + json.dumps(info["public_key"]),
+                          "    short-id: " + json.dumps(info["sid"])])
+        generic_path, clash_path, sb_path = (self.root / name for name in SUBSCRIPTION_FILES)
+        text = generic_path.read_text(encoding="utf-8")
+        # Repeated refresh hooks do not duplicate records.
+        text = "\n".join(line for line in text.splitlines() if not any(urllib.parse.quote(n) in line for n in names))
+        generic_output = text.rstrip() + "\n" + "\n".join(generic) + "\n"
+        data = json.loads(sb_path.read_text(encoding="utf-8"))
+        data["outbounds"] = [o for o in data.get("outbounds", []) if o.get("tag") not in names]
+        data["outbounds"].extend(proxies)
+        for outbound in data["outbounds"]:
+            if outbound.get("type") == "selector" and isinstance(outbound.get("outbounds"), list):
+                outbound["outbounds"] = list(dict.fromkeys(outbound["outbounds"] + names))
+        sb_output = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        lines = clash_path.read_text(encoding="utf-8").splitlines()
+        try:
+            boundary = lines.index("proxy-groups:")
+        except ValueError as exc:
+            raise ClusterError("Clash 基础订阅格式不支持链式追加") from exc
+        start = lines.index("proxies:") + 1
+        blocks: list[list[str]] = []
+        block: list[str] = []
+        for line in lines[start:boundary]:
+            if line.startswith("- name:") and block:
+                blocks.append(block)
+                block = []
+            block.append(line)
+        if block:
+            blocks.append(block)
+        clean: list[str] = []
+        for block in blocks:
+            raw = block[0].split(":", 1)[-1].strip()
+            with contextlib.suppress(ValueError):
+                raw = json.loads(raw)
+            if raw not in names:
+                clean.extend(block)
+        tail = []
+        for line in lines[boundary:]:
+            raw = line.strip().removeprefix("- ")
+            with contextlib.suppress(ValueError):
+                raw = json.loads(raw)
+            if raw not in names:
+                tail.append(line)
+        lines = lines[:start] + clean + tail
+        boundary = lines.index("proxy-groups:")
+        lines[boundary:boundary] = clash + [""]
+        # Manual groups only: do not silently include a new chain in load balance / automatic selection.
+        output = lines[:lines.index("proxy-groups:") + 1]
+        group: list[str] = []
+        def append_group() -> None:
+            if "  type: select" in group and "  proxies:" in group:
+                at = group.index("  proxies:") + 1
+                while at < len(group) and group[at].startswith("    -"):
+                    at += 1
+                group[at:at] = ["    - " + json.dumps(name, ensure_ascii=False) for name in names]
+            output.extend(group)
+        for line in lines[lines.index("proxy-groups:") + 1:]:
+            if line.startswith("- name:") or line == "rules:":
+                append_group()
+                group = []
+            group.append(line)
+        append_group()
+        for path, content in ((generic_path, generic_output), (sb_path, sb_output), (clash_path, "\n".join(output) + "\n")):
+            atomic_write(path, content, 0o600)
+        return len(rows)
+
+    def inject(self, data: dict[str, Any]) -> dict[str, Any]:
+        data = copy.deepcopy(data)
+        routes = self.load()["routes"]
+        data["inbounds"] = [item for item in data.get("inbounds", []) if not str(item.get("tag", "")).startswith(self.PREFIX)]
+        for item in data["inbounds"]:
+            clients = item.get("settings", {}).get("clients", [])
+            if isinstance(clients, list):
+                clients[:] = [client for client in clients if not str(client.get("email", "")).startswith(self.TRANSIT)]
+        data["outbounds"] = [item for item in data.get("outbounds", []) if not str(item.get("tag", "")).startswith(self.PREFIX)]
+        routing = data.setdefault("routing", {})
+        rules = [rule for rule in routing.get("rules", []) if not str(rule.get("ruleTag", "")).startswith(self.PREFIX)]
+        chain_rules: list[dict[str, Any]] = []
+        active = [(cid, row) for cid, row in routes.items() if self.enabled(row)]
+        if not active:
+            routing["rules"] = rules
+            return data
+        base = self.template(data)
+        # An owned direct outbound prevents existing WARP/default rules changing the promised B exit.
+        data["outbounds"].extend([{"tag": self.PREFIX + "direct", "protocol": "freedom", "settings": {}},
+                                 {"tag": self.PREFIX + "blocked", "protocol": "blackhole", "settings": {}}])
+        for cid, row in active:
+            marker = self.PREFIX + cid
+            if row["role"] == "entry":
+                inbound = copy.deepcopy(base)
+                inbound.update(tag=self.PREFIX + "entry-" + cid, port=int(row["port"]))
+                data["inbounds"].append(inbound)
+                match: dict[str, Any] = {"inboundTag": [inbound["tag"]]}
+                hop = row["hop"]
+                peer = dict(self.cluster.node(row["peer_id"]))
+                hosts = member_endpoint_hosts(peer)
+                host = str(hop["host"])
+                for candidate in hosts:
+                    with contextlib.suppress(ClusterError):
+                        normalized = normalize_public_ip(candidate)
+                        # NAT's public IPv4 port is not interchangeable with an IPv6 internal port.
+                        if ipaddress.ip_address(normalized).version == ipaddress.ip_address(host).version:
+                            host = normalized
+                            break
+                data["outbounds"].append({"tag": marker, "protocol": "vless", "settings": {"vnext": [{
+                    "address": host, "port": int(hop["port"]), "users": [{"id": hop["uuid"],
+                    "encryption": "none", "flow": "xtls-rprx-vision"}]}]}, "streamSettings": {
+                    "network": "tcp", "security": "reality", "realitySettings": {
+                        "serverName": hop["sni"], "publicKey": hop["public_key"],
+                        "shortId": hop["sid"], "fingerprint": "chrome"}}})
+                target = marker
+            else:
+                identity = self.TRANSIT + cid
+                base_inbound = next(item for item in data["inbounds"] if item.get("tag") == "reality-vision")
+                base_inbound["settings"].setdefault("clients", []).append({"id": row["hop_uuid"],
+                    "email": identity, "flow": "xtls-rprx-vision", "level": 1})
+                match = {"user": [identity]}
+                target = self.PREFIX + "direct"
+            for condition in ({"ip": self.PRIVATE}, {"domain": ["full:metadata.google.internal",
+                               "full:metadata.azure.internal", "full:instance-data.ec2.internal"]},
+                              {"network": "tcp", "port": "25"}, {"network": "udp"}):
+                chain_rules.append({"type": "field", **match, **condition,
+                                    "outboundTag": self.PREFIX + "blocked", "ruleTag": marker})
+            chain_rules.append({"type": "field", **match, "network": "tcp", "outboundTag": target, "ruleTag": marker})
+        # Keep all pre-existing blocking policy before the new routes; never bypass user guards.
+        blocked = {item.get("tag") for item in data["outbounds"] if item.get("protocol") == "blackhole"}
+        routing["rules"] = [r for r in rules if r.get("outboundTag") in blocked] + chain_rules + [r for r in rules if r.get("outboundTag") not in blocked]
+        return data
+
+    def apply(self, value: dict[str, Any]) -> None:
+        script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+        ready = self.cluster._run(["bash", str(script), "chain-runtime-status"], timeout=30, check=False)
+        if ready.returncode:
+            raise ClusterError("Xray 尚未运行；请先启动原代理服务，再配置链式代理")
+        with FileLock(self.root / ".chain.lock", timeout=30):
+            owned = ["chain_routes.json", "xr.json", *SUBSCRIPTION_FILES]
+            if any((self.root / name).is_symlink() for name in owned):
+                raise ClusterError("链式事务目标不能是符号链接")
+            temporary = Path(tempfile.mkdtemp(prefix=".chain-transaction-", dir=self.root))
+            os.chmod(temporary, 0o700)
+            try:
+                for name in owned:
+                    path = self.root / name
+                    if path.exists():
+                        shutil.copy2(path, temporary / name)
+            except Exception:
+                # No state has changed yet; an incomplete backup is not a recovery snapshot.
+                shutil.rmtree(temporary)
+                raise
+            try:
+                self.save(value)
+                applied = self.cluster._run(["bash", str(script), "chain-runtime-apply"], timeout=300, check=False)
+                if applied.returncode:
+                    raise ClusterError("链式核心校验、服务或订阅重建失败")
+            except Exception as exc:
+                try:
+                    for name in owned:
+                        backup, target = temporary / name, self.root / name
+                        if backup.exists():
+                            shutil.copy2(backup, target)
+                        else:
+                            target.unlink(missing_ok=True)
+                    restored = self.cluster._run(["bash", str(script), "chain-runtime-restore"], timeout=300, check=False)
+                    if restored.returncode:
+                        raise ClusterError("服务恢复失败")
+                except Exception as restore_exc:
+                    raise ClusterError(f"链式操作失败且恢复未完成，保留快照：{temporary}；{str(restore_exc)[:200]}") from exc
+                shutil.rmtree(temporary)
+                raise ClusterError("链式操作失败，已恢复此前配置和服务") from exc
+            shutil.rmtree(temporary)
+
+    def action(self, action: str, payload: dict[str, Any], peer_id: str) -> dict[str, Any]:
+        allowed = {"chain.info": set(), "chain.list": set(), "chain.port": {"port"}, "chain.exit.create": {"chain_id", "entry_id", "name"},
+                   "chain.describe": {"chain_id"}, "chain.entry.create": {"chain_id", "exit_id", "port", "name"},
+                   "chain.repair": {"chain_id"}, "chain.remove": {"chain_id"}}
+        if set(payload) != allowed[action]:
+            raise ClusterError("链式操作字段无效")
+        if action == "chain.info":
+            return self.info()
+        if action == "chain.list":
+            return {"routes": self.rows()}
+        if action == "chain.port":
+            selected = self.choose_port(int(payload["port"]))
+            host, public = self.endpoint(selected)
+            return {"port": selected, "public_port": public, "host": host}
+        cid = self.chain_id(payload["chain_id"])
+        value = self.load()
+        row = value["routes"].get(cid)
+        if action == "chain.describe":
+            if not row or row["role"] != "exit" or not self.enabled(row):
+                raise ClusterError("出口链路不存在或已停用")
+            if peer_id not in {"local", row["entry_id"]}:
+                raise ClusterError("中转凭据只向对应入口成员返回")
+            self.require_peer(row["entry_id"])
+            return {**self.info(), "uuid": row["hop_uuid"], "chain_id": cid}
+        if action == "chain.remove":
+            if row:
+                del value["routes"][cid]
+                self.apply(value)
+            return {"chain_id": cid, "removed": True}
+        if action == "chain.repair":
+            if not row or not self.enabled(row):
+                raise ClusterError("链路不存在或已停用；已撤销成员不能自动重新启用")
+            self.require_peer(row["peer_id"])
+            if row["role"] == "entry":
+                row["hop"] = chain_call(self.cluster, row["exit_id"], "chain.describe", {"chain_id": cid})
+            self.apply(value)
+            return {"chain_id": cid, "repaired": True}
+        if row or len(value["routes"]) >= 16:
+            raise ClusterError("链路 ID 已存在或本机链路已达到 16 条上限")
+        self.info()  # Preflight core, endpoint and multi-user compatibility before mutation.
+        local_id = str(self.cluster.load_config()["node_id"])
+        other = str(payload.get("entry_id") if action == "chain.exit.create" else payload.get("exit_id"))
+        self.require_peer(other)
+        row = {"active": True, "peer_id": other, "name": safe_label(str(payload["name"]), 120),
+               "created_at": utc_now()}
+        match = re.fullmatch(r"\[[^\[\]\x00-\x1f]+\]vless-reality-chain-tcp-([0-9]+)-([0-9]+)-" + cid[:6], row["name"])
+        if row["name"] != str(payload["name"]) or not match:
+            raise ClusterError("链式节点名称必须由预览生成，不能截断或包含控制字符")
+        entry_id, exit_id = (other, local_id) if action == "chain.exit.create" else (local_id, other)
+        expected = [int(self.cluster.node(n)["server_number"]) for n in (entry_id, exit_id)]
+        if list(map(int, match.groups())) != expected:
+            raise ClusterError("链路两端编号尚未收敛，请先同步成员状态后重新预览")
+        if any(item.get("name") == row["name"] for item in value["routes"].values()):
+            raise ClusterError("链式节点名称重复，请重新创建")
+        if action == "chain.exit.create":
+            row.update(role="exit", entry_id=other, exit_id=local_id, hop_uuid=str(uuid.uuid4()))
+        else:
+            port = self.choose_port(int(payload["port"]))
+            hop = chain_call(self.cluster, other, "chain.describe", {"chain_id": cid})
+            if hop.get("node_id") != other or hop.get("chain_id") != cid:
+                raise ClusterError("出口身份或中转凭据不匹配")
+            row.update(role="entry", entry_id=local_id, exit_id=other, port=port, hop=hop)
+        value["routes"][cid] = row
+        self.apply(value)
+        return {"chain_id": cid, "created": True, "role": row["role"], "port": row.get("port")}
+
+
+def chain_call(cluster: Cluster, node_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if node_id == cluster.load_config().get("node_id"):
+        result = execute_action(cluster, {"action": action, "payload": payload, "request_id": uuid.uuid4().hex})
+    else:
+        timeout = 12 if action in {"chain.info", "chain.list", "chain.port"} else 30 if action == "chain.describe" else 360
+        result = send_action(cluster, node_id, action, payload, timeout=timeout, coordinate_failures=False)
+    return _action_result_payload(result)
+
+
+def chain_plan(cluster: Cluster, entry: str, exit_node: str, port: int = 0) -> dict[str, Any]:
+    a, b = cluster.node(entry), cluster.node(exit_node)
+    if a["id"] == b["id"]:
+        raise ClusterError("入口和出口不能相同；第一版只支持固定两跳")
+    manager = ChainRoutes(cluster)
+    for node in (a, b):
+        if not manager.trusted(str(node["id"])):
+            raise ClusterError("只能选择已信任且未撤销的联邦成员")
+    info_a, info_b = (chain_call(cluster, str(node["id"]), "chain.info", {}) for node in (a, b))
+    selected = chain_call(cluster, str(a["id"]), "chain.port", {"port": port})
+    return {"entry_id": str(a["id"]), "exit_id": str(b["id"]), "entry": info_a, "exit": info_b,
+            "port": selected["port"], "public_port": selected["public_port"],
+            "name": f"[{info_a['place']}→{info_b['place']}]vless-reality-chain-tcp-{int(a['server_number']):02d}-{int(b['server_number']):02d}"}
+
+
+def chain_create(cluster: Cluster, entry: str, exit_node: str, port: int = 0,
+                 progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+    plan = chain_plan(cluster, entry, exit_node, port)
+    cid = uuid.uuid4().hex
+    name = plan["name"] + "-" + cid[:6]
+    a, b = plan["entry_id"], plan["exit_id"]
+    try:
+        if progress:
+            progress("正在配置 B 的独立中转身份并校验出口……")
+        chain_call(cluster, b, "chain.exit.create", {"chain_id": cid, "entry_id": a, "name": name})
+        if progress:
+            progress("正在配置 A 的独立入口、路由与三种订阅……")
+        created = chain_call(cluster, a, "chain.entry.create", {"chain_id": cid, "exit_id": b, "port": plan["port"], "name": name})
+    except Exception as exc:
+        pending = []
+        # A lost response may conceal a successful entry commit: always clean BOTH roles.
+        for node in (a, b):
+            try:
+                chain_call(cluster, node, "chain.remove", {"chain_id": cid})
+            except Exception:
+                pending.append(node)
+        raise ClusterError("链路创建未完成，已清理可达成员；请在链路列表重试清理：" + cid
+                           + ("，待处理成员：" + ",".join(pending) if pending else "")
+                           + "；原因：" + str(exc)[:250]) from exc
+    return {"chain_id": cid, "name": name, "entry_id": a, "exit_id": b, "port": created.get("port")}
+
+
+def chain_inventory(cluster: Cluster) -> dict[str, Any]:
+    nodes = cluster.trusted_federation_nodes(include_self=True)
+    def fetch(node: sqlite3.Row) -> tuple[list[dict[str, Any]], int | None]:
+        try:
+            rows = chain_call(cluster, str(node["id"]), "chain.list", {})["routes"]
+            return [{**row, "owner": str(node["id"]), "server_number": int(node["server_number"])}
+                    for row in rows], None
+        except ClusterError:
+            return [], int(node["server_number"])
+        finally:
+            cluster.close()  # Close only this worker's thread-local SQLite connection.
+    rows, missing = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(nodes)))) as executor:
+        for result, unavailable in executor.map(fetch, nodes):
+            rows.extend(result)
+            if unavailable is not None:
+                missing.append(unavailable)
+    return {"routes": rows, "unavailable": missing}
+
+
 def execute_action(cluster: Cluster, request: dict[str, Any], peer_id: str = "local") -> dict[str, Any]:
     action = str(request.get("action", ""))
     request_id = str(request.get("request_id", ""))
@@ -6073,6 +6702,8 @@ def install_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _execute_action_locked(cluster: Cluster, action: str, payload: dict[str, Any], request: dict[str, Any],
                            peer_id: str = "local") -> dict[str, Any]:
     script = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
+    if action.startswith("chain."):
+        return ChainRoutes(cluster).action(action, payload, peer_id)
     if action in {"cdn.pool.preview", "cdn.pool.apply"}:
         if set(payload) != {"mode", "cfip"}:
             raise ClusterError("CDN 优选池操作只接受 mode 与 cfip")
@@ -6725,6 +7356,19 @@ def build_parser() -> argparse.ArgumentParser:
     switch.add_argument("--node-id", required=True)
     switch.add_argument("--confirm", required=True)
     sub.add_parser("nodes")
+    for command in ("chain-plan", "chain-create"):
+        chain = sub.add_parser(command)
+        chain.add_argument("--entry", required=True)
+        chain.add_argument("--exit", required=True)
+        chain.add_argument("--port", type=int, default=0)
+    sub.add_parser("chain-list")
+    for command in ("chain-remove", "chain-repair"):
+        chain = sub.add_parser(command)
+        chain.add_argument("--node-id", required=True)
+        chain.add_argument("--chain-id", required=True)
+    sub.add_parser("chain-inject")
+    sub.add_parser("chain-subscriptions")
+    sub.add_parser("chain-empty")
     sync = sub.add_parser("sync")
     sync.add_argument("--node-id", required=True)
     sync.add_argument("--profile", default="legacy")
@@ -6876,6 +7520,60 @@ def main(argv: list[str] | None = None) -> int:
             result = cluster.nodes()
             if not args.json:
                 print_nodes(result)
+        elif args.command in {"chain-plan", "chain-create"}:
+            if args.port and not valid_port(args.port):
+                raise ClusterError("入口端口无效")
+            result = chain_plan(cluster, args.entry, args.exit, args.port) if args.command == "chain-plan" else chain_create(
+                cluster, args.entry, args.exit, args.port,
+                None if args.json else lambda message: print(message, flush=True))
+            if not args.json:
+                print(result["name"])
+                if args.command == "chain-plan":
+                    print("入口：" + str(result["entry"]["host"]) + "；内网端口：" + str(result["port"]) + "；公网端口：" + str(result["public_port"]))
+                    print("出口：" + str(result["exit"]["host"]) + ":" + str(result["exit"]["port"]))
+                    print("只转发 TCP；保留普通节点。B 故障即停止，不回落 A 直出。")
+                else:
+                    print("链式节点已生成，请刷新入口 VPS 的个人订阅或集群聚合订阅。")
+        elif args.command == "chain-list":
+            result = chain_inventory(cluster)
+            if not args.json:
+                for item in result["routes"]:
+                    print(f"{item['chain_id']}  服务器{item['server_number']:02d}  "
+                          + ("入口" if item["role"] == "entry" else "出口")
+                          + (" / 已启用  " if item["active"] else " / 已停用  ") + str(item["name"]))
+                for number in result["unavailable"]:
+                    print(f"服务器 {number:02d} 不可达或尚未支持链式模块")
+                if not result["routes"]:
+                    print("暂无链路；从“手动新建链路”开始。")
+        elif args.command in {"chain-remove", "chain-repair"}:
+            owner = str(cluster.node(args.node_id)["id"])
+            rows = chain_call(cluster, owner, "chain.list", {})["routes"]
+            matches = [row for row in rows if row["chain_id"].startswith(args.chain_id)]
+            if len(matches) != 1 or len(args.chain_id) < 6:
+                raise ClusterError("链路编号不存在或前缀不唯一（至少输入前 6 位）")
+            row, results, errors = matches[0], {}, {}
+            other = row["exit_id"] if row["role"] == "entry" else row["entry_id"]
+            targets = (owner, other) if row["role"] == "entry" else (other, owner)
+            for node_id in dict.fromkeys(targets):
+                try:
+                    action = "chain.remove" if args.command == "chain-remove" else "chain.repair"
+                    results[node_id] = chain_call(cluster, node_id, action, {"chain_id": row["chain_id"]})
+                except ClusterError as exc:
+                    errors[node_id] = str(exc)
+            if errors:
+                raise ClusterError("部分成员待重试；不会回落直连：" + json_dumps(errors))
+            result = results
+            if not args.json:
+                print("链路已删除，普通节点保持不变。" if args.command == "chain-remove" else "链路配置和订阅已修复。")
+        elif args.command == "chain-inject":
+            ChainRoutes(cluster).inject_core()
+            result = {"applied": True}
+        elif args.command == "chain-subscriptions":
+            result = {"nodes": ChainRoutes(cluster).subscriptions()}
+        elif args.command == "chain-empty":
+            if ChainRoutes(cluster).load()["routes"]:
+                raise ClusterError("本机仍有链路配置（含已停用链路）")
+            result = {"empty": True}
         elif args.command == "sync":
             result = federation_sync(cluster, args.node_id) if cluster.is_federation() else sync_node(cluster, args.node_id, args.profile)
             print("节点状态和订阅快照已同步。")

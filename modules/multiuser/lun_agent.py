@@ -33,11 +33,12 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 PROTOCOLS = (
     "vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"
 )
@@ -833,7 +834,7 @@ class Agent:
             }
             for inbound in data.get("inbounds", []):
                 tag = str(inbound.get("tag", ""))
-                if tag not in XRAY_TAG_PROTOCOL:
+                if tag not in XRAY_TAG_PROTOCOL and not tag.startswith("lun-chain-entry-"):
                     continue
                 settings = inbound.get("settings")
                 if isinstance(settings, dict):
@@ -1975,7 +1976,38 @@ class Agent:
             self.secure_sensitive_files()
             return changed
 
+    def _active_chain_routes(self) -> dict[str, Any]:
+        path = self.root / "chain_routes.json"
+        if not path.exists():
+            return {}
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            routes = state["routes"]
+            if state.get("version") != 1 or not isinstance(routes, dict):
+                raise ValueError("invalid chain state")
+            if not routes:
+                return {}
+            if not all(isinstance(row, dict) and isinstance(row.get("active"), bool)
+                       and row.get("role") in {"entry", "exit"} for row in routes.values()):
+                raise ValueError("invalid chain route")
+            database = self.root / "modules/cluster/data/cluster.db"
+            local = json.loads((self.root / "modules/cluster/config.json").read_text(encoding="utf-8")).get("node_id")
+            connection = sqlite3.connect(f"file:{database.resolve().as_posix()}?mode=ro", uri=True, timeout=2)
+            try:
+                trusted = {row[0] for row in connection.execute(
+                    "SELECT k.node_id FROM federation_keys k JOIN nodes n ON n.id=k.node_id "
+                    "WHERE k.revoked_at=0 AND n.state NOT IN ('legacy-unverified','revoked','removed')")}
+            finally:
+                connection.close()
+            return {cid: row for cid, row in routes.items()
+                    if re.fullmatch(r"[0-9a-f]{32}", cid) and row.get("active") is True
+                    and (row.get("entry_id") if row["role"] == "entry" else row.get("exit_id")) == local
+                    and row.get("entry_id") in trusted and row.get("exit_id") in trusted}
+        except (OSError, KeyError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
+            raise AgentError("链式配置或成员信任不可用，已拒绝覆盖核心配置") from exc
+
     def _reconcile_xray(self, data: dict[str, Any], devices: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+        chains = self._active_chain_routes()
         monitor = self.visit_monitor_settings()
         if monitor["enabled"]:
             self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1991,10 +2023,12 @@ class Agent:
         )
         for inbound in data.get("inbounds", []):
             tag = inbound.get("tag", "")
-            protocol_key = XRAY_TAG_PROTOCOL.get(tag)
+            protocol_key = "vl" if tag.startswith("lun-chain-entry-") else XRAY_TAG_PROTOCOL.get(tag)
             if not protocol_key:
                 continue
             selected = [d for d in devices if self.protocol_allowed(d, protocol_key)]
+            if tag.startswith("lun-chain-entry-") and tag.removeprefix("lun-chain-entry-") not in chains:
+                selected = []
             settings = inbound.setdefault("settings", {})
             protocol = inbound.get("protocol")
             if protocol in {"vless", "vmess"}:
@@ -2008,6 +2042,18 @@ class Agent:
                     client["level"] = 0
                     clients.append(client)
                 settings["clients"] = clients
+                if tag == "reality-vision":
+                    if chains:
+                        try:
+                            for cid, chain in chains.items():
+                                if chain.get("role") == "exit" and chain.get("active"):
+                                    if not re.fullmatch(r"[0-9a-f]{32}", cid):
+                                        raise ValueError("invalid chain ID")
+                                    transit = str(uuid.UUID(chain["hop_uuid"]))
+                                    clients.append({"id": transit, "email": "lun-transit-" + cid,
+                                                    "flow": "xtls-rprx-vision", "level": 1})
+                        except (OSError, KeyError, ValueError, TypeError) as exc:
+                            raise AgentError("链式中转凭据损坏，已拒绝覆盖核心配置") from exc
             elif protocol == "socks":
                 settings["accounts"] = [
                     {"user": d["uuid"], "pass": d["password"]} for d in selected

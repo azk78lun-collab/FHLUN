@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.10.11.2"
+echo "当前版本：V26.10.20.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -3529,6 +3529,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
   }
 }
 EOF
+chain_inject_core || return 1
 if pidof systemd >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; then
 cat > /etc/systemd/system/xr.service <<EOF
 [Unit]
@@ -5659,6 +5660,7 @@ return 0
 }
 
 cluster_disable_ui(){
+chain_require_empty || return 1
 red_line "停用只移除本机联邦控制面；不会卸载代理协议、普通本机数据或网站访问监控。"
 printf "回车确认停用本机联邦（输入 0 返回）："; IFS= read -r cluster_confirm
 [ "$cluster_confirm" = 0 ] && return
@@ -5670,6 +5672,7 @@ if ! cluster_subscription_takeover_release; then
 red_line "单用户订阅恢复失败，已保留联邦数据和回退快照；请运行状态/修复后重试。"
 return 1
 fi
+rm -f "$HOME/lun/chain_routes.json"
 rm -rf "$(cluster_module_dir)"
 apply_lun_firewall_rules quiet || true
 if [ "$cluster_disable_keeps_multiuser" = yes ]; then
@@ -5756,6 +5759,97 @@ esac
 done
 }
 
+cluster_chain_ui(){
+while :; do
+ui_title "Lun 手动链式代理（A 入口 → B 出口）"
+echo "固定两跳 VLESS Reality / TCP；B 故障即停止，不回落入口直出。"
+echo " 1. 查看链路"
+echo " 2. 手动新建链路"
+echo " 3. 检查 / 修复链路"
+echo " 4. 删除链路"
+echo " 0. 返回"
+printf "请选择 [0-4]（输入 0 返回）："; IFS= read -r chain_choice || return
+case "$chain_choice" in
+1) cluster_cmd chain-list; ui_pause ;;
+2)
+cluster_show_nodes
+printf "入口 A 服务器编号（输入 0 返回）："; IFS= read -r chain_entry || return
+[ "$chain_entry" = 0 ] && continue
+printf "出口 B 服务器编号（输入 0 返回）："; IFS= read -r chain_exit || return
+[ "$chain_exit" = 0 ] && continue
+printf "A 的独立内网端口（回车自动分配，输入 0 返回）："; IFS= read -r chain_port || return
+[ "$chain_port" = 0 ] && continue
+chain_port=${chain_port:-0}
+cluster_cmd chain-plan --entry "$chain_entry" --exit "$chain_exit" --port "$chain_port" || { ui_pause; continue; }
+yellow_line "A 增加独立端口；B 复用原 Reality 端口。NAT 需先在服务商添加映射，Lun 只自动放行本机防火墙。"
+echo "两台 VPS 都消耗流量；多用户额度只在 A 统计；普通节点保持原样。"
+printf "回车确认创建（输入 0 返回）："; IFS= read -r chain_confirm || return
+[ -z "$chain_confirm" ] || continue
+cluster_cmd chain-create --entry "$chain_entry" --exit "$chain_exit" --port "$chain_port" \
+&& { green_line "链式代理已启用；请刷新个人或集群订阅。"; cluster_refresh_profiles_async; }
+ui_pause
+;;
+3|4)
+cluster_cmd chain-list
+printf "链路所在服务器编号（入口或出口均可，输入 0 返回）："; IFS= read -r chain_owner || return
+[ "$chain_owner" = 0 ] && continue
+printf "链路 ID（至少前 6 位，输入 0 返回）："; IFS= read -r chain_id || return
+[ "$chain_id" = 0 ] && continue
+if [ "$chain_choice" = 4 ]; then
+printf "回车确认删除（输入 0 返回）："; IFS= read -r chain_confirm || return
+[ -z "$chain_confirm" ] || continue
+cluster_cmd chain-remove --node-id "$chain_owner" --chain-id "$chain_id"
+else
+cluster_cmd chain-repair --node-id "$chain_owner" --chain-id "$chain_id"
+fi
+cluster_refresh_profiles_async
+ui_pause
+;;
+0|"") return ;;
+*) red_line "输入错误。" ;;
+esac
+done
+}
+
+chain_require_empty(){
+[ -s "$HOME/lun/chain_routes.json" ] || return 0
+cluster_cmd chain-empty && return 0
+red_line "请先在“分布式服务器集群 → 链式代理”中删除本机链路，再停用、重置或卸载，避免遗留中转凭据。"
+return 1
+}
+
+chain_inject_core(){
+[ -s "$HOME/lun/chain_routes.json" ] || return 0
+cluster_cmd chain-inject
+}
+
+chain_runtime_status(){
+if pidof systemd >/dev/null 2>&1; then
+systemctl is-active --quiet xr
+elif command -v rc-service >/dev/null 2>&1; then
+rc-service xray status >/dev/null 2>&1
+else
+return 1
+fi
+}
+
+chain_runtime_apply(){
+cluster_cmd chain-inject || return 1
+if multiuser_enabled; then
+multiuser_reconcile_configs || return 1
+elif visit_monitor_enabled; then
+multiuser_cmd visit-apply || return 1
+fi
+validate_core_configs || return 1
+xrestart || return 1
+chain_runtime_status || return 1
+if subscription_agent_enabled; then
+multiuser_service_restart || return 1
+fi
+apply_lun_firewall_rules quiet || return 1
+LUN_CHAIN_REBUILD=yes refresh_subscription_outputs
+}
+
 cluster_federation_menu(){
 while :; do
 ui_title "Lun 分布式服务器集群"
@@ -5768,8 +5862,9 @@ printf " 3. %s刷新并查看聚合订阅%s\n" "$LUN_CYAN" "$LUN_RESET"
 echo " 4. 同步成员状态"
 printf " 5. %s更新与维护%s\n" "$LUN_YELLOW" "$LUN_RESET"
 echo " 6. 集群设置"
+echo " 7. 链式代理（手动配置）"
 echo " 0. 返回"
-printf "请选择 [0-6]（输入 0 返回）："
+printf "请选择 [0-7]（输入 0 返回）："
 IFS= read -r cluster_menu_choice || return
 case "$cluster_menu_choice" in
 1) cluster_server_management_ui ;;
@@ -5778,6 +5873,7 @@ case "$cluster_menu_choice" in
 4) cluster_sync_ui; ui_pause ;;
 5) cluster_maintenance_ui ;;
 6) cluster_settings_ui; cluster_enabled || return ;;
+7) cluster_chain_ui ;;
 0|"") return ;;
 *) echo "输入错误。" ;;
 esac
@@ -5863,6 +5959,9 @@ firewall_append_file tcp "$fw_root/subport_legacy.log" "$fw_output"
 firewall_append_file tcp "$fw_root/subport_public.log" "$fw_output"
 firewall_append_file tcp "$fw_root/cdnopt_port" "$fw_output"
 firewall_append_file tcp "$fw_root/acme_http01_port" "$fw_output"
+for fw_file in "$fw_root"/port_chain_*; do
+firewall_append_file tcp "$fw_file" "$fw_output"
+done
 
 fw_config="$fw_root/modules/multiuser/config.json"
 if [ -s "$fw_config" ]; then
@@ -7563,8 +7662,14 @@ rules:
   - MATCH,🌍选择代理节点
 EOF
 rm -f "$HOME/lun/.cdn_sbox_entries" "$HOME/lun/.cdn_sbox_tags" "$HOME/lun/.cdn_clash_entries" "$HOME/lun/.cdn_clash_names"
+if [ -s "$HOME/lun/chain_routes.json" ]; then
+cluster_cmd chain-subscriptions || return 1
+fi
 if restart_subscription_service; then
 show_subscription_links
+elif [ "${LUN_CHAIN_REBUILD:-no}" = yes ]; then
+red_line "链式订阅服务启动失败，正在回滚链路配置。"
+return 1
 elif [ -s "$HOME/lun/subport.log" ]; then
 yellow_line "订阅服务未启动，暂不输出不可用链接；请进入“节点订阅分享”重试。"
 fi
@@ -7644,6 +7749,7 @@ return 0
 }
 
 validate_core_configs(){
+chain_inject_core || return 1
 rebuild_configs=0
 if [ -s "$HOME/lun/xr.json" ]; then
 rebuild_configs=$((rebuild_configs + 1))
@@ -7717,6 +7823,7 @@ rc-service ip6tables save >/dev/null 2>&1
 fi
 }
 factory_reset(){
+chain_require_empty || return 1
 if cluster_enabled && [ "${LUN_CLUSTER_DESTRUCTIVE:-no}" != yes ]; then
 red_line "本机已启用分布式集群；请先停用本机联邦，或从集群模块执行带快照的远程清空。"
 return 1
@@ -8098,6 +8205,12 @@ used_public=$(client_port "$used")
 [ "$used_public" = "$p" ] && return 0
 [ "$used" = "$p_public" ] && return 0
 [ "$used_public" = "$p_public" ] && return 0
+done
+for chain_reserved_file in "$HOME/lun"/port_chain_*; do
+[ -s "$chain_reserved_file" ] || continue
+used=$(cat "$chain_reserved_file")
+[ "$used" != "$p" ] || return 0
+[ "$(client_port "$used")" != "$p_public" ] || return 0
 done
 return 1
 }
@@ -14764,7 +14877,13 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "cert-http-pre" ]; then
+if [ "$1" = "chain-runtime-status" ]; then
+chain_runtime_status
+exit $?
+elif [ "$1" = "chain-runtime-apply" ] || [ "$1" = "chain-runtime-restore" ]; then
+chain_runtime_apply
+exit $?
+elif [ "$1" = "cert-http-pre" ]; then
 acme_http_pre "$2"
 exit $?
 elif [ "$1" = "cert-http-post" ]; then
@@ -14843,6 +14962,7 @@ export LUN_CLUSTER_DESTRUCTIVE
 factory_reset
 exit $?
 elif [ "$1" = "cluster-uninstall" ]; then
+chain_require_empty || exit 1
 sleep 3
 LUN_CLUSTER_DESTRUCTIVE=yes
 export LUN_CLUSTER_DESTRUCTIVE
@@ -14850,6 +14970,7 @@ cleandel
 rm -rf sbx_update "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx"
 exit 0
 elif [ "$1" = "del" ]; then
+chain_require_empty || exit 1
 cleandel
 rm -rf sbx_update "$HOME/lun" "$HOME/weblun" "$HOME/agsbx" "$HOME/websbx"
 echo "卸载完成"

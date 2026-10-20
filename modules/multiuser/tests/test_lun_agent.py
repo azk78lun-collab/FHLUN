@@ -1216,5 +1216,67 @@ rules:
         self.assertIn("anytls", rendered)
 
 
+    def _write_chain_state(self, role):
+        cid = "c" * 32
+        routes = {cid: {"role": role, "active": True, "entry_id": "a" * 32,
+                        "exit_id": "b" * 32, "peer_id": "b" * 32,
+                        "hop_uuid": "22222222-2222-4222-8222-222222222222"}}
+        (self.root / "chain_routes.json").write_text(json.dumps({"version": 1, "routes": routes}), encoding="utf-8")
+        path = self.root / "modules/cluster/data/cluster.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "modules/cluster/config.json").write_text(json.dumps({"node_id": ("a" if role == "entry" else "b") * 32}))
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.execute("CREATE TABLE federation_keys(node_id TEXT PRIMARY KEY,revoked_at INTEGER)")
+            connection.execute("CREATE TABLE nodes(id TEXT PRIMARY KEY,state TEXT)")
+            connection.executemany("INSERT INTO federation_keys VALUES(?,0)", [("a" * 32,), ("b" * 32,)])
+            connection.executemany("INSERT INTO nodes VALUES(?,'online')", [("a" * 32,), ("b" * 32,)])
+            connection.commit()
+        return cid
+
+    def test_chain_entry_tracks_device_permissions_rotation_and_revocation(self):
+        cid = self._write_chain_state("entry")
+        device = self.add_user()
+        config = self.agent.load_config()
+        data = {"inbounds": [{"tag": "lun-chain-entry-" + cid, "protocol": "vless",
+                "settings": {"clients": [{"id": config["legacy_uuid"], "flow": "xtls-rprx-vision"}]}}]}
+        data = self.agent._reconcile_xray(data, self.agent.active_devices(), config)
+        clients = data["inbounds"][0]["settings"]["clients"]
+        self.assertIn(device["uuid"], {c["id"] for c in clients})
+        self.assertIn(f"lun:u:{device['user_id']}:d:{device['id']}", {c["email"] for c in clients})
+        self.agent.set_protocol(device["user_id"], "vl", False)
+        data = self.agent._reconcile_xray(data, self.agent.active_devices(), config)
+        self.assertNotIn(device["uuid"], {c["id"] for c in data["inbounds"][0]["settings"]["clients"]})
+        with contextlib.closing(sqlite3.connect(self.root / "modules/cluster/data/cluster.db")) as connection:
+            connection.execute("UPDATE federation_keys SET revoked_at=1 WHERE node_id=?", ("b" * 32,))
+            connection.commit()
+        data = self.agent._reconcile_xray(data, self.agent.active_devices(), config)
+        self.assertEqual(data["inbounds"][0]["settings"]["clients"], [])
+
+    def test_chain_transit_is_not_a_device_or_billable_identity(self):
+        cid = self._write_chain_state("exit")
+        data = {"inbounds": [{"tag": "reality-vision", "protocol": "vless", "settings": {"clients": [{}]}}]}
+        data = self.agent._reconcile_xray(data, self.agent.active_devices(), self.agent.load_config())
+        transit = next(c for c in data["inbounds"][0]["settings"]["clients"] if c["email"].startswith("lun-transit-"))
+        self.assertEqual(transit["level"], 1)
+        (self.root / "xray").write_text("fixture")
+        payload = {"stat": [{"name": f"user>>>{transit['email']}>>>traffic>>>uplink", "value": 9000}]}
+        with mock.patch.object(self.agent, "_run", return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), "")):
+            self.assertEqual(self.agent.sample_core_stats("xray", "127.0.0.1:10085"), 0)
+        self.assertNotIn(transit["email"], self.agent._visit_identity_map())
+        source = f"vless://{self.agent.load_config()['legacy_uuid']}@example.com:12345#vless-reality-chain-tcp-01-02-cccccc\n"
+        device = self.add_user()
+        self.agent.set_protocol(device["user_id"], "vl", False)
+        self.assertEqual(self.agent.render_generic(source, device, self.agent.device_permissions(device["user_id"]), self.agent.load_config()), "")
+
+    def test_chain_bad_state_refuses_reconciliation(self):
+        (self.root / "chain_routes.json").write_text("{")
+        with self.assertRaises(lun_agent.AgentError):
+            self.agent._reconcile_xray({"inbounds": []}, self.agent.active_devices(), self.agent.load_config())
+
+    def test_empty_chain_state_does_not_require_cluster_after_disable(self):
+        (self.root / "chain_routes.json").write_text('{"version":1,"routes":{}}')
+        self.assertEqual(self.agent._active_chain_routes(), {})
+
+
 if __name__ == "__main__":
     unittest.main()
