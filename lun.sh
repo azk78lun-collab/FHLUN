@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.10.20.1"
+echo "当前版本：V26.10.20.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -5351,7 +5351,9 @@ return 1
 }
 fi
 cluster_install_service || return 1
+if ! cluster_cmd service-current >/dev/null 2>&1; then
 cluster_service_restart || { red_line "本机分布式集群服务重启失败。"; return 1; }
+fi
 
 cluster_script_payload=$(mktemp "$HOME/lun/.cluster-script.XXXXXX") || return 1
 cluster_agent_payload=$(mktemp "$HOME/lun/.cluster-agent.XXXXXX") || { rm -f "$cluster_script_payload"; return 1; }

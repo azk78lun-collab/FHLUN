@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.10.20.1'
+contains "$SCRIPT" '当前版本：V26.10.20.2'
 contains "$SCRIPT" '自动巡检：每天一次'
 contains "$SCRIPT" '"suspect": "疑似离线"'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'

@@ -44,7 +44,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.2"
+CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
 JOIN_TTL = 15 * 60
@@ -1410,7 +1411,8 @@ class Cluster:
             ),
             "public_port": int(config.get("public_port", 0)),
             "internal_port": int(config.get("internal_port", 0)), "remark": config.get("remark", ""),
-            "paired": bool(config.get("paired")), "api_version": API_VERSION,
+            "paired": bool(config.get("paired")), "api_version": API_VERSION, "cluster_version": VERSION,
+            "cluster_source_sha256": CLUSTER_SOURCE_SHA256,
             "lun_version": self._lun_version(), "snapshot_at": utc_now(), "location": location,
             "server_number": server_number,
             "uuid": (self.root / "uuid").read_text(encoding="utf-8").strip() if (self.root / "uuid").exists() else "",
@@ -3355,16 +3357,22 @@ class Cluster:
             {"node_id": node_id, **signed},
         )
 
-    def record_transport_failure(self, candidate_id: str, reporter_id: str | None = None, when: int | None = None) -> dict[str, Any]:
+    def record_transport_failure(self, candidate_id: str, reporter_id: str | None = None, when: int | None = None,
+                                 *, started_at: int | None = None) -> dict[str, Any]:
         reporter_id = reporter_id or str(self.load_config().get("node_id", ""))
         when = int(when or utc_now())
         with self.db.connection:
+            changed = self.db.connection.execute(
+                "UPDATE nodes SET state='suspect',last_failure=?,updated_at=? WHERE id=? "
+                "AND state NOT IN ('revoked','removed') AND (? IS NULL OR last_success<?)",
+                (when, when, candidate_id, started_at, started_at),
+            ).rowcount
+            if not changed:
+                row = self.db.connection.execute("SELECT state FROM nodes WHERE id=?", (candidate_id,)).fetchone()
+                return {"candidate_id": candidate_id, "state": row[0] if row else "unknown",
+                        "failures": 0, "failure_times": [], "needs_probe": False, "ignored": True}
             self.db.connection.execute("INSERT OR IGNORE INTO federation_failures(candidate_id,reporter_id,failed_at) VALUES(?,?,?)", (candidate_id, reporter_id, when))
             self.db.connection.execute("DELETE FROM federation_failures WHERE failed_at<?", (when - HEALTH_FAILURE_WINDOW,))
-            self.db.connection.execute(
-                "UPDATE nodes SET state='suspect',last_failure=?,updated_at=? WHERE id=? AND state NOT IN ('revoked','removed')",
-                (when, when, candidate_id),
-            )
         rows = self.db.connection.execute(
             "SELECT failed_at FROM federation_failures WHERE candidate_id=? AND reporter_id=? AND failed_at>=? "
             "ORDER BY failed_at",
@@ -3384,7 +3392,8 @@ class Cluster:
             self.db.connection.execute("DELETE FROM federation_failures WHERE candidate_id=?", (candidate_id,))
             self.db.connection.execute("DELETE FROM federation_probe_observations WHERE candidate_id=?", (candidate_id,))
             self.db.connection.execute(
-                "UPDATE nodes SET state='online',last_success=?,updated_at=? WHERE id=? AND state NOT IN ('revoked','removed')",
+                "UPDATE nodes SET state='online',last_success=MAX(last_success,?),updated_at=MAX(updated_at,?) "
+                "WHERE id=? AND state NOT IN ('revoked','removed')",
                 (when, when, candidate_id),
             )
         return {"candidate_id": candidate_id, "state": "online", "cleared": True}
@@ -4955,7 +4964,7 @@ def mutual_request(cluster: Cluster, host: str, port: int, method: str, path: st
         data = response.read(MAX_BODY + 1)
     except ssl.SSLCertVerificationError as exc:
         raise ClusterError(f"远端证书验证失败，未尝试其他地址：{exc}") from exc
-    except (OSError, ssl.SSLError, TimeoutError) as exc:
+    except (OSError, ssl.SSLError, TimeoutError, http.client.HTTPException) as exc:
         raise FederationTransportError(f"federation transport failed: {exc}") from exc
     finally:
         connection.close()
@@ -4989,8 +4998,17 @@ def member_request(cluster: Cluster, node: Any, method: str, path: str,
     last_error: FederationTransportError | None = None
     for host in member_endpoint_hosts(node):
         try:
-            return mutual_request(cluster, host, int(node["endpoint_port"]), method, path,
-                                  body, timeout=timeout, expected_node_id=str(node["id"]))
+            result = mutual_request(cluster, host, int(node["endpoint_port"]), method, path,
+                                    body, timeout=timeout, expected_node_id=str(node["id"]))
+            if path == '/v1/status':
+                status = result.get('status')
+                if not isinstance(status, dict) or status.get('node_id') != node['id']:
+                    raise ClusterError('health response identity mismatch')
+            if cluster.is_federation():
+                # Only a direct response over identity-pinned mTLS proves liveness;
+                # imported/relayed signed snapshots must not clear health failures.
+                cluster.record_transport_success(str(node['id']))
+            return result
         except FederationTransportError as exc:
             last_error = exc
     if last_error:
@@ -5036,11 +5054,12 @@ def federation_health_round(cluster: Cluster) -> dict[str, Any]:
 
     def check(node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         node_id = str(node['id'])
+        started_at = utc_now()
         try:
             probe_federation_member(cluster, node)
             return node_id, cluster.record_transport_success(node_id)
         except (ClusterError, OSError, ssl.SSLError) as exc:
-            result = cluster.record_transport_failure(node_id)
+            result = cluster.record_transport_failure(node_id, started_at=started_at)
             return node_id, {**result, 'error': str(exc)[-500:]}
         finally:
             cluster.close()
@@ -5189,6 +5208,7 @@ def federation_sync(cluster: Cluster, node_id: str, *, attempts: int = 3,
         raise ClusterError("旧迁移候选或已撤销节点必须重新显式配对后才能同步")
     last_error: FederationTransportError | None = None
     attempts = max(1, int(attempts))
+    started_at = utc_now()
     for attempt in range(attempts):
         try:
             local_manifest = cluster.federation_manifest()
@@ -5212,7 +5232,7 @@ def federation_sync(cluster: Cluster, node_id: str, *, attempts: int = 3,
         except FederationTransportError as exc:
             last_error = exc
     if coordinate_failures:
-        failure = cluster.record_transport_failure(str(node["id"]))
+        failure = cluster.record_transport_failure(str(node["id"]), started_at=started_at)
         health = cluster._coordinate_after_failures(
             str(node["id"]), list(failure["failure_times"])[-3:]
         ) if failure["needs_probe"] else failure
@@ -5731,26 +5751,29 @@ def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
         peers = [(str(row["id"]), str(row["endpoint_host"]), int(row["endpoint_port"]))
                  for row in cluster.trusted_federation_nodes()]
 
-        def publish_one(peer: tuple[str, str, int]) -> tuple[str, str]:
+        def publish_one(peer: tuple[str, str, int]) -> tuple[str, str, bool, int]:
             node_id, host, port = peer
+            started_at = utc_now()
             try:
                 member_request(
                     cluster, node_id, "POST", "/v1/federation/snapshot",
                     {"snapshot": snapshot}, timeout=15,
                 )
-                return node_id, "ok"
+                return node_id, "ok", False, started_at
+            except FederationTransportError as exc:
+                return node_id, f"failed: {exc}", True, started_at
             except ClusterError as exc:
-                return node_id, f"failed: {exc}"
+                return node_id, f"failed: {exc}", False, started_at
             finally:
                 cluster.db.close()
 
         if peers:
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(FEDERATION_FANOUT, len(peers))) as executor:
-                for node_id, status in executor.map(publish_one, peers):
+                for node_id, status, transport_failed, started_at in executor.map(publish_one, peers):
                     delivered[node_id] = status
-                    if status != "ok":
-                        cluster.record_transport_failure(node_id)
+                    if transport_failed:
+                        cluster.record_transport_failure(node_id, started_at=started_at)
         return {"snapshot": snapshot, "peers": delivered}
     if config.get("role") != "child" or not config.get("paired"):
         raise ClusterError("当前服务器不是已配对子 VPS")
@@ -6662,6 +6685,8 @@ def validate_agent_install_payload(payload: dict[str, Any]) -> tuple[bytes, str]
 
 def install_script_payload(cluster: Cluster, script: Path, payload: dict[str, Any]) -> dict[str, Any]:
     content = validate_script_install_payload(payload)
+    if script.is_file() and script.read_bytes() == content:
+        return {"sha256": hashlib.sha256(content).hexdigest(), "path": str(script), "unchanged": True}
     script.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=str(script.parent), delete=False) as handle:
         handle.write(content)
@@ -6682,6 +6707,9 @@ def install_script_payload(cluster: Cluster, script: Path, payload: dict[str, An
 def install_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
     content, _ = validate_agent_install_payload(payload)
     destination = Path(__file__).resolve()
+    if destination.is_file() and destination.read_bytes() == content:
+        return {"sha256": hashlib.sha256(content).hexdigest(), "path": str(destination),
+                "unchanged": True, "restart_required": False}
     with tempfile.NamedTemporaryFile(dir=str(destination.parent), delete=False) as handle:
         handle.write(content)
         temporary = Path(handle.name)
@@ -6987,6 +7015,7 @@ def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, 
     request = {"schema_version": API_VERSION, "request_id": uuid.uuid4().hex, "action": action, "payload": payload}
     last_error: FederationTransportError | None = None
     attempts = 3 if cluster.is_federation() and coordinate_failures else 1
+    started_at = utc_now()
     for attempt in range(attempts):
         try:
             result = member_request(
@@ -7005,7 +7034,7 @@ def send_action(cluster: Cluster, node_id: str, action: str, payload: dict[str, 
         except FederationTransportError as exc:
             last_error = exc
     if cluster.is_federation() and coordinate_failures:
-        failure = cluster.record_transport_failure(str(node["id"]))
+        failure = cluster.record_transport_failure(str(node["id"]), started_at=started_at)
         health = cluster._coordinate_after_failures(
             str(node["id"]), list(failure["failure_times"])[-3:]
         ) if failure["needs_probe"] else failure
@@ -7028,6 +7057,40 @@ def cdn_pool_command(cluster: Cluster, node_id: str, mode: str, cfip: str, *, ap
     return execute_action(cluster, request)["result"]
 
 
+def local_service_current(cluster: Cluster) -> bool:
+    if not cluster.is_federation():
+        return False
+    config = cluster.load_config()
+    try:
+        response = mutual_request(cluster, '127.0.0.1', int(config.get('internal_port', 0)),
+                                  'GET', '/v1/status', timeout=3, expected_node_id=str(config['node_id']))
+        status = response.get('status', {})
+        return bool(isinstance(status, dict) and status.get('node_id') == config['node_id']
+                    and status.get('cluster_source_sha256') == CLUSTER_SOURCE_SHA256)
+    except (ClusterError, OSError):
+        return False
+
+
+def wait_for_member_update(cluster: Cluster, node_id: str, expected_version: str,
+                           expected_sha256: str = "") -> dict[str, Any]:
+    """An acknowledged install still needs its new TLS listener to come back."""
+    last_error: Exception | None = None
+    for attempt in range(6):
+        try:
+            status = probe_federation_member(cluster, cluster.node(node_id))
+            if status.get("cluster_version") == expected_version and (
+                    not expected_sha256 or status.get("cluster_source_sha256") == expected_sha256):
+                return status
+            last_error = ClusterError("联邦服务仍在切换版本")
+        except FederationTransportError as exc:
+            last_error = exc
+        if attempt < 5:
+            time.sleep(attempt + 1)
+    if isinstance(last_error, FederationTransportError):
+        raise FederationTransportError("文件已更新，但联邦服务重启尚未恢复：" + str(last_error)) from last_error
+    raise ClusterError("文件已更新，但未确认新版联邦服务就绪")
+
+
 def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_peer: str = "local",
                               install_local: bool = False) -> dict[str, Any]:
     config = cluster.load_config()
@@ -7036,7 +7099,10 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
     script_payload = payload.get("script") if isinstance(payload.get("script"), dict) else {}
     agent_payload = payload.get("agent") if isinstance(payload.get("agent"), dict) else {}
     script_content = validate_script_install_payload(script_payload)
-    validate_agent_install_payload(agent_payload)
+    _, agent_source = validate_agent_install_payload(agent_payload)
+    module_match = re.search(r'^VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', agent_source, re.M)
+    ready_version = module_match.group(1) if module_match and re.search(
+        r'[\'"]cluster_version[\'"]\s*:\s*VERSION', agent_source) else ""
     version_match = re.search(rb"V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", script_content)
     lun_version = version_match.group().decode() if version_match else ""
 
@@ -7061,6 +7127,7 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
         if node_id in excluded:
             results[number] = {"status": "excluded" if node_id != source_peer else "source-current"}
             continue
+        started_at = utc_now()
         try:
             status = _action_result_payload(
                 send_action(
@@ -7076,6 +7143,10 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
             agent_result = _action_result_payload(
                 send_action(cluster, node_id, "agent.install", agent_payload, timeout=180)
             )
+            if cluster.is_federation() and ready_version:
+                expected_sha = str(agent_payload["sha256"]) if 'cluster_source_sha256' in agent_source else ""
+                status = wait_for_member_update(cluster, node_id, ready_version, expected_sha)
+                cluster.upsert_node(status, role="federation")
             results[number] = {
                 "status": "updated", "version": lun_version,
                 "script_sha256": script_result.get("sha256", ""),
@@ -7090,11 +7161,17 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
             detail = str(exc)[-1000:]
             failures[number] = detail
             results[number] = {"status": "failed", "error": detail}
-            with cluster.db.connection:
-                cluster.db.connection.execute(
-                    "UPDATE nodes SET state='unreachable',last_failure=?,updated_at=? WHERE id=?",
-                    (utc_now(), utc_now(), node_id),
-                )
+            if cluster.is_federation():
+                if isinstance(exc, FederationTransportError):
+                    cluster.record_transport_failure(node_id, started_at=started_at)
+                # Validation, permission and other update errors do not prove
+                # a dead control plane. Keep them in the update result only.
+            else:
+                with cluster.db.connection:
+                    cluster.db.connection.execute(
+                        "UPDATE nodes SET state='unreachable',last_failure=?,updated_at=? WHERE id=?",
+                        (utc_now(), utc_now(), node_id),
+                    )
 
     local_result: dict[str, Any] = {"status": "current", "version": lun_version}
     if install_local:
@@ -7438,6 +7515,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("endpoint-reconcile")
     sub.add_parser("revocation-check")
     sub.add_parser("status")
+    sub.add_parser("service-current")
     sub.add_parser("serve")
     return parser
 
@@ -7729,6 +7807,10 @@ def main(argv: list[str] | None = None) -> int:
             if not args.json:
                 print("revoked federation identity cleaned" if result.get("cleaned") else
                       f"membership checked: {result.get('checked', 0)}")
+        elif args.command == "service-current":
+            if not local_service_current(cluster):
+                raise ClusterError("本机联邦服务未就绪或仍在运行旧程序")
+            result = {"current": True}
         elif args.command == "status":
             result = {"config": cluster.load_config(), "nodes": cluster.nodes(),
                       "endpoint": cluster.endpoint_status(),

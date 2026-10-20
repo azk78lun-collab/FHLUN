@@ -1493,6 +1493,10 @@ class ClusterTestCase(unittest.TestCase):
             public = first.root.parent / 'weblun' / profile['token'] / 'jhsub.txt'
             self.assertIn('8.8.8.8', public.read_text())
             now = lun_cluster.utc_now()
+            # These simulated failures predate the test's wall clock. Their
+            # last live evidence must be older still, not a future recovery.
+            with first.db.connection:
+                first.db.connection.execute("UPDATE nodes SET last_success=? WHERE id=?", (now - 100, node_id))
             with mock.patch.object(lun_cluster, 'probe_federation_member',
                                    side_effect=lun_cluster.FederationTransportError('offline')), \
                     mock.patch.object(lun_cluster, 'broadcast_federation_events') as broadcast:
@@ -2149,6 +2153,10 @@ class ClusterTestCase(unittest.TestCase):
         try:
             first.federation_register_peer(second.federation_public_bundle())
             second_id = second.load_config()["node_id"]
+            # Simulate an outage after earlier live evidence, not inside the
+            # same-second recovery guard immediately following registration.
+            with first.db.connection:
+                first.db.connection.execute("UPDATE nodes SET last_success=0 WHERE id=?", (second_id,))
             with mock.patch.object(lun_cluster, "mutual_request",
                                    side_effect=lun_cluster.FederationTransportError("offline")) as transport, \
                     mock.patch.object(first, "_coordinate_after_failures",
@@ -2162,6 +2170,8 @@ class ClusterTestCase(unittest.TestCase):
             ).fetchone()[0], 1)
             first.record_transport_success(second_id)
             now = lun_cluster.utc_now()
+            with first.db.connection:
+                first.db.connection.execute("UPDATE nodes SET last_success=0 WHERE id=?", (second_id,))
             first.record_transport_failure(second_id, when=now - 40)
             first.record_transport_failure(second_id, when=now - 20)
             with mock.patch.object(lun_cluster, "mutual_request",
