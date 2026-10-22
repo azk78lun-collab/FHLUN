@@ -171,17 +171,17 @@ addout=replace
 ippz=
 cdnmode=rewrite
 cdnym=proxy.example.com
-v4=77.90.28.162
+v4=192.0.2.10
 v6=
 vpsmode=nat
 ptmap='45126-12343 45201-12340'
-[[ $(direct_address_entries) == '77.90.28.162|IPv4' ]]
+[[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
 [[ $(address_mode_label) == '源站 IP（端口回源自动保护）' ]]
 
 # 普通 VPS 复用橙云回源 Host 时受到同样影响，也必须使用源站 IP。
 vpsmode=normal
 ptmap=
-[[ $(direct_address_entries) == '77.90.28.162|IPv4' ]]
+[[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
 
 # 单独准备的 DNS-only 直连域名与回源 Host 不同，应继续保留域名输出。
 addym=direct.example.com
@@ -196,15 +196,15 @@ cdnmode=standard
 cdnmode=rewrite
 addrmode=all
 v6=2001:db8::10
-expected_direct_addresses=$'77.90.28.162|IPv4\n2001:db8::10|IPv6'
+expected_direct_addresses=$'192.0.2.10|IPv4\n2001:db8::10|IPv6'
 [[ $(direct_address_entries) == "$expected_direct_addresses" ]]
 
 # 临时公网探测失败时可复用已记录的源站 IP；完全没有 IP 时拒绝生成错误域名节点。
 addrmode=domain
 v4=
 v6=
-printf '%s\n' '77.90.28.162' > "$HOME/lun/server_ip.log"
-[[ $(direct_address_entries) == '77.90.28.162|IPv4' ]]
+printf '%s\n' '192.0.2.10' > "$HOME/lun/server_ip.log"
+[[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
 rm -f "$HOME/lun/server_ip.log"
 [[ -z $(direct_address_entries) ]]
 rm -rf "$address_test_home"
@@ -421,17 +421,17 @@ cluster_refresh_profiles_async() { :; }
 multiuser_enabled() { return 1; }
 subscription_agent_enabled() { return 1; }
 subscription_direct_domain() { :; }
-client_port() { [[ $1 == 443 ]] && printf '52581\n' || printf '%s\n' "$1"; }
+client_port() { [[ $1 == 443 ]] && printf '50000\n' || printf '%s\n' "$1"; }
 cluster_cmd() {
   [[ $* == "--json profiles" ]] || return 1
   printf '%s\n' '[{"name":"全部节点","token":"test-token"}]'
 }
 HOME=$(mktemp -d)
 mkdir -p "$HOME/lun"
-printf '%s\n' '77.90.28.162' > "$HOME/lun/server_ip.log"
+printf '%s\n' '192.0.2.10' > "$HOME/lun/server_ip.log"
 printf '%s\n' '443' > "$HOME/lun/subport.log"
 cluster_links=$(cluster_show_subscription_links)
-[[ $cluster_links == *'http://77.90.28.162:52581/test-token/jhsub.txt'* ]]
+[[ $cluster_links == *'http://192.0.2.10:50000/test-token/jhsub.txt'* ]]
 rm -rf "$HOME"
 HOME=$original_home
 

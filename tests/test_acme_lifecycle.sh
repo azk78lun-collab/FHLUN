@@ -105,7 +105,7 @@ for kind in old new; do
 done
 cp "$tmp/old.key" "$HOME/lun/private.key"; cp "$tmp/old.crt" "$HOME/lun/cert.crt"
 cp "$tmp/new.key" "$stage/private.key"; cp "$tmp/new.crt" "$stage/cert.crt"
-printf '{"scheme":"http","public_host":"example.test","port":27260,"legacy_token":"unchanged"}\n' > "$HOME/lun/modules/multiuser/config.json"
+printf '{"scheme":"http","public_host":"example.test","port":50001,"legacy_token":"unchanged"}\n' > "$HOME/lun/modules/multiuser/config.json"
 cp "$HOME/lun/modules/multiuser/config.json" "$tmp/config-before"
 config_metadata=$(stat -c '%a:%u:%g' "$HOME/lun/modules/multiuser/config.json")
 cert_covers_domain(){ openssl x509 -in "$1" -noout -checkhost "$2" >/dev/null 2>&1; }
@@ -137,7 +137,7 @@ rm "$tmp/probe-fails"
 deploy_acme_cert example.test domain
 cmp "$HOME/lun/cert.crt" "$tmp/new.crt"
 [[ $(multiuser_config_value scheme) == https ]]
-[[ $(multiuser_config_value port) == 27260 && $(multiuser_config_value legacy_token) == unchanged ]]
+[[ $(multiuser_config_value port) == 50001 && $(multiuser_config_value legacy_token) == unchanged ]]
 ! grep -q 'restart sb' "$calls"
 [[ -z $(find "$HOME/lun" -maxdepth 1 -type d -name '.cert-deploy.*' -print) ]]
 echo 'ok - certificate/subscription rollback and HTTPS recovery; inactive cores unchanged'

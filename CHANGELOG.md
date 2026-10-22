@@ -16,6 +16,12 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - These notes preserve the original commits, hashes and order. Later versions may supersede historical behavior; follow the current [README](README.md) and module documentation for usage.
 - The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
 
+## 2026 年 10 月 23 日
+
+- **文档 / Documentation**（脚本版本保持 `V26.10.20.3`）
+  - 中文：精简首页并增加中英文切换，详细用法移至独立指南；公开报告与测试样例移除真实服务器标识，保留镜像运行入口及原 Git 历史。
+  - English: Shorten the landing README and add Chinese/English navigation, move detailed usage into a guide, and anonymize current reports and test fixtures while retaining the operational mirror and Git history.
+
 ## 2026 年 10 月 20 日
 
 - `V26.10.20.3` · 更新整合与链路自动准备 / Unified updates and automatic chain preparation

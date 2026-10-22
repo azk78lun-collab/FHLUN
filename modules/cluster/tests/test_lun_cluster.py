@@ -56,20 +56,20 @@ class ClusterTestCase(unittest.TestCase):
 
     def test_public_ip_detection_requires_two_matching_https_sources(self) -> None:
         values = {
-            "icanhazip": "34.89.100.236\n",
-            "api64": "34.89.100.236",
-            "amazonaws": "35.212.163.79\n",
+            "icanhazip": "1.1.1.1\n",
+            "api64": "1.1.1.1",
+            "amazonaws": "8.8.8.8\n",
         }
 
         def fetch(url: str, _timeout: int) -> str:
             return next(value for marker, value in values.items() if marker in url)
 
-        result = lun_cluster.detect_public_ip("35.189.127.5", fetcher=fetch)
+        result = lun_cluster.detect_public_ip("9.9.9.9", fetcher=fetch)
         self.assertTrue(result["confirmed"])
-        self.assertEqual(result["ip"], "34.89.100.236")
-        values["api64"] = "35.212.163.79"
+        self.assertEqual(result["ip"], "1.1.1.1")
+        values["api64"] = "8.8.8.8"
         values.pop("amazonaws")
-        result = lun_cluster.detect_public_ip("35.189.127.5", fetcher=fetch)
+        result = lun_cluster.detect_public_ip("9.9.9.9", fetcher=fetch)
         self.assertFalse(result["confirmed"])
         with self.assertRaisesRegex(lun_cluster.ClusterError, "公网 IP"):
             lun_cluster.normalize_public_ip("10.0.0.1")
@@ -180,10 +180,10 @@ class ClusterTestCase(unittest.TestCase):
         self._add_node(other_id, "DE")
         with self.cluster.db.connection:
             self.cluster.db.connection.execute(
-                "UPDATE nodes SET endpoint_host='161.33.24.201',state='legacy-unverified' WHERE id=?", (old_id,)
+                "UPDATE nodes SET endpoint_host='192.0.2.20',state='legacy-unverified' WHERE id=?", (old_id,)
             )
             self.cluster.db.connection.execute(
-                "UPDATE nodes SET endpoint_host='161.33.24.201',state='online' WHERE id=?", (target_id,)
+                "UPDATE nodes SET endpoint_host='192.0.2.20',state='online' WHERE id=?", (target_id,)
             )
             self.cluster.db.connection.execute(
                 "UPDATE nodes SET state='legacy-unverified' WHERE id=?", (other_id,)
@@ -327,10 +327,10 @@ class ClusterTestCase(unittest.TestCase):
         self._add_node(active, "ZZ")
         with self.cluster.db.connection:
             self.cluster.db.connection.execute(
-                "UPDATE nodes SET endpoint_host='161.33.24.201',state='revoked' WHERE id=?", (retired,)
+                "UPDATE nodes SET endpoint_host='192.0.2.20',state='revoked' WHERE id=?", (retired,)
             )
             self.cluster.db.connection.execute(
-                "UPDATE nodes SET endpoint_host='161.33.24.201',state='online' WHERE id=?", (active,)
+                "UPDATE nodes SET endpoint_host='192.0.2.20',state='online' WHERE id=?", (active,)
             )
         self.assertEqual([row["id"] for row in self.cluster.nodes()], [active])
         self.assertEqual(self.cluster.identity_place(self.cluster.node(active)), "未设置地区")
@@ -1056,15 +1056,15 @@ class ClusterTestCase(unittest.TestCase):
         try:
             before = cluster.load_config()
             before_id = before["node_id"]
-            result = cluster.reconcile_public_endpoint("34.89.100.236")
+            result = cluster.reconcile_public_endpoint("1.1.1.1")
             after = cluster.load_config()
             self.assertTrue(result["changed"])
-            self.assertEqual(after["public_host"], "34.89.100.236")
+            self.assertEqual(after["public_host"], "1.1.1.1")
             for key in ("node_id", "public_port", "internal_port", "server_number"):
                 self.assertEqual(after[key], before[key])
             self.assertEqual(result["event"]["author_id"], before_id)
             self.assertEqual(result["event"]["type"], "node.metadata")
-            self.assertEqual(cluster.node(before_id)["endpoint_host"], "34.89.100.236")
+            self.assertEqual(cluster.node(before_id)["endpoint_host"], "1.1.1.1")
         finally:
             cluster.close()
 
@@ -1073,10 +1073,10 @@ class ClusterTestCase(unittest.TestCase):
         cluster = self._federation_cluster("endpoint-stable", 24202)
         try:
             config = cluster.load_config()
-            config["public_host"] = "34.89.100.236"
+            config["public_host"] = "1.1.1.1"
             cluster.save_config(config)
             cluster.upsert_node(cluster.local_status(), role="federation")
-            detection = {"confirmed": True, "ip": "34.89.100.236", "observations": {},
+            detection = {"confirmed": True, "ip": "1.1.1.1", "observations": {},
                          "errors": {}, "checked_at": lun_cluster.utc_now()}
             with mock.patch.object(lun_cluster, "broadcast_federation_events") as broadcast, \
                     mock.patch.object(lun_cluster, "push_snapshot") as publish:
@@ -1095,9 +1095,9 @@ class ClusterTestCase(unittest.TestCase):
             with mock.patch.object(cluster, "publish_local_node_metadata",
                                    side_effect=lun_cluster.ClusterError("sign failed")):
                 with self.assertRaisesRegex(lun_cluster.ClusterError, "sign failed"):
-                    cluster.reconcile_public_endpoint("35.212.163.79")
-            self.assertEqual(cluster.load_config()["public_host"], "34.89.100.236")
-            self.assertEqual(cluster.node(config["node_id"])["endpoint_host"], "34.89.100.236")
+                    cluster.reconcile_public_endpoint("8.8.8.8")
+            self.assertEqual(cluster.load_config()["public_host"], "1.1.1.1")
+            self.assertEqual(cluster.node(config["node_id"])["endpoint_host"], "1.1.1.1")
         finally:
             cluster.close()
 
@@ -1113,8 +1113,8 @@ class ClusterTestCase(unittest.TestCase):
             baseline = london.federation_public_bundle()
             oregon.import_federation_bundle(baseline, allow_cluster_adopt=True)
             stable.import_federation_bundle(baseline, allow_cluster_adopt=True)
-            london_event = london.reconcile_public_endpoint("34.89.100.236")["event"]
-            oregon_event = oregon.reconcile_public_endpoint("35.212.163.79")["event"]
+            london_event = london.reconcile_public_endpoint("1.1.1.1")["event"]
+            oregon_event = oregon.reconcile_public_endpoint("8.8.8.8")["event"]
             stable.federation_import_events([london_event, oregon_event])
             shared = stable.federation_events_since({})
             london.federation_import_events(shared)
@@ -1122,8 +1122,8 @@ class ClusterTestCase(unittest.TestCase):
             london_id = london.load_config()["node_id"]
             oregon_id = oregon.load_config()["node_id"]
             for receiver in clusters:
-                self.assertEqual(receiver.node(london_id)["endpoint_host"], "34.89.100.236")
-                self.assertEqual(receiver.node(oregon_id)["endpoint_host"], "35.212.163.79")
+                self.assertEqual(receiver.node(london_id)["endpoint_host"], "1.1.1.1")
+                self.assertEqual(receiver.node(oregon_id)["endpoint_host"], "8.8.8.8")
         finally:
             for item in clusters:
                 item.close()
