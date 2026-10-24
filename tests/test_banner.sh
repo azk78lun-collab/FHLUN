@@ -21,11 +21,12 @@ fail(){ printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_eq(){ [[ "$1" == "$2" ]] || fail "expected [$2], got [$1]"; }
 
 assert_eq "$(LUN_BANNER_TEST_COLS=71 LUN_BANNER_TEST_LINES=50 lun_banner_ascii_size)" compact
-assert_eq "$(LUN_BANNER_TEST_COLS=72 LUN_BANNER_TEST_LINES=25 lun_banner_ascii_size)" small
-assert_eq "$(LUN_BANNER_TEST_COLS=96 LUN_BANNER_TEST_LINES=31 lun_banner_ascii_size)" medium
-assert_eq "$(LUN_BANNER_TEST_COLS=120 LUN_BANNER_TEST_LINES=37 lun_banner_ascii_size)" large
+assert_eq "$(LUN_BANNER_TEST_COLS=72 LUN_BANNER_TEST_LINES=27 lun_banner_ascii_size)" small
+assert_eq "$(LUN_BANNER_TEST_COLS=96 LUN_BANNER_TEST_LINES=33 lun_banner_ascii_size)" medium
+assert_eq "$(LUN_BANNER_TEST_COLS=120 LUN_BANNER_TEST_LINES=39 lun_banner_ascii_size)" large
+assert_eq "$(LUN_BANNER_TEST_COLS=120 LUN_BANNER_TEST_LINES=38 lun_banner_ascii_size)" medium
 
-for spec in small:12:72 medium:18:96 large:24:120; do
+for spec in small:14:72 medium:20:96 large:26:120; do
   IFS=: read -r size expected_lines expected_width <<< "$spec"
   lun_banner_ascii_data "$size" > "$tmp/$size.marked"
   sed 's/@[CWO]@//g' "$tmp/$size.marked" > "$tmp/$size.txt"
@@ -33,20 +34,22 @@ for spec in small:12:72 medium:18:96 large:24:120; do
   awk -v max="$expected_width" 'length($0)>max{exit 1}' "$tmp/$size.txt" || fail "$size exceeds width"
   LC_ALL=C grep -q '[^ -~]' "$tmp/$size.txt" && fail "$size contains non-ASCII art"
   grep -q '[^ .+*#@-]' "$tmp/$size.txt" && fail "$size contains an unexpected glyph"
+  head -n1 "$tmp/$size.txt" | grep -q -- '--.*--' || fail "$size top rim missing"
+  tail -n1 "$tmp/$size.txt" | grep -q -- '--.*--' || fail "$size bottom rim missing"
 done
 
 lun_banner_render_ascii medium > "$tmp/rendered.txt"
 grep -q '@[CWO]@' "$tmp/rendered.txt" && fail "color marker leaked"
-[[ $(wc -l < "$tmp/rendered.txt") -eq 18 ]] || fail "rendered medium line count"
+[[ $(wc -l < "$tmp/rendered.txt") -eq 20 ]] || fail "rendered medium line count"
 
 clear(){ :; }
 LUN_BANNER_ALLOW_NONTTY=1
 LUN_BANNER_TEST_COLS=96
-LUN_BANNER_TEST_LINES=31
+LUN_BANNER_TEST_LINES=33
 TERM=xterm
 export LUN_BANNER_ALLOW_NONTTY LUN_BANNER_TEST_COLS LUN_BANNER_TEST_LINES TERM
 lun_splash > "$tmp/splash.txt"
-[[ $(wc -l < "$tmp/splash.txt") -eq 21 ]] || fail "splash should contain medium art, title, intro and prompt"
+[[ $(wc -l < "$tmp/splash.txt") -eq 23 ]] || fail "splash should contain medium art, title, intro and prompt"
 grep -q '正在准备主面板，完成后自动进入' "$tmp/splash.txt" || fail "automatic dashboard preparation prompt missing"
 ! grep -q '秒后自动继续' "$tmp/splash.txt" || fail "automatic splash timeout remains"
 ! grep -q '按任意键' "$tmp/splash.txt" || fail "any-key trigger remains"

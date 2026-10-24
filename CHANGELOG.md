@@ -1,8 +1,8 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.10.20.3`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.10.24.1`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.10.20.3`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.10.24.1`.
 
 ## 阅读说明 Reading guide
 
@@ -15,6 +15,13 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - Versions come from `lun.sh` at each commit. Several fixes or documentation changes may share a version. Merge entries are integration records, not additional releases.
 - These notes preserve the original commits, hashes and order. Later versions may supersede historical behavior; follow the current [README](README.md) and module documentation for usage.
 - The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
+
+## 2026 年 10 月 24 日
+
+- `V26.10.24.1`：中文：修复脚本下载覆盖更新目标变量造成的“假最新版”，按实际入口内容更新并校验；更新后回车重载新菜单并清除继承的安装参数。终端缺少 tput / terminfo 时回退 ANSI 配色，欢迎轮胎补齐上下轮廓并按完整高度选档。
+- English: Fix downloader variable leakage that compared the staged script with itself instead of updating the command. Verify the installed entry and reload the new menu after Enter without inherited install arguments. Fall back to ANSI colors without tput/terminfo and complete the wheel's upper/lower outline with height-aware sizing.
+- 中文：新增域名证书、CDN、隧道和端口回源的按需配置入口，保留原完整套餐；公开证书不再回退到自签默认主体，复用前检查有效期、可信性与域名匹配，申请失败恢复原服务域名，核心安装不忽略证书失败。保留现有代理配置。
+- English: Add optional setup paths for domain certificates, CDN, tunnels and origin rules while retaining the full preset. Never derive public-certificate requests from self-signed defaults; validate expiry, trust and hostname before reuse, restore the service domain on issuance failure, and propagate certificate failures from core installers. Preserve existing proxy configuration.
 
 ## 2026 年 10 月 23 日
 

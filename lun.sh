@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.10.20.3"
+echo "当前版本：V26.10.24.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1408,8 +1408,7 @@ fi
 }
 
 download_lun_script(){
-target=$1
-source_mode=${2:-configured}
+local target=$1 source_mode=${2:-configured} tmp download_url fallback_url
 tmp="${target}.tmp.$$"
 if [ "$source_mode" = official ]; then
 download_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/lun.sh?ref=main"
@@ -1450,7 +1449,7 @@ chmod +x "$target"
 }
 
 install_lun_entry(){
-target=$1
+local target=$1 tmp current_script current_base
 tmp="${target}.tmp.$$"
 current_script=$0
 current_base=$(basename "$current_script" 2>/dev/null)
@@ -1475,6 +1474,7 @@ download_lun_script "$target"
 }
 
 ensure_lun_command(){
+local target
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
 target="/usr/bin/lun"
 else
@@ -1930,7 +1930,7 @@ printf '%s@gmail.com\n' "$prefix"
 }
 
 reuse_local_cert_interactive(){
-[ -f "$HOME/lun/cert.crt" ] && [ -f "$HOME/lun/private.key" ] || return 1
+cert_reusable_for_request "${1:-any}" "${2:-}" || return 1
 [ -t 0 ] || return 1
 local subj
 subj=$(cat "$HOME/lun/cert_subject" 2>/dev/null)
@@ -1942,6 +1942,26 @@ case "$ans" in
 n|N) return 1 ;;
 *) sync_cert_metadata || { echo "现有证书与私钥不匹配，不能复用。"; return 1; }; echo "已复用本机已有证书，跳过证书生成。"; return 0 ;;
 esac
+}
+
+cert_reusable_for_request(){
+cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key" || return 1
+openssl x509 -in "$HOME/lun/cert.crt" -noout -checkend 0 >/dev/null 2>&1 || return 1
+case "$1" in
+domain|dns|ip) cert_publicly_trusted_for_domain "$HOME/lun/cert.crt" "$2" ;;
+*) return 0 ;;
+esac
+}
+
+public_cert_subject(){
+local requested_domain=${1:-${domain:-}}
+[ -n "$requested_domain" ] || requested_domain=$(cat "$HOME/lun/domain" 2>/dev/null)
+case "$requested_domain" in del|none) requested_domain= ;; esac
+if [ -z "$requested_domain" ] || ! valid_domain "$requested_domain" || is_ip_literal "$requested_domain"; then
+red_line "公开域名证书需要明确设置服务域名；请进入“按需配置 → 仅域名与公开证书”。不会使用自签证书主体或 Reality 伪装域名申请。" >&2
+return 1
+fi
+printf '%s\n' "$requested_domain"
 }
 
 cert_subject_default(){
@@ -2404,7 +2424,8 @@ return 0
 }
 
 issue_public_domain_cert(){
-subject=$1
+local subject
+subject=$(public_cert_subject "$1") || return 1
 if saved_dns_acme_available; then
 green_line "检测到已保存的 DNS API 凭据，使用 DNS-01 申请约 90 天的公开域名证书。"
 issue_acme_cert dns "$subject"
@@ -2540,28 +2561,35 @@ install_acme_cert "$subject" "$mode"
 }
 
 prepare_runtime_cert(){
+local subject
 load_domain_cert_config
-if [ "${ONECLICK_FORCE_CERT:-no}" != yes ] && reuse_local_cert_interactive; then return 0; fi
-subject=$(cert_subject_default)
 case "$certmode" in
-domain)
-[ -n "$domain" ] && subject="$domain"
+domain|dns)
+subject=$(public_cert_subject) || return 1
+if [ "${ONECLICK_FORCE_CERT:-no}" != yes ] && cert_reusable_for_request "$certmode" "$subject"; then
+cert_hash_update
+green_line "已复用匹配 $subject 的有效公开证书；是否到续期窗口由每日任务检查，不在重建时重复申请。"
+return 0
+fi
+if [ "$certmode" = domain ]; then
 echo "证书模式：自动公开域名证书，证书主体：$subject"
 issue_public_domain_cert "$subject" && return 0
 red_line "公开域名证书申请失败；现有证书保持不变，不会自动改成自签。"
-sync_cert_metadata >/dev/null 2>&1 || true
-return 1
-;;
-dns)
-[ -n "$domain" ] && subject="$domain"
+else
 echo "证书模式：ACME DNS-01，证书主体：$subject"
 issue_acme_cert dns "$subject" && return 0
 red_line "DNS API 证书申请失败；现有证书保持不变，不会自动改成自签。"
+fi
 sync_cert_metadata >/dev/null 2>&1 || true
 return 1
 ;;
 ip)
-subject=$(select_ip_cert_subject)
+subject=$(select_ip_cert_subject) || return 1
+[ -n "$subject" ] || { red_line "未找到可申请证书的本机公网 IP。"; return 1; }
+if [ "${ONECLICK_FORCE_CERT:-no}" != yes ] && cert_reusable_for_request ip "$subject"; then
+cert_hash_update
+return 0
+fi
 echo "证书模式：Let's Encrypt IP 短期证书（约 6 天），证书主体：$subject"
 issue_acme_cert ip "$subject" && return 0
 red_line "IP 证书申请失败；现有证书保持不变，不会自动改成自签。"
@@ -2569,6 +2597,7 @@ sync_cert_metadata >/dev/null 2>&1 || true
 return 1
 ;;
 self|*)
+if cert_reusable_for_request any ""; then sync_cert_metadata; return $?; fi
 if [ ! -f "$HOME/lun/private.key" ] || [ ! -f "$HOME/lun/cert.crt" ] || [ ! -f "$HOME/lun/SHA256.txt" ]; then
 self_signed_cert
 else
@@ -2782,13 +2811,7 @@ dekey=$(cat "$HOME/lun/xrk/dekey")
 enkey=$(cat "$HOME/lun/xrk/enkey")
 fi
 if [ -n "$xup" ] || [ -n "$xcp" ]; then
-if [ "${ONECLICK_FORCE_CERT:-no}" = yes ]; then
 prepare_runtime_cert || { echo "XHTTP TLS 证书准备失败。"; return 1; }
-elif cert_key_matches "$HOME/lun/cert.crt" "$HOME/lun/private.key"; then
-sync_cert_metadata || { echo "XHTTP TLS 证书元数据同步失败。"; return 1; }
-else
-prepare_runtime_cert || { echo "XHTTP TLS 证书准备失败。"; return 1; }
-fi
 fi
 
 if [ -n "$xhp" ]; then
@@ -3113,7 +3136,9 @@ cat > "$HOME/lun/sb.json" <<EOF
   "inbounds": [
 EOF
 insuuid
-prepare_runtime_cert
+if [ -n "$hyp" ] || [ -n "$tup" ] || [ -n "$anp" ] || [ -n "$nvp" ]; then
+prepare_runtime_cert || { echo "Sing-box 证书准备失败。"; return 1; }
+fi
 if [ -n "$nvp" ]; then
 naive_certificate_ready || return 1
 nvp=nvpt
@@ -7989,8 +8014,7 @@ fi
 }
 
 lun_install_update_stage(){
-stage=$1
-target=$2
+local stage=$1 target=$2 target_dir target_tmp target_backup expected_hash actual_hash
 target_dir=$(dirname "$target")
 target_tmp="${target}.replace.$$"
 target_backup="${target}.update-backup"
@@ -8014,8 +8038,7 @@ actual_hash=$(sha256sum "$target" 2>/dev/null | awk '{print $1}')
 }
 
 lun_sync_secondary_entry(){
-source=$1
-primary=$2
+local source=$1 primary=$2 secondary secondary_tmp
 secondary="$HOME/bin/lun"
 [ -f "$secondary" ] || return 0
 [ "$secondary" != "$primary" ] || return 0
@@ -8137,6 +8160,8 @@ return "$bundle_rc"
 }
 
 update_lun_script(){
+local target update_stage current_lun_version new_lun_version
+LUN_UPDATED_ENTRY=
 target=$(lun_update_target)
 mkdir -p "$HOME/bin" 2>/dev/null || true
 if [ -w "$(dirname "$target")" ]; then
@@ -8166,6 +8191,7 @@ fi
 if [ -s "$target" ] && cmp -s "$target" "$update_stage" 2>/dev/null; then
 lun_sync_secondary_entry "$update_stage" "$target"
 rm -f "$update_stage"
+LUN_UPDATED_ENTRY=$target
 green_line "当前已是最新版：${current_lun_version:-$new_lun_version}"
 return 0
 fi
@@ -8176,9 +8202,23 @@ return 1
 fi
 lun_sync_secondary_entry "$update_stage" "$target"
 rm -f "$update_stage"
+LUN_UPDATED_ENTRY=$target
 green_line "Lun 脚本更新完成：${current_lun_version:-未知} → $new_lun_version"
 green_line "生效入口：$target"
-yellow_line "新版本将在下次运行 lun 时完全生效。"
+yellow_line "菜单内更新后，按回车会重新载入已安装版本；无需退出 SSH。"
+}
+
+lun_reopen_updated_menu(){
+local entry=${LUN_UPDATED_ENTRY:-}
+[ -n "$entry" ] && [ -r "$entry" ] || return 1
+# A fresh menu must load saved state, not treat inherited protocol picks as installation arguments.
+unset vlpt vmpt vwpt hypt tupt xhpt vxpt anpt sspt arpt sopt xupt xcpt nvpt
+unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop xup xcp nvp vmag wap
+unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so port_xu port_xc port_nv
+unset uuid reym ym_vl_re domain certmode acme_email acme_dns name warp oap ippz
+unset cdnym cfip cdnmode cdnpt cdnproto addrmode addym addout ptmap portpool inpool outpool vpsmode
+unset argo argoip agn agk ARGO_DOMAIN ARGO_AUTH sub subid subpt subipmode ONECLICK_FORCE_CERT
+exec bash "$entry"
 }
 
 
@@ -8186,28 +8226,8 @@ ui_line(){ printf '%s\n' "======================================================
 ui_dash(){ printf '%s\n' "--------------------------------------------------------------------------------"; }
 ui_title(){ ui_line; printf '%s\n' "$1"; ui_line; }
 ui_pause(){ printf "%s按回车返回菜单%s：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r _pause; }
-if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
-LUN_RED=$(tput setaf 1 2>/dev/null)
-LUN_GREEN=$(tput setaf 2 2>/dev/null)
-LUN_YELLOW=$(tput setaf 3 2>/dev/null)
-LUN_BLUE=$(tput setaf 4 2>/dev/null)
-LUN_CYAN=$(tput setaf 6 2>/dev/null)
-LUN_WHITE=$(tput setaf 7 2>/dev/null)
-LUN_BOLD=$(tput bold 2>/dev/null)
-LUN_COLOR_COUNT=$(tput colors 2>/dev/null || printf 0)
-if [ "$LUN_COLOR_COUNT" -ge 256 ] 2>/dev/null; then
-LUN_ORANGE=$(tput setaf 208 2>/dev/null)
-LUN_LIME=$(tput setaf 226 2>/dev/null)
-LUN_BANNER_CYAN=$(tput setaf 51 2>/dev/null)
-LUN_BANNER_WHITE=$(tput setaf 230 2>/dev/null)
-else
-LUN_ORANGE=$LUN_YELLOW
-LUN_LIME=$LUN_YELLOW
-LUN_BANNER_CYAN=$LUN_CYAN
-LUN_BANNER_WHITE=$LUN_WHITE
-fi
-LUN_RESET=$(tput sgr0 2>/dev/null)
-else
+lun_init_colors(){
+local detected_colors=
 LUN_RED=
 LUN_GREEN=
 LUN_YELLOW=
@@ -8221,7 +8241,34 @@ LUN_BANNER_CYAN=
 LUN_BANNER_WHITE=
 LUN_COLOR_COUNT=0
 LUN_RESET=
+[ -t 1 ] && [ "${TERM:-}" != dumb ] && [ -z "${NO_COLOR:-}" ] || return 0
+# Minimal Alpine images may lack tput/terminfo; ordinary SSH terminals still support ANSI.
+LUN_RED=$'\033[31m'
+LUN_GREEN=$'\033[32m'
+LUN_YELLOW=$'\033[33m'
+LUN_BLUE=$'\033[34m'
+LUN_CYAN=$'\033[36m'
+LUN_WHITE=$'\033[37m'
+LUN_BOLD=$'\033[1m'
+LUN_RESET=$'\033[0m'
+LUN_COLOR_COUNT=8
+if command -v tput >/dev/null 2>&1; then detected_colors=$(tput colors 2>/dev/null) || detected_colors=; fi
+case "$detected_colors" in ''|*[!0-9]*) detected_colors=0 ;; esac
+case "${TERM:-}:${COLORTERM:-}" in *256color*|*truecolor*|*24bit*) detected_colors=256 ;; esac
+if [ "$detected_colors" -ge 256 ] 2>/dev/null; then
+LUN_COLOR_COUNT=256
+LUN_ORANGE=$'\033[38;5;208m'
+LUN_LIME=$'\033[38;5;226m'
+LUN_BANNER_CYAN=$'\033[38;5;51m'
+LUN_BANNER_WHITE=$'\033[38;5;230m'
+else
+LUN_ORANGE=$LUN_YELLOW
+LUN_LIME=$LUN_YELLOW
+LUN_BANNER_CYAN=$LUN_CYAN
+LUN_BANNER_WHITE=$LUN_WHITE
 fi
+}
+lun_init_colors
 green_line(){ printf '%s%s%s\n' "$LUN_GREEN" "$1" "$LUN_RESET"; }
 yellow_line(){ printf '%s%s%s\n' "$LUN_YELLOW" "$1" "$LUN_RESET"; }
 red_line(){ printf '%s%s%s\n' "$LUN_RED" "$1" "$LUN_RESET"; }
@@ -9334,11 +9381,11 @@ case "$banner_lines" in ''|*[!0-9]*) banner_lines=32 ;; esac
 
 lun_banner_ascii_size(){
 lun_banner_dimensions
-if [ "$banner_cols" -ge 120 ] 2>/dev/null && [ "$banner_lines" -ge 37 ] 2>/dev/null; then
+if [ "$banner_cols" -ge 120 ] 2>/dev/null && [ "$banner_lines" -ge 39 ] 2>/dev/null; then
 printf 'large\n'
-elif [ "$banner_cols" -ge 96 ] 2>/dev/null && [ "$banner_lines" -ge 31 ] 2>/dev/null; then
+elif [ "$banner_cols" -ge 96 ] 2>/dev/null && [ "$banner_lines" -ge 33 ] 2>/dev/null; then
 printf 'medium\n'
-elif [ "$banner_cols" -ge 72 ] 2>/dev/null && [ "$banner_lines" -ge 25 ] 2>/dev/null; then
+elif [ "$banner_cols" -ge 72 ] 2>/dev/null && [ "$banner_lines" -ge 27 ] 2>/dev/null; then
 printf 'small\n'
 else
 printf 'compact\n'
@@ -9349,6 +9396,7 @@ lun_banner_ascii_data(){
 case "$1" in
 small)
 cat <<'LUN_ASCII_SMALL'
+              @C@..--@W@+++@O@--..
           @C@...-+#####@W@#######**@O@+-...... ..
        @C@..+*##@#**@W@++*##@O@*++@W@+*###@#@O@+---++--....... ....... ..   ..
      @C@.-+#@@**+@W@-..@O@..@W@.#*@O@*...@W@.+@O@+++@W@#@#@O@#*****++-..  ........ .. ....... .....
@@ -9361,10 +9409,12 @@ cat <<'LUN_ASCII_SMALL'
    @C@...+*##**#*@W@**-@C@.@W@.@C@.@W@....@O@.@W@.##@O@*@W@#*@O@+@W@#@@O@**+--................. ... ..  .    .
       @C@...+*#**+++@W@********#**@O@*@W@##@O@#+-+++--+---..... .... ...    ..
           @C@...-+++-++-@W@+-++-+*+@O@-............        .   .
+              @C@..--@W@+++@O@--..
 LUN_ASCII_SMALL
 ;;
 medium)
 cat <<'LUN_ASCII_MEDIUM'
+                      @C@..--++@W@***@O@++--..
                 @C@....+-**###@W@#*#*##+*---@O@--....  ..  . .
             @C@...++##@@#@*#+@W@**+*+***@#@@##@O@++.-....+-+....-.....   ...
           @C@.--*#@W@@@C@@@*+++@W@+.--#@##+@O@++-+-@W@++#@#@@O@**+-+--.-...      .-.   ....... ...     ..
@@ -9383,10 +9433,12 @@ cat <<'LUN_ASCII_MEDIUM'
         @C@...--*##*+-+*-@W@**#*******#*#*#@O@+-*@W@#@@O@#+++*+*-+---.+.--.....     .. ....      .@C@.
             @C@...++**++---*@W@+**+*+*+.+@O@-*@W@*##@O@++..........--....       . ..   .
                @C@.....--+-+.--.@W@-.-+-+--.@O@...........
+                      @C@..--++@W@***@O@++--..
 LUN_ASCII_MEDIUM
 ;;
 large)
 cat <<'LUN_ASCII_LARGE'
+                              @C@..--++@W@****@O@++--..
                          @C@......--.--.@W@........@O@..
                   @C@.---+*#@@@##@W@@@@######@#@######@O@**+--... ....  . .
                @C@...-**#@@@##*+@W@+--....@O@...-+@W@*+++##@@#+@O@+----.. .-++-------.......    ...
@@ -9411,6 +9463,7 @@ cat <<'LUN_ASCII_LARGE'
             @C@....--*##**++++.-@W@*+***##***#***--@O@+@W@+@O@*@W@###@O@*+++--.--.-....---...   . ...  . ..    ..          ..@C@.
                   @C@....++***-..+++-@W@----+++-.-***#@O@*++-.---...--.. .....               .     .
                       @C@.....---+++@W@-@C@.@W@-.--+++-@O@.....
+                             @C@..--++@W@****@O@++--..
 LUN_ASCII_LARGE
 ;;
 *) return 1 ;;
@@ -13048,6 +13101,41 @@ done
 refresh_protocol_flags
 }
 
+configure_public_domain_certificate(){
+local previous_domain=${domain:-} previous_file= had_domain=no requested_domain rc=0
+if [ -f "$HOME/lun/domain" ]; then
+had_domain=yes
+previous_file=$(cat "$HOME/lun/domain" 2>/dev/null)
+fi
+prompt_service_domain || rc=$?
+if [ "$rc" = 0 ]; then
+requested_domain=$(public_cert_subject) || rc=1
+fi
+if [ "$rc" = 0 ]; then
+domain=$requested_domain
+if cert_reusable_for_request domain "$domain"; then
+sync_cert_metadata || rc=1
+[ "$rc" != 0 ] || green_line "已复用与 $domain 匹配的有效公开证书，无需重新申请。"
+else
+prompt_acme_email || rc=$?
+if [ "$rc" = 0 ]; then
+issue_public_domain_cert "$domain" || rc=$?
+[ "$rc" != 0 ] || green_line "公开域名证书申请完成。"
+fi
+fi
+fi
+if [ "$rc" != 0 ]; then
+domain=$previous_domain
+if [ "$had_domain" = yes ]; then
+printf '%s\n' "$previous_file" > "$HOME/lun/domain"
+else
+rm -f "$HOME/lun/domain"
+fi
+[ "$rc" = 2 ] || red_line "公开域名证书未完成；已恢复原服务域名，现有证书不变。"
+fi
+return "$rc"
+}
+
 certificate_menu(){
 while :; do
 ui_title "Lun 证书管理"
@@ -13065,24 +13153,15 @@ IFS= read -r c
 case "$c" in
 1) self_signed_cert && echo "已恢复自签证书。" || echo "自签证书生成失败。"; LUN_MENU_ACTION=list; ui_pause; return ;;
 2)
-prompt_service_domain; rc=$?
+configure_public_domain_certificate; rc=$?
 [ "$rc" = 2 ] && continue
-[ -n "$domain" ] || { echo "当前没有服务域名，不能申请域名证书。"; continue; }
-if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
-prompt_acme_email; rc=$?
-[ "$rc" = 2 ] && continue
-if issue_public_domain_cert "$domain"; then
-green_line "公开域名证书申请完成。"
-else
-red_line "公开域名证书申请失败，现有证书未改动。"
-fi
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
 3)
 prompt_service_domain; rc=$?
 [ "$rc" = 2 ] && continue
 [ -n "$domain" ] || { echo "当前没有服务域名，不能申请 DNS API 证书。"; continue; }
-if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
+if reuse_local_cert_interactive dns "$domain"; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
 prompt_acme_email; rc=$?
 [ "$rc" = 2 ] && continue
 save_dns_env_interactive; rc=$?
@@ -13096,11 +13175,11 @@ fi
 LUN_MENU_ACTION=list; ui_pause; return
 ;;
 4)
-if reuse_local_cert_interactive; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
-prompt_acme_email; rc=$?
-[ "$rc" = 2 ] && continue
 subject=$(select_ip_cert_subject)
 [ -n "$subject" ] || { red_line "未找到可直接从公网完成 TCP 80 验证的 IP。"; ui_pause; continue; }
+if reuse_local_cert_interactive ip "$subject"; then echo "已复用本机证书，跳过申请。"; LUN_MENU_ACTION=list; ui_pause; return; fi
+prompt_acme_email; rc=$?
+[ "$rc" = 2 ] && continue
 yellow_line "Let's Encrypt IP 证书有效期约 6 天，acme.sh 会每日检查并自动续期。"
 if issue_acme_cert ip "$subject"; then
 green_line "IP 证书申请完成。"
@@ -13329,19 +13408,80 @@ rc-service argo stop >/dev/null 2>&1 || true
 fi
 }
 
+oneclick_setup_menu(){
+local selection rc
+while :; do
+ui_title "Lun 按需配置"
+echo "独立设置不自动串联其它流程；第 5 项才会按套餐重新配置协议。"
+echo " 1. 仅域名与公开证书（不启用 CDN / 隧道 / 回源）"
+echo " 2. 仅 CDN Host / 优选入口（不申请证书，不创建隧道）"
+echo " 3. 仅 CF 隧道 / Argo"
+echo " 4. 仅端口回源（手动登记 / API 自动部署）"
+echo " 5. 全部自动配置（重新选择协议套餐，需完整 Cloudflare 权限）"
+echo " 0. 返回"
+printf "请选择 [0-5]（输入 0 返回）："
+IFS= read -r selection || return 2
+case "$selection" in
+1)
+configure_public_domain_certificate; rc=$?
+[ "$rc" = 2 ] && continue
+[ "$rc" = 0 ] || { ui_pause; continue; }
+LUN_MENU_ACTION=list; return 0
+;;
+2)
+prompt_cdn; rc=$?
+[ "$rc" = 2 ] && continue
+[ "$rc" = 0 ] || { ui_pause; continue; }
+if [ "$CDN_REBUILD_REQUIRED" = yes ]; then
+load_installed_protocol_flags; LUN_MENU_ACTION=rep
+else
+LUN_MENU_ACTION=list
+fi
+return 0
+;;
+3)
+argo_network_menu; rc=$?
+[ "$rc" = 2 ] && continue
+[ "$rc" = 0 ] || { ui_pause; continue; }
+return 0
+;;
+4)
+prompt_origin_rules; rc=$?
+[ "$rc" = 2 ] && continue
+[ "$rc" = 0 ] || { ui_pause; continue; }
+if [ "$CDN_REBUILD_REQUIRED" = yes ]; then
+[ "$CLOUDFLARE_PROTOCOL_PORT_CHANGED" = yes ] || load_installed_protocol_flags
+LUN_MENU_ACTION=rep
+else
+LUN_MENU_ACTION=list
+fi
+return 0
+;;
+5)
+oneclick_full_setup; rc=$?
+[ "$rc" = 2 ] && continue
+[ "$rc" = 0 ] || { ui_pause; continue; }
+LUN_MENU_ACTION=rep; return 0
+;;
+0|"") return 2 ;;
+*) echo "输入错误。" ;;
+esac
+done
+}
+
 install_protocol_menu(){
 while :; do
 ui_title "Lun 安装 / 协议管理"
 echo " 1. 引导式安装 / 新建协议"
 echo " 2. 增删改协议（保留内核，仅重建配置）"
-printf " 3. %s一键全配置（CDN / 域名证书 / 隧道 / 端口回源）%s\n" "$LUN_GREEN" "$LUN_RESET"
+printf " 3. %s按需配置（域名证书 / CDN / 隧道 / 端口回源）%s\n" "$LUN_GREEN" "$LUN_RESET"
 echo " 0. 返回"
 printf "请选择 [0-3]："
 IFS= read -r c
 case "$c" in
 1) guided_install; rc=$?; [ "$rc" = 0 ] && { { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; } && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
 2) pick_protocols; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
-3) oneclick_full_setup; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
+3) oneclick_setup_menu; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] && return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -13533,7 +13673,14 @@ case "$c" in
 1) LUN_MENU_ACTION=res; return ;;
 2) stop_lun_services; echo "已停止 Lun 服务。"; exit ;;
 3) log_menu ;;
-4) update_local_lun_bundle; ui_pause ;;
+4)
+update_local_lun_bundle || true
+ui_pause
+if [ -n "${LUN_UPDATED_ENTRY:-}" ]; then
+lun_reopen_updated_menu || red_line "新脚本已保存，但菜单重新载入失败；请重新运行 lun。"
+return
+fi
+;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
