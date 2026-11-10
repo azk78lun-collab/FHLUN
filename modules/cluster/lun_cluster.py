@@ -4837,15 +4837,22 @@ def serve(cluster: Cluster) -> None:
         while not maintenance_ready.wait(1):
             if stopping.is_set():
                 return
+        first_round = True  # Initial maintenance already checks the endpoint.
         while not stopping.is_set():
             started = time.monotonic()
             try:
                 if cluster.is_federation():
+                    if not first_round:
+                        try:
+                            reconcile_federation_endpoint(cluster)
+                        except (ClusterError, OSError, sqlite3.Error) as exc:
+                            sys.stderr.write(f"federation endpoint check failed: {exc}\n")
                     federation_health_round(cluster)
             except (ClusterError, OSError, sqlite3.Error) as exc:
                 sys.stderr.write(f"federation health check failed: {exc}\n")
             finally:
                 cluster.close()
+            first_round = False
             if stopping.wait(max(1, HEALTH_CHECK_INTERVAL - (time.monotonic() - started))):
                 return
 

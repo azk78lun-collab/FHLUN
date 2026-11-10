@@ -28,6 +28,21 @@ class FakeResponse:
 
 
 class OptimizerTests(unittest.TestCase):
+    def test_domain_url_keeps_actual_server_ip_in_vps_metadata(self):
+        args = MOD.build_parser().parse_args([
+            'serve', '--port', '8080', '--public-host', 'ddns.example.com',
+            '--server-ip', '8.8.8.8', '--result-file', 'unused.json', '--token', 'fixture',
+        ])
+        server = mock.Mock()
+        server.server_address = ('0.0.0.0', 8080)
+        server.vps_job = None
+        with mock.patch.object(MOD, 'load_candidates', return_value=([], {})), \
+                mock.patch.object(MOD, 'OptimizerServer', return_value=server), \
+                mock.patch.object(MOD.threading, 'Timer'), \
+                mock.patch('builtins.print'):
+            MOD.serve(args)
+        self.assertEqual(server.vps_meta['ip'], '8.8.8.8')
+
     def test_browser_body_deadline_cancellation_port_labels_and_concurrency(self):
         node = shutil.which("node")
         if not node:
@@ -70,7 +85,7 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(MOD._validate_measurements([{**row, "speed_mbps": 10}], candidates, "client"), [])
 
     def test_version_and_page_expose_two_independent_boards(self):
-        self.assertEqual(MOD.VERSION, "2.0.5")
+        self.assertEqual(MOD.VERSION, "2.0.6")
         for marker in ('id="clientRows"', 'id="vpsRows"', 'id="preview"', 'id="manual"', '一键双向优选'):
             self.assertIn(marker, MOD.PAGE)
         self.assertIn("不做隐藏加权", MOD.PAGE)

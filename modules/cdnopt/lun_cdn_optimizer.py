@@ -32,7 +32,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-VERSION = "2.0.5"
+VERSION = "2.0.6"
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATES = 4096
@@ -980,7 +980,7 @@ def serve(args):
     server.vps_retry_results = []
     server.vps_result_history = {}
     server.vps_job = None
-    server.vps_meta = {"ip": args.public_host, "region": args.server_place or "未设置地区"}
+    server.vps_meta = {"ip": args.server_ip or args.public_host, "region": args.server_place or "未设置地区"}
     server.preview_secret = secrets.token_bytes(32)
     server.preview = None
     server.candidate_history = {item["ip"]: item for item in candidates}
@@ -1039,6 +1039,7 @@ def build_parser():
     run.add_argument("--bind", default="0.0.0.0")
     run.add_argument("--port", type=int, required=True)
     run.add_argument("--public-host", required=True)
+    run.add_argument("--server-ip", default="")
     run.add_argument("--public-port", type=int, default=0)
     run.add_argument("--result-file", required=True)
     run.add_argument("--current-file")

@@ -1,8 +1,8 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.10.24.1`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.10.1`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.10.24.1`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.10.1`.
 
 ## 阅读说明 Reading guide
 
@@ -15,6 +15,11 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - Versions come from `lun.sh` at each commit. Several fixes or documentation changes may share a version. Merge entries are integration records, not additional releases.
 - These notes preserve the original commits, hashes and order. Later versions may supersede historical behavior; follow the current [README](README.md) and module documentation for usage.
 - The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
+
+## 2026 年 11 月 10 日
+
+- 中文：优选网页每次使用实时公网 IP，优先输出解析完全匹配的服务域名；VPS 榜仍显示真实 IP。探测冲突时拒绝输出旧地址；开启优选时后台检查集群地址，每日巡检同步检查，沿用签名事件与限流广播。
+- English: Detect a current public IP for each CDN optimizer session, preferring a configured domain only when its DNS resolves solely to that IP; the VPS board retains the actual IP. Reject conflicting probes and reconcile cluster endpoints asynchronously at optimizer startup and during the existing daily health check.
 
 ## 2026 年 10 月 24 日
 

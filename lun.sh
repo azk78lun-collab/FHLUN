@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.10.24.1"
+echo "当前版本：V26.11.10.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -11783,7 +11783,7 @@ cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
 mkdir -p "$cdnopt_dir" || return 1
 rm -f "$cdnopt_tmp"
-if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.5 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
+if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.6 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
 return 0
 fi
 if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
@@ -11826,7 +11826,7 @@ red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
 return 1
 }
 cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
-[ "$cdnopt_version" = 2.0.5 ] || {
+[ "$cdnopt_version" = 2.0.6 ] || {
 rm -f "$cdnopt_tmp"
 red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
 return 1
@@ -11836,13 +11836,76 @@ chmod 700 "$cdnopt_target"
 }
 
 cdnopt_public_host(){
-cdnopt_host=$(cat "$HOME/lun/server_ip.log" 2>/dev/null)
-[ -n "$cdnopt_host" ] || cdnopt_host=${v4:-${v6:-}}
-[ -n "$cdnopt_host" ] || cdnopt_host=$(local_public_ips | sed -n '1p')
-cdnopt_host=${cdnopt_host#\[}
-cdnopt_host=${cdnopt_host%\]}
-[ -n "$cdnopt_host" ] || return 1
-printf '%s\n' "$cdnopt_host"
+local family first second candidate url_a url_b
+for family in 4 6; do
+if [ "$family" = 4 ]; then
+url_a=https://ipv4.icanhazip.com; url_b=https://api.ipify.org
+else
+url_a=https://ipv6.icanhazip.com; url_b=https://api6.ipify.org
+fi
+first=$(curl -fsS -"$family" --connect-timeout 3 --max-time 5 -H 'Cache-Control: no-cache' "$url_a" 2>/dev/null) || first=
+second=$(curl -fsS -"$family" --connect-timeout 3 --max-time 5 -H 'Cache-Control: no-cache' "$url_b" 2>/dev/null) || second=
+first=$(python3 -c 'import ipaddress,sys
+try:
+ ip=ipaddress.ip_address(sys.argv[1].strip()); print(ip.compressed if ip.is_global and ip.version == int(sys.argv[2]) else "")
+except ValueError: print("")' "$first" "$family")
+second=$(python3 -c 'import ipaddress,sys
+try:
+ ip=ipaddress.ip_address(sys.argv[1].strip()); print(ip.compressed if ip.is_global and ip.version == int(sys.argv[2]) else "")
+except ValueError: print("")' "$second" "$family")
+if [ -n "$first" ] && [ -n "$second" ] && [ "$first" != "$second" ]; then
+yellow_line "公网 IPv$family 探测结果不一致，无法安全生成测速页地址。" >&2
+return 1
+fi
+candidate=${first:-$second}
+if [ -n "$candidate" ]; then
+[ -n "$first" ] && [ -n "$second" ] || yellow_line "只有一个公网 IPv$family 探测源可用，请确认页面地址。" >&2
+printf '%s\n' "$candidate"
+return 0
+fi
+done
+yellow_line "公网 IP 检测失败；为避免输出旧地址，未启动测速页。" >&2
+return 1
+}
+
+cdnopt_reconcile_cluster_async(){
+cluster_enabled || return 0
+(
+umask 077
+if command -v flock >/dev/null 2>&1; then
+exec 9> "$HOME/lun/.cdnopt-endpoint-sync.lock"
+flock -n 9 || exit 0
+fi
+cluster_cmd endpoint-reconcile > "$HOME/lun/cdnopt-endpoint-sync.log" 2>&1
+) </dev/null >/dev/null 2>&1 &
+}
+
+cdnopt_domain_matches_ip(){
+timeout 5 python3 - "$1" "$2" <<'PY'
+import ipaddress, socket, sys
+try:
+    expected = ipaddress.ip_address(sys.argv[2])
+    addresses = {ipaddress.ip_address(row[4][0].split('%')[0]) for row in socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)}
+    # A competing address family could send browsers to an unreachable NAT port.
+    sys.exit(0 if addresses and addresses == {expected} else 1)
+except (ValueError, OSError):
+    sys.exit(1)
+PY
+}
+
+cdnopt_preferred_host(){
+local detected_ip=$1 candidate configured_host=
+if subscription_agent_enabled; then configured_host=$(multiuser_config_value public_host 2>/dev/null); fi
+for candidate in "$(cat "$HOME/lun/domain" 2>/dev/null)" "$configured_host" "$(cat "$HOME/lun/addym" 2>/dev/null)"; do
+[ -n "$candidate" ] || continue
+is_ip_literal "$candidate" && continue
+valid_domain "$candidate" || continue
+if cdnopt_domain_matches_ip "$candidate" "$detected_ip"; then
+printf '%s\n' "$candidate"
+return 0
+fi
+done
+printf '%s\n' "$detected_ip"
 }
 
 cdnopt_prompt_count(){
@@ -11881,7 +11944,9 @@ is_nat_mode && yellow_line "NAT VPS 需要至少一组尚未被协议占用的�
 return 1
 }
 cdnopt_public=$(client_port "$cdnopt_internal")
-cdnopt_host=$(cdnopt_public_host) || { red_line "无法识别 VPS 公网 IP，未启动测速页。"; return 1; }
+cdnopt_ip=$(cdnopt_public_host) || { red_line "无法识别 VPS 公网 IP，未启动测速页。"; return 1; }
+cdnopt_host=$(cdnopt_preferred_host "$cdnopt_ip")
+cdnopt_reconcile_cluster_async
 cdnopt_result_dir=$(cdnopt_module_dir)
 cdnopt_result="$cdnopt_result_dir/result.$$.json"
 rm -f "$cdnopt_result"
@@ -11894,13 +11959,13 @@ yellow_line "如页面无法打开，请在云安全组临时放行 TCP $cdnopt_
 fi
 if [ -n "${LUN_CDNOPT_CANDIDATE_FILE:-}" ]; then
 python3 "$(cdnopt_agent)" serve \
---port "$cdnopt_internal" --public-host "$cdnopt_host" --public-port "$cdnopt_public" \
+--port "$cdnopt_internal" --public-host "$cdnopt_host" --server-ip "$cdnopt_ip" --public-port "$cdnopt_public" \
 --result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
 --current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512 \
 --source-file "$LUN_CDNOPT_CANDIDATE_FILE"
 else
 python3 "$(cdnopt_agent)" serve \
---port "$cdnopt_internal" --public-host "$cdnopt_host" --public-port "$cdnopt_public" \
+--port "$cdnopt_internal" --public-host "$cdnopt_host" --server-ip "$cdnopt_ip" --public-port "$cdnopt_public" \
 --result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
 --current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512
 fi
