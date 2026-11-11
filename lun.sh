@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.11.1"
+echo "当前版本：V26.11.11.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -6423,26 +6423,129 @@ case "$CMD" in
 *httpd*"-h $HOME/weblun"*|*httpd*"-h $HOME/websbx"*)
 kill "$PID" 2>/dev/null
 ;;
+*" $HOME/lun/subscription_httpd.py "*) kill "$PID" 2>/dev/null ;;
 esac
 done
 }
 
+ensure_subscription_httpd_fallback(){
+command -v python3 >/dev/null 2>&1 || { red_line "订阅服务需要 BusyBox httpd 或 Python 3。"; return 1; }
+local script="$HOME/lun/subscription_httpd.py" temporary
+temporary=$(mktemp "$script.XXXXXX") || return 1
+cat > "$temporary" <<'PY'
+import argparse, contextlib, hmac, http.server, os, re, shutil, socket, socketserver, threading
+from urllib.parse import urlsplit
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--root', required=True)
+parser.add_argument('--port', type=int, required=True)
+args = parser.parse_args()
+with open(os.path.join(args.root, 'subtoken.log')) as f:
+    token = f.read().strip()
+if not re.match(r'^[A-Za-z0-9_~-][A-Za-z0-9._~-]*$', token) or not 1 <= args.port <= 65535:
+    raise SystemExit('Invalid subscription token or port')
+files = {'jhsub.txt': 'text/plain', 'clmi.yaml': 'text/yaml', 'sbox.json': 'application/json'}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # Never write subscription tokens to request logs.
+
+    def do_HEAD(self):
+        self.send_file(False)
+
+    def do_GET(self):
+        self.send_file(True)
+
+    def send_file(self, body):
+        parts = urlsplit(self.path).path.split('/')
+        if len(parts) != 3 or not hmac.compare_digest(parts[1].encode(), token.encode()) or parts[2] not in files:
+            self.send_error(404)
+            return
+        try:
+            source = open(os.path.join(args.root, parts[2]), 'rb')
+        except OSError:
+            self.send_error(404)
+            return
+        with source:
+            self.send_response(200)
+            self.send_header('Content-Type', files[parts[2]] + '; charset=utf-8')
+            self.send_header('Content-Length', str(os.fstat(source.fileno()).st_size))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            if body:
+                with contextlib.suppress(OSError):
+                    shutil.copyfileobj(source, self.wfile)
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    slots = threading.BoundedSemaphore(16)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(15)
+        return request, address
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+
+class DualServer(Server):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+try:
+    server = DualServer(('::', args.port), Handler)
+except OSError:
+    server = Server(('0.0.0.0', args.port), Handler)
+with server:
+    server.serve_forever()
+PY
+python3 -c 'import sys; compile(open(sys.argv[1]).read(),sys.argv[1],"exec")' "$temporary" 2>/dev/null && chmod 700 "$temporary" && mv -f "$temporary" "$script" || { rm -f "$temporary"; return 1; }
+}
+
 start_subscription_httpd(){
-httpd_port=$1
-if command -v apk >/dev/null 2>&1; then
-busybox-extras httpd -f -p "$httpd_port" -h "$HOME/weblun" > /dev/null 2>&1 &
-else
-busybox httpd -f -p "$httpd_port" -h "$HOME/weblun" > /dev/null 2>&1 &
+local httpd_port=$1 httpd_command httpd_log="$HOME/lun/subscription_httpd-$1.log"
+valid_port_value "$httpd_port" || return 1
+mkdir -p "$HOME/lun"
+(umask 077; : > "$httpd_log") || return 1
+chmod 600 "$httpd_log" || return 1
+for httpd_command in busybox-extras busybox; do
+if command -v "$httpd_command" >/dev/null 2>&1 && "$httpd_command" --list 2>/dev/null | grep -qx httpd; then
+"$httpd_command" httpd -f -p "$httpd_port" -h "$HOME/weblun" > "$httpd_log" 2>&1 &
+return 0
 fi
+done
+ensure_subscription_httpd_fallback || return 1
+nohup python3 "$HOME/lun/subscription_httpd.py" --root "$HOME/lun" --port "$httpd_port" > "$httpd_log" 2>&1 < /dev/null &
+}
+
+subscription_httpd_failure(){
+red_line "订阅 HTTP 服务未能启动，内网端口：$1。"
+[ ! -s "$HOME/lun/subscription_httpd-$1.log" ] || tail -5 "$HOME/lun/subscription_httpd-$1.log" >&2
 }
 
 subscription_httpd_ready(){
-httpd_port=$1
-httpd_token=$2
-if command -v wget >/dev/null 2>&1; then
-wget -qO /dev/null "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" 2>/dev/null
+local httpd_port=$1 httpd_token=$2
+if command -v curl >/dev/null 2>&1; then
+curl --noproxy '*' -fsS --max-time 3 "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" >/dev/null 2>&1
 else
-curl -fsS --max-time 3 "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" >/dev/null 2>&1
+wget -T 3 -qO /dev/null "http://127.0.0.1:$httpd_port/$httpd_token/jhsub.txt" 2>/dev/null
 fi
 }
 
@@ -6456,9 +6559,9 @@ mkdir -p "$HOME/weblun/$runtime_subtoken"
 ln -sf "$HOME/lun/clmi.yaml" "$HOME/weblun/$runtime_subtoken/clmi.yaml"
 ln -sf "$HOME/lun/sbox.json" "$HOME/weblun/$runtime_subtoken/sbox.json"
 ln -sf "$HOME/lun/jhsub.txt" "$HOME/weblun/$runtime_subtoken/jhsub.txt"
-start_subscription_httpd "$runtime_subport"
+start_subscription_httpd "$runtime_subport" || return 1
 sleep 1
-subscription_httpd_ready "$runtime_subport" "$runtime_subtoken" || return 1
+subscription_httpd_ready "$runtime_subport" "$runtime_subtoken" || { subscription_httpd_failure "$runtime_subport"; return 1; }
 if [ -s "$HOME/lun/subport_public.log" ]; then
 runtime_public_port=$(cat "$HOME/lun/subport_public.log" 2>/dev/null)
 if valid_port_value "$runtime_public_port" && [ "$runtime_public_port" != "$runtime_subport" ] && ! port_in_use "$runtime_public_port"; then
@@ -6497,9 +6600,9 @@ ln -sf "$HOME/lun/clmi.yaml" "$HOME/weblun/$subtoken/clmi.yaml"
 ln -sf "$HOME/lun/sbox.json" "$HOME/weblun/$subtoken/sbox.json"
 ln -sf "$HOME/lun/jhsub.txt" "$HOME/weblun/$subtoken/jhsub.txt"
 rm -f "$HOME/lun/subport_public.log"
-start_subscription_httpd "$subport"
+start_subscription_httpd "$subport" || return 1
 sleep 1
-subscription_httpd_ready "$subport" "$subtoken" || { echo "订阅 HTTP 服务未能监听内网端口 $subport。"; return 1; }
+subscription_httpd_ready "$subport" "$subtoken" || { subscription_httpd_failure "$subport"; return 1; }
 sub_public_port=$(client_port "$subport")
 if is_nat_mode && [ "$sub_public_port" != "$subport" ] && ! port_in_use "$sub_public_port"; then
 start_subscription_httpd "$sub_public_port"
@@ -6511,20 +6614,20 @@ else
 yellow_line "无法在公网映射端口 $sub_public_port 增加 IPv6 直连监听，订阅链接将继续使用 IPv4 地址。"
 fi
 fi
+local subscription_cli=/usr/bin/lun
+[ "$(id -u)" = 0 ] || subscription_cli="$HOME/bin/lun"
 if command -v apk >/dev/null 2>&1; then
 cat > /etc/local.d/alpinesublun.start <<EOF
 #!/bin/bash
 sleep 10
-busybox-extras httpd -f -p \$(cat $HOME/lun/subport.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &
-[ ! -s $HOME/lun/subport_public.log ] || busybox-extras httpd -f -p \$(cat $HOME/lun/subport_public.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &
+exec "$subscription_cli" subscription-start >/dev/null 2>&1
 EOF
 chmod +x /etc/local.d/alpinesublun.start
 rc-update add local default >/dev/null 2>&1
 else
 crontab -l 2>/dev/null > /tmp/crontab.tmp
 sed -i '/weblun/d' /tmp/crontab.tmp
-echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat $HOME/lun/subport.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &"' >> /tmp/crontab.tmp
-[ ! -s "$HOME/lun/subport_public.log" ] || echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat $HOME/lun/subport_public.log 2>/dev/null) -h $HOME/weblun > /dev/null 2>&1 &"' >> /tmp/crontab.tmp
+printf '@reboot sleep 10 && "%s" subscription-start >/dev/null 2>&1 # weblun\n' "$subscription_cli" >> /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 fi
@@ -15265,6 +15368,10 @@ elif [ "$1" = "cert-deploy" ]; then
 [ "$(cat "$HOME/lun/cert_subject" 2>/dev/null)" = "$2" ] || exit 0
 [ "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" = "$3" ] || exit 0
 deploy_acme_cert "$2" "$3"
+exit $?
+elif [ "$1" = "subscription-start" ]; then
+if subscription_agent_enabled || cluster_enabled; then exit 0; fi
+start_subscription_busybox_runtime
 exit $?
 elif [ "$1" = "subscription-refresh" ]; then
 refresh_subscription_share
