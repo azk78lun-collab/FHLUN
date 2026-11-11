@@ -97,7 +97,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.10.1"
+echo "当前版本：V26.11.11.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -2255,7 +2255,10 @@ for line in conf.read_text().splitlines():
  if sep and key in ('Le_RealKeyPath','Le_RealFullChainPath'):
   parsed=shlex.split(value); values[key]=parsed[0] if parsed else ''
 paths=[values.get('Le_RealKeyPath',''),values.get('Le_RealFullChainPath','')]
-if all(p and pathlib.Path(p).is_file() and pathlib.Path(p).resolve().is_relative_to('/etc/nginx') for p in paths):
+def in_nginx_dir(path):
+ try: pathlib.Path(path).resolve().relative_to('/etc/nginx'); return True
+ except ValueError: return False
+if all(p and pathlib.Path(p).is_file() and in_nginx_dir(p) for p in paths):
  target.write_text(json.dumps(paths)+'\n'); os.chmod(target,0o600)
 PY
 }
@@ -2318,10 +2321,13 @@ acme_cert_transaction(){
 python3 - "$HOME/lun" "$1" "$2" "$3" <<'PY'
 import pathlib,json,shutil,os,tempfile,sys
 root=pathlib.Path(sys.argv[1]); action=sys.argv[2]; txn=pathlib.Path(sys.argv[3]); stage=pathlib.Path(sys.argv[4])
+def in_nginx_dir(path):
+ try: pathlib.Path(path).resolve().relative_to('/etc/nginx'); return True
+ except ValueError: return False
 targets=[]
 if (stage/'nginx-targets.json').exists():
  targets=json.loads((stage/'nginx-targets.json').read_text())
- if len(targets)!=2 or not all(pathlib.Path(p).is_absolute() and pathlib.Path(p).resolve().is_relative_to('/etc/nginx') for p in targets):
+ if len(targets)!=2 or not all(pathlib.Path(p).is_absolute() and in_nginx_dir(p) for p in targets):
   raise ValueError('Unsafe Nginx certificate target')
 manifest=txn/'manifest.json'
 def atomic_copy(source,target):

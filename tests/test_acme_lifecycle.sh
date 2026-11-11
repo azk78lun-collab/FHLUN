@@ -98,6 +98,24 @@ echo 'ok - daily renewal cron idempotent; unrelated tasks preserved'
 
 stage=$(acme_stage_dir example.test)
 mkdir -p "$stage"
+# Emulate Python versions before 3.9, where Path.is_relative_to is absent.
+(
+  python3(){
+    [[ ${1:-} == - ]] || { command python3 "$@"; return; }
+    shift
+    command python3 -c 'import pathlib,sys; delattr(pathlib.PurePath, "is_relative_to") if hasattr(pathlib.PurePath, "is_relative_to") else None; exec(sys.stdin.read())' "$@"
+  }
+  mkdir -p "$HOME/.acme.sh/example.test_ecc" "$tmp/txn"
+  : > "$tmp/existing.key"; : > "$tmp/existing.crt"
+  printf "Le_RealKeyPath='%s'\nLe_RealFullChainPath='%s'\n" "$tmp/existing.key" "$tmp/existing.crt" > "$HOME/.acme.sh/example.test_ecc/example.test.conf"
+  acme_preserve_nginx_target example.test "$stage"
+  [[ ! -e "$stage/nginx-targets.json" ]]
+  printf '["/etc/nginx-evil/key", "/etc/nginx-evil/cert"]\n' > "$stage/nginx-targets.json"
+  ! acme_cert_transaction snapshot "$tmp/txn" "$stage"
+  [[ ! -e "$tmp/txn/manifest.json" ]]
+  rm "$stage/nginx-targets.json"
+)
+echo 'ok - old Python supports Nginx path checks and rejects outside targets'
 for kind in old new; do
   (cd "$tmp" && MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -subj '/CN=example.test' -addext 'subjectAltName=DNS:example.test' \
