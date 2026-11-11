@@ -45,6 +45,27 @@ if multiuser_security_transaction delete-user --user-id 2 --confirm alice; then 
 [[ " ${events[*]} " == *'security-rollback disable-autostart green'* ]]
 [[ " ${events[*]} " != *'visit-start'* ]]
 
+# A one-shot local identity change must not activate subscription delivery.
+subscription_agent_enabled(){ return 1; }
+events=()
+multiuser_security_transaction set-local-identity --uuid example
+[[ " ${events[*]} " == *'set-local-identity --uuid example security-commit'* ]]
+[[ " ${events[*]} " != *' start '* ]]
+
+(
+for helper in local_identity_apply prompt_local_identity; do
+  eval "$(sed -n "/^${helper}(){/,/^}/p" "$ROOT/lun.sh")"
+done
+events=()
+cluster_push_event(){ events+=(snapshot); }
+multiuser_security_transaction(){ events+=(transaction); return 1; }
+if local_identity_apply example; then exit 1; fi
+[[ " ${events[*]} " == ' transaction ' ]]
+# Neither menu is allowed to write the UUID file before its transaction.
+! grep -q 'echo "UUID 已更新：' "$ROOT/lun.sh"
+[[ $(grep -c 'prompt_local_identity; ui_pause' "$ROOT/lun.sh") == 2 ]]
+)
+
 # Reject an outdated agent before stopping services or mutating credentials.
 old=$(mktemp -d)
 trap 'rm -rf "$old"' EXIT

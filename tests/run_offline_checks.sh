@@ -6,6 +6,8 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT/tests/offline${PYTHONPATH:+:$PYTHONPATH}"
 unset LUN_TEST_SKIP_SYMLINK
 unset LUN_TEST_XRAY LUN_TEST_CHAIN_LIVE
+# Tests with temporary cluster roots must never invoke the host's installed Lun.
+export LUN_SCRIPT="$ROOT/tests/offline/disabled-system-lun"
 
 for file in lun.sh upgrade.sh sap.sh saph.sh sapsbx.sh sapsbxh.sh container/nodejs/start.sh \
     mirror/fhlun-core-mirror-sync.sh modules/multiuser/build-singbox-enhanced.sh; do

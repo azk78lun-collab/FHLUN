@@ -39,6 +39,7 @@ for helper in \
   direct_mode_uses_domain \
   direct_domain_matches_rewrite_host \
   direct_domain_ip_guard_active \
+  domain_is_cloudflare_proxy \
   direct_origin_ip_entries \
   direct_address_entries \
   address_mode_label \
@@ -95,6 +96,8 @@ original_home=$HOME
 HOME=$test_home
 mkdir -p "$HOME/lun"
 cdnym=proxy.example.com
+cf_dns=104.16.1.1
+resolve_domain_ips(){ if [[ $1 == direct.example.com ]]; then echo 192.0.2.22; else printf '%s\n' "$cf_dns"; fi; }
 cdnmode=rewrite
 cdnproto=xhttp
 port_xc=8443
@@ -176,7 +179,7 @@ v6=
 vpsmode=nat
 ptmap='45126-12343 45201-12340'
 [[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
-[[ $(address_mode_label) == '源站 IP（端口回源自动保护）' ]]
+[[ $(address_mode_label) == '源站 IP（CDN 代理保护）' ]]
 
 # 普通 VPS 复用橙云回源 Host 时受到同样影响，也必须使用源站 IP。
 vpsmode=normal
@@ -187,10 +190,10 @@ ptmap=
 addym=direct.example.com
 [[ $(direct_address_entries) == 'direct.example.com|DOMAIN' ]]
 
-# 未启用端口改写时保持原有域名模式兼容。
+# 即便未开启回源配置，实际经过 Cloudflare 的域名也不能作为直连入口。
 addym=proxy.example.com
 cdnmode=standard
-[[ $(direct_address_entries) == 'proxy.example.com|DOMAIN' ]]
+[[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
 
 # all 模式在端口回源保护下只保留源站 IP，不再混入橙云域名。
 cdnmode=rewrite
@@ -199,14 +202,32 @@ v6=2001:db8::10
 expected_direct_addresses=$'192.0.2.10|IPv4\n2001:db8::10|IPv6'
 [[ $(direct_address_entries) == "$expected_direct_addresses" ]]
 
-# 临时公网探测失败时可复用已记录的源站 IP；完全没有 IP 时拒绝生成错误域名节点。
+# 公网探测失败时不得把旧缓存伪装为当前源站 IP。
 addrmode=domain
 v4=
 v6=
 printf '%s\n' '192.0.2.10' > "$HOME/lun/server_ip.log"
-[[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
+[[ -z $(direct_address_entries) ]]
 rm -f "$HOME/lun/server_ip.log"
 [[ -z $(direct_address_entries) ]]
+# DNS-only dynamic NAT domain must not be replaced merely because rewrite is on.
+cf_dns=192.0.2.22
+v4=192.0.2.10
+[[ $(direct_address_entries) == 'proxy.example.com|DOMAIN' ]]
+[[ $(address_mode_label) == '仅域名' ]]
+# Automatic selection also prefers a configured domain; explicit IP choice wins.
+addrmode= addym= addout= ippz=
+[[ $(direct_address_entries) == 'proxy.example.com|DOMAIN' ]]
+addrmode=ipv4
+[[ $(direct_address_entries) == '192.0.2.10|IPv4' ]]
+cf_dns=2606:4700::1
+domain_is_cloudflare_proxy proxy.example.com
+cf_dns='::ffff:104.16.1.1'
+domain_is_cloudflare_proxy proxy.example.com
+cf_dns='::ffff:192.0.2.22'
+! domain_is_cloudflare_proxy proxy.example.com
+cf_dns=
+! domain_is_cloudflare_proxy proxy.example.com
 rm -rf "$address_test_home"
 HOME=$original_home
 
@@ -226,7 +247,7 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.11.11.4' "$SCRIPT"
+grep -q '当前版本：V26.11.11.5' "$SCRIPT"
 grep -q '^lun_update_target(){' "$SCRIPT"
 grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
 grep -q '一键更新所有 VPS 代理脚本' "$SCRIPT"

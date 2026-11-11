@@ -942,6 +942,115 @@ rules:
             self.assertFalse(self.agent.security_pending.exists())
             self.assertEqual(preinstall.read_text(), device["uuid"])
 
+    def identity_fixture(self, old=None):
+        old = old or (self.root / "uuid").read_text().strip()
+        core = {"inbounds": [{"tag": "reality-vision", "protocol": "vless",
+                 "settings": {"clients": [{"id": old}]}},
+                 {"tag": "xhttp-reality", "protocol": "vless",
+                  "settings": {"clients": [{"id": old}]},
+                  "streamSettings": {"xhttpSettings": {"path": "/" + old + "-xh"}}}],
+                "outbounds": [{"tag": "remote-chain", "settings": {"id": old}}]}
+        (self.root / "xr.json").write_text(json.dumps(core))
+        (self.root / "sb.json").write_text(json.dumps({"inbounds": [
+            {"tag": "naive-sb", "type": "naive", "users": [{"username": old, "password": old}]},
+            {"tag": "hy2-sb", "type": "hysteria2", "users": [{"password": old}]}]}))
+        vmess = base64.b64encode(json.dumps({"id": old, "path": "/" + old + "-vm"}).encode()).decode()
+        (self.root / "jhsub.txt").write_text(f"vless://{old}@example.com:443?path=/{old}-xh#vless-xhttp-reality\nvmess://{vmess}\n")
+        (self.root / "sbox.json").write_text(json.dumps({"outbounds": [{"uuid": old}]}))
+        (self.root / "clmi.yaml").write_text("uuid: " + old)
+        return old
+
+    def test_local_identity_updates_paths_templates_and_db_but_not_remote_chain(self):
+        old = self.identity_fixture()
+        local = self.agent.local_subscription_device()
+        other = self.add_user()
+        core = json.loads((self.root / "xr.json").read_text())
+        core["inbounds"][0]["settings"]["clients"].append({"id": other["uuid"]})
+        core["inbounds"].append({"tag": "lun-chain-entry-test", "settings": {"clients": [{"id": old}]}})
+        (self.root / "xr.json").write_text(json.dumps(core))
+        with self.agent.db.connection:
+            self.agent.db.set_setting("visit_xray_identity_before", json.dumps({"clients": [{"client_id": old}]}))
+        new = "22222222-2222-4222-8222-222222222222"
+        with mock.patch.object(self.agent, "_validate_core"), mock.patch.object(self.agent, "restart_cores"), \
+             mock.patch.object(self.agent, "_security_service_states", return_value={}):
+            self.agent.set_local_identity(new)
+        core = json.loads((self.root / "xr.json").read_text())
+        self.assertEqual(core["inbounds"][0]["settings"]["clients"], [{"id": new}, {"id": other["uuid"]}])
+        self.assertEqual(core["inbounds"][1]["streamSettings"]["xhttpSettings"]["path"], "/" + new + "-xh")
+        self.assertEqual(core["outbounds"][0]["settings"]["id"], old)
+        self.assertEqual(core["inbounds"][2]["settings"]["clients"][0]["id"], new)
+        self.assertEqual(json.loads(self.agent.db.setting("visit_xray_identity_before"))["clients"][0]["client_id"], new)
+        self.assertEqual(json.loads((self.root / "sb.json").read_text())["inbounds"][0]["users"], [{"username": new, "password": new}])
+        refreshed = self.agent.local_subscription_device()
+        self.assertEqual((refreshed["id"], refreshed["token"]), (local["id"], local["token"]))
+        self.assertEqual(refreshed["uuid"], new)
+        text = (self.root / "jhsub.txt").read_text()
+        self.assertIn(new, text)
+        vmess = json.loads(base64.b64decode(text.splitlines()[1].split("://", 1)[1]))
+        self.assertEqual(vmess["id"], new)
+        self.assertEqual(vmess["path"], "/" + new + "-vm")
+        self.assertEqual((self.agent.generated / local["token"] / "jhsub.txt").read_text(), text)
+        self.assertFalse(self.agent.security_pending.exists())
+
+    def test_local_identity_repairs_state_ahead_of_core_using_saved_identity(self):
+        old = self.identity_fixture()
+        previous = self.root / ".last_good_rebuild/lun/uuid"
+        previous.parent.mkdir(parents=True)
+        previous.write_text(old)
+        new = "22222222-2222-4222-8222-222222222222"
+        (self.root / "uuid").write_text(new)
+        with mock.patch.object(self.agent, "_validate_core"), mock.patch.object(self.agent, "restart_cores"), \
+             mock.patch.object(self.agent, "_security_service_states", return_value={}):
+            self.agent.set_local_identity(new)
+        self.assertEqual(json.loads((self.root / "xr.json").read_text())["inbounds"][0]["settings"]["clients"][0]["id"], new)
+
+    def test_local_identity_validation_restart_and_deferred_http_failure_restore_everything(self):
+        self.identity_fixture()
+        before = {n: (self.root / n).read_bytes() for n in (*lun_agent.IDENTITY_FILES, "xr.json", "sb.json")}
+        config = self.agent.config_path.read_bytes()
+        device = dict(self.agent.local_subscription_device())
+        for fail in ("_validate_core", "restart_cores"):
+            with self.subTest(fail=fail), mock.patch.object(self.agent, "_security_service_states", return_value={}), \
+                 mock.patch.object(self.agent, "_validate_core"), mock.patch.object(self.agent, "restart_cores"), \
+                 mock.patch.object(self.agent, fail, side_effect=[lun_agent.AgentError("injected failure"), None]):
+                with self.assertRaisesRegex(lun_agent.AgentError, "已恢复"):
+                    self.agent.set_local_identity("22222222-2222-4222-8222-222222222222")
+            self.assertEqual({n: (self.root / n).read_bytes() for n in before}, before)
+            self.assertEqual(self.agent.config_path.read_bytes(), config)
+            self.assertEqual(dict(self.agent.local_subscription_device()), device)
+        self.agent.defer_security_commit = True
+        with mock.patch.object(self.agent, "_validate_core"), mock.patch.object(self.agent, "restart_cores"), \
+             mock.patch.object(self.agent, "_security_service_states", return_value={}):
+            self.agent.set_local_identity("22222222-2222-4222-8222-222222222222")
+            self.agent.security_rollback()
+        self.assertEqual({n: (self.root / n).read_bytes() for n in before}, before)
+
+    def test_local_identity_works_without_enabling_multiuser_or_subscription_service(self):
+        self.identity_fixture()
+        self.agent.config_path.unlink()
+        with mock.patch.object(self.agent, "_validate_core"), mock.patch.object(self.agent, "restart_cores"), \
+             mock.patch.object(self.agent, "_security_service_states", return_value={}):
+            self.agent.set_local_identity("22222222-2222-4222-8222-222222222222")
+        self.assertFalse(self.agent.config_path.exists())
+        self.assertEqual(self.agent.db.connection.execute("SELECT COUNT(*) FROM devices WHERE legacy=1").fetchone()[0], 1)
+
+    def test_local_identity_rejects_invalid_and_other_device_uuid(self):
+        other = self.add_user()
+        for value in ("not-a-uuid", other["uuid"]):
+            with self.assertRaises(lun_agent.AgentError):
+                self.agent.set_local_identity(value)
+        self.assertFalse(self.agent.security_pending.exists())
+
+    def test_local_identity_reads_current_state_under_shared_write_lock(self):
+        read = self.agent._read_text
+        def locked_read(name):
+            self.assertTrue(self.agent.lock_path.exists())
+            return read(name)
+        with mock.patch.object(self.agent, "_read_text", side_effect=locked_read), \
+             mock.patch.object(self.agent, "_security_service_states", return_value={}):
+            self.agent.set_local_identity("22222222-2222-4222-8222-222222222222")
+        self.assertFalse(self.agent.lock_path.exists())
+
     def test_security_core_restart_failure_restores_old_identity(self):
         device = self.add_user()
         core = self.root / "xr.json"

@@ -101,7 +101,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.11.4"
+echo "当前版本：V26.11.11.5"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -898,7 +898,39 @@ rewrite_host_key=$(printf '%s' "$rewrite_host" | tr '[:upper:]' '[:lower:]' | se
 }
 
 direct_domain_ip_guard_active(){
-direct_mode_uses_domain "${1:-}" && direct_domain_matches_rewrite_host
+local direct_host
+direct_mode_uses_domain "${1:-}" || return 1
+direct_host=$(normalize_host "${addym:-$domain}")
+[ "$(endpoint_kind "$direct_host")" = DOMAIN ] || return 1
+domain_is_cloudflare_proxy "$direct_host"
+}
+
+domain_is_cloudflare_proxy(){
+local addresses
+addresses=$(resolve_domain_ips "$1")
+[ -n "$addresses" ] || return 1
+# Cloudflare's published proxy ranges; no API token or runtime download required.
+# https://www.cloudflare.com/ips-v4/ and https://www.cloudflare.com/ips-v6/
+python3 - "$addresses" <<'PY'
+import ipaddress,sys
+ranges = '''173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22
+141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20
+197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13
+104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32
+2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32
+2a06:98c0::/29 2c0f:f248::/32'''
+networks = [ipaddress.ip_network(item) for item in ranges.split()]
+for value in sys.argv[1].split():
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        continue
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if any(address.version == network.version and address in network for network in networks):
+        sys.exit(0)
+sys.exit(1)
+PY
 }
 
 direct_origin_ip_entries(){
@@ -907,13 +939,7 @@ origin_v4=$(normalize_host "${v4:-}")
 origin_v6=$(normalize_host "${v6:-}")
 [ "$(endpoint_kind "$origin_v4")" = V4 ] || origin_v4=
 [ "$(endpoint_kind "$origin_v6")" = V6 ] || origin_v6=
-if [ -z "$origin_v4" ] || [ -z "$origin_v6" ]; then
-origin_logged=$(normalize_host "$(cat "$HOME/lun/server_ip.log" 2>/dev/null)")
-case "$(endpoint_kind "$origin_logged")" in
-V4) [ -n "$origin_v4" ] || origin_v4=$origin_logged ;;
-V6) [ -n "$origin_v6" ] || origin_v6=$origin_logged ;;
-esac
-fi
+# A cached address is not proof of the current origin, especially on dynamic NAT.
 case "$origin_preference" in
 dual)
 [ -n "$origin_v4" ] && printf '%s|IPv4\n' "$origin_v4"
@@ -990,12 +1016,12 @@ fi
 *)
 if [ "$direct_guard" = yes ]; then
 direct_origin_ip_entries auto
+elif [ -n "$domain_addr" ]; then
+printf '%s|DOMAIN\n' "$domain_addr"
 elif [ -n "$v4" ]; then
 printf '%s|IPv4\n' "$v4"
 elif [ -n "$v6" ]; then
 printf '%s|IPv6\n' "$v6"
-elif [ -n "$domain_addr" ]; then
-printf '%s|DOMAIN\n' "$domain_addr"
 fi
 ;;
 esac
@@ -1003,7 +1029,7 @@ esac
 
 address_mode_label(){
 if direct_domain_ip_guard_active "$(effective_address_mode)"; then
-printf '源站 IP（端口回源自动保护）\n'
+printf '源站 IP（CDN 代理保护）\n'
 return
 fi
 case "$(effective_address_mode)" in
@@ -6929,13 +6955,13 @@ argoip_cfg=$(cat "$HOME/lun/argoip" 2>/dev/null)
 direct_entries=$(direct_address_entries)
 if [ -z "$direct_entries" ]; then
 if direct_domain_ip_guard_active "$(effective_address_mode)"; then
-red_line "Origin Rules 使用的橙云域名不能作为直连入口，且当前未检测到可用源站 IP；已停止生成订阅，避免输出必然失败的节点。"
+red_line "直连域名解析到 Cloudflare 代理，且未检测到实时源站 IP；已停止生成订阅，避免输出旧地址或不可用直连节点。"
 fi
 echo "当前地址输出模式 $(address_mode_label) 没有可用地址，请在高级设置中重新选择。"
 return 1
 fi
 if direct_domain_ip_guard_active "$(effective_address_mode)"; then
-yellow_line "已识别端口回源 Host ${cdnym:-$(cat "$HOME/lun/cdnym" 2>/dev/null)}：直连节点自动使用源站 IP；CDN/回源节点继续使用该域名与 CF 优选入口。"
+yellow_line "已识别直连域名解析到 Cloudflare 代理：直连节点使用实时源站 IP；CDN/回源节点继续使用原 Host 与优选入口。"
 fi
 direct_entry_count=$(printf '%s\n' "$direct_entries" | sed '/^$/d' | wc -l | tr -d ' ')
 primary_entry=$(printf '%s\n' "$direct_entries" | sed -n '1p')
@@ -12759,7 +12785,7 @@ printf '%s\n' "$addrmode" > "$HOME/lun/address_mode"
 export addrmode ippz addym addout
 echo "节点地址输出已设置为：$(address_mode_label)"
 if direct_domain_ip_guard_active "$new_addrmode"; then
-yellow_line "该域名同时用于 Cloudflare Origin Rules；直连节点将自动使用源站 IP，TLS SNI/Host 仍保留域名。需要域名直连时，请另设一个 DNS-only 域名。"
+yellow_line "该域名解析到 Cloudflare 代理；直连节点将使用实时源站 IP，TLS SNI/Host 保留域名。需要域名直连时，请另设 DNS-only 域名。"
 fi
 return 0
 }
@@ -13669,7 +13695,7 @@ echo " 0. 返回"
 printf "请选择 [0-9]："
 IFS= read -r c
 case "$c" in
-1) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
+1) prompt_local_identity; ui_pause; LUN_MENU_ACTION=menu; return ;;
 2) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
 3) certificate_menu; return ;;
 4) prompt_argo; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
@@ -14053,7 +14079,7 @@ case "$c" in
 2) certificate_menu; [ "$LUN_MENU_ACTION" = "menu" ] && continue; return ;;
 3) prompt_warp; rc=$?; [ "$rc" = 2 ] && continue; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 4) prompt_address_mode; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || continue; LUN_MENU_ACTION=list; return ;;
-5) printf "请输入新 UUID（%s回车随机生成%s）：" "$LUN_YELLOW" "$LUN_RESET"; IFS= read -r uuid; [ -z "$uuid" ] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid); echo "$uuid" > "$HOME/lun/uuid"; echo "UUID 已更新：$uuid"; LUN_MENU_ACTION=list; return ;;
+5) prompt_local_identity; ui_pause; LUN_MENU_ACTION=menu; return ;;
 6) LUN_MENU_ACTION=del; return ;;
 7) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=install; return; } ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
@@ -14418,8 +14444,31 @@ fi
 return 1
 }
 
+local_identity_apply(){
+local requested=${1:-$(cat "$HOME/lun/uuid" 2>/dev/null)}
+if ! grep -q '^    def set_local_identity(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null; then
+multiuser_download_agent || { red_line "凭据同步组件下载失败，原配置未改动。"; return 1; }
+fi
+grep -q '^    def set_local_identity(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null || {
+red_line "凭据同步组件版本过旧，原配置未改动。"; return 1;
+ }
+multiuser_security_transaction set-local-identity --uuid "$requested" || return 1
+uuid=$(cat "$HOME/lun/uuid")
+export uuid
+cluster_push_event
+}
+
+prompt_local_identity(){
+local requested
+printf "请输入新 UUID（%s回车随机生成，输入 0 返回%s）：" "$LUN_YELLOW" "$LUN_RESET"
+IFS= read -r requested
+[ "$requested" = 0 ] && return 0
+[ -n "$requested" ] || requested=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$HOME/lun/xray" uuid 2>/dev/null || "$HOME/lun/sing-box" generate uuid)
+local_identity_apply "$requested"
+}
+
 multiuser_security_transaction(){
-local mu_security_visit=no mu_security_agent=no mu_security_autostart=no
+local mu_security_visit=no mu_security_agent=no mu_security_autostart=no mu_security_http=yes
 if ! grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null; then
 multiuser_download_agent || { red_line "安全操作需要新版多用户程序，更新失败，未修改用户。"; return 1; }
 grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null || {
@@ -14430,15 +14479,16 @@ fi
 lun_service_running lun-agent && mu_security_agent=yes
 lun_service_running lun-visit-monitor && mu_security_visit=yes
 lun_service_enabled lun-agent && mu_security_autostart=yes
+[ "$1" != set-local-identity ] || subscription_agent_enabled || mu_security_http=no
 multiuser_service_stop
 visit_monitor_service_stop
 if multiuser_cmd --defer-security-commit "$@"; then
-if multiuser_service_start; then
+if [ "$mu_security_http" = no ] || multiuser_service_start; then
 if multiuser_cmd security-commit; then
 [ "$mu_security_agent" = yes ] || multiuser_service_stop
 [ "$mu_security_autostart" = yes ] || lun_service_disable_autostart lun-agent
 [ "$mu_security_visit" != yes ] || visit_monitor_service_start || yellow_line "网站监控重启失败，请进入监控自检。"
-green_line "安全操作已生效，旧凭据与备份已清理。"
+green_line "安全操作已生效，核心与订阅保持同步。"
 if cluster_enabled && cluster_is_federation; then
 cluster_cmd sync-users || yellow_line "本机已生效，但至少一台成员暂未同步。"
 fi
@@ -15514,7 +15564,10 @@ del) set -- del ;;
 esac
 fi
 
-if [ "$1" = "chain-runtime-status" ]; then
+if [ "$1" = "identity-reconcile" ]; then
+local_identity_apply "$2"
+exit $?
+elif [ "$1" = "chain-runtime-status" ]; then
 chain_runtime_status
 exit $?
 elif [ "$1" = "chain-runtime-apply" ] || [ "$1" = "chain-runtime-restore" ]; then

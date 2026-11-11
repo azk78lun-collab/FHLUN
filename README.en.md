@@ -5,7 +5,7 @@
 Lun is a VPS terminal script for multi-protocol proxies, CDN optimization, multi-user access and distributed server management.
 
 Powered by Xray, sing-box and Cloudflared, with guided menus and environment-variable installation.
-Current script version: `V26.11.11.4`.
+Current script version: `V26.11.11.5`.
 
 ## Features
 

@@ -1,8 +1,8 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.11.4`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.11.5`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.11.4`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.11.5`.
 
 ## 阅读说明 Reading guide
 
@@ -17,6 +17,10 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
 
 ## 2026 年 11 月 11 日
+
+- `V26.11.11.5`：修改本机 UUID 时事务同步入站凭据、传输路径、个人/多用户订阅和身份数据库；校验、核心或订阅服务失败时完整回滚，保持 Token、端口、证书及集群身份不变。提供 `lun identity-reconcile` 修复旧配置错位，不自动配对。
+- `V26.11.11.5`: Transactionally synchronize local UUID credentials, transport paths, subscriptions and the legacy identity database; roll back on validation, core or subscription startup failure without changing tokens, ports, certificates or federation identity. Add `lun identity-reconcile` to repair historical drift without pairing.
+- 直连自动模式优先使用已配置域名；端口回源仅在 DNS 实际指向 Cloudflare 代理网段时启用源站 IP 保护，不再误替换 DNS-only 动态域名。公网探测失败时不输出旧源站缓存。Prefer configured domains for automatic direct endpoints; only activate the origin-IP guard when DNS resolves to Cloudflare proxy ranges. Never publish stale origin cache after public-IP detection fails.
 
 - `V26.11.11.4`：固定 `upgrade.sh` 旧版恢复入口；菜单更新核验 main 最新提交和文件内容标识，增加目标覆盖防护与旧版断更回归测试。Fixed legacy recovery entry, commit-pinned menu updates, content verification and regression coverage for stranded older installers.
 - 集群 `0.3.5`：新成员导入旧联邦时保留已撤销成员的历史验签证书及编号，不将其恢复为活动信任；修复“事件作者未受信任”配对失败，继续拒绝撤销边界后的重放。Cluster `0.3.5`: Retain verification-only keys and number reservations for revoked members during history replay, without reactivating trust; reject post-revocation replay and fix new-peer pairing.

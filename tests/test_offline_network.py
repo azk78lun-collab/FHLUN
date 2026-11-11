@@ -1,4 +1,6 @@
 import errno
+import os
+from pathlib import Path
 import socket
 import sys
 import unittest
@@ -27,3 +29,8 @@ class OfflineNetworkTests(unittest.TestCase):
                 with listener.accept()[0] as server:
                     client.sendall(b"fixture")
                     self.assertEqual(server.recv(7), b"fixture")
+
+    def test_installed_lun_entry_is_not_used_by_cluster_fixtures(self):
+        script = os.environ.get("LUN_SCRIPT", "")
+        self.assertTrue(script.endswith("tests/offline/disabled-system-lun"))
+        self.assertFalse(Path(script).exists())

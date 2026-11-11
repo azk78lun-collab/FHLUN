@@ -38,7 +38,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
+IDENTITY_FILES = ("uuid", "jhsub.txt", "clmi.yaml", "sbox.json")
 PROTOCOLS = (
     "vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"
 )
@@ -1597,15 +1598,16 @@ class Agent:
                 backup.unlink(missing_ok=True)
 
     @contextlib.contextmanager
-    def security_transaction(self, tokens: Iterable[str]):
+    def security_transaction(self, tokens: Iterable[str], *, apply_cores: bool = True, locked: bool = False):
         """Keep rollback material until both cores and subscription startup succeed."""
-        with FileLock(self.lock_path):
+        with contextlib.nullcontext() if locked else FileLock(self.lock_path):
             if self.security_pending.exists():
                 raise AgentError("存在未完成的安全操作，请先执行 security-rollback")
             self._security_snapshot(tokens)
             try:
                 yield
-                self.apply(locked=True)
+                if apply_cores:
+                    self.apply(locked=True)
             except Exception as exc:
                 try:
                     self._security_rollback_locked()
@@ -1626,18 +1628,20 @@ class Agent:
             os.chmod(stage / "before.sqlite3", 0o600)
             files = []
             for filename in ("xr.json", "sb.json", "subport.log", "subport_public.log",
-                             "subport_legacy.log", "subport_legacy_public.log", "subtoken.log"):
+                             "subport_legacy.log", "subport_legacy_public.log", "subtoken.log", *IDENTITY_FILES):
                 source = self.root / filename
                 if source.exists():
                     shutil.copy2(source, stage / filename)
                     os.chmod(stage / filename, 0o600)
                     files.append(filename)
-            shutil.copy2(self.config_path, stage / "module-config.json")
-            os.chmod(stage / "module-config.json", 0o600)
+            if self.config_path.exists():
+                shutil.copy2(self.config_path, stage / "module-config.json")
+                os.chmod(stage / "module-config.json", 0o600)
             if self.generated.exists():
                 shutil.copytree(self.generated, stage / "generated")
             atomic_write(stage / "state.json", json.dumps({
                 "tokens": list(tokens), "files": files, "services": self._security_service_states(),
+                "identity_files": True,
             }))
             os.replace(stage, self.security_pending)
 
@@ -1721,7 +1725,10 @@ class Agent:
         finally:
             before.close()
         changed = {}
-        shutil.copy2(pending / "module-config.json", self.config_path)
+        if (pending / "module-config.json").exists():
+            shutil.copy2(pending / "module-config.json", self.config_path)
+        else:
+            self.config_path.unlink(missing_ok=True)
         for core, filename in (("xray", "xr.json"), ("singbox", "sb.json")):
             target = self.root / filename
             saved = pending / filename
@@ -1731,8 +1738,11 @@ class Agent:
                 shutil.copy2(saved, target)
             else:
                 target.unlink(missing_ok=True)
-        for filename in ("subport.log", "subport_public.log", "subport_legacy.log",
-                         "subport_legacy_public.log", "subtoken.log"):
+        restore_files = ("subport.log", "subport_public.log", "subport_legacy.log",
+                         "subport_legacy_public.log", "subtoken.log")
+        if state.get("identity_files"):
+            restore_files += IDENTITY_FILES
+        for filename in restore_files:
             target = self.root / filename
             if filename in state["files"]:
                 shutil.copy2(pending / filename, target)
@@ -1748,6 +1758,111 @@ class Agent:
         with FileLock(self.lock_path):
             if self.security_pending.exists():
                 self._security_rollback_locked()
+
+    def set_local_identity(self, value: str) -> dict[str, bool]:
+        """Change only local inbound credentials/paths, preserving tokens and peers."""
+        try:
+            value = str(uuid.UUID(value))
+        except (ValueError, AttributeError) as exc:
+            raise AgentError("请输入有效 UUID；未修改现有配置") from exc
+        with FileLock(self.lock_path):
+            return self._set_local_identity_locked(value)
+
+    def _set_local_identity_locked(self, value: str) -> dict[str, bool]:
+        current = self._read_text("uuid")
+        if not current:
+            raise AgentError("请先安装至少一个协议；未找到本机 UUID")
+        config = self.load_config() if self.config_path.exists() else None
+        device = self.db.connection.execute(
+            "SELECT * FROM devices WHERE legacy=1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        previous = self.root / ".last_good_rebuild" / "lun" / "uuid"
+        old_values = {current, config.get("legacy_uuid", "") if config else "",
+                      device["uuid"] if device else "",
+                      previous.read_text().strip() if previous.is_file() else ""} - {""}
+        for other in self.db.connection.execute("SELECT uuid FROM devices WHERE legacy=0"):
+            if other["uuid"] in old_values | {value}:
+                raise AgentError("本机 UUID 与其他设备冲突，已拒绝自动替换")
+        if device and device["password"] != device["uuid"]:
+            raise AgentError("本机设备使用独立密码，请先核对身份，未自动覆盖")
+
+        def replace(item: Any) -> Any:
+            if isinstance(item, str):
+                for old in old_values:
+                    item = item.replace(old, value)
+                return item
+            if isinstance(item, list):
+                return [replace(part) for part in item]
+            if isinstance(item, dict):
+                return {key: replace(part) for key, part in item.items()}
+            return item
+
+        changed = {"xray": False, "singbox": False}
+        with self.security_transaction([], apply_cores=False, locked=True):
+            staged = {}
+            for core, filename, tags in (("xray", "xr.json", XRAY_TAG_PROTOCOL),
+                                          ("singbox", "sb.json", SINGBOX_TAG_PROTOCOL)):
+                target = self.root / filename
+                if not target.exists():
+                    continue
+                data = json.loads(target.read_text())
+                before = copy.deepcopy(data)
+                data["inbounds"] = [replace(inbound) if inbound.get("tag") in tags or (
+                    core == "xray" and str(inbound.get("tag", "")).startswith("lun-chain-entry-")) else inbound
+                                    for inbound in data.get("inbounds", [])]
+                if data == before:
+                    continue
+                candidate = self.security_pending / ("candidate-" + filename)
+                atomic_write(candidate, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+                self._validate_core(core, candidate)
+                staged[filename] = candidate.read_bytes()
+                changed[core] = True
+            state = json.loads((self.security_pending / "state.json").read_text())
+            state["restart_cores"] = changed
+            atomic_write(self.security_pending / "state.json", json.dumps(state))
+            for filename, content in staged.items():
+                atomic_write(self.root / filename, content)
+            for filename in IDENTITY_FILES[1:]:
+                target = self.root / filename
+                if not target.exists():
+                    continue
+                text = target.read_text()
+                if filename == "jhsub.txt":
+                    lines = []
+                    for line in text.splitlines():
+                        if line.startswith("vmess://"):
+                            encoded = line.split("://", 1)[1]
+                            payload = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4)))
+                            line = "vmess://" + base64.b64encode(json.dumps(replace(payload), ensure_ascii=False).encode()).decode()
+                        else:
+                            line = replace(line)
+                        lines.append(line)
+                    text = "\n".join(lines) + ("\n" if lines else "")
+                else:
+                    text = replace(text)
+                atomic_write(target, text)
+            with self.db.connection:
+                local = self._ensure_legacy_identity(current)
+                self.db.connection.execute(
+                    "UPDATE devices SET uuid=?,password=?,updated_at=? WHERE id=?",
+                    (value, value, utc_now(), local["id"]),
+                )
+                for key in ("visit_xray_identity_before", "visit_singbox_identity_before"):
+                    saved = self.db.setting(key, "")
+                    if saved:
+                        self.db.set_setting(key, json.dumps(replace(json.loads(saved)), ensure_ascii=False))
+                self.db.audit("identity.local", "module", "credentials and local paths reconciled")
+            atomic_write(self.root / "uuid", value + "\n")
+            if config:
+                config["legacy_uuid"] = value
+                self.save_config(config)
+                self.render_all_subscriptions()
+            self.restart_cores(changed)
+            states = self._security_service_states()
+            if any(touched and core in states and not states[core]["active"]
+                   for core, touched in changed.items()):
+                raise AgentError("新凭据核心服务未就绪")
+        return changed
 
     def month_period(self, reset_day: int, now: dt.datetime | None = None) -> str:
         current = now or dt.datetime.now(dt.timezone.utc)
@@ -3497,6 +3612,8 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_device_parser = sub.add_parser("rotate-device")
     rotate_device_parser.add_argument("--device-id", type=int, required=True)
     rotate_device_parser.add_argument("--confirm", required=True)
+    local_identity = sub.add_parser("set-local-identity")
+    local_identity.add_argument("--uuid", required=True)
 
     delete_device_parser = sub.add_parser("delete-device")
     delete_device_parser.add_argument("--device-id", type=int, required=True)
@@ -3618,6 +3735,9 @@ def main(argv: list[str] | None = None) -> int:
             device = agent.update_device(args.device_id, args.name, args.enabled)
             result = dict(device)
             print("设备信息已更新。")
+        elif args.command == "set-local-identity":
+            result = agent.set_local_identity(args.uuid)
+            print("本机凭据、核心与订阅已同步；订阅 Token 和服务器身份保持不变。")
         elif args.command == "rotate-device":
             device = agent.rotate_device(args.device_id, args.confirm)
             result = dict(device)
