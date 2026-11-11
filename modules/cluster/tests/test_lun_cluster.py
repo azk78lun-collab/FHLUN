@@ -1175,6 +1175,45 @@ class ClusterTestCase(unittest.TestCase):
             second.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_federation_certificate_subject_accepts_legacy_openssl_spacing(self) -> None:
+        self.cluster.federation_init("127.0.0.1", 26010)
+        node_id = self.cluster.load_config()["node_id"]
+        original = self.cluster._openssl
+
+        def legacy_subject(arguments, **kwargs):
+            result = original(arguments, **kwargs)
+            if "-subject" in arguments:
+                result.stdout = "subject= CN = " + node_id + "\n"
+            return result
+
+        root = self.cluster.federation_root_certificate()
+        identity = self.cluster.federation_identity_certificate()
+        with mock.patch.object(self.cluster, "_openssl", side_effect=legacy_subject):
+            self.cluster.validate_federation_certificates(node_id, root, identity)
+            with self.assertRaisesRegex(lun_cluster.ClusterError, "CN"):
+                self.cluster.validate_federation_certificates("f" * 32, root, identity)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_federation_public_keys_do_not_rely_on_x509_output_file(self) -> None:
+        self.cluster.federation_init("127.0.0.1", 26011)
+        original = self.cluster._openssl
+
+        def old_openssl(arguments, **kwargs):
+            if arguments[0] == "x509" and "-pubkey" in arguments:
+                self.assertNotIn("-out", arguments)
+            return original(arguments, **kwargs)
+
+        cert = self.cluster.federation_root_certificate()
+        key = (self.cluster.pki / "federation-root.key").read_bytes()
+        content = b"legacy-openssl-test"
+        signature = self.cluster._sign_federation(content)
+        with mock.patch.object(self.cluster, "_openssl", side_effect=old_openssl):
+            self.assertTrue(self.cluster._verify_federation_signature(cert, content, signature))
+            self.assertFalse(self.cluster._verify_federation_signature(cert, content + b"tampered", signature))
+            self.assertTrue(self.cluster._private_key_matches_certificate(key, cert.encode()))
+            self.assertFalse(self.cluster._private_key_matches_certificate(key, self.cluster.federation_identity_certificate().encode()))
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_old_master_configuration_requires_and_supports_explicit_migration(self) -> None:
         self.cluster.init_master("127.0.0.1", 26001)
         with self.assertRaises(lun_cluster.ClusterError):

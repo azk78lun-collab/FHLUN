@@ -1,8 +1,8 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.10.1`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.11.3`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.10.1`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.11.3`.
 
 ## 阅读说明 Reading guide
 
@@ -15,6 +15,14 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - Versions come from `lun.sh` at each commit. Several fixes or documentation changes may share a version. Merge entries are integration records, not additional releases.
 - These notes preserve the original commits, hashes and order. Later versions may supersede historical behavior; follow the current [README](README.md) and module documentation for usage.
 - The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
+
+## 2026 年 11 月 11 日
+
+- `V26.11.11.3`：基础依赖按实际能力检查并按需补装；模块在旧 Python/SQLite 环境中使用校验过的 Lun 私有运行环境，不替换系统 Python。安装失败不留下“已就绪”标记或半成品服务。
+- `V26.11.11.3`: Check and install missing base dependencies on demand; provision a verified Lun-private runtime for modules on older Python/SQLite systems without replacing system Python. Failed installations cannot leave false readiness markers or activate incomplete services.
+- 集群 `0.3.4`：兼容旧 OpenSSL 的证书 CN 格式和公钥标准输出；保持签名、密钥匹配和身份校验。Cluster `0.3.4`: Handle legacy OpenSSL subject formatting and public-key stdout without weakening signature, key-pair or identity checks.
+- [普通订阅备用服务 / Subscription fallback](https://github.com/azk78lun-collab/FHLUN/commit/f6499e1)：兼容缺少 BusyBox 的机器，增加受令牌保护的轻量订阅服务和启动错误日志。Serve token-scoped subscriptions without BusyBox and preserve startup errors.
+- [旧 Python 证书部署修复 / Legacy Python certificate fix](https://github.com/azk78lun-collab/FHLUN/commit/36465b8)、[测试修正 / Test correction](https://github.com/azk78lun-collab/FHLUN/commit/adb5f21)：证书部署兼容 Python 3.6，并修正 Python 3.12 测试环境中的模拟方式。Support certificate deployment on Python 3.6 and correct the compatibility test on Python 3.12.
 
 ## 2026 年 11 月 10 日
 

@@ -24,6 +24,7 @@ calls="$tmp/calls"; : > "$calls"
 red_line(){ printf '%s\n' "$*" >&2; }
 green_line(){ :; }
 yellow_line(){ :; }
+lun_python_ensure(){ :; } # Runtime provisioning has its own isolated tests.
 pidof(){ [[ $1 == systemd ]]; }
 nginx(){
   [[ ! -f "$tmp/nginx-invalid" ]] || return 1

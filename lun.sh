@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-export LC_ALL=C.UTF-8
-export LANG=C.UTF-8
-export LANGUAGE=C.UTF-8
+_lun_locale=$(LC_ALL=C locale -a 2>/dev/null | awk 'tolower($0) ~ /^c\.utf-?8$/ {preferred=$0} tolower($0) ~ /utf-?8$/ && !fallback {fallback=$0} END {print preferred ? preferred : fallback}')
+export LC_ALL=${_lun_locale:-C}
+export LANG="$LC_ALL"
+export LANGUAGE="$LC_ALL"
+export PYTHONIOENCODING=${PYTHONIOENCODING:-utf-8}
+export PYTHONUTF8=${PYTHONUTF8:-1}
+unset _lun_locale
 [ -z "${vlpt+x}" ] || vlp=yes
 [ -z "${vmpt+x}" ] || { vmp=yes; vmag=yes; }
 [ -z "${vwpt+x}" ] || { vwp=yes; vmag=yes; }
@@ -35,7 +39,7 @@ if [ "$1" = "rep" ]; then
 [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
 fi
 else
-[ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
+[ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$1" = "runtime-ensure" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
 fi
 export uuid=${uuid:-''}
 export port_vl_re=${vlpt:-''}
@@ -97,7 +101,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.11.2"
+echo "当前版本：V26.11.11.3"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1489,6 +1493,180 @@ grep -qxF 'export PATH="$HOME/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null || echo 'e
 fi
 }
 
+lun_install_packages(){
+local log="$HOME/lun/dependencies-install.log"
+[ "$#" -gt 0 ] || return 0
+[ "$(id -u)" = 0 ] || { echo "缺少组件：$*；请使用 root 安装。" >&2; return 1; }
+mkdir -p "$HOME/lun" || return 1
+(umask 077; : > "$log") || return 1
+chmod 600 "$log"
+echo "按需安装组件：$*" >&2
+if command -v apk >/dev/null 2>&1; then
+apk add --no-cache "$@" > "$log" 2>&1 && return 0
+elif command -v apt-get >/dev/null 2>&1; then
+apt-get update > "$log" 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >> "$log" 2>&1 && return 0
+elif command -v dnf >/dev/null 2>&1; then
+dnf install -y "$@" > "$log" 2>&1 && return 0
+elif command -v yum >/dev/null 2>&1; then
+yum install -y "$@" > "$log" 2>&1 && return 0
+fi
+echo "组件安装未完成，未标记为就绪。请检查软件源和日志：$log" >&2
+return 1
+}
+
+lun_base_dependencies_ready(){
+local tool
+for tool in tar gzip openssl timeout flock ss sha256sum; do
+command -v "$tool" >/dev/null 2>&1 || return 1
+done
+{ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; } || return 1
+[ -s /etc/ssl/certs/ca-certificates.crt ] || [ -s /etc/pki/tls/certs/ca-bundle.crt ] || [ -s /etc/ssl/cert.pem ]
+}
+
+ensure_lun_base_dependencies(){
+local marker="$HOME/lun/.dependencies_ready" packages=() route=iproute2
+lun_base_dependencies_ready && { : > "$marker"; return 0; }
+rm -f "$marker"
+if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then route=iproute; fi
+command -v tar >/dev/null 2>&1 || packages+=(tar)
+command -v gzip >/dev/null 2>&1 || packages+=(gzip)
+command -v openssl >/dev/null 2>&1 || packages+=(openssl)
+command -v flock >/dev/null 2>&1 || packages+=(util-linux)
+command -v ss >/dev/null 2>&1 || packages+=("$route")
+if ! command -v timeout >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then packages+=(coreutils); fi
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then packages+=(curl); fi
+if [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ] && [ ! -s /etc/ssl/cert.pem ]; then packages+=(ca-certificates); fi
+lun_install_packages "${packages[@]}" || return 1
+lun_base_dependencies_ready || { echo "基础依赖检查仍未通过，已停止启动。" >&2; return 1; }
+: > "$marker"
+}
+
+lun_python_healthy(){
+local binary=$1 profile=${2:-modules}
+[ -x "$binary" ] || return 1
+"$binary" - "$profile" >/dev/null 2>&1 <<'PY'
+import sys, ssl, sqlite3, json, hashlib, zlib, ctypes
+if sys.argv[1] == 'basic':
+    assert sys.version_info >= (3, 6)
+else:
+    assert sys.version_info >= (3, 10)
+    assert sqlite3.sqlite_version_info >= (3, 25)
+    assert hasattr(ssl, 'TLSVersion')
+    with sqlite3.connect(':memory:') as db:
+        db.execute('CREATE TABLE t(k PRIMARY KEY, v)')
+        db.execute('INSERT INTO t VALUES(1,1) ON CONFLICT(k) DO UPDATE SET v=excluded.v')
+        db.execute('SELECT row_number() OVER (ORDER BY k) FROM t').fetchall()
+PY
+}
+
+lun_python_activate(){
+local bindir="$HOME/lun/runtime/bin"
+[ -x "$bindir/python3" ] || return 0
+case ":$PATH:" in *":$bindir:"*) ;; *) export PATH="$bindir:$PATH" ;; esac
+}
+
+lun_python_select(){
+local binary=$1 runtime="$HOME/lun/runtime" temporary
+mkdir -p "$runtime/bin" || return 1
+chmod 700 "$runtime" "$runtime/bin" || return 1
+temporary=$(mktemp "$runtime/bin/.python3.XXXXXX") || return 1
+cat > "$temporary" <<'SH'
+#!/bin/sh
+if [ -z "${SSL_CERT_FILE:-}" ]; then
+for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+[ ! -s "$ca" ] || { export SSL_CERT_FILE="$ca"; break; }
+done
+fi
+SH
+MSYS_NO_PATHCONV=1 "$binary" -c 'import shlex,sys; print("exec " + shlex.quote(sys.argv[1]) + " \"$@\"")' "$binary" >> "$temporary" || { rm -f "$temporary"; return 1; }
+chmod 700 "$temporary" && mv -f "$temporary" "$runtime/bin/python3" || { rm -f "$temporary"; return 1; }
+}
+
+lun_python_asset(){
+local arch libc=gnu
+arch=$(uname -m)
+ldd --version 2>&1 | grep -qi musl && libc=musl
+case "$arch-$libc" in
+x86_64-gnu) echo 'x86_64-unknown-linux-gnu 6a9e62dad033790aef722dbd370e0ce76ce17b73627ba3ae679f537049350b39' ;;
+aarch64-gnu|arm64-gnu) echo 'aarch64-unknown-linux-gnu b6a41defec4975d94b4ff1950236e7383e5c02ba40ea48c9ec33c66087a35aab' ;;
+x86_64-musl) echo 'x86_64-unknown-linux-musl e32685cf248d2f33b249816120774143b4b57578cb30de5b8dba3e54963765c3' ;;
+aarch64-musl|arm64-musl) echo 'aarch64-unknown-linux-musl 64bb304e59d5d6ed5eaae24e95e743a2420a8897d2f6c854b1438ff9cb47e432' ;;
+*) echo "没有适用于 $arch/$libc 的已校验运行环境。" >&2; return 1 ;;
+esac
+}
+
+lun_runtime_fetch(){
+local url=$1 target=$2
+if command -v curl >/dev/null 2>&1; then
+curl --proto '=https' --proto-redir '=https' -fL --connect-timeout 10 --max-time 240 --retry 2 -o "$target" "$url"
+else
+wget --timeout=60 --tries=2 -O "$target" "$url"
+fi
+}
+
+lun_python_install_portable(){
+(
+umask 077
+local runtime="$HOME/lun/runtime" target hash asset instance stage archive available
+mkdir -p "$runtime/instances" || exit 1
+chmod 700 "$runtime" "$runtime/instances" || exit 1
+exec 9> "$runtime/.install.lock"
+flock -w 120 9 || { echo "另一个 Lun 组件安装正在运行，请稍后重试。" >&2; exit 1; }
+read -r target hash < <(lun_python_asset) || exit 1
+[ -n "$target" ] && [ -n "$hash" ] || exit 1
+asset="cpython-3.12.16+20261110-${target}-install_only_stripped.tar.gz"
+instance="$runtime/instances/cpython-3.12.16-20261110-$target"
+if lun_python_healthy "$instance/python/bin/python3" modules; then
+lun_python_select "$instance/python/bin/python3"
+exit $?
+fi
+available=$(df -Pk "$runtime" | awk 'NR==2 {print $4}')
+case "$available" in ''|*[!0-9]*) echo "无法确认剩余磁盘空间，未安装运行环境。" >&2; exit 1 ;; esac
+[ "$available" -ge 262144 ] || { echo "Lun 独立运行环境至少需要 256 MiB 可用磁盘，未改动现有组件。" >&2; exit 1; }
+stage=$(mktemp -d "$runtime/.install.XXXXXX") || exit 1
+trap 'rm -rf "$stage"' EXIT
+archive="$stage/python.tar.gz"
+echo "当前 Python/SQLite 不满足模块要求，按需安装 Lun 独立运行环境（约 28–35 MB 下载）；系统 Python 保持不变。" >&2
+lun_runtime_fetch "https://github.com/astral-sh/python-build-standalone/releases/download/20261110/$asset" "$archive" || exit 1
+printf '%s  %s\n' "$hash" "$archive" | sha256sum -c - >/dev/null 2>&1 || { echo "运行环境 SHA-256 不匹配，已拒绝安装。" >&2; exit 1; }
+tar -tzf "$archive" > "$stage/members" || exit 1
+awk 'BEGIN {ok=1} !/^python(\/|$)/ || /(^|\/)\.\.(\/|$)/ {ok=0} END {exit !ok}' "$stage/members" || { echo "运行环境归档路径不安全。" >&2; exit 1; }
+mkdir "$stage/extracted" || exit 1
+tar -xzf "$archive" -C "$stage/extracted" || exit 1
+lun_python_healthy "$stage/extracted/python/bin/python3" modules || { echo "独立运行环境无法在本机运行，未替换旧环境；请检查系统内核/动态库兼容性。" >&2; exit 1; }
+[ ! -e "$instance" ] || { echo "已有同版本环境异常，请人工检查：$instance" >&2; exit 1; }
+mv "$stage/extracted" "$instance" || exit 1
+lun_python_healthy "$instance/python/bin/python3" modules || exit 1
+lun_python_select "$instance/python/bin/python3" || exit 1
+printf '%s %s\n' "$asset" "$hash" > "$runtime/source.sha256"
+)
+}
+
+lun_python_ensure(){
+local profile=${1:-modules} candidate binary current
+lun_python_activate
+current=$(command -v python3 2>/dev/null) || current=
+if [ -n "$current" ] && lun_python_healthy "$current" "$profile"; then return 0; fi
+for candidate in python3.12 python3.13 python3.11 python3.10 python3.14; do
+binary=$(command -v "$candidate" 2>/dev/null) || continue
+if lun_python_healthy "$binary" "$profile"; then
+lun_python_select "$binary" || return 1
+lun_python_activate
+return 0
+fi
+done
+if [ -z "$current" ]; then
+if lun_install_packages python3; then
+current=$(command -v python3 2>/dev/null) || current=
+if [ -n "$current" ] && lun_python_healthy "$current" "$profile"; then return 0; fi
+fi
+fi
+lun_python_install_portable || return 1
+lun_python_activate
+lun_python_healthy "$(command -v python3)" "$profile"
+}
+
+lun_bootstrap(){
 if [ "$1" != "del" ]; then
 migrate_lun_state
 mkdir -p "$HOME/lun"
@@ -1502,23 +1680,12 @@ load_vps_mode_config
 load_cdn_mode_config
 load_argoip_config
 load_subip_mode_config
-ensure_lun_command || true
-dependency_marker="$HOME/lun/.dependencies_ready"
-if [ -f sbx_update ] && [ ! -f "$dependency_marker" ]; then
-touch "$dependency_marker"
+ensure_lun_base_dependencies || exit 1
+ensure_lun_command || { echo "Lun 命令入口保存失败，已停止安装。" >&2; exit 1; }
+lun_python_activate
 fi
-if [ ! -f "$dependency_marker" ]; then
-echo "执行必要的脚本依赖中，请稍等10秒……"
-if command -v apk >/dev/null 2>&1; then
-apk update >/dev/null 2>&1 && apk add --no-cache bash busybox-extras curl gcompat libc6-compat iptables openssl >/dev/null 2>&1
-elif command -v apt >/dev/null 2>&1; then
-export DEBIAN_FRONTEND=noninteractive
-printf 'iptables-persistent iptables-persistent/autosave_v4 boolean true\niptables-persistent iptables-persistent/autosave_v6 boolean true\n' | debconf-set-selections
-apt update >/dev/null 2>&1 && apt install -y busybox coreutils curl util-linux iptables iptables-persistent cron openssl >/dev/null 2>&1
-fi
-touch "$dependency_marker"
-fi
-fi
+}
+lun_bootstrap "$@"
 v4v6(){
 v4=$( (command -v curl >/dev/null 2>&1 && curl -s4m5 -k "$v46url" 2>/dev/null) || (command -v wget >/dev/null 2>&1 && timeout 3 wget -4 --tries=2 -qO- "$v46url" 2>/dev/null) )
 v6=$( (command -v curl >/dev/null 2>&1 && curl -s6m5 -k "$v46url" 2>/dev/null) || (command -v wget >/dev/null 2>&1 && timeout 3 wget -6 --tries=2 -qO- "$v46url" 2>/dev/null) )
@@ -2458,6 +2625,7 @@ issue_acme_cert(){
 local mode=$1 subject=$2 acme acme_log cli method rc force=() http_args=() pre_hook post_hook
 [ -z "$subject" ] && return 1
 printf '%s' "$subject" | grep -Eq '^[A-Za-z0-9.:_-]+$' || return 1
+lun_python_ensure basic || return 1
 ensure_acme_sh || return 1
 umask 077
 exec 9> "$HOME/lun/.acme-renew.lock"
@@ -3695,6 +3863,7 @@ fi
 fi
 }
 ins(){
+lun_python_ensure basic || return 1
 if [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$ssp" != yes ] && [ "$nvp" != yes ]; then
 installxray || return 1
 xrsbvm
@@ -3976,6 +4145,7 @@ grep -Eq '"(enabled|subscription_only)"[[:space:]]*:[[:space:]]*true' "$(multius
 multiuser_cmd(){
 agent=$(multiuser_agent)
 [ -x "$agent" ] || { echo "多用户代理程序未安装。" >&2; return 1; }
+lun_python_ensure modules || return 1
 "$agent" --root "$HOME/lun" "$@"
 }
 
@@ -4040,8 +4210,10 @@ apply_lun_firewall_rules quiet || true
 
 multiuser_service_start(){
 subscription_agent_enabled || return 0
+lun_python_ensure modules || return 1
 multiuser_service_stop
 multiuser_prepare_service_port || return 1
+multiuser_install_service || return 1
 if pidof systemd >/dev/null 2>&1; then
 systemctl enable --now lun-agent >/dev/null 2>&1 || return 1
 sleep 1
@@ -4063,6 +4235,7 @@ multiuser_service_start
 }
 
 multiuser_install_service(){
+lun_python_ensure modules || return 1
 python_bin=$(command -v python3) || return 1
 agent_py="$(multiuser_module_dir)/lun_agent.py"
 if pidof systemd >/dev/null 2>&1; then
@@ -4145,6 +4318,7 @@ done
 
 visit_monitor_service_start(){
 visit_monitor_enabled || return 0
+visit_monitor_install_service || return 1
 if pidof systemd >/dev/null 2>&1; then
 systemctl enable --now lun-visit-monitor >/dev/null 2>&1 || return 1
 sleep 1
@@ -4165,6 +4339,7 @@ visit_monitor_service_start
 }
 
 visit_monitor_install_service(){
+lun_python_ensure modules || return 1
 python_bin=$(command -v python3) || return 1
 agent_py="$(multiuser_module_dir)/lun_agent.py"
 if pidof systemd >/dev/null 2>&1; then
@@ -4405,6 +4580,7 @@ printf '%s\n' "$cluster_filtered"
 cluster_cmd(){
 cluster_exec=$(cluster_agent)
 [ -x "$cluster_exec" ] || { echo "分布式集群程序未安装。" >&2; return 1; }
+lun_python_ensure modules || return 1
 "$cluster_exec" --root "$HOME/lun" "$@"
 }
 
@@ -4450,6 +4626,7 @@ done
 
 cluster_service_start(){
 cluster_enabled || return 0
+cluster_install_service || return 1
 if pidof systemd >/dev/null 2>&1; then
 systemctl enable --now lun-cluster-agent >/dev/null 2>&1 || return 1
 sleep 1
@@ -4469,6 +4646,7 @@ cluster_service_start
 }
 
 cluster_install_service(){
+lun_python_ensure modules || return 1
 python_bin=$(command -v python3) || return 1
 agent_py="$(cluster_module_dir)/lun_cluster.py"
 if pidof systemd >/dev/null 2>&1; then
@@ -4534,6 +4712,7 @@ fi
 }
 
 cluster_download_agent(){
+lun_python_ensure modules || return 1
 cluster_dir=$(cluster_module_dir)
 cluster_target="$cluster_dir/lun_cluster.py"
 cluster_tmp="$cluster_target.tmp.$$"
@@ -4571,7 +4750,7 @@ mv -f "$cluster_tmp" "$cluster_target"
 chmod 700 "$cluster_target"
 cat > "$cluster_dir/lun-cluster" <<EOF
 #!/bin/sh
-exec python3 "$cluster_target" "\$@"
+exec "$(command -v python3)" "$cluster_target" "\$@"
 EOF
 chmod 700 "$cluster_dir/lun-cluster"
 }
@@ -4886,6 +5065,7 @@ cluster_cmd refresh-profiles >/dev/null 2>&1 || true
 }
 
 refresh_subscription_outputs(){
+lun_python_ensure basic || return 1
 cip || return 1
 cluster_push_event
 }
@@ -6429,7 +6609,7 @@ done
 }
 
 ensure_subscription_httpd_fallback(){
-command -v python3 >/dev/null 2>&1 || { red_line "订阅服务需要 BusyBox httpd 或 Python 3。"; return 1; }
+lun_python_ensure basic || return 1
 local script="$HOME/lun/subscription_httpd.py" temporary
 temporary=$(mktemp "$script.XXXXXX") || return 1
 cat > "$temporary" <<'PY'
@@ -6573,6 +6753,12 @@ return 0
 
 restart_subscription_busybox(){
 [ -s "$HOME/lun/subport.log" ] || [ -n "$sub" ] || return 0
+if ! command -v apk >/dev/null 2>&1 && ! command -v crontab >/dev/null 2>&1; then
+local cron_package=cron
+if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then cron_package=cronie; fi
+lun_install_packages "$cron_package" || return 1
+command -v crontab >/dev/null 2>&1 || { red_line "订阅自启动组件未能就绪。"; return 1; }
+fi
 if [ -n "$subid" ]; then
 subtoken="$subid"
 elif [ -s "$HOME/lun/subtoken.log" ]; then
@@ -10026,6 +10212,7 @@ done
 }
 
 refresh_subscription_share(){
+lun_python_ensure basic || return 1
 if multiuser_enabled; then
 multiuser_cmd reconcile >/dev/null 2>&1 || { red_line "多用户订阅配置修复失败。"; return 1; }
 multiuser_service_start >/dev/null 2>&1 || { red_line "多用户订阅服务启动失败。"; return 1; }
@@ -10182,19 +10369,7 @@ esac
 # 效果：隐藏 VPS 真实 IP，通过 CDN 中转提升连接稳定性和速度
 # 限制：只有 VMess WS、VLESS WS、VLESS XHTTP（非Reality）与 VLESS XHTTP TLS 支持
 ensure_cloudflare_origin_helper(){
-command -v python3 >/dev/null 2>&1 || {
-yellow_line "自动配置 Cloudflare 需要 Python 3，正在安装……"
-if command -v apk >/dev/null 2>&1; then
-apk add --no-cache python3 >/dev/null 2>&1
-elif command -v apt-get >/dev/null 2>&1; then
-apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1
-elif command -v dnf >/dev/null 2>&1; then
-dnf install -y python3 >/dev/null 2>&1
-elif command -v yum >/dev/null 2>&1; then
-yum install -y python3 >/dev/null 2>&1
-fi
-}
-command -v python3 >/dev/null 2>&1 || { red_line "Python 3 安装失败，无法调用 Cloudflare API。"; return 1; }
+lun_python_ensure modules || return 1
 mkdir -p "$HOME/lun"
 cat > "$HOME/lun/cdn_cloudflare_api.py" <<'PY'
 #!/usr/bin/env python3
@@ -11869,24 +12044,11 @@ printf '%s/lun_cdn_optimizer.py\n' "$(cdnopt_module_dir)"
 }
 
 cdnopt_install_python(){
-command -v python3 >/dev/null 2>&1 && return 0
-yellow_line "一键优选 CDN 模块需要 Python 3（仅在测速时运行），正在安装……"
-if command -v apk >/dev/null 2>&1; then
-apk add --no-cache python3 >/dev/null 2>&1
-elif command -v apt-get >/dev/null 2>&1; then
-apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1
-elif command -v dnf >/dev/null 2>&1; then
-dnf install -y python3 >/dev/null 2>&1
-elif command -v yum >/dev/null 2>&1; then
-yum install -y python3 >/dev/null 2>&1
-else
-red_line "当前系统无法自动安装 Python 3，请先手动安装。"
-return 1
-fi
-command -v python3 >/dev/null 2>&1
+lun_python_ensure modules
 }
 
 cdnopt_download_agent(){
+cdnopt_install_python || return 1
 cdnopt_dir=$(cdnopt_module_dir)
 cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
@@ -13889,20 +14051,11 @@ done
 }
 
 multiuser_install_python(){
-command -v python3 >/dev/null 2>&1 && return 0
-yellow_line "多用户模块需要 Python 3（仅模块使用），正在安装……"
-if command -v apk >/dev/null 2>&1; then
-apk add --no-cache python3 >/dev/null 2>&1
-elif command -v apt-get >/dev/null 2>&1; then
-apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 >/dev/null 2>&1
-else
-red_line "当前系统没有 apk/apt-get，请先手动安装 Python 3。"
-return 1
-fi
-command -v python3 >/dev/null 2>&1
+lun_python_ensure modules
 }
 
 multiuser_download_agent(){
+multiuser_install_python || return 1
 mu_dir=$(multiuser_module_dir)
 mu_target="$mu_dir/lun_agent.py"
 mu_tmp="$mu_target.tmp.$$"
@@ -13940,7 +14093,7 @@ mv -f "$mu_tmp" "$mu_target"
 chmod 700 "$mu_target"
 cat > "$mu_dir/lun-agent" <<EOF
 #!/bin/sh
-exec python3 "$mu_target" "\$@"
+exec "$(command -v python3)" "$mu_target" "\$@"
 EOF
 chmod 700 "$mu_dir/lun-agent"
 }
@@ -14143,6 +14296,7 @@ red_line "多用户模块只支持 systemd 或 OpenRC；当前无 init 模式已
 return 1
 }
 [ -s "$HOME/lun/uuid" ] || { red_line "请先完成至少一个风火轮协议安装。"; return 1; }
+multiuser_install_python || return 1
 multiuser_had_visit=no
 visit_monitor_enabled && multiuser_had_visit=yes
 multiuser_had_subscription_only=no
@@ -14162,7 +14316,6 @@ done
 multiuser_service_stop
 fi
 visit_monitor_service_stop
-multiuser_install_python || return 1
 multiuser_download_agent || { red_line "多用户代理程序下载/复制失败。"; multiuser_abort_install; return 1; }
 multiuser_prepare_subscription || { multiuser_abort_install; return 1; }
 
@@ -15368,6 +15521,11 @@ elif [ "$1" = "cert-deploy" ]; then
 [ "$(cat "$HOME/lun/cert_subject" 2>/dev/null)" = "$2" ] || exit 0
 [ "$(cat "$HOME/lun/cert_mode" 2>/dev/null)" = "$3" ] || exit 0
 deploy_acme_cert "$2" "$3"
+exit $?
+elif [ "$1" = "runtime-ensure" ]; then
+case "${2:-modules}" in basic|modules) ;; *) echo "用法：lun runtime-ensure basic|modules" >&2; exit 2 ;; esac
+lun_python_ensure "${2:-modules}" || exit 1
+python3 -c 'import sys,sqlite3; print("Lun 运行环境已就绪：Python %s / SQLite %s" % (sys.version.split()[0],sqlite3.sqlite_version))'
 exit $?
 elif [ "$1" = "subscription-start" ]; then
 if subscription_agent_enabled || cluster_enabled; then exit 0; fi

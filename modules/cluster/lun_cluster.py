@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -2589,8 +2589,8 @@ class Cluster:
             if verify.returncode:
                 raise ClusterError("联邦身份证书不受所提供根证书签发")
             subject = self._openssl(["x509", "-in", str(identity), "-noout", "-subject", "-nameopt", "RFC2253"]).stdout.strip()
-            match = re.search(r"(?:^|,)CN=([^,]+)", subject.removeprefix("subject="))
-            if not match or match.group(1) != node_id:
+            match = re.search(r"(?:^|,)CN\s*=\s*([^,]+)", subject.removeprefix("subject=").strip())
+            if not match or match.group(1).strip() != node_id:
                 raise ClusterError("联邦身份证书 CN 与 node_id 不一致")
             purpose = self._openssl(["x509", "-in", str(identity), "-noout", "-purpose"]).stdout
             if not re.search(r"SSL client\s*:\s*Yes", purpose, re.IGNORECASE) or not re.search(r"SSL server\s*:\s*Yes", purpose, re.IGNORECASE):
@@ -2732,7 +2732,8 @@ class Cluster:
             source.write_bytes(content)
             sig.write_bytes(raw_signature)
             try:
-                self._openssl(["x509", "-in", str(cert), "-pubkey", "-noout", "-out", str(public)])
+                # OpenSSL 1.0.x writes -pubkey to stdout even when -out is used.
+                atomic_write(public, self._openssl(["x509", "-in", str(cert), "-pubkey", "-noout"]).stdout, 0o600)
                 return self._openssl(["dgst", "-sha256", "-verify", str(public), "-signature", str(sig), str(source)], check=False).returncode == 0
             except ClusterError:
                 return False
@@ -4231,14 +4232,15 @@ class Cluster:
     def _private_key_matches_certificate(self, private_key: bytes, certificate: bytes) -> bool:
         with tempfile.TemporaryDirectory(dir=self.module) as temporary:
             key_path, cert_path = Path(temporary) / "identity.key", Path(temporary) / "identity.crt"
-            key_pub, cert_pub = Path(temporary) / "key.pub", Path(temporary) / "cert.pub"
             key_path.write_bytes(private_key)
             cert_path.write_bytes(certificate)
-            if self._openssl(["pkey", "-in", str(key_path), "-pubout", "-out", str(key_pub)], check=False).returncode:
+            key_pub = self._openssl(["pkey", "-in", str(key_path), "-pubout"], check=False)
+            if key_pub.returncode:
                 return False
-            if self._openssl(["x509", "-in", str(cert_path), "-pubkey", "-noout", "-out", str(cert_pub)], check=False).returncode:
+            cert_pub = self._openssl(["x509", "-in", str(cert_path), "-pubkey", "-noout"], check=False)
+            if cert_pub.returncode or not key_pub.stdout.strip() or not cert_pub.stdout.strip():
                 return False
-            return hmac.compare_digest(key_pub.read_bytes(), cert_pub.read_bytes())
+            return hmac.compare_digest(key_pub.stdout.strip().encode(), cert_pub.stdout.strip().encode())
 
     def restore_federation_backup(self, source: Path, password: str, *, require_identity: bool = False) -> dict[str, Any]:
         payload = source.read_bytes()
@@ -6070,7 +6072,7 @@ class ChainRoutes:
                 raise ValueError("X25519 public key derivation failed")
             return base64.urlsafe_b64encode(result.stdout[-32:]).decode().rstrip("=")
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            raise ClusterError("Reality 公钥生成失败，未返回或复制私钥") from exc
+            raise ClusterError("Reality 公钥生成失败：需要支持 X25519 的 OpenSSL 1.1.1+；未返回或复制私钥") from exc
 
     def endpoint(self, internal: int) -> tuple[str, int]:
         config = self.cluster.load_config()

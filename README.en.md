@@ -5,7 +5,7 @@
 Lun is a VPS terminal script for multi-protocol proxies, CDN optimization, multi-user access and distributed server management.
 
 Powered by Xray, sing-box and Cloudflared, with guided menus and environment-variable installation.
-Current script version: `V26.10.20.3`.
+Current script version: `V26.11.11.3`.
 
 ## Features
 
@@ -50,6 +50,7 @@ Use the menu to configure protocols, certificates and subscriptions.
 Detailed guides are currently in Chinese; the changelog includes English summaries.
 
 - [User guide: menus, variables, certificates, CDN and NAT](docs/USAGE.zh-CN.md)
+- [On-demand components and legacy system compatibility](docs/RUNTIME.zh-CN.md)
 - [Users, traffic and connection monitoring](modules/multiuser/README.md)
 - [Distributed cluster and proxy chains](modules/cluster/README.md)
 - [Dual-path CDN testing](modules/cdnopt/README.md)
@@ -65,7 +66,7 @@ Thank you to yonggekkk and all contributors for their open-source work.
 Thanks also to [Xray-core](https://github.com/XTLS/Xray-core),
 [sing-box](https://github.com/SagerNet/sing-box),
 [Cloudflared](https://github.com/cloudflare/cloudflared),
-[BestCF](https://github.com/DustinWin/BestCF) and
+[BestCF](https://github.com/DustinWin/BestCF), [Python Build Standalone](https://github.com/astral-sh/python-build-standalone) and
 [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel).
 
 ## License
