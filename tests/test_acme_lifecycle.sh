@@ -98,12 +98,12 @@ echo 'ok - daily renewal cron idempotent; unrelated tasks preserved'
 
 stage=$(acme_stage_dir example.test)
 mkdir -p "$stage"
-# Emulate Python versions before 3.9, where Path.is_relative_to is absent.
+# Reject use of the Python 3.9-only method in the embedded certificate helpers.
 (
   python3(){
     [[ ${1:-} == - ]] || { command python3 "$@"; return; }
     shift
-    command python3 -c 'import pathlib,sys; delattr(pathlib.PurePath, "is_relative_to") if hasattr(pathlib.PurePath, "is_relative_to") else None; exec(sys.stdin.read())' "$@"
+    command python3 -c 'import ast,sys; code=sys.stdin.read(); tree=ast.parse(code); assert not any(isinstance(n, ast.Attribute) and n.attr == "is_relative_to" for n in ast.walk(tree)); exec(compile(tree,"<stdin>","exec"))' "$@"
   }
   mkdir -p "$HOME/.acme.sh/example.test_ecc" "$tmp/txn"
   : > "$tmp/existing.key"; : > "$tmp/existing.crt"
