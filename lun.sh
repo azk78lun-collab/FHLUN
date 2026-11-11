@@ -2525,7 +2525,9 @@ elif action=='restore':
   if row['existed']:
    atomic_copy(txn/row['backup'],p); os.chmod(p,row['mode'])
    if hasattr(os,'chown'): os.chown(p,row['uid'],row['gid'])
-  else: p.unlink(missing_ok=True)
+  else:
+   try: p.unlink()
+   except FileNotFoundError: pass
 elif action=='install':
  atomic_copy(stage/'private.key',root/'private.key'); atomic_copy(stage/'cert.crt',root/'cert.crt')
  os.chmod(root/'private.key',0o600)

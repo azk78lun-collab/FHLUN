@@ -104,7 +104,7 @@ mkdir -p "$stage"
   python3(){
     [[ ${1:-} == - ]] || { command python3 "$@"; return; }
     shift
-    command python3 -c 'import ast,sys; code=sys.stdin.read(); tree=ast.parse(code); assert not any(isinstance(n, ast.Attribute) and n.attr == "is_relative_to" for n in ast.walk(tree)); exec(compile(tree,"<stdin>","exec"))' "$@"
+    command python3 -c 'import ast,sys; code=sys.stdin.read(); tree=ast.parse(code); assert not any((isinstance(n, ast.Attribute) and n.attr == "is_relative_to") or (isinstance(n, ast.keyword) and n.arg == "missing_ok") for n in ast.walk(tree)); exec(compile(tree,"<stdin>","exec"))' "$@"
   }
   mkdir -p "$HOME/.acme.sh/example.test_ecc" "$tmp/txn"
   : > "$tmp/existing.key"; : > "$tmp/existing.crt"
