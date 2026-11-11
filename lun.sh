@@ -101,7 +101,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.11.3"
+echo "当前版本：V26.11.11.4"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -1411,22 +1411,30 @@ else
 fi
 }
 
-download_lun_script(){
-local target=$1 source_mode=${2:-configured} tmp download_url fallback_url
-tmp="${target}.tmp.$$"
-if [ "$source_mode" = official ]; then
-download_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/lun.sh?ref=main"
-fallback_url="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh"
-else
-download_url=$lunurl
-fallback_url=
-case "$download_url" in
-https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh)
-fallback_url=$download_url
-download_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/lun.sh?ref=main"
-;;
-esac
+download_lun_update_bridge(){
+local output=$1 url fallback
+url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/upgrade.sh?ref=main&fhlun_nocache=$(date +%s)-$$"
+fallback="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/upgrade.sh?fhlun_nocache=$(date +%s)-$$"
+if command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 60 --retry 2 "$url" -o "$output"; then :
+elif command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 60 --retry 2 "$fallback" -o "$output"; then :
+elif command -v wget >/dev/null 2>&1 && wget -qO "$output" --header='Accept: application/vnd.github.raw+json' --header='Cache-Control: no-cache' --timeout=30 --tries=2 "$url"; then :
+elif command -v wget >/dev/null 2>&1 && wget -qO "$output" --header='Cache-Control: no-cache' --timeout=30 --tries=2 "$fallback"; then :
+else rm -f "$output"; return 1
 fi
+grep -qx 'LUN_UPGRADE_API=1' "$output" && bash -n "$output" 2>/dev/null || { rm -f "$output"; return 1; }
+}
+
+download_lun_script(){
+local target=$1 source_mode=${2:-configured} tmp download_url
+if [ "$source_mode" = official ] || [ "${lunurl:-}" = 'https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/lun.sh' ]; then
+local bridge="${target}.bridge.$$" bridge_rc=0
+download_lun_update_bridge "$bridge" || return 1
+bash "$bridge" --stage "$target" || bridge_rc=$?
+rm -f "$bridge"
+return "$bridge_rc"
+fi
+tmp="${target}.tmp.$$"
+download_url=$lunurl
 case "$download_url" in
 https://raw.githubusercontent.com/*|https://github.com/*/raw/*|https://api.github.com/*)
 case "$download_url" in
@@ -1439,10 +1447,6 @@ rm -f "$tmp"
 if command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 30 --retry 2 "$download_url" -o "$tmp"; then
 :
 elif command -v wget >/dev/null 2>&1 && wget -qO "$tmp" --header='Accept: application/vnd.github.raw+json' --header='Cache-Control: no-cache' --timeout=30 --tries=2 "$download_url"; then
-:
-elif [ -n "$fallback_url" ] && command -v curl >/dev/null 2>&1 && curl -fsSL -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 30 --retry 2 "${fallback_url}?fhlun_nocache=$(date +%s)" -o "$tmp"; then
-:
-elif [ -n "$fallback_url" ] && command -v wget >/dev/null 2>&1 && wget -qO "$tmp" --header='Cache-Control: no-cache' --timeout=30 --tries=2 "${fallback_url}?fhlun_nocache=$(date +%s)" -o "$tmp"; then
 :
 else
 rm -f "$tmp"
@@ -8457,9 +8461,10 @@ return "$bundle_rc"
 }
 
 update_lun_script(){
-local target update_stage current_lun_version new_lun_version
+local target update_stage current_lun_version new_lun_version install_target
 LUN_UPDATED_ENTRY=
 target=$(lun_update_target)
+install_target=$target
 mkdir -p "$HOME/bin" 2>/dev/null || true
 if [ -w "$(dirname "$target")" ]; then
 update_stage="${target}.update.$$"
@@ -8472,6 +8477,11 @@ yellow_line "正在检查 Lun 更新，请稍候……"
 if ! download_lun_script "$update_stage" official; then
 rm -f "$update_stage"
 red_line "Lun 脚本更新失败：无法下载远端脚本，请检查网络后重试。"
+return 1
+fi
+if [ "$target" != "$install_target" ] || [ "$target" = "$update_stage" ] || [ "$target" -ef "$update_stage" ]; then
+rm -f "$update_stage"
+red_line "更新目标被临时下载变量覆盖，已停止；没有把本次检查误报为最新版。请使用官方 upgrade.sh 修复入口。"
 return 1
 fi
 new_lun_version=$(lun_script_version "$update_stage")

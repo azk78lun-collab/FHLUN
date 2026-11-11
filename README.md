@@ -5,7 +5,7 @@
 Lun 风火轮：集多协议代理、CDN 优选、多用户与分布式服务器管理于一体的 VPS 终端脚本。
 
 基于 Xray、sing-box 与 Cloudflared，支持菜单引导和环境变量安装。
-当前脚本版本：`V26.11.11.3`。
+当前脚本版本：`V26.11.11.4`。
 
 ## 核心功能
 
@@ -49,6 +49,7 @@ lun
 
 - [使用指南：菜单、参数、证书、CDN 与 NAT](docs/USAGE.zh-CN.md)
 - [按需组件与旧系统兼容](docs/RUNTIME.zh-CN.md)
+- [更新规则与旧版恢复](docs/UPDATE_CONTRACT.md)
 - [多用户、流量与网站监控](modules/multiuser/README.md)
 - [分布式集群与链式代理](modules/cluster/README.md)
 - [CDN 双向优选](modules/cdnopt/README.md)

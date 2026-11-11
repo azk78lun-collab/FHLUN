@@ -1,8 +1,8 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.11.3`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.11.4`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.11.3`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.11.4`.
 
 ## 阅读说明 Reading guide
 
@@ -17,6 +17,9 @@ Bilingual update history for Lun, newest date first. Each commit link opens the 
 - The retrospective covers all 80 commits from repository initialization through `e1c83d2`, including 5 PR merges. Future updates belong at the top.
 
 ## 2026 年 11 月 11 日
+
+- `V26.11.11.4`：固定 `upgrade.sh` 旧版恢复入口；菜单更新核验 main 最新提交和文件内容标识，增加目标覆盖防护与旧版断更回归测试。Fixed legacy recovery entry, commit-pinned menu updates, content verification and regression coverage for stranded older installers.
+- 集群 `0.3.5`：新成员导入旧联邦时保留已撤销成员的历史验签证书及编号，不将其恢复为活动信任；修复“事件作者未受信任”配对失败，继续拒绝撤销边界后的重放。Cluster `0.3.5`: Retain verification-only keys and number reservations for revoked members during history replay, without reactivating trust; reject post-revocation replay and fix new-peer pairing.
 
 - `V26.11.11.3`：基础依赖按实际能力检查并按需补装；模块在旧 Python/SQLite 环境中使用校验过的 Lun 私有运行环境，不替换系统 Python。安装失败不留下“已就绪”标记或半成品服务。
 - `V26.11.11.3`: Check and install missing base dependencies on demand; provision a verified Lun-private runtime for modules on older Python/SQLite systems without replacing system Python. Failed installations cannot leave false readiness markers or activate incomplete services.

@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -2597,7 +2597,8 @@ class Cluster:
                 raise ClusterError("联邦身份证书必须同时支持客户端和服务端 TLS")
         return self._certificate_fingerprint_pem(root_certificate), self._certificate_fingerprint_pem(identity_certificate)
 
-    def register_federation_key(self, node_id: str, root_certificate: str, identity_certificate: str = "") -> None:
+    def register_federation_key(self, node_id: str, root_certificate: str, identity_certificate: str = "",
+                                *, revocation: tuple[int, int, str] | None = None) -> None:
         root_fingerprint, identity_fingerprint = self.validate_federation_certificates(
             node_id, root_certificate, identity_certificate
         )
@@ -2607,11 +2608,16 @@ class Cluster:
         if existing and str(existing["identity_fingerprint"] or self._certificate_fingerprint_pem(str(existing["identity_certificate"]))) != identity_fingerprint:
             raise ClusterError("活动 node_id 的身份证书不可替换；请使用新 node_id 重新加入")
         now = utc_now()
+        revoked_at, cutoff, revocation_id = revocation or (0, -1, "")
         with self.db.connection:
             self.db.connection.execute(
-                "INSERT INTO federation_keys(node_id,root_certificate,identity_certificate,root_fingerprint,identity_fingerprint,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(node_id) DO UPDATE SET updated_at=excluded.updated_at",
-                (node_id, root_certificate, identity_certificate, root_fingerprint, identity_fingerprint, now, now),
+                "INSERT INTO federation_keys(node_id,root_certificate,identity_certificate,root_fingerprint,identity_fingerprint,created_at,updated_at,revoked_at,revoked_after_seq,revocation_event_id) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(node_id) DO UPDATE SET updated_at=excluded.updated_at,"
+                "revoked_at=CASE WHEN excluded.revoked_at=0 THEN federation_keys.revoked_at WHEN federation_keys.revoked_at=0 THEN excluded.revoked_at ELSE MIN(federation_keys.revoked_at,excluded.revoked_at) END,"
+                "revoked_after_seq=CASE WHEN excluded.revoked_at=0 THEN federation_keys.revoked_after_seq WHEN federation_keys.revoked_after_seq<0 THEN excluded.revoked_after_seq ELSE MIN(federation_keys.revoked_after_seq,excluded.revoked_after_seq) END,"
+                "revocation_event_id=CASE WHEN excluded.revoked_at=0 THEN federation_keys.revocation_event_id WHEN federation_keys.revocation_event_id='' OR excluded.revocation_event_id<federation_keys.revocation_event_id THEN excluded.revocation_event_id ELSE federation_keys.revocation_event_id END",
+                (node_id, root_certificate, identity_certificate, root_fingerprint, identity_fingerprint,
+                 now, now, revoked_at, cutoff, revocation_id),
             )
 
     def federation_member_payload(self, status: dict[str, Any], root_certificate: str | None = None,
@@ -3225,6 +3231,32 @@ class Cluster:
         tombstone_types = {"member.revoke", "revocation.proof", "user.delete", "device.delete", "token.delete"}
         incoming_tombstone = event["type"] in tombstone_types
         permanent_prefix = str(event["entity_key"]).split(":", 1)[0] in {"member", "user", "device", "token"}
+        if current and int(current["deleted"]) and event["type"] == "member.upsert":
+            # A fresh peer may replay the revocation before an older introduction
+            # from another author. Retain that historical verification key with
+            # its revocation boundary, never as an active trust/client identity.
+            incoming_key = self._event_sort_key(event)
+            if incoming_key >= (int(current["lamport"]), str(current["author_id"]), str(current["event_id"])):
+                return  # Later introductions cannot revive a retired identity.
+            status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+            member_id = str(status.get("node_id", ""))
+            proof = self.db.connection.execute(
+                "SELECT created_at,payload,event_id FROM federation_events WHERE event_id=?",
+                (current["event_id"],),
+            ).fetchone()
+            if not proof or current["type"] not in {"member.revoke", "revocation.proof"}:
+                raise ClusterError("成员撤销墓碑缺少可验证事件")
+            proof_payload = json.loads(proof["payload"])
+            if proof_payload.get("node_id") != member_id:
+                raise ClusterError("历史成员证书与撤销墓碑不一致")
+            self.register_federation_key(
+                member_id, str(payload.get("root_certificate", "")), str(payload.get("identity_certificate", "")),
+                revocation=(max(1, int(proof["created_at"])), max(0, int(proof_payload.get("revoked_after_seq", 0))), str(proof["event_id"])),
+            )
+            claim = self.db.connection.execute("SELECT * FROM federation_number_claims WHERE node_id=?", (member_id,)).fetchone()
+            if not claim or incoming_key > (int(claim["lamport"]), str(claim["author_id"]), str(claim["event_id"])):
+                self._record_number_claim(event, member_id, payload)
+            return
         if event["type"] in {"member.revoke", "revocation.proof"}:
             node_id = str(payload.get("node_id", str(event["entity_key"]).removeprefix("member:")))
             cutoff = max(0, int(payload.get("revoked_after_seq", 0)))

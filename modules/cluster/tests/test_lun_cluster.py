@@ -1230,6 +1230,37 @@ class ClusterTestCase(unittest.TestCase):
             self.assertIn("pki/cluster-ca.key", archive.getnames())
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_new_peer_can_import_history_with_revocation_before_membership(self) -> None:
+        peers = []
+        try:
+            for index, letter in enumerate("abcd"):
+                with mock.patch.object(lun_cluster, "random_node_id", return_value=letter * 32):
+                    peers.append(self._federation_cluster("history-" + letter, 28001 + index))
+            anchor, retired, introducer, newcomer = peers
+            retired_id = retired.load_config()["node_id"]
+            introducer.federation_register_peer(retired.federation_public_bundle())
+            bundle = introducer.federation_public_bundle()
+            anchor.import_federation_bundle(bundle, allow_cluster_adopt=True)
+            anchor.confirm_federation_member(bundle)
+            anchor.revoke_member(retired_id)
+            newcomer.import_federation_bundle(anchor.federation_public_bundle(), allow_cluster_adopt=True)
+            key = newcomer.db.connection.execute("SELECT * FROM federation_keys WHERE node_id=?", (retired_id,)).fetchone()
+            self.assertIsNotNone(key)
+            self.assertGreater(key["revoked_at"], 0)
+            self.assertTrue(newcomer.federation_cleanup_plan(retired_id)["revoked"])
+            self.assertIsNotNone(newcomer.db.connection.execute("SELECT server_number FROM node_number_history WHERE node_id=?", (retired_id,)).fetchone())
+            self.assertEqual(newcomer.load_config()["node_id"], "d" * 32)
+            self.assertNotIn(retired_id, {str(row["id"]) for row in newcomer.trusted_federation_nodes()})
+            certificate = retired.federation_root_certificate()
+            self.assertNotIn(certificate.strip(), newcomer.federation_trust_bundle().read_text())
+            late = retired.create_event("node.metadata", "node:" + retired_id, {"node_id": retired_id, "status": retired.local_status()})
+            with self.assertRaises(lun_cluster.ClusterError):
+                newcomer.ingest_event(late)
+        finally:
+            for peer in peers:
+                peer.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_third_node_dependency_join_root_immutability_and_failed_pairing(self) -> None:
         first = self._federation_cluster("join-first", 27001)
         second = self._federation_cluster("join-second", 27002)

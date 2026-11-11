@@ -8,7 +8,7 @@ mkdir -p "$HOME/bin" "$TMP/empty" "$TMP/system"
 load(){
   eval "$(awk -v name="$1" '$0 ~ "^" name "\\(\\)\\{" {p=1; print; next} p && /^[A-Za-z_][A-Za-z_0-9]*\(\)\{/ {exit} p {print}' "$ROOT/lun.sh")"
 }
-for name in download_lun_script lun_script_version lun_version_is_older lun_install_update_stage \
+for name in download_lun_update_bridge download_lun_script lun_script_version lun_version_is_older lun_install_update_stage \
     lun_sync_secondary_entry update_lun_script lun_reopen_updated_menu lun_init_colors service_update_menu; do load "$name"; done
 yellow_line(){ :; }; green_line(){ :; }; red_line(){ :; }; ui_title(){ :; }; ui_pause(){ :; }
 ENTRY="$TMP/system/lun"
@@ -16,16 +16,26 @@ REMOTE="$TMP/remote"
 lun_update_target(){ printf '%s\n' "$ENTRY"; }
 fixture(){ printf '#!/usr/bin/env bash\n# V%s\n# Lun 项目地址\nprintf "%%s\\n" "%s"\n' "$2" "$3" > "$1"; }
 curl(){
-  local output= previous= argument
+  local output= previous= argument url= blob
   [[ ${download_ok:-yes} == yes ]] || return 1
   for argument; do
     [[ $previous != -o ]] || output=$argument
+    case "$argument" in https://*) url=$argument ;; esac
     previous=$argument
   done
   [[ -n $output ]] || return 1
-  cp "$REMOTE" "$output"
+  case "$url" in
+    *upgrade.sh*) cp "$ROOT/upgrade.sh" "$output" ;;
+    */commits/main*) printf '%040d\n' 1 > "$output" ;;
+    */contents/lun.sh*)
+      blob=$({ printf 'blob %s\0' "$(wc -c < "$REMOTE" | tr -d '[:space:]')"; cat "$REMOTE"; } | sha1sum | awk '{print $1}')
+      printf '{\n  "sha": "%s"\n}\n' "$blob" > "$output" ;;
+    *) cp "$REMOTE" "$output" ;;
+  esac
 }
 wget(){ return 1; }
+export -f curl wget
+export REMOTE ROOT
 
 fixture "$ENTRY" 26.10.20.3 old
 fixture "$HOME/bin/lun" 26.10.20.3 secondary-old
@@ -59,11 +69,22 @@ fixture "$REMOTE" 26.10.24.2 syntax-check
 printf 'if broken\n' >> "$REMOTE"
 ! update_lun_script
 cmp "$ENTRY" "$TMP/expected"
-download_ok=no
+export download_ok=no
 ! update_lun_script
 cmp "$ENTRY" "$TMP/expected"
 [[ -z $LUN_UPDATED_ENTRY ]]
 echo 'ok - same-version changes, verified no-op, downgrade and corrupt/download failures'
+
+(
+  # Regression guard: even a future helper leaking a dynamic variable must fail
+  # closed rather than compare the downloaded file with itself.
+  download_lun_script(){ cp "$REMOTE" "$1"; target=$1; }
+  fixture "$REMOTE" 26.10.24.3 leak-regression
+  ! update_lun_script
+  cmp "$ENTRY" "$TMP/expected"
+  [[ -z $LUN_UPDATED_ENTRY ]]
+)
+echo 'ok - a leaked update target cannot produce a false latest-version result'
 
 (
   update_local_lun_bundle(){ LUN_UPDATED_ENTRY=$ENTRY; return 1; } # Core failure must not strand a successfully updated menu.
