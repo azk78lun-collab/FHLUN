@@ -1,8 +1,13 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.11.5`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.12.1`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.11.5`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.12.1`.
+
+## 2026 年 11 月 12 日
+
+- `V26.11.12.1` / 集群 `0.3.6`：每 6 小时交叉确认公网地址，与每日离线巡检独立。地址变化后事务更新本机连接地址及个人/多用户订阅，保留域名、凭据、端口和联邦身份，签名广播元数据并推送新订阅；失败保留待补发，不计入离线判定。不自动重新配对，不修改 DNS 记录或内核。
+- `V26.11.12.1` / cluster `0.3.6`: Cross-check public addresses every six hours independently of daily health checks. Transactionally refresh local connection addresses and subscriptions, preserve domains, credentials, ports and federation identity, then broadcast signed metadata and snapshots. Retry pending delivery without counting endpoint-check failures as health failures. No automatic pairing, DNS edits or core updates.
 
 ## 阅读说明 Reading guide
 

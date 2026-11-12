@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -58,6 +58,7 @@ ROLE_TRANSFER_TTL = 15 * 60
 FEDERATION_FANOUT = 10
 FEDERATION_FANOUT_TTL = 180
 HEALTH_CHECK_INTERVAL = 24 * 60 * 60
+ENDPOINT_CHECK_INTERVAL = 6 * 60 * 60
 HEALTH_CHECK_TIMEOUT = 4
 HEALTH_DELIVERY_RETRY = 60
 HEALTH_FAILURE_WINDOW = HEALTH_CHECK_INTERVAL * 3 + 60
@@ -228,6 +229,52 @@ def normalize_host(value: str) -> str:
 
 def uri_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def replace_subscription_addresses(text: str, filename: str, replacements: dict[str, str]) -> str:
+    """Replace connection addresses only, not SNI, credentials, paths or CDN IPs."""
+    def host(value: Any) -> Any:
+        return replacements.get(str(value).strip("[]"), value)
+
+    def link(line: str) -> str:
+        if line.startswith("vmess://"):
+            value = json.loads(b64decode(line.split("://", 1)[1]))
+            if host(value.get("add", "")) == value.get("add", ""):
+                return line
+            value["add"] = host(value.get("add", ""))
+            return "vmess://" + base64.b64encode(json_dumps(value).encode()).decode()
+        parsed = urllib.parse.urlsplit(line)
+        if parsed.scheme in {"ss", "socks", "socks5"} and "@" not in parsed.netloc:
+            body, marker, label = line.split("://", 1)[1].partition("#")
+            decoded = b64decode(body).decode()
+            fixed = link("http://" + decoded).split("://", 1)[1]
+            return parsed.scheme + "://" + base64.b64encode(fixed.encode()).decode() + marker + label
+        if not parsed.hostname or host(parsed.hostname) == parsed.hostname:
+            return line
+        credentials, marker, _authority = parsed.netloc.rpartition("@")
+        authority = (credentials + marker if marker else "") + uri_host(str(host(parsed.hostname)))
+        if parsed.port:
+            authority += ":" + str(parsed.port)
+        return urllib.parse.urlunsplit((parsed.scheme, authority, parsed.path, parsed.query, parsed.fragment))
+
+    if filename == "sbox.json":
+        data = json.loads(text)
+        before = copy.deepcopy(data)
+        for outbound in data.get("outbounds", []):
+            if "server" in outbound:
+                outbound["server"] = host(outbound["server"])
+        return text if data == before else json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    if filename == "clmi.yaml":
+        def server(match: re.Match[str]) -> str:
+            address = match[2].strip().strip("\"'")
+            updated = host(address)
+            return match[0] if updated == address else match[1] + json.dumps(updated)
+        return re.sub(r"(?m)^([ \t]*server:[ \t]*)([^\r\n]+)$", server, text)
+    encoded = "://" not in text and bool(text.strip())
+    source = b64decode(text).decode() if encoded else text
+    result = "\n".join(link(line) if "://" in line else line for line in source.splitlines())
+    result += "\n" if source.endswith("\n") else ""
+    return base64.b64encode(result.encode()).decode() if encoded else result
 
 
 def normalize_country_code(value: str) -> str:
@@ -2659,6 +2706,7 @@ class Cluster:
             "pending": pending if isinstance(pending, dict) else {},
             "successful": successful if isinstance(successful, dict) else {},
             "last_checked": int(self.db.setting("federation.endpoint.last_checked", "0") or 0),
+            "check_interval_seconds": ENDPOINT_CHECK_INTERVAL,
             "changed_at": int(self.db.setting("federation.endpoint.changed_at", "0") or 0),
         }
 
@@ -2689,24 +2737,100 @@ class Cluster:
         old_hosts = order_public_hosts(
             config.get("public_hosts", []) if isinstance(config.get("public_hosts"), list) else [], old_host
         )
-        new_hosts = order_public_hosts(public_hosts or [], new_host)
-        new_host = new_hosts[0]
-        with contextlib.suppress(ValueError, ClusterError):
-            if normalize_public_ip(old_host) == new_host and old_hosts == new_hosts:
-                return {"changed": False, "old_host": old_host, "new_host": new_host,
-                        "old_hosts": old_hosts, "new_hosts": new_hosts, "event": None}
+        detected = order_public_hosts(public_hosts or [], new_host)
+        ips = {ipaddress.ip_address(item).version: item for item in detected}
+        preferred = old_host
         try:
             ipaddress.ip_address(old_host.strip().strip("[]"))
+            preferred = new_host
+            for filename in ("domain", "addym"):
+                candidate = self.root / filename
+                if not candidate.is_file():
+                    continue
+                name = normalize_host(candidate.read_text().strip())
+                with contextlib.suppress(ValueError):
+                    ipaddress.ip_address(name)
+                    continue
+                try:
+                    resolved = {str(ipaddress.ip_address(item[4][0])) for item in
+                                socket.getaddrinfo(name, None, type=socket.SOCK_STREAM)}
+                except OSError:
+                    continue
+                if resolved and resolved.issubset(set(detected)):
+                    preferred = name
+                    break
         except ValueError:
-            raise ClusterError("联邦当前公布的是域名，不会自动改为 IP")
+            pass  # An explicit stable domain is not replaced by a detected IP.
+        new_host = preferred
+        new_hosts = order_public_hosts(detected, preferred)
+        metadata_changed = old_host != new_host or old_hosts != new_hosts
+        old_ips = set()
+        for item in [old_host, *old_hosts, *(self._read_text_file(n) for n in ("server_ip.log", "server_ip6.log"))]:
+            with contextlib.suppress(ValueError):
+                old_ips.add(str(ipaddress.ip_address(item.strip("[]"))))
+        replacements = {old: ips[ipaddress.ip_address(old).version] for old in old_ips
+                        if ipaddress.ip_address(old).version in ips}
+        preferred_is_ip = False
+        with contextlib.suppress(ValueError):
+            ipaddress.ip_address(preferred)
+            preferred_is_ip = True
+        if (not preferred_is_ip and self._read_text_file("address_mode") in {"", "domain"}
+                and self._read_text_file("addout") != "both"):
+            replacements = {old: preferred for old in replacements}
+        staged: dict[Path, bytes] = {}
+        roots = [self.root, self.root / "modules/multiuser/generated"]
+        for filename in SUBSCRIPTION_FILES:
+            targets = [self.root / filename, *(roots[1].glob("*/" + filename))]
+            token = self._read_text_file("subtoken.log")
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", token):
+                targets.append(self.root.parent / "weblun" / token / filename)
+            for target in targets:
+                if not target.is_file() or target.is_symlink():
+                    continue
+                if not any(target.resolve().is_relative_to(root.resolve()) for root in
+                           (self.root, self.root.parent / "weblun")):
+                    raise ClusterError("订阅文件越过本机目录，未更新地址")
+                if target.stat().st_size > MAX_BODY:
+                    raise ClusterError("订阅文件过大，未更新地址")
+                before = target.read_text(encoding="utf-8")
+                try:
+                    after = replace_subscription_addresses(before, filename, replacements)
+                except (ValueError, UnicodeError, binascii.Error) as exc:
+                    raise ClusterError("订阅格式异常，未发布新地址：" + filename) from exc
+                if before != after:
+                    staged[target] = after.encode()
+        for filename, value in (("server_ip.log", ips.get(4) or uri_host(ips[6])),
+                                ("server_ip6.log", uri_host(ips[6]) if 6 in ips else "")):
+            if value and ((self.root / filename).exists() or (self.root / "jhsub.txt").exists()):
+                staged[self.root / filename] = (value + "\n").encode()
+        mu_config_path = self.root / "modules/multiuser/config.json"
+        if mu_config_path.is_file():
+            mu_config = json.loads(mu_config_path.read_text())
+            if str(mu_config.get("public_host", "")).strip("[]") in old_ips:
+                mu_config["public_host"] = preferred
+                staged[mu_config_path] = (json.dumps(mu_config, ensure_ascii=False, indent=2) + "\n").encode()
+        staged = {path: value for path, value in staged.items() if not path.exists() or path.read_bytes() != value}
+        if sum(map(len, staged.values())) > 8 * MAX_BODY:
+            raise ClusterError("本机订阅更新超过事务内存上限，原地址未改动")
+        if not metadata_changed and not staged:
+            return {"changed": False, "old_host": old_host, "new_host": new_host,
+                    "old_hosts": old_hosts, "new_hosts": new_hosts, "event": None}
         original = json.loads(json.dumps(config))
         original_status = self.local_status()
         config["public_host"] = new_host
         config["public_hosts"] = new_hosts
+        backups = {path: (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None for path in staged}
         try:
+            for path, value in staged.items():
+                atomic_write(path, value, backups[path][1] if backups[path] else 0o600)
             self.save_config(config)
-            event = self.publish_local_node_metadata()
+            event = self.publish_local_node_metadata() if metadata_changed else None
         except Exception:
+            for path, before in backups.items():
+                if before is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, before[0], before[1])
             self.save_config(original)
             self.upsert_node(original_status, role="federation")
             raise
@@ -2716,6 +2840,10 @@ class Cluster:
                       f"{old_host}->{new_host}")
         return {"changed": True, "old_host": old_host, "new_host": new_host,
                 "old_hosts": old_hosts, "new_hosts": new_hosts, "event": event}
+
+    def _read_text_file(self, filename: str) -> str:
+        path = self.root / filename
+        return path.read_text().strip() if path.is_file() else ""
 
     def _sign_federation(self, content: bytes) -> str:
         key = self.pki / "federation-root.key"
@@ -4871,24 +4999,30 @@ def serve(cluster: Cluster) -> None:
         while not maintenance_ready.wait(1):
             if stopping.is_set():
                 return
-        first_round = True  # Initial maintenance already checks the endpoint.
         while not stopping.is_set():
             started = time.monotonic()
             try:
                 if cluster.is_federation():
-                    if not first_round:
-                        try:
-                            reconcile_federation_endpoint(cluster)
-                        except (ClusterError, OSError, sqlite3.Error) as exc:
-                            sys.stderr.write(f"federation endpoint check failed: {exc}\n")
                     federation_health_round(cluster)
             except (ClusterError, OSError, sqlite3.Error) as exc:
                 sys.stderr.write(f"federation health check failed: {exc}\n")
             finally:
                 cluster.close()
-            first_round = False
             if stopping.wait(max(1, HEALTH_CHECK_INTERVAL - (time.monotonic() - started))):
                 return
+
+    def endpoint_loop() -> None:
+        while not maintenance_ready.wait(1):
+            if stopping.is_set():
+                return
+        while not stopping.wait(ENDPOINT_CHECK_INTERVAL):
+            try:
+                if cluster.is_federation():
+                    reconcile_federation_endpoint(cluster)
+            except (ClusterError, OSError, sqlite3.Error, ValueError) as exc:
+                sys.stderr.write(f"federation endpoint check failed: {exc}\n")
+            finally:
+                cluster.close()
 
     def delivery_loop() -> None:
         while not maintenance_ready.wait(1):
@@ -4908,6 +5042,7 @@ def serve(cluster: Cluster) -> None:
 
     if cluster.is_federation():
         threading.Thread(target=health_loop, daemon=True).start()
+        threading.Thread(target=endpoint_loop, daemon=True).start()
         threading.Thread(target=delivery_loop, daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.5)
@@ -5646,18 +5781,21 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
     checked_at = int(observed.get("checked_at", utc_now()))
     cluster.db.set_setting("federation.endpoint.last_checked", str(checked_at))
     actual = str(observed.get("ip", "")) if observed.get("confirmed") else ""
-    if actual:
-        cluster.db.set_setting("federation.endpoint.actual", actual)
     if not observed.get("confirmed"):
         cluster.db.set_setting("federation.endpoint.actual", "")
         cluster.db.audit("federation.endpoint.unconfirmed", str(config.get("node_id", "")),
                          json_dumps(observed.get("errors", {}))[-500:])
         return {"changed": False, "confirmed": False, "detection": observed,
                 "endpoint": cluster.endpoint_status(actual)}
-    with FileLock(cluster.lock_path, timeout=5):
+    with FileLock(cluster.lock_path, timeout=5), FileLock(cluster.root / "modules/multiuser/.lock", timeout=5):
         detected_hosts = observed.get("ips") if isinstance(observed.get("ips"), list) else [actual]
         local = cluster.reconcile_public_endpoint(actual, detected_hosts)
-    if not local["changed"]:
+    cluster.db.set_setting("federation.endpoint.actual", actual)
+    try:
+        pending = json.loads(cluster.db.setting("federation.endpoint.pending", "{}"))
+    except json.JSONDecodeError:
+        pending = {}
+    if not local["changed"] and not pending:
         return {"changed": False, "confirmed": True, "detection": observed,
                 "endpoint": cluster.endpoint_status(actual)}
     try:
@@ -5666,11 +5804,14 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
         propagation = {"batch_id": "", "delivered": {},
                        "failures": {"broadcast": str(exc)[-1000:]}}
     try:
-        publication = push_snapshot(cluster)
+        publication = push_snapshot(cluster, record_failures=False)
     except (ClusterError, OSError, sqlite3.Error) as exc:
         publication = {"peers": {}, "error": str(exc)[-1000:]}
     failures = dict(propagation.get("failures", {}))
-    cluster.db.set_setting("federation.endpoint.pending", json_dumps(failures))
+    failures.update({node_id: status for node_id, status in publication.get("peers", {}).items()
+                     if status != "ok"})
+    if publication.get("error"):
+        failures["snapshot"] = str(publication["error"])
     cluster.db.set_setting(
         "federation.endpoint.success",
         json_dumps({str(node_id): utc_now() for node_id in propagation.get("delivered", {})}),
@@ -5679,8 +5820,10 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
         refreshed = len(cluster.refresh_profiles())
     except (ClusterError, OSError, sqlite3.Error) as exc:
         refreshed = 0
+        failures["local-profile"] = str(exc)[-500:]
         cluster.db.audit("federation.endpoint.refresh-failed",
                          str(config.get("node_id", "")), str(exc)[-500:])
+    cluster.db.set_setting("federation.endpoint.pending", json_dumps(failures))
     return {**local, "confirmed": True, "detection": observed,
             "propagation": propagation, "publication": publication,
             "refreshed": refreshed,
@@ -5783,7 +5926,7 @@ def deliver_federation_snapshots(cluster: Cluster,
     return delivered, failures
 
 
-def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
+def push_snapshot(cluster: Cluster, profile: str = "legacy", *, record_failures: bool = True) -> dict[str, Any]:
     config = cluster.load_config()
     if cluster.is_federation():
         cluster.record_local_snapshot(profile)
@@ -5813,7 +5956,7 @@ def push_snapshot(cluster: Cluster, profile: str = "legacy") -> dict[str, Any]:
                     max_workers=min(FEDERATION_FANOUT, len(peers))) as executor:
                 for node_id, status, transport_failed, started_at in executor.map(publish_one, peers):
                     delivered[node_id] = status
-                    if transport_failed:
+                    if transport_failed and record_failures:
                         cluster.record_transport_failure(node_id, started_at=started_at)
         return {"snapshot": snapshot, "peers": delivered}
     if config.get("role") != "child" or not config.get("paired"):
@@ -7923,7 +8066,7 @@ def main(argv: list[str] | None = None) -> int:
             result = reconcile_federation_endpoint(cluster)
             if not args.json:
                 if result.get("changed"):
-                    print(f"联邦公布 IP 已从 {result['old_host']} 更新为 {result['new_host']}。")
+                    print(f"联邦公布地址已从 {result['old_host']} 更新为 {result['new_host']}，本机订阅已同步。")
                     pending = result.get("endpoint", {}).get("pending", {})
                     if pending:
                         print(terminal_color(f"仍有 {len(pending)} 个成员待后续补齐。", "33"))

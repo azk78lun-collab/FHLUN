@@ -1068,6 +1068,118 @@ class ClusterTestCase(unittest.TestCase):
         finally:
             cluster.close()
 
+    def test_endpoint_formats_only_replace_connection_addresses(self) -> None:
+        old, new = '1.1.1.1', '8.8.8.8'
+        generic = f'vless://secret@{old}:443?sni={old}&path=/{old}#node\n'
+        fixed = lun_cluster.replace_subscription_addresses(generic, 'jhsub.txt', {old: new})
+        self.assertIn('secret@8.8.8.8:443', fixed)
+        self.assertIn('sni=1.1.1.1&path=/1.1.1.1', fixed)
+        vmess = 'vmess://' + base64.b64encode(json.dumps({'add': old, 'id': 'keep', 'host': old}).encode()).decode()
+        fixed = lun_cluster.replace_subscription_addresses(vmess, 'jhsub.txt', {old: new})
+        data = json.loads(base64.b64decode(fixed.split('://')[1]))
+        self.assertEqual(data, {'add': new, 'id': 'keep', 'host': old})
+        for scheme in ('ss', 'socks'):
+            encoded = base64.b64encode(f'user:password@{old}:1080'.encode()).decode()
+            fixed = lun_cluster.replace_subscription_addresses(scheme + '://' + encoded + '#node', 'jhsub.txt', {old: new})
+            self.assertEqual(base64.b64decode(fixed.split('://')[1].split('#')[0]).decode(), 'user:password@8.8.8.8:1080')
+        ipv6 = 'tuic://user:pass@[2001:4860:4860::8888]:123?sni=keep#n'
+        self.assertIn('@[2606:4700:4700::1111]:123', lun_cluster.replace_subscription_addresses(ipv6, 'jhsub.txt', {'2001:4860:4860::8888': '2606:4700:4700::1111'}))
+        sb = json.dumps({'dns': {'servers': [old]}, 'outbounds': [{'server': old, 'password': old, 'tls': {'server_name': old}}, {'server': '104.16.1.1'}]})
+        data = json.loads(lun_cluster.replace_subscription_addresses(sb, 'sbox.json', {old: new}))
+        self.assertEqual(data['dns']['servers'], [old])
+        self.assertEqual(data['outbounds'][0], {'server': new, 'password': old, 'tls': {'server_name': old}})
+        self.assertEqual(data['outbounds'][1]['server'], '104.16.1.1')
+        yaml = f'  server: {old}\n  password: {old}\n  sni: {old}\n'
+        fixed = lun_cluster.replace_subscription_addresses(yaml, 'clmi.yaml', {old: new})
+        self.assertIn('server: "8.8.8.8"', fixed)
+        self.assertIn('password: 1.1.1.1\n  sni: 1.1.1.1', fixed)
+
+    def test_endpoint_snapshot_failures_do_not_count_as_health_failures(self) -> None:
+        self.cluster.save_config({'mode':'federation','node_id':'a'*32})
+        peer={'id':'b'*32,'endpoint_host':'8.8.8.8','endpoint_port':12345}
+        with mock.patch.object(self.cluster,'record_local_snapshot'), \
+             mock.patch.object(self.cluster,'federation_snapshot',return_value={}), \
+             mock.patch.object(self.cluster,'trusted_federation_nodes',return_value=[peer]), \
+             mock.patch.object(lun_cluster,'member_request',side_effect=lun_cluster.FederationTransportError('offline')), \
+             mock.patch.object(self.cluster,'record_transport_failure') as failed:
+            result=lun_cluster.push_snapshot(self.cluster,record_failures=False)
+            self.assertIn('failed:',result['peers']['b'*32])
+            failed.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_endpoint_promotes_matching_service_domain_and_keeps_identity_and_ports(self) -> None:
+        cluster=self._federation_cluster('endpoint-promote-domain',24217)
+        try:
+            before=cluster.load_config()
+            (cluster.root/'domain').write_text('dynamic.example.com')
+            (cluster.root/'jhsub.txt').write_text('vless://keep@8.8.8.8:123#n\n')
+            (cluster.root/'server_ip.log').write_text('8.8.8.8\n')
+            resolved=[(socket.AF_INET,socket.SOCK_STREAM,6,'',('1.1.1.1',0))]
+            with mock.patch.object(lun_cluster.socket,'getaddrinfo',return_value=resolved):
+                result=cluster.reconcile_public_endpoint('1.1.1.1')
+            self.assertTrue(result['changed'])
+            after=cluster.load_config()
+            self.assertEqual(after['public_host'],'dynamic.example.com')
+            self.assertIn('@dynamic.example.com:123', (cluster.root/'jhsub.txt').read_text())
+            for key in ('node_id','server_number','internal_port','public_port'):
+                self.assertEqual(after[key],before[key])
+        finally:cluster.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_endpoint_change_updates_local_and_device_subscriptions_and_rolls_back(self) -> None:
+        cluster = self._federation_cluster('endpoint-subscription', 24215)
+        try:
+            cfg = cluster.load_config();cfg['public_host'] = '1.1.1.1';cfg['public_hosts'] = ['1.1.1.1'];cluster.save_config(cfg)
+            cluster.upsert_node(cluster.local_status(), role='federation')
+            for root in (cluster.root, cluster.root / 'modules/multiuser/generated/kept-token'):
+                root.mkdir(parents=True, exist_ok=True)
+                (root/'jhsub.txt').write_text('vless://keep@1.1.1.1:123?sni=keep#n\n')
+            (cluster.root/'server_ip.log').write_text('1.1.1.1\n')
+            (cluster.root/'xr.json').write_text('{"listen":"::","uuid":"keep"}')
+            mu = cluster.root/'modules/multiuser/config.json'
+            mu.write_text(json.dumps({'public_host':'1.1.1.1','public_port':123,'legacy_token':'unchanged'}))
+            cluster.reconcile_public_endpoint('8.8.8.8')
+            self.assertIn('@8.8.8.8:123', (cluster.root/'jhsub.txt').read_text())
+            self.assertIn('@8.8.8.8:123', (mu.parent/'generated/kept-token/jhsub.txt').read_text())
+            self.assertEqual(json.loads(mu.read_text()), {'public_host':'8.8.8.8','public_port':123,'legacy_token':'unchanged'})
+            files = {p:p.read_bytes() for p in (mu,cluster.root/'server_ip.log',cluster.root/'jhsub.txt')}
+            with mock.patch.object(cluster,'publish_local_node_metadata',side_effect=lun_cluster.ClusterError('injected sign failure')):
+                with self.assertRaises(lun_cluster.ClusterError):cluster.reconcile_public_endpoint('9.9.9.9')
+            self.assertEqual({p:p.read_bytes() for p in files}, files)
+            self.assertEqual((cluster.root/'xr.json').read_text(), '{"listen":"::","uuid":"keep"}')
+        finally:cluster.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_endpoint_domain_survives_ip_changes_and_pending_delivery_is_retried(self) -> None:
+        cluster = self._federation_cluster('endpoint-domain', 24216)
+        try:
+            cfg=cluster.load_config();cfg['public_host']='dynamic.example.com';cfg['public_hosts']=['1.1.1.1','dynamic.example.com'];cluster.save_config(cfg)
+            (cluster.root/'server_ip.log').write_text('1.1.1.1\n')
+            (cluster.root/'jhsub.txt').write_text('vless://keep@dynamic.example.com:123#n\n')
+            detection={'confirmed':True,'ip':'8.8.8.8','ips':['8.8.8.8'],'checked_at':lun_cluster.utc_now()}
+            with mock.patch.object(lun_cluster,'broadcast_federation_events',return_value={'delivered':{},'failures':{}}), \
+                 mock.patch.object(lun_cluster,'push_snapshot',return_value={'peers':{'offline':'failed: offline'}}) as publish:
+                result=lun_cluster.reconcile_federation_endpoint(cluster,detection=detection)
+                self.assertTrue(result['changed'])
+                publish.assert_called_once_with(cluster,record_failures=False)
+            self.assertEqual(cluster.load_config()['public_host'],'dynamic.example.com')
+            self.assertIn('@dynamic.example.com:', (cluster.root/'jhsub.txt').read_text())
+            self.assertIn('offline',cluster.endpoint_status()['pending'])
+            with mock.patch.object(lun_cluster,'broadcast_federation_events',return_value={'delivered':{},'failures':{}}) as broadcast, \
+                 mock.patch.object(lun_cluster,'push_snapshot',return_value={'peers':{'offline':'ok'}}):
+                lun_cluster.reconcile_federation_endpoint(cluster,detection=detection)
+                broadcast.assert_called_once()
+            self.assertFalse(cluster.endpoint_status()['pending'])
+            cluster.db.set_setting('federation.endpoint.pending',json.dumps({'offline':'retry'}))
+            with mock.patch.object(lun_cluster,'broadcast_federation_events',return_value={'delivered':{},'failures':{}}), \
+                 mock.patch.object(lun_cluster,'push_snapshot',return_value={'peers':{}}), \
+                 mock.patch.object(cluster,'refresh_profiles',side_effect=lun_cluster.ClusterError('local cache failed')):
+                lun_cluster.reconcile_federation_endpoint(cluster,detection=detection)
+            self.assertIn('local-profile',cluster.endpoint_status()['pending'])
+            self.assertEqual(lun_cluster.ENDPOINT_CHECK_INTERVAL,21600)
+            self.assertEqual(lun_cluster.HEALTH_CHECK_INTERVAL,86400)
+        finally:cluster.close()
+
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_endpoint_reconcile_no_change_has_zero_broadcast_and_failure_rolls_back(self) -> None:
         cluster = self._federation_cluster("endpoint-stable", 24202)
@@ -1920,6 +2032,7 @@ class ClusterTestCase(unittest.TestCase):
         publish.assert_called_once_with(self.cluster)
         self.assertEqual(started.count("initial_federation_maintenance"), 1)
         self.assertEqual(started.count("health_loop"), 1)
+        self.assertEqual(started.count("endpoint_loop"), 1)
         self.assertEqual(started.count("delivery_loop"), 1)
 
     def test_serve_restart_request_exits_for_service_supervisor(self) -> None:
