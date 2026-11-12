@@ -1164,7 +1164,9 @@ class ClusterTestCase(unittest.TestCase):
                 publish.assert_called_once_with(cluster,record_failures=False)
             self.assertEqual(cluster.load_config()['public_host'],'dynamic.example.com')
             self.assertIn('@dynamic.example.com:', (cluster.root/'jhsub.txt').read_text())
-            self.assertIn('offline',cluster.endpoint_status()['pending'])
+            self.assertIn('snapshot:offline',cluster.endpoint_status()['pending'])
+            cluster.mark_endpoint_synced('offline')
+            self.assertIn('snapshot:offline',cluster.endpoint_status()['pending'])
             with mock.patch.object(lun_cluster,'broadcast_federation_events',return_value={'delivered':{},'failures':{}}) as broadcast, \
                  mock.patch.object(lun_cluster,'push_snapshot',return_value={'peers':{'offline':'ok'}}):
                 lun_cluster.reconcile_federation_endpoint(cluster,detection=detection)

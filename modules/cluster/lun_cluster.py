@@ -5808,7 +5808,9 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
     except (ClusterError, OSError, sqlite3.Error) as exc:
         publication = {"peers": {}, "error": str(exc)[-1000:]}
     failures = dict(propagation.get("failures", {}))
-    failures.update({node_id: status for node_id, status in publication.get("peers", {}).items()
+    # Event acknowledgement is not acknowledgement of the larger snapshot body.
+    # mark_endpoint_synced() may clear member IDs but must not lose snapshot retries.
+    failures.update({"snapshot:" + node_id: status for node_id, status in publication.get("peers", {}).items()
                      if status != "ok"})
     if publication.get("error"):
         failures["snapshot"] = str(publication["error"])
