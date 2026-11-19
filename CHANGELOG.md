@@ -1,8 +1,13 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.12.1`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.19.1`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.12.1`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.19.1`.
+
+## 2026 年 11 月 19 日
+
+- `V26.11.19.1` / 集群 `0.3.7`：手动同步回车默认选择全部；分开报告用户配置及节点快照同步结果。凭据校验不再扫描未授权共享的本机管理设备或已撤销成员的历史设备，并继续拦截有效授权中的重复凭据。服务器总览显示中文城市、州或国家。
+- `V26.11.19.1` / cluster `0.3.7`: Default manual sync to all members on Enter and distinguish user-sync failures from snapshot results. Exclude unauthorized local devices and revoked member history from credential validation while retaining active collision checks. Localize location labels in the server overview.
 
 ## 2026 年 11 月 12 日
 

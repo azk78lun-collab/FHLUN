@@ -101,7 +101,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.12.1"
+echo "当前版本：V26.11.19.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4549,7 +4549,7 @@ for row in sorted(rows, key=lambda item: int(item.get("server_number") or 999999
         label = state.get(raw, "未知")
     number = int(row.get("server_number") or 0)
     number = f"{number:02d}" if number and number < 100 else str(number or "-")
-    region = str(row.get("region") or row.get("country") or "未设置地区")
+    region = str(row.get("display_place") or row.get("city") or row.get("region") or row.get("country") or "未设置地区")
     port = row.get("public_port") or row.get("endpoint_port") or "-"
     addresses = " / ".join(f"[{host}]:{port}" if ":" in host else f"{host}:{port}" for host in hosts)
     print(f"{number:<5} {label:<22} {region:<20} {addresses}")
@@ -5787,21 +5787,33 @@ ui_pause
 }
 
 cluster_sync_ui(){
-cluster_cmd endpoint-reconcile || yellow_line "未能确认本机公网 IP；本次继续同步已有联邦事件。"
-printf "节点 ID（输入 all 同步全部，输入 0 返回）："
-IFS= read -r cluster_node_id
-[ "$cluster_node_id" = 0 ] && return
+local cluster_node_id cluster_ids cluster_id user_rc=0 node_rc=0
+printf "节点 ID（回车同步全部，输入 0 返回）："
+IFS= read -r cluster_node_id || return 0
+[ "$cluster_node_id" = 0 ] && return 0
+cluster_node_id=${cluster_node_id:-all}
 if [ "$cluster_node_id" = all ]; then
-cluster_cmd sync-users || true
-cluster_trusted_member_ids | while read -r cluster_id; do
-cluster_cmd sync --node-id "$cluster_id" || true
-done
+cluster_ids=$(cluster_trusted_member_ids) || { red_line "无法读取可信成员列表。"; return 1; }
 else
 cluster_node_allowed "$cluster_node_id" || return 1
-cluster_cmd sync-users --node-id "$cluster_node_id" || true
-cluster_cmd sync --node-id "$cluster_node_id"
+cluster_ids=$cluster_node_id
 fi
+cluster_cmd endpoint-reconcile || yellow_line "未能确认本机公网 IP；本次继续同步已有联邦事件。"
+if [ "$cluster_node_id" = all ]; then
+cluster_cmd sync-users || user_rc=1
+else
+cluster_cmd sync-users --node-id "$cluster_node_id" || user_rc=1
+fi
+while IFS= read -r cluster_id; do
+[ -n "$cluster_id" ] || continue
+cluster_cmd sync --node-id "$cluster_id" || node_rc=1
+done <<EOF
+$cluster_ids
+EOF
 cluster_refresh_profiles_async
+[ "$user_rc" = 0 ] || yellow_line "用户配置同步未完成；上面的节点状态和订阅快照结果独立有效。"
+[ "$node_rc" = 0 ] || yellow_line "部分节点或订阅快照同步未完成，请检查上面的报错。"
+[ "$user_rc" = 0 ] && [ "$node_rc" = 0 ]
 }
 
 cluster_join_ui(){

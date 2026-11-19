@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.11.12.1'
+contains "$SCRIPT" '当前版本：V26.11.19.1'
 contains "$SCRIPT" '自动巡检：每天一次'
 contains "$SCRIPT" '"suspect": "疑似离线"'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
@@ -46,8 +46,28 @@ TRUSTED=$(section "$SCRIPT" cluster_trusted_member_ids)
 printf '%s\n' "$TRUSTED" | grep -Fq 'row.get("trusted") is not True' || fail 'trusted member list ignores backend trusted flag'
 SHOW_NODES=$(section "$SCRIPT" cluster_show_nodes)
 printf '%s\n' "$SHOW_NODES" | grep -Fq 'row.get("trusted") is not True' || fail 'display state does not expose untrusted backend records'
+printf '%s\n' "$SHOW_NODES" | grep -Fq 'row.get("display_place")' || fail 'menu ignores localized region'
 UNTRUSTED=$(section "$SCRIPT" cluster_untrusted_member_numbers)
 printf '%s\n' "$UNTRUSTED" | grep -Fq 'row.get("trusted") is not True' || fail 'automatic update exclusion ignores backend trusted flag'
+
+(
+  eval "$(section "$SCRIPT" cluster_sync_ui)"
+  cluster_trusted_member_ids() { printf '%s\n' 03 10; }
+  cluster_node_allowed() { [[ $1 == 10 ]]; }
+  cluster_refresh_profiles_async() { printf '%s\n' 'refresh'; }
+  yellow_line() { printf '%s\n' "$*"; }
+  red_line() { printf '%s\n' "$*"; }
+  cluster_cmd() { printf 'CMD %s\n' "$*"; [[ $1 != "${FAIL_COMMAND:-}" ]]; }
+  all=$(cluster_sync_ui <<< "")
+  [[ $all == "$(cluster_sync_ui <<< all)" ]] || fail 'Enter does not match all'
+  [[ $all == *'CMD sync --node-id 03'* && $all == *'CMD sync --node-id 10'* ]] || fail 'Enter did not sync all peers'
+  selected=$(cluster_sync_ui <<< 10)
+  [[ $selected == *'CMD sync-users --node-id 10'* && $selected != *'--node-id 03'* ]] || fail 'single node sync changed'
+  cancelled=$(cluster_sync_ui <<< 0)
+  [[ $cancelled != *'CMD '* ]] || fail 'cancel still performs sync'
+  if partial=$(FAIL_COMMAND=sync-users cluster_sync_ui <<< ""); then fail 'user sync failure reported as success'; fi
+  [[ $partial == *'CMD sync --node-id 10'* && $partial == *'用户配置同步未完成'* ]] || fail 'partial sync wrongly stops snapshots or hides user failure'
+)
 
 PUSH=$(section "$SCRIPT" cluster_push_event)
 printf '%s\n' "$PUSH" | grep -Fq 'cluster_cmd push' || fail 'rebuild publication missing push'

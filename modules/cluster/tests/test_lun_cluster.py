@@ -218,6 +218,88 @@ class ClusterTestCase(unittest.TestCase):
         self.assertIn("美国-洛杉矶", text)
         self.assertNotIn(first[:8], text)
         self.assertEqual(lun_cluster.infer_country_code("美国-洛杉矶"), "US")
+
+    def test_node_json_localizes_known_cities_and_falls_back_to_region(self) -> None:
+        first, second = "a" * 32, "b" * 32
+        self._add_node(first, "DE")
+        self._add_node(second, "US")
+        self.cluster.set_location(first, "DE", "Germany", "Hessen", "Frankfurt am Main")
+        self.cluster.set_location(second, "US", "United States", "California", "San Jose")
+        rows = self.cluster.nodes()
+        self.assertEqual([row["display_place"] for row in rows], ["德国-法兰克福", "美国-圣何塞"])
+        self.assertEqual([row["region"] for row in rows], ["Hessen", "California"])
+        for location, expected in (
+            ({"country_code": "DE", "region": "Hessen", "city": "Unmapped"}, "德国-黑森州"),
+            ({"country_code": "US", "region": "California"}, "美国-加利福尼亚州"),
+            ({"country_code": "JP", "region": "日本-箕面"}, "日本-大阪"),
+            ({"country_code": "JP", "city": "Unmapped"}, "日本"),
+        ):
+            with self.subTest(location=location):
+                self.assertEqual(lun_cluster.chinese_place(location), expected)
+
+    def test_federation_user_projection_ignores_unassigned_and_revoked_credentials(self) -> None:
+        local, active, unassigned, revoked = (char * 32 for char in "abcd")
+        self.cluster.save_config({"mode": "federation", "node_id": local})
+        for member in (local, active, unassigned, revoked):
+            self._add_node(member, "US")
+            self.cluster.db.connection.execute(
+                "INSERT INTO federation_keys(node_id,root_certificate,revoked_at,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (member, "unused-in-projection-test", int(member == revoked), 1, 1),
+            )
+        device = self._sample_federation_user_bundle(1)["users"][0]["devices"][0]
+
+        def seed(owner, nodes, token):
+            user_key = owner + ":user:7"
+            device_key = user_key + ":device:" + device["uuid"]
+            shared = {"owner_id": owner, "user_key": user_key}
+            rows = (
+                ("user.upsert", "user:" + user_key, {**shared, "name": "fixture"}),
+                ("authorization.upsert", "authorization:" + user_key, {**shared, "nodes": nodes}),
+                ("device.upsert", "device:" + device_key, {**shared, **device, "device_key": device_key}),
+                ("token.upsert", "token:" + device_key, {**shared, "device_key": device_key, "token": token}),
+            )
+            with self.cluster.db.connection:
+                self.cluster.db.connection.executemany(
+                    "INSERT OR REPLACE INTO federation_entities(entity_key,type,payload,lamport,author_id,event_id,updated_at) "
+                    "VALUES(?,?,?,1,?,'fixture',1)",
+                    [(key, kind, json.dumps(payload), owner) for kind, key, payload in rows],
+                )
+
+        seed(active, [local, revoked], device["token"])
+        seed(unassigned, [], device["uuid"])  # A legacy personal Token can equal its UUID.
+        seed(revoked, [local], device["token"])  # Retired identity kept in the event history.
+        with mock.patch.object(self.cluster, "_apply_federation_user_bundle",
+                               return_value={"users": 1}) as apply:
+            result = self.cluster.apply_federation_users(refresh=False)
+            self.assertEqual(result["users"], 1)
+            self.assertEqual(result["profiles"], 1)
+            self.assertEqual(len(apply.call_args.args[0]["users"]), 1)
+            selector = self.cluster.db.connection.execute("SELECT selector FROM profiles").fetchone()[0]
+            self.assertEqual(selector, "nodes:" + local)
+            apply.reset_mock()
+
+            # Two different authorized devices with the same UUID are still rejected.
+            seed(unassigned, [local], "another_subscription_token")
+            with mock.patch.object(self.cluster, "ensure_profile") as write_profile:
+                with self.assertRaisesRegex(lun_cluster.ClusterError, "UUID 或订阅 Token 重复"):
+                    self.cluster.apply_federation_users(refresh=False)
+            write_profile.assert_not_called()
+            apply.assert_not_called()
+
+    def test_sync_users_cli_reports_partial_failure_without_claiming_success(self) -> None:
+        result = {"failures": {"b" * 32: "fixture failure"}}
+        command = ["--root", str(self.root)]
+        for json_output in (False, True):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                    mock.patch.object(lun_cluster, "sync_cluster_users", return_value=result):
+                rc = lun_cluster.main(command + (["--json"] if json_output else []) + ["sync-users"])
+            self.assertEqual(rc, 1)
+            if json_output:
+                self.assertEqual(json.loads(stdout.getvalue()), result)
+            else:
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("1 个成员同步失败", stderr.getvalue())
         self.assertEqual(
             lun_cluster.chinese_place({"country_code": "DE", "region": "德国-法兰克福"}),
             "德国-法兰克福",

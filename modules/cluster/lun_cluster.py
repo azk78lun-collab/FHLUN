@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -105,10 +105,15 @@ COUNTRY_NAMES_ZH = {
     "TW": "中国台湾", "US": "美国",
 }
 CITY_NAMES_ZH = {
-    "frankfurt": "法兰克福", "hong kong": "香港", "london": "伦敦",
-    "los angeles": "洛杉矶",
+    "frankfurt": "法兰克福", "frankfurt am main": "法兰克福",
+    "hong kong": "香港", "london": "伦敦", "los angeles": "洛杉矶",
+    "san jose": "圣何塞", "san josé": "圣何塞",
     "minoh": "大阪", "osaka": "大阪", "seoul": "首尔", "singapore": "新加坡",
     "tokyo": "东京",
+}
+REGION_NAMES_ZH = {
+    ("DE", "hesse"): "黑森州", ("DE", "hessen"): "黑森州",
+    ("US", "california"): "加利福尼亚州",
 }
 PLACE_LABEL_ALIASES_ZH = {"日本-箕面": "日本-大阪", "箕面": "大阪"}
 STATE_NAMES_ZH = {"online": "在线", "unreachable": "离线", "unknown": "待检测",
@@ -292,11 +297,16 @@ def infer_country_code(value: str) -> str:
 
 def chinese_place(row: dict[str, Any]) -> str:
     code = normalize_country_code(str(row.get("country_code", "")))
+    city = canonical_place_label(str(row.get("city") or ""))
+    region = canonical_place_label(str(row.get("region") or ""))
     country = COUNTRY_NAMES_ZH.get(code, "")
-    detail = canonical_place_label(str(row.get("city") or row.get("region") or ""))
-    if detail:
-        detail = CITY_NAMES_ZH.get(detail.lower(), detail if re.search(r"[\u3400-\u9fff]", detail) else "")
-        detail = canonical_place_label(detail)
+    if not country and re.search(r"[\u3400-\u9fff]", str(row.get("country") or "")):
+        country = safe_label(str(row["country"]))
+    detail = next((value for value in (
+        CITY_NAMES_ZH.get(city.casefold(), city if re.search(r"[\u3400-\u9fff]", city) else ""),
+        REGION_NAMES_ZH.get((code, region.casefold())),
+        CITY_NAMES_ZH.get(region.casefold(), region if re.search(r"[\u3400-\u9fff]", region) else ""),
+    ) if value), "")
     if country and detail and (detail == country or detail.startswith(country + "-") or detail.startswith(country + " ")):
         return detail
     if country and detail:
@@ -1239,8 +1249,10 @@ class Cluster:
                 "WHERE k.revoked_at=0 AND n.state NOT IN ('legacy-unverified','revoked','removed')"
             )}
         result: list[dict[str, Any]] = []
+        places = numbered_place_labels(rows)
         for row in rows:
             item = dict(row)
+            item["display_place"] = places[str(row["id"])]
             try:
                 stored_hosts = json.loads(str(item.get("endpoint_hosts") or "[]"))
             except json.JSONDecodeError:
@@ -3161,8 +3173,9 @@ class Cluster:
             if isinstance(payload, dict):
                 entities[str(row["entity_key"])] = (str(row["type"]), payload, bool(row["deleted"]))
         local_id = str(self.load_config().get("node_id", ""))
+        trusted_ids = {str(row["id"]) for row in self.trusted_federation_nodes(include_self=True)}
         bundle_users: list[dict[str, Any]] = []
-        active_profile_ids: set[int] = set()
+        profiles: list[tuple[str, str, str]] = []
         seen_agent_keys: dict[str, str] = {}
         devices_by_user: dict[str, list[dict[str, Any]]] = {}
         tokens_by_device: dict[str, tuple[str, dict[str, Any], bool]] = {}
@@ -3175,18 +3188,19 @@ class Cluster:
         for entity_key, (event_type, user, deleted) in sorted(entities.items()):
             if not entity_key.startswith("user:") or event_type != "user.upsert" or deleted:
                 continue
+            if str(user.get("owner_id", "")) not in trusted_ids or user.get("manual_disabled", False):
+                continue
             user_key = str(user.get("user_key", ""))
             authorization = entities.get("authorization:" + user_key)
             if not authorization or authorization[2] or authorization[0] != "authorization.upsert":
-                nodes: list[str] = []
-                permissions: dict[str, bool] = {}
-                authorized = False
-            else:
-                auth = authorization[1]
-                nodes = [str(value) for value in auth.get("nodes", [])]
-                permissions = {str(key): bool(value) for key, value in auth.get("permissions", {}).items()}
-                authorized = bool(auth.get("enabled", True)) and not bool(auth.get("deleted", False))
-            authorized = authorized and not bool(user.get("manual_disabled", False))
+                continue
+            auth = authorization[1]
+            nodes = [str(value) for value in auth.get("nodes", []) if str(value) in trusted_ids]
+            # Unassigned local devices and revoked owners remain signed history,
+            # not active users or subscriptions that reserve shared credentials.
+            if not nodes or not auth.get("enabled", True) or auth.get("deleted", False):
+                continue
+            permissions = {str(key): bool(value) for key, value in auth.get("permissions", {}).items()}
             agent_key = self._federation_agent_user_key(user_key)
             collision = seen_agent_keys.get(agent_key)
             if collision and collision != user_key:
@@ -3204,7 +3218,7 @@ class Cluster:
                 token = str(token_payload.get("token", ""))
                 for credential in (str(device.get("uuid", "")), token):
                     if credential in seen_credentials:
-                        raise ClusterError("federation device UUID or token is duplicated")
+                        raise ClusterError("有效联邦授权中的设备 UUID 或订阅 Token 重复；未写入本轮用户配置")
                     seen_credentials.add(credential)
                 enabled = bool(device.get("enabled", True)) and bool(token_payload.get("enabled", True))
                 devices.append({
@@ -3213,11 +3227,10 @@ class Cluster:
                     "password": str(device.get("password", "")), "ss_password": str(device.get("ss_password", "")),
                     "token": token, "enabled": enabled,
                 })
-                if authorized and enabled and nodes:
+                if enabled:
                     profile_name = safe_label(f"用户 {agent_key} {user.get('name', '')} / {device.get('name', '')}")
-                    profile = self.ensure_profile(profile_name, "nodes:" + ",".join(nodes), token, token)
-                    active_profile_ids.add(int(profile["id"]))
-            if authorized and local_id in nodes and user.get("owner_id") != local_id:
+                    profiles.append((profile_name, "nodes:" + ",".join(nodes), token))
+            if local_id in nodes and user.get("owner_id") != local_id:
                 bundle_users.append({
                     "key": agent_key, "name": str(user.get("name", "")),
                     "manual_disabled": False, "lifetime_quota": int(user.get("lifetime_quota", 0)),
@@ -3225,6 +3238,8 @@ class Cluster:
                     "expires_at": user.get("expires_at"), "max_devices": max(int(user.get("max_devices", 1)), len(devices)),
                     "devices": devices, "permissions": permissions,
                 })
+        active_profile_ids = {int(self.ensure_profile(name, selector, token, token)["id"])
+                              for name, selector, token in profiles}
         try:
             old_values = json.loads(self.db.setting("federation.user_profile_ids", "[]") or "[]")
         except json.JSONDecodeError:
@@ -4520,7 +4535,7 @@ def print_nodes(rows: list[dict[str, Any]]) -> None:
             f"{int(row.get('number', len(values) + 1)):02d}", STATE_NAMES_ZH.get(row["state"], "异常"),
             {"master": "主机", "child": "子机", "federation": "对等节点",
              "legacy-candidate": "未验证候选"}.get(str(row["role"]), "未知"),
-            place_labels.get(str(row.get("id", "")), chinese_place(row)),
+            row.get("display_place") or place_labels.get(str(row.get("id", "")), chinese_place(row)),
             addresses or "-", row["remark"] or "-",
             iso_time(row["snapshot_at"]),
         ))
@@ -8039,7 +8054,10 @@ def main(argv: list[str] | None = None) -> int:
             print("用户服务器授权已更新。")
         elif args.command == "sync-users":
             result = sync_cluster_users(cluster, args.node_id)
-            print("主 VPS 用户、凭据、权限与订阅已同步。")
+            if not args.json:
+                if result.get("failures"):
+                    raise ClusterError(f"联邦用户同步未完成：{len(result['failures'])} 个成员同步失败")
+                print("用户、凭据、权限与订阅已同步。")
         elif args.command == "backup":
             password = read_password(args.password_file, "备份口令：")
             exporter = cluster.export_federation_backup if cluster.is_federation() else cluster.export_backup
@@ -8115,7 +8133,7 @@ def main(argv: list[str] | None = None) -> int:
             serve(cluster)
         if args.json and result is not None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        return int(args.command == "sync-users" and bool(result.get("failures")))
     except (ClusterError, sqlite3.Error, OSError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         print(terminal_color(f"错误：{exc}", "31", stream=sys.stderr), file=sys.stderr)
         return 1
