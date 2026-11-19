@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+lun_has_systemd(){
+# The same runtime marker used by sd_booted; a user systemd process is not PID 1.
+command -v systemctl >/dev/null 2>&1 && test -d /run/systemd/system
+}
+
+LUN_CLUSTER_REQUIRED_VERSION=0.3.8
 _lun_locale=$(LC_ALL=C locale -a 2>/dev/null | awk 'tolower($0) ~ /^c\.utf-?8$/ {preferred=$0} tolower($0) ~ /utf-?8$/ && !fallback {fallback=$0} END {print preferred ? preferred : fallback}')
 export LC_ALL=${_lun_locale:-C}
 export LANG="$LC_ALL"
@@ -101,7 +107,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.19.1"
+echo "当前版本：V26.11.19.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -2297,7 +2303,7 @@ done < "$saved"
 
 acme_http_owner_service(){
 local pid=$1 service exe
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 for service in nginx apache2 httpd caddy xr sb; do
 grep -Eq "/$service\\.service(/|$)" "/proc/$pid/cgroup" 2>/dev/null && { printf 'systemd|%s\n' "$service"; return; }
 done
@@ -2473,7 +2479,7 @@ exec 8> "$HOME/lun/.cert-deploy.lock"
 flock -w 30 8 || exit 1
 txn=$(mktemp -d "$HOME/lun/.cert-deploy.XXXXXX") || exit 1
 : > "$txn/services"
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 for service in nginx xr sb lun-agent; do
 systemctl is-active --quiet "$service" && printf 'systemd|%s\n' "$service" >> "$txn/services"
 done
@@ -3762,7 +3768,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
 EOF
 chain_preserve_existing_core_fields || return 1
 chain_inject_core || return 1
-if pidof systemd >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; then
+if lun_has_systemd && [ "$(id -u 2>/dev/null)" = "0" ]; then
 cat > /etc/systemd/system/xr.service <<EOF
 [Unit]
 Description=xr service
@@ -3853,7 +3859,7 @@ cat >> "$HOME/lun/sb.json" <<EOF
   }
 }
 EOF
-if pidof systemd >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; then
+if lun_has_systemd && [ "$(id -u 2>/dev/null)" = "0" ]; then
 cat > /etc/systemd/system/sb.service <<EOF
 [Unit]
 Description=sb service
@@ -3927,7 +3933,7 @@ fi
 if [ "$argo" = "vmpt" ]; then argoport=$(cat "$HOME/lun/port_vm_ws" 2>/dev/null); echo "Vmess" > "$HOME/lun/vlvm"; elif [ "$argo" = "vwpt" ]; then argoport=$(cat "$HOME/lun/port_vw" 2>/dev/null); echo "Vless" > "$HOME/lun/vlvm"; fi; echo "$argoport" > "$HOME/lun/argoport.log"
 if [ -n "${ARGO_DOMAIN}" ] && [ -n "${ARGO_AUTH}" ]; then
 argoname='固定'
-if pidof systemd >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ]; then
+if lun_has_systemd && [ "$(id -u 2>/dev/null)" = "0" ]; then
 cat > /etc/systemd/system/argo.service <<EOF
 [Unit]
 Description=argo service
@@ -3998,7 +4004,7 @@ SCRIPT_PATH="$HOME/bin/lun"
 mkdir -p "$HOME/bin"
 fi
 install_lun_entry "$SCRIPT_PATH" || { echo "Lun脚本安装失败，请检查网络后重试。"; exit 1; }
-if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
+if ! lun_has_systemd && ! command -v rc-service >/dev/null 2>&1; then
 echo "_lun_ok=no; for _P in /proc/[0-9]*; do [ -L \"\$_P/exe\" ] || continue; _exe=\$(readlink -f \"\$_P/exe\" 2>/dev/null) || continue; case \"\$_exe\" in */lun/sing-box*|*/lun/xray*) _lun_ok=yes; break ;; esac; done; [ \"\$_lun_ok\" = no ] && pgrep -f 'lun/(sing-box|xray)([[:space:]]|$)' >/dev/null 2>&1 && _lun_ok=yes; [ \"\$_lun_ok\" = no ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_ok=yes; if [ \"\$_lun_ok\" = no ]; then echo '检测到系统可能中断过，或者变量格式错误？建议在SSH对话框输入 reboot 重启下服务器。现在自动执行Lun脚本的节点恢复操作，请稍等……'; sleep 6; export cfip=\"${cfip}\" hyjpt=\"${hyjpt}\" cdnym=\"${cdnym}\" cdnmode=\"${cdnmode}\" cdnpt=\"${cdnpt}\" cdnproto=\"${cdnproto}\" addrmode=\"${addrmode}\" addym=\"${addym}\" addout=\"${addout}\" ptmap=\"${ptmap}\" portpool=\"${portpool}\" inpool=\"${inpool}\" outpool=\"${outpool}\" vpsmode=\"${vpsmode}\" argoip=\"${argoip}\" subipmode=\"${subipmode}\" domain=\"${domain}\" certmode=\"${certmode}\" acme_email=\"${acme_email}\" acme_dns=\"${acme_dns}\" name=\"${name}\" ippz=\"${ippz}\" argo=\"${argo}\" uuid=\"${uuid}\" $wap=\"${warp}\" $xhp=\"${port_xh}\" $vxp=\"${port_vx}\" $xup=\"${port_xu}\" $xcp=\"${port_xc}\" $nvp=\"${port_nv}\" $ssp=\"${port_ss}\" $sop=\"${port_so}\" $anp=\"${port_an}\" $arp=\"${port_ar}\" $vlp=\"${port_vl_re}\" $vwp=\"${port_vw}\" $vmp=\"${port_vm_ws}\" $hyp=\"${port_hy2}\" $tup=\"${port_tu}\" reym=\"${ym_vl_re}\" agn=\"${ARGO_DOMAIN}\" agk=\"${ARGO_AUTH}\"; bash \"${SCRIPT_PATH}\"; fi" >> ~/.bashrc
 fi
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' ~/.bashrc
@@ -4008,7 +4014,7 @@ fi
 grep -qxF 'source ~/.bashrc' ~/.bash_profile 2>/dev/null || echo 'source ~/.bashrc' >> ~/.bash_profile
 . ~/.bashrc 2>/dev/null
 crontab -l > /tmp/crontab.tmp 2>/dev/null
-if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
+if ! lun_has_systemd && ! command -v rc-service >/dev/null 2>&1; then
 sed -i '/lun\/sing-box/d' /tmp/crontab.tmp
 sed -i '/lun\/xray/d' /tmp/crontab.tmp
 _sb_running=no; _xr_running=no
@@ -4029,7 +4035,7 @@ fi
 sed -i '/lun\/cloudflared/d' /tmp/crontab.tmp
 if [ -n "$argo" ] && [ -n "$vmag" ]; then
 if [ -n "${ARGO_DOMAIN}" ] && [ -n "${ARGO_AUTH}" ]; then
-if ! pidof systemd >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
+if ! lun_has_systemd && ! command -v rc-service >/dev/null 2>&1; then
 echo '@reboot sleep 10 && /bin/sh -c "nohup $HOME/lun/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $(cat $HOME/lun/sbargotoken.log 2>/dev/null) >/dev/null 2>&1 &"' >> /tmp/crontab.tmp
 fi
 else
@@ -4113,7 +4119,7 @@ else
 echo "Xray：未安装"
 fi
 if cluster_enabled; then
-if { pidof systemd >/dev/null 2>&1 && systemctl is-active --quiet lun-cluster-agent 2>/dev/null; } \
+if { lun_has_systemd && systemctl is-active --quiet lun-cluster-agent 2>/dev/null; } \
 || { command -v rc-service >/dev/null 2>&1 && rc-service lun-cluster-agent status >/dev/null 2>&1; }; then
 echo "分布式服务器集群：运行中"
 else
@@ -4187,7 +4193,7 @@ multiuser_cmd sync-subscription-state >/dev/null
 }
 
 multiuser_service_stop(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl stop lun-agent >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-agent stop >/dev/null 2>&1 || true
@@ -4246,7 +4252,7 @@ lun_python_ensure modules || return 1
 multiuser_service_stop
 multiuser_prepare_service_port || return 1
 multiuser_install_service || return 1
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl enable --now lun-agent >/dev/null 2>&1 || return 1
 sleep 1
 systemctl is-active --quiet lun-agent
@@ -4270,7 +4276,7 @@ multiuser_install_service(){
 lun_python_ensure modules || return 1
 python_bin=$(command -v python3) || return 1
 agent_py="$(multiuser_module_dir)/lun_agent.py"
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 cat > /etc/systemd/system/lun-agent.service <<EOF
 [Unit]
 Description=Lun subscription and multi-user agent
@@ -4319,7 +4325,7 @@ fi
 
 multiuser_remove_service(){
 multiuser_service_stop
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable lun-agent >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/lun-agent.service
 systemctl daemon-reload >/dev/null 2>&1 || true
@@ -4335,7 +4341,7 @@ multiuser_cmd --json visit-status 2>/dev/null | grep -Eq '"enabled"[[:space:]]*:
 }
 
 visit_monitor_service_stop(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl stop lun-visit-monitor >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-visit-monitor stop >/dev/null 2>&1 || true
@@ -4351,7 +4357,7 @@ done
 visit_monitor_service_start(){
 visit_monitor_enabled || return 0
 visit_monitor_install_service || return 1
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl enable --now lun-visit-monitor >/dev/null 2>&1 || return 1
 sleep 1
 systemctl is-active --quiet lun-visit-monitor
@@ -4374,7 +4380,7 @@ visit_monitor_install_service(){
 lun_python_ensure modules || return 1
 python_bin=$(command -v python3) || return 1
 agent_py="$(multiuser_module_dir)/lun_agent.py"
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 cat > /etc/systemd/system/lun-visit-monitor.service <<EOF
 [Unit]
 Description=FHLUN website visit monitor
@@ -4423,7 +4429,7 @@ fi
 
 visit_monitor_remove_service(){
 visit_monitor_service_stop
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable lun-visit-monitor >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/lun-visit-monitor.service
 systemctl daemon-reload >/dev/null 2>&1 || true
@@ -4617,7 +4623,7 @@ lun_python_ensure modules || return 1
 }
 
 cluster_service_stop(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl stop lun-cluster-agent >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-cluster-agent stop >/dev/null 2>&1 || true
@@ -4659,7 +4665,7 @@ done
 cluster_service_start(){
 cluster_enabled || return 0
 cluster_install_service || return 1
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl enable --now lun-cluster-agent >/dev/null 2>&1 || return 1
 sleep 1
 systemctl is-active --quiet lun-cluster-agent
@@ -4681,7 +4687,7 @@ cluster_install_service(){
 lun_python_ensure modules || return 1
 python_bin=$(command -v python3) || return 1
 agent_py="$(cluster_module_dir)/lun_cluster.py"
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 cat > /etc/systemd/system/lun-cluster-agent.service <<EOF
 [Unit]
 Description=Lun on-demand federation member service
@@ -4733,7 +4739,7 @@ fi
 
 cluster_remove_service(){
 cluster_service_stop
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable lun-cluster-agent >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/lun-cluster-agent.service
 systemctl daemon-reload >/dev/null 2>&1 || true
@@ -4743,7 +4749,19 @@ rm -f /etc/init.d/lun-cluster-agent
 fi
 }
 
+cluster_agent_version(){
+sed -n 's/^VERSION[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"[[:space:]]*$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+cluster_agent_version_current(){
+local version
+version=$(cluster_agent_version "${1:-$(cluster_module_dir)/lun_cluster.py}")
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+&& ! lun_version_is_older "$version" "$LUN_CLUSTER_REQUIRED_VERSION"
+}
+
 cluster_download_agent(){
+local destination=${1:-} cluster_dir cluster_target cluster_tmp cluster_url cluster_fallback
 lun_python_ensure modules || return 1
 cluster_dir=$(cluster_module_dir)
 cluster_target="$cluster_dir/lun_cluster.py"
@@ -4761,16 +4779,16 @@ cluster_url="https://api.github.com/repos/azk78lun-collab/FHLUN/contents/modules
 cluster_fallback="https://raw.githubusercontent.com/azk78lun-collab/FHLUN/main/modules/cluster/lun_cluster.py?fhlun_nocache=$(date +%s)"
 fi
 if command -v curl >/dev/null 2>&1 && curl -fL -H 'Accept: application/vnd.github.raw+json' -H 'Cache-Control: no-cache' \
---connect-timeout 10 --max-time 120 --retry 2 -o "$cluster_tmp" "$cluster_url"; then
+--connect-timeout 5 --max-time 20 -o "$cluster_tmp" "$cluster_url"; then
 :
 elif command -v wget >/dev/null 2>&1 && wget -O "$cluster_tmp" --header='Accept: application/vnd.github.raw+json' \
---header='Cache-Control: no-cache' --tries=2 --timeout=60 "$cluster_url"; then
+--header='Cache-Control: no-cache' --tries=1 --timeout=15 "$cluster_url"; then
 :
 elif [ -n "$cluster_fallback" ] && command -v curl >/dev/null 2>&1 && curl -fL -H 'Cache-Control: no-cache' \
---connect-timeout 10 --max-time 120 --retry 2 -o "$cluster_tmp" "$cluster_fallback"; then
+--connect-timeout 5 --max-time 20 -o "$cluster_tmp" "$cluster_fallback"; then
 :
 elif [ -n "$cluster_fallback" ] && command -v wget >/dev/null 2>&1 && wget -O "$cluster_tmp" \
---header='Cache-Control: no-cache' --tries=2 --timeout=60 "$cluster_fallback"; then
+--header='Cache-Control: no-cache' --tries=1 --timeout=15 "$cluster_fallback"; then
 :
 else
 rm -f "$cluster_tmp"
@@ -4778,13 +4796,82 @@ return 1
 fi
 fi
 python3 -m py_compile "$cluster_tmp" >/dev/null 2>&1 || { rm -f "$cluster_tmp"; red_line "分布式集群程序语法校验失败。"; return 1; }
-mv -f "$cluster_tmp" "$cluster_target"
-chmod 700 "$cluster_target"
+if ! cluster_agent_version_current "$cluster_tmp"; then
+rm -f "$cluster_tmp"
+red_line "联邦组件版本不匹配：需要 $LUN_CLUSTER_REQUIRED_VERSION 或更新版本，已保留旧组件。"
+return 1
+fi
+chmod 700 "$cluster_tmp" && mv -f "$cluster_tmp" "${destination:-$cluster_target}" || { rm -f "$cluster_tmp"; return 1; }
+[ -z "$destination" ] || return 0
 cat > "$cluster_dir/lun-cluster" <<EOF
 #!/bin/sh
 exec "$(command -v python3)" "$cluster_target" "\$@"
 EOF
 chmod 700 "$cluster_dir/lun-cluster"
+}
+
+cluster_runtime_command(){
+if lun_has_systemd; then
+systemctl "$1" lun-cluster-agent >/dev/null 2>&1
+elif command -v rc-service >/dev/null 2>&1; then
+local action=$1
+[ "$action" != is-active ] || action=status
+rc-service lun-cluster-agent "$action" >/dev/null 2>&1
+else
+return 1
+fi
+}
+
+cluster_wait_for_running_agent(){
+local attempt
+for attempt in 1 2 3 4 5 6 7 8; do
+cluster_cmd service-current >/dev/null 2>&1 && return 0
+sleep 1
+done
+return 1
+}
+
+cluster_upgrade_local_agent(){
+(
+cluster_enabled && cluster_is_federation || return 0
+local target stage active=no previous
+target="$(cluster_module_dir)/lun_cluster.py"
+if cluster_agent_version_current "$target"; then
+if ! cluster_runtime_command is-active || cluster_cmd service-current >/dev/null 2>&1; then return 0; fi
+cluster_runtime_command restart && cluster_wait_for_running_agent && return 0
+red_line "联邦文件已更新，但服务未加载该版本；请查看集群日志。"
+return 1
+fi
+stage=$(mktemp -d "$(cluster_module_dir)/.upgrade.XXXXXX") || return 1
+trap 'rm -f "$stage/new.py" "$stage/previous.py"; rmdir "$stage" 2>/dev/null || true' EXIT
+previous=$(cluster_agent_version "$target")
+yellow_line "正在补齐联邦组件（${previous:-未知} → 至少 $LUN_CLUSTER_REQUIRED_VERSION）……"
+cluster_download_agent "$stage/new.py" || { red_line "联邦组件未更新，原版本保持不变。"; return 1; }
+cp -p "$target" "$stage/previous.py" || return 1
+cluster_runtime_command is-active && active=yes
+mv -f "$stage/new.py" "$target" || return 1
+if [ "$active" = yes ] && { ! cluster_runtime_command restart || ! cluster_wait_for_running_agent; }; then
+if ! mv -f "$stage/previous.py" "$target"; then
+trap - EXIT
+red_line "联邦组件回滚失败，原文件保留在 $stage/previous.py。"
+elif cluster_runtime_command restart; then
+red_line "新版联邦服务未就绪，已恢复原组件。"
+else
+red_line "已恢复旧联邦文件，但服务未重启，请查看集群日志。"
+fi
+return 1
+fi
+green_line "联邦组件已更新至 $(cluster_agent_version "$target")。"
+)
+}
+
+cluster_update_from_installed_script(){
+local entry=${LUN_UPDATED_ENTRY:-}
+if [ -n "$entry" ] && grep -q '^LUN_CLUSTER_REQUIRED_VERSION=' "$entry" 2>/dev/null; then
+bash "$entry" cluster-update-module
+else
+cluster_upgrade_local_agent
+fi
 }
 
 cluster_pick_port(){
@@ -4977,7 +5064,7 @@ rm -f "$HOME/lun/$cluster_sub_file"
 fi
 done
 
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable lun-agent >/dev/null 2>&1 || true
 if [ -e "$cluster_sub_snapshot/systemd.present" ]; then
 cp -p "$cluster_sub_snapshot/lun-agent.service" /etc/systemd/system/lun-agent.service || return 1
@@ -5052,7 +5139,7 @@ if [ -e "$cluster_install_snapshot/cluster.present" ]; then
 mkdir -p "$(cluster_module_dir)"
 cp -a "$cluster_install_snapshot/cluster/." "$(cluster_module_dir)/" || return 1
 fi
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable lun-cluster-agent >/dev/null 2>&1 || true
 if [ -e "$cluster_install_snapshot/cluster-systemd.present" ]; then
 cp -p "$cluster_install_snapshot/lun-cluster-agent.service" /etc/systemd/system/lun-cluster-agent.service || return 1
@@ -5122,7 +5209,7 @@ cluster_install(){
 [ "$(id -u 2>/dev/null)" = 0 ] || { red_line "分布式集群安装需要 root。"; return 1; }
 cluster_migrate=${1:-no}
 cluster_existing_internal=$(cluster_config_value internal_port 2>/dev/null)
-{ pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
+{ lun_has_systemd || command -v rc-service >/dev/null 2>&1; } || {
 red_line "分布式集群只支持 systemd 或 OpenRC。"
 return 1
 }
@@ -5382,7 +5469,7 @@ PY
 cluster_service_is_active(){
 cluster_systemd_name=$1
 cluster_openrc_name=$2
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl is-active --quiet "$cluster_systemd_name" 2>/dev/null
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service "$cluster_openrc_name" status >/dev/null 2>&1
@@ -5404,7 +5491,7 @@ done
 
 cluster_argo_start(){
 [ -x "$HOME/lun/cloudflared" ] || { echo "Argo/Cloudflared 未安装。" >&2; return 1; }
-if pidof systemd >/dev/null 2>&1 && [ -s /etc/systemd/system/argo.service ]; then
+if lun_has_systemd && [ -s /etc/systemd/system/argo.service ]; then
 systemctl start argo
 elif command -v rc-service >/dev/null 2>&1 && [ -x /etc/init.d/argo ]; then
 rc-service argo start
@@ -5421,7 +5508,7 @@ fi
 }
 
 cluster_argo_stop(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl stop argo >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service argo stop >/dev/null 2>&1 || true
@@ -5468,12 +5555,12 @@ case "$cluster_operation" in status|start|stop|restart) ;; *) echo "服务操作
 if [ "$cluster_operation" = stop ] || [ "$cluster_operation" = restart ]; then
 case "$cluster_component" in
 xray)
-if pidof systemd >/dev/null 2>&1; then systemctl stop xr >/dev/null 2>&1 || true
+if lun_has_systemd; then systemctl stop xr >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then rc-service xray stop >/dev/null 2>&1 || true; fi
 cluster_stop_core_process xray
 ;;
 singbox)
-if pidof systemd >/dev/null 2>&1; then systemctl stop sb >/dev/null 2>&1 || true
+if lun_has_systemd; then systemctl stop sb >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then rc-service sing-box stop >/dev/null 2>&1 || true; fi
 cluster_stop_core_process sing-box
 ;;
@@ -5570,9 +5657,11 @@ yellow_line "以下旧/撤销/禁止连接记录将自动排除：$cluster_auto_
 cluster_update_exclude="${cluster_update_exclude:+$cluster_update_exclude,}$cluster_auto_exclude"
 fi
 
-if [ "$cluster_update_origin" = official ] && ! update_lun_script; then
-red_line "本机主脚本未能更新，已停止集群推送。"
+if [ "$cluster_update_origin" = official ]; then
+if ! update_lun_script || ! cluster_update_from_installed_script; then
+red_line "本机主脚本或联邦组件未完整更新，已停止集群推送。"
 return 1
+fi
 fi
 cluster_update_source=$(lun_update_target)
 [ -s "$cluster_update_source" ] && bash -n "$cluster_update_source" 2>/dev/null || {
@@ -5581,10 +5670,14 @@ return 1
 }
 cluster_agent_source="$(cluster_module_dir)/lun_cluster.py"
 if [ -s "$cluster_agent_source" ] \
+&& cluster_agent_version_current "$cluster_agent_source" \
 && python3 -m py_compile "$cluster_agent_source" >/dev/null 2>&1 \
 && grep -q 'update-all' "$cluster_agent_source" \
 && grep -q '"chain.preflight"' "$cluster_agent_source"; then
 green_line "已复用本机通过校验的分布式集群程序。"
+elif [ "$cluster_update_origin" = local ]; then
+red_line "本机联邦组件未达到配套版本，请先完成本机更新，或选择从 GitHub 更新。"
+return 1
 elif ! cluster_download_agent; then
 red_line "分布式集群程序下载失败，且本机缓存不支持集群更新。"
 return 1
@@ -5980,6 +6073,22 @@ esac
 done
 }
 
+cluster_maintenance_repair(){
+local rc=0
+if ! cluster_service_is_active lun-cluster-agent lun-cluster-agent && ! cluster_service_start; then
+red_line "联邦服务未能启动，请检查服务日志。"
+cluster_cmd status
+return 1
+fi
+if ! cluster_service_is_active lun-agent lun-agent || ! subscription_agent_ready; then
+restart_subscription_service || rc=1
+fi
+cluster_cmd endpoint-reconcile || rc=1
+apply_lun_firewall_rules || rc=1
+cluster_cmd status || rc=1
+return "$rc"
+}
+
 cluster_maintenance_ui(){
 while :; do
 ui_title "Lun 更新与维护"
@@ -5993,7 +6102,7 @@ IFS= read -r cluster_maintenance_choice || return
 case "$cluster_maintenance_choice" in
 1) cluster_update_all_ui; ui_pause ;;
 2) cluster_cdn_sync_ui; ui_pause ;;
-3) cluster_cmd endpoint-reconcile || true; cluster_cmd status; cluster_install_service; cluster_service_restart; restart_subscription_service; apply_lun_firewall_rules; ui_pause ;;
+3) cluster_maintenance_repair; ui_pause ;;
 4) cluster_backup_ui ;;
 0|"") return ;;
 *) red_line "输入错误。" ;;
@@ -6116,7 +6225,7 @@ cluster_cmd chain-inject
 }
 
 chain_runtime_status(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl is-active --quiet xr
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service xray status >/dev/null 2>&1
@@ -6189,6 +6298,9 @@ case "$cluster_choice" in
 esac
 fi
 if cluster_is_federation; then
+if ! cluster_agent_version_current; then
+cluster_upgrade_local_agent || yellow_line "仍在使用旧联邦版本；域名/IP 自动修复尚未生效。"
+fi
 cluster_federation_menu
 elif cluster_legacy_present; then
 ui_title "Lun 分布式服务器集群迁移"
@@ -8128,7 +8240,7 @@ hy2_hop_apply "$(cat "$HOME/lun/hy2_hop_ports" 2>/dev/null)" "$(cat "$HOME/lun/h
 yellow_line "核心配置已恢复，但 Lun 跳跃规则未能恢复，请检查。"
 [ -f "$rebuild_snapshot/bashrc" ] && cp -a "$rebuild_snapshot/bashrc" "$HOME/.bashrc"
 [ -s "$rebuild_snapshot/crontab" ] && crontab "$rebuild_snapshot/crontab" >/dev/null 2>&1 || true
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 for rebuild_service in xr sb argo; do
 [ -f "$rebuild_snapshot/services/$rebuild_service.service" ] && cp -a "$rebuild_snapshot/services/$rebuild_service.service" "/etc/systemd/system/$rebuild_service.service"
 done
@@ -8214,7 +8326,7 @@ crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 [ "$keep_entry" = "keep-entry" ] || \
 rm -rf "$HOME/bin/lun" /usr/bin/lun 2>/dev/null
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 for svc in xr sb argo; do
 systemctl stop "$svc" >/dev/null 2>&1
 systemctl disable "$svc" >/dev/null 2>&1
@@ -8272,7 +8384,7 @@ return 0
 }
 xrestart(){
 for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/xray"|*"/lun/x") kill "$(basename "$P")" 2>/dev/null ;; esac; done
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl restart xr >/dev/null 2>&1
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service xray restart >/dev/null 2>&1
@@ -8282,7 +8394,7 @@ fi
 }
 sbrestart(){
 for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/sing-box"|*"/lun/s") kill "$(basename "$P")" 2>/dev/null ;; esac; done
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl restart sb >/dev/null 2>&1
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service sing-box restart >/dev/null 2>&1
@@ -8390,7 +8502,7 @@ mv -f "$secondary_tmp" "$secondary" 2>/dev/null || rm -f "$secondary_tmp"
 
 core_update_running(){
 case "$1" in xray) unit=xr; openrc=xray ;; sing-box) unit=sb; openrc=sing-box ;; *) return 1 ;; esac
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl is-active --quiet "$unit"
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service "$openrc" status >/dev/null 2>&1
@@ -8491,10 +8603,11 @@ green_line "$engine 已更新：${old_version:-未知} → $new_version（原先
 
 update_local_lun_bundle(){
 update_lun_script || return 1
-bundle_rc=0
+local bundle_rc=0
+cluster_update_from_installed_script || bundle_rc=1
 update_installed_core xray || bundle_rc=1
 update_installed_core sing-box || bundle_rc=1
-[ "$bundle_rc" = 0 ] || red_line "脚本已检查；部分内核未更新，原内核已保留或恢复，请查看上方原因。"
+[ "$bundle_rc" = 0 ] || red_line "主脚本已检查；有配套组件未更新，请查看上方原因。"
 return "$bundle_rc"
 }
 
@@ -8672,7 +8785,7 @@ kill "$pid" 2>/dev/null || true
 fi
 done
 stop_subscription_service
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl stop xr sb argo >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service xray stop >/dev/null 2>&1 || true
@@ -11898,7 +12011,7 @@ red_line "订阅文件缺少 CDN 或 Tunnel 节点。"
 return 1
 fi
 rm -f "$subscription_check"
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl is-active --quiet argo || { red_line "Cloudflare Tunnel 服务未运行。"; return 1; }
 else
 pgrep -f "$HOME/lun/cloudflared.*tunnel" >/dev/null 2>&1 || { red_line "Cloudflare Tunnel 进程未运行。"; return 1; }
@@ -13785,7 +13898,7 @@ ui_pause
 stop_lun_services(){
 multiuser_service_stop
 stop_lun_owned_processes
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl stop xr sb argo >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service xray stop >/dev/null 2>&1 || true
@@ -14051,7 +14164,7 @@ ui_title "Lun 服务与更新"
 echo " 1. 重启服务"
 echo " 2. 停止服务"
 echo " 3. 查看运行日志"
-echo " 4. 更新本机 Lun 脚本（同时检查 Xray / Sing-box）"
+echo " 4. 更新本机 Lun 脚本（同时检查 Xray / Sing-box 与已启用的联邦组件）"
 echo " 0. 返回"
 printf "请选择 [0-4]（输入 0 返回）："
 IFS= read -r c
@@ -14150,7 +14263,7 @@ chmod 700 "$mu_dir/lun-agent"
 
 visit_monitor_prepare(){
 [ "$(id -u 2>/dev/null)" = 0 ] || { red_line "网站访问监控安装需要 root。"; return 1; }
-{ pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
+{ lun_has_systemd || command -v rc-service >/dev/null 2>&1; } || {
 red_line "网站访问监控只支持 systemd 或 OpenRC。"
 return 1
 }
@@ -14341,7 +14454,7 @@ visit_monitor_service_start >/dev/null 2>&1 || true
 
 multiuser_install(){
 [ "$(id -u 2>/dev/null)" = 0 ] || { red_line "多用户模块安装需要 root。"; return 1; }
-{ pidof systemd >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1; } || {
+{ lun_has_systemd || command -v rc-service >/dev/null 2>&1; } || {
 red_line "多用户模块只支持 systemd 或 OpenRC；当前无 init 模式已拒绝安装。"
 return 1
 }
@@ -14523,7 +14636,7 @@ return 1
 }
 
 lun_service_running(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl is-active --quiet "$1"
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service "$1" status >/dev/null 2>&1
@@ -14533,7 +14646,7 @@ fi
 }
 
 lun_service_enabled(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl is-enabled --quiet "$1"
 elif command -v rc-update >/dev/null 2>&1; then
 rc-update show default 2>/dev/null | grep -qw "$1"
@@ -14543,7 +14656,7 @@ fi
 }
 
 lun_service_disable_autostart(){
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable "$1" >/dev/null 2>&1 || yellow_line "原服务自启动状态未能恢复：$1"
 elif command -v rc-update >/dev/null 2>&1; then
 rc-update del "$1" default >/dev/null 2>&1 || yellow_line "原服务自启动状态未能恢复：$1"
@@ -14865,7 +14978,7 @@ chmod 700 "$mu_bw_runner"
 
 multiuser_bandwidth_install_service(){
 mu_bw_runner=$(multiuser_bandwidth_runner)
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 cat > /etc/systemd/system/lun-fair-bandwidth.service <<EOF
 [Unit]
 Description=风火轮动态公平下载带宽
@@ -14945,7 +15058,7 @@ return 1
 fi
 mu_bw_started=no
 if mv "$mu_bw_candidate" "$mu_bw_config"; then
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl enable lun-fair-bandwidth >/dev/null 2>&1 && systemctl start lun-fair-bandwidth && mu_bw_started=yes
 else
 rc-update add lun-fair-bandwidth default >/dev/null 2>&1 && rc-service lun-fair-bandwidth start && mu_bw_started=yes
@@ -14971,7 +15084,7 @@ mu_bw_runner=$(multiuser_bandwidth_runner)
 if [ -r "$(multiuser_bandwidth_config)" ] || [ -r "$(multiuser_bandwidth_config).owned" ]; then
 multiuser_bandwidth_write_runner || return 1
 fi
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl disable --now lun-fair-bandwidth >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-fair-bandwidth stop >/dev/null 2>&1 || true
@@ -14987,7 +15100,7 @@ green_line "动态公平带宽已关闭，仅移除 Lun 自己的队列。"
 multiuser_bandwidth_remove(){
 multiuser_bandwidth_disable >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/lun-fair-bandwidth.service /etc/init.d/lun-fair-bandwidth
-pidof systemd >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+lun_has_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
 rm -f "$(multiuser_bandwidth_runner)" "$(multiuser_bandwidth_config)" "$(multiuser_bandwidth_config).mode" "$(multiuser_bandwidth_config).owned"
 }
 
@@ -15158,7 +15271,7 @@ echo "监控状态：尚未初始化"
 return 0
 fi
 multiuser_cmd visit-status
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 if systemctl is-active --quiet lun-visit-monitor 2>/dev/null; then
 green_line "采集服务：运行中（不监听网络端口）"
 elif visit_monitor_enabled; then
@@ -15644,6 +15757,9 @@ exit "$cert_cli_rc"
 elif [ "$1" = "self-update" ]; then
 update_local_lun_bundle
 exit $?
+elif [ "$1" = "cluster-update-module" ]; then
+cluster_upgrade_local_agent
+exit $?
 elif [ "$1" = "cluster-refresh-identity" ]; then
 cip || exit $?
 if multiuser_enabled; then
@@ -15733,7 +15849,7 @@ xrestart
 *"/lun/c"*)
 kill "$(basename "$P")" 2>/dev/null
 if [ -e "$HOME/lun/sbargotoken.log" ]; then
-if pidof systemd >/dev/null 2>&1; then
+if lun_has_systemd; then
 systemctl restart argo >/dev/null 2>&1
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service argo restart >/dev/null 2>&1

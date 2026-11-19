@@ -1232,7 +1232,8 @@ class ClusterTestCase(unittest.TestCase):
         finally:cluster.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
-    def test_endpoint_domain_survives_ip_changes_and_pending_delivery_is_retried(self) -> None:
+    @mock.patch.object(lun_cluster, "public_dns_addresses", return_value=[])
+    def test_endpoint_domain_survives_ip_changes_and_pending_delivery_is_retried(self, _dns) -> None:
         cluster = self._federation_cluster('endpoint-domain', 24216)
         try:
             cfg=cluster.load_config();cfg['public_host']='dynamic.example.com';cfg['public_hosts']=['1.1.1.1','dynamic.example.com'];cluster.save_config(cfg)
@@ -1263,6 +1264,70 @@ class ClusterTestCase(unittest.TestCase):
             self.assertEqual(lun_cluster.ENDPOINT_CHECK_INTERVAL,21600)
             self.assertEqual(lun_cluster.HEALTH_CHECK_INTERVAL,86400)
         finally:cluster.close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_fixed_domain_reports_and_broadcasts_two_successive_nat_ip_changes(self) -> None:
+        local = self._federation_cluster("ddns-nat", 24219)
+        peer = self._federation_cluster("ddns-observer", 24220)
+        try:
+            host, before_ip = "dynamic.example.com", "1.1.1.1"
+            cfg = local.load_config()
+            local.save_config({**cfg, "public_host": host, "public_hosts": [before_ip, host],
+                               "public_port": 24443})
+            local.upsert_node(local.local_status(), role="federation")
+            local.federation_register_peer(peer.federation_public_bundle())
+            peer.import_federation_bundle(local.federation_public_bundle(), allow_cluster_adopt=True)
+            subscription = local.root / "jhsub.txt"
+            original = f"vless://keep@{host}:123?sni=unchanged#node\n"
+            subscription.write_text(original)
+            (local.root / "server_ip.log").write_text(before_ip + "\n")
+            identities = local.federation_identity_certificate()
+            stable_port = local.load_config()["public_port"]
+            self_id = cfg["node_id"]
+
+            for next_ip in ("8.8.8.8", "9.9.9.9"):
+                detection = {"confirmed": True, "ip": next_ip, "ips": [next_ip]}
+                answers = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (next_ip, 0))]
+                local.db.set_setting("federation.endpoint.actual", next_ip)
+                with mock.patch.object(lun_cluster.socket, "getaddrinfo", return_value=answers) as lookup, \
+                     mock.patch.object(lun_cluster, "broadcast_federation_events",
+                                       return_value={"delivered": {}, "failures": {}}) as broadcast, \
+                     mock.patch.object(lun_cluster, "push_snapshot", return_value={"peers": {}}) as push:
+                    self.assertFalse(local.endpoint_status()["synced"])
+                    result = lun_cluster.reconcile_federation_endpoint(local, detection=detection)
+                    broadcast.assert_called_once()
+                    push.assert_called_once_with(local, record_failures=False)
+                    lookup.assert_called_with(host, None, type=socket.SOCK_STREAM)
+                    self.assertTrue(result["changed"])
+                    self.assertTrue(result["endpoint"]["synced"])
+                    self.assertTrue(result["endpoint"]["dns_matches_public_ip"])
+                    self.assertEqual(result["endpoint"]["advertised_ips"], [next_ip])
+                    self.assertEqual(result["endpoint"]["dns_ips"], [next_ip])
+                    self.assertFalse(lun_cluster.reconcile_federation_endpoint(local, detection=detection)["changed"])
+                    self.assertEqual(broadcast.call_count, 1)
+                    self.assertEqual(push.call_count, 1)
+                event = result["event"]
+                self.assertEqual(event["author_id"], self_id)
+                peer.federation_import_events(local.federation_events_since(peer.federation_manifest()))
+                peer_view = peer.node(self_id)
+                self.assertEqual(lun_cluster.member_endpoint_hosts(peer_view), [next_ip, host])
+                self.assertEqual(lun_cluster.member_dial_hosts(peer_view), [host, next_ip])
+                self.assertEqual(peer_view["endpoint_port"], stable_port)
+                self.assertEqual((local.root / "server_ip.log").read_text().strip(), next_ip)
+                self.assertEqual(subscription.read_text(), original)
+                self.assertEqual(local.load_config()["public_host"], host)
+                self.assertEqual(local.federation_identity_certificate(), identities)
+
+            with mock.patch.object(lun_cluster.socket, "getaddrinfo", return_value=answers), \
+                 mock.patch.object(lun_cluster, "broadcast_federation_events") as broadcast:
+                unverified = lun_cluster.reconcile_federation_endpoint(local, detection={"confirmed": False})
+                self.assertEqual(unverified["endpoint"]["dns_ips"], ["9.9.9.9"])
+                self.assertFalse(unverified["endpoint"]["synced"])
+                self.assertEqual(unverified["endpoint"]["advertised_ips"], ["9.9.9.9"])
+                broadcast.assert_not_called()
+        finally:
+            local.close()
+            peer.close()
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
     def test_endpoint_reconcile_no_change_has_zero_broadcast_and_failure_rolls_back(self) -> None:
@@ -1887,12 +1952,23 @@ class ClusterTestCase(unittest.TestCase):
 
     def test_identity_or_api_rejection_does_not_try_another_address(self) -> None:
         node = {'id': 'a' * 32, 'endpoint_host': '8.8.8.8',
-                'endpoint_hosts': '["2001:4860:4860::8888"]', 'endpoint_port': 12345}
+                'endpoint_hosts': '["2001:4860:4860::8888","dynamic.example.com"]', 'endpoint_port': 12345}
         with mock.patch.object(lun_cluster, 'mutual_request',
                                side_effect=lun_cluster.ClusterError('identity mismatch')) as request:
             with self.assertRaisesRegex(lun_cluster.ClusterError, 'identity mismatch'):
                 lun_cluster.member_request(self.cluster, node, 'POST', '/v1/action', {})
         self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[1], "dynamic.example.com")
+
+    def test_member_tries_signed_dns_then_ip_on_resolution_failure(self) -> None:
+        node = {"id": "a" * 32, "endpoint_host": "8.8.8.8", "endpoint_port": 12345,
+                "endpoint_hosts": ["dynamic.example.com", "2001:4860:4860::8888"]}
+        with mock.patch.object(lun_cluster, "mutual_request", side_effect=[
+            lun_cluster.FederationTransportError("DNS unavailable"), {"ok": True},
+        ]) as transport:
+            self.assertEqual(lun_cluster.member_request(self.cluster, node, "GET", "/fixture"), {"ok": True})
+        self.assertEqual([call.args[1] for call in transport.call_args_list], ["dynamic.example.com", "8.8.8.8"])
+        self.assertTrue(all(call.kwargs["expected_node_id"] == node["id"] for call in transport.call_args_list))
 
     def test_health_probe_falls_back_to_ipv6_and_checks_node_identity(self) -> None:
         node = {'id': 'a' * 32, 'endpoint_host': '8.8.8.8',

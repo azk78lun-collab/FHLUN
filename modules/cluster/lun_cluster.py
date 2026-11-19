@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -365,6 +365,23 @@ def normalize_public_ip(value: str) -> str:
     if not address.is_global:
         raise ClusterError("只允许公网 IP 作为联邦地址")
     return address.compressed
+
+
+def is_ip_literal(host: str) -> bool:
+    with contextlib.suppress(ValueError):
+        ipaddress.ip_address(host.strip("[]"))
+        return True
+    return False
+
+
+def public_dns_addresses(host: str) -> list[str]:
+    if not host or is_ip_literal(host):
+        return []
+    try:
+        answers = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        return order_public_hosts(normalize_public_ip(answer[4][0]) for answer in answers)
+    except (OSError, ClusterError):
+        return []
 
 
 def _fetch_public_ip(url: str, timeout: int = 4) -> str:
@@ -2701,6 +2718,10 @@ class Cluster:
     def endpoint_status(self, actual_ip: str = "") -> dict[str, Any]:
         config = self.load_config()
         advertised = str(config.get("public_host", ""))
+        hosts = config.get("public_hosts", [])
+        advertised_ips = [host for host in order_public_hosts(hosts if isinstance(hosts, list) else [], advertised)
+                          if is_ip_literal(host)]
+        actual = actual_ip or self.db.setting("federation.endpoint.actual", "")
         pending_text = self.db.setting("federation.endpoint.pending", "{}")
         success_text = self.db.setting("federation.endpoint.success", "{}")
         try:
@@ -2711,10 +2732,14 @@ class Cluster:
             successful = json.loads(success_text)
         except json.JSONDecodeError:
             successful = {}
+        dns_ips = public_dns_addresses(advertised)
         return {
-            "actual_ip": actual_ip or self.db.setting("federation.endpoint.actual", ""),
+            "actual_ip": actual,
             "advertised_ip": advertised,
-            "synced": not bool(pending),
+            "advertised_ips": advertised_ips,
+            "dns_ips": dns_ips,
+            "dns_matches_public_ip": bool(actual and actual in dns_ips),
+            "synced": actual in advertised_ips and not pending,
             "pending": pending if isinstance(pending, dict) else {},
             "successful": successful if isinstance(successful, dict) else {},
             "last_checked": int(self.db.setting("federation.endpoint.last_checked", "0") or 0),
@@ -2751,28 +2776,18 @@ class Cluster:
         )
         detected = order_public_hosts(public_hosts or [], new_host)
         ips = {ipaddress.ip_address(item).version: item for item in detected}
-        preferred = old_host
-        try:
-            ipaddress.ip_address(old_host.strip().strip("[]"))
+        preferred = old_host  # Do not replace a configured DDNS name with a literal IP.
+        if not old_host or is_ip_literal(old_host):
             preferred = new_host
             for filename in ("domain", "addym"):
-                candidate = self.root / filename
-                if not candidate.is_file():
-                    continue
-                name = normalize_host(candidate.read_text().strip())
-                with contextlib.suppress(ValueError):
-                    ipaddress.ip_address(name)
-                    continue
                 try:
-                    resolved = {str(ipaddress.ip_address(item[4][0])) for item in
-                                socket.getaddrinfo(name, None, type=socket.SOCK_STREAM)}
-                except OSError:
+                    name = normalize_host(self._read_text_file(filename))
+                except ClusterError:
                     continue
-                if resolved and resolved.issubset(set(detected)):
+                resolved = public_dns_addresses(name)
+                if resolved and set(resolved).issubset(detected):
                     preferred = name
                     break
-        except ValueError:
-            pass  # An explicit stable domain is not replaced by a detected IP.
         new_host = preferred
         new_hosts = order_public_hosts(detected, preferred)
         metadata_changed = old_host != new_host or old_hosts != new_hosts
@@ -2782,11 +2797,7 @@ class Cluster:
                 old_ips.add(str(ipaddress.ip_address(item.strip("[]"))))
         replacements = {old: ips[ipaddress.ip_address(old).version] for old in old_ips
                         if ipaddress.ip_address(old).version in ips}
-        preferred_is_ip = False
-        with contextlib.suppress(ValueError):
-            ipaddress.ip_address(preferred)
-            preferred_is_ip = True
-        if (not preferred_is_ip and self._read_text_file("address_mode") in {"", "domain"}
+        if (not is_ip_literal(preferred) and self._read_text_file("address_mode") in {"", "domain"}
                 and self._read_text_file("addout") != "both"):
             replacements = {old: preferred for old in replacements}
         staged: dict[Path, bytes] = {}
@@ -2849,7 +2860,7 @@ class Cluster:
         now = utc_now()
         self.db.set_setting("federation.endpoint.changed_at", str(now))
         self.db.audit("federation.endpoint.changed", str(config.get("node_id", "")),
-                      f"{old_host}->{new_host}")
+                      f"{', '.join(old_hosts)} -> {', '.join(new_hosts)}")
         return {"changed": True, "old_host": old_host, "new_host": new_host,
                 "old_hosts": old_hosts, "new_hosts": new_hosts, "event": event}
 
@@ -5182,12 +5193,18 @@ def member_endpoint_hosts(node: Any) -> list[str]:
     return order_public_hosts(value if isinstance(value, list) else [], str(node["endpoint_host"]))
 
 
+def member_dial_hosts(node: Any) -> list[str]:
+    # Leave IPv4/IPv6 ordering in the menu unchanged. For connections, resolve
+    # a signed hostname before trying IPs cached from earlier address checks.
+    return sorted(member_endpoint_hosts(node), key=is_ip_literal)
+
+
 def member_request(cluster: Cluster, node: Any, method: str, path: str,
                    body: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
     if isinstance(node, str):
         node = cluster.node(node)
     last_error: FederationTransportError | None = None
-    for host in member_endpoint_hosts(node):
+    for host in member_dial_hosts(node):
         try:
             result = mutual_request(cluster, host, int(node["endpoint_port"]), method, path,
                                     body, timeout=timeout, expected_node_id=str(node["id"]))
@@ -5208,7 +5225,7 @@ def member_request(cluster: Cluster, node: Any, method: str, path: str,
 
 
 def probe_federation_member(cluster: Cluster, node: Any) -> dict[str, Any]:
-    """Probe the authenticated control plane, trying IPv4 then available IPv6."""
+    """Probe the authenticated control plane using DNS, IPv4, and IPv6 candidates."""
     response = member_request(cluster, node, 'GET', '/v1/status', timeout=HEALTH_CHECK_TIMEOUT)
     status = response.get('status', {})
     if not isinstance(status, dict) or status.get('node_id') != node['id']:
@@ -5791,13 +5808,12 @@ def broadcast_federation_events(cluster: Cluster) -> dict[str, Any]:
 def reconcile_federation_endpoint(cluster: Cluster, *,
                                   detection: dict[str, Any] | None = None) -> dict[str, Any]:
     config = cluster.load_config()
-    current = str(config.get("public_host", ""))
     observed = detection if detection is not None else detect_public_hosts()
     checked_at = int(observed.get("checked_at", utc_now()))
     cluster.db.set_setting("federation.endpoint.last_checked", str(checked_at))
     actual = str(observed.get("ip", "")) if observed.get("confirmed") else ""
+    cluster.db.set_setting("federation.endpoint.actual", actual)
     if not observed.get("confirmed"):
-        cluster.db.set_setting("federation.endpoint.actual", "")
         cluster.db.audit("federation.endpoint.unconfirmed", str(config.get("node_id", "")),
                          json_dumps(observed.get("errors", {}))[-500:])
         return {"changed": False, "confirmed": False, "detection": observed,
@@ -5805,7 +5821,9 @@ def reconcile_federation_endpoint(cluster: Cluster, *,
     with FileLock(cluster.lock_path, timeout=5), FileLock(cluster.root / "modules/multiuser/.lock", timeout=5):
         detected_hosts = observed.get("ips") if isinstance(observed.get("ips"), list) else [actual]
         local = cluster.reconcile_public_endpoint(actual, detected_hosts)
-    cluster.db.set_setting("federation.endpoint.actual", actual)
+        if local["changed"]:
+            # Persist retry intent before making any network calls.
+            cluster.db.set_setting("federation.endpoint.pending", json_dumps({"broadcast": "新地址及订阅待发"}))
     try:
         pending = json.loads(cluster.db.setting("federation.endpoint.pending", "{}"))
     except json.JSONDecodeError:
@@ -8085,17 +8103,23 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "endpoint-reconcile":
             result = reconcile_federation_endpoint(cluster)
             if not args.json:
+                endpoint = result["endpoint"]
                 if result.get("changed"):
-                    print(f"联邦公布地址已从 {result['old_host']} 更新为 {result['new_host']}，本机订阅已同步。")
-                    pending = result.get("endpoint", {}).get("pending", {})
-                    if pending:
-                        print(terminal_color(f"仍有 {len(pending)} 个成员待后续补齐。", "33"))
-                    else:
-                        print(terminal_color("全部可达成员已收到新地址。", "32"))
+                    print(f"已识别公网 IP：{endpoint['actual_ip']}；联邦入口：{result['new_host']}，本机订阅已同步。")
                 elif result.get("confirmed"):
-                    print("联邦公布 IP 与实际公网 IP 一致，未产生广播。")
+                    print("联邦公布 IP 与实际公网 IP 一致。" + (
+                        "已补发上次未完成的同步。" if "propagation" in result else "未产生广播。"))
                 else:
                     print(terminal_color("多个公网 IP 探测源未能达成一致，已保持原联邦地址。", "33"))
+                if result.get("confirmed") and endpoint["advertised_ip"] and not is_ip_literal(endpoint["advertised_ip"]):
+                    answers = " / ".join(endpoint["dns_ips"]) or "未确认"
+                    print(f"域名解析 IP：{answers}" + ("（与实测公网 IP 一致）" if endpoint["dns_matches_public_ip"]
+                                                            else "（尚未与实测公网 IP 一致）"))
+                pending = endpoint["pending"]
+                if pending:
+                    print(terminal_color(f"还有 {len(pending)} 项地址或订阅投递待补齐。", "33"))
+                elif result.get("changed"):
+                    print(terminal_color("成员地址和订阅已同步。", "32"))
         elif args.command == "revocation-check":
             result = cluster.check_self_revocation()
             if not args.json:
@@ -8118,7 +8142,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"撤销通知待补齐：{len(result['health'].get('pending_delivery', []))} 台")
                 endpoint = result["endpoint"]
                 print(f"实际公网 IP：{endpoint.get('actual_ip') or '未确认'}")
-                print(f"联邦公布 IP：{endpoint.get('advertised_ip') or '-'}")
+                print(f"联邦公布入口：{endpoint['advertised_ip'] or '-'}")
+                print(f"联邦公布 IP：{' / '.join(endpoint['advertised_ips']) or '-'}")
+                if endpoint["advertised_ip"] and not is_ip_literal(endpoint["advertised_ip"]):
+                    print(f"域名解析 IP：{' / '.join(endpoint['dns_ips']) or '未确认'}")
                 print(f"地址同步：{'已同步' if endpoint.get('synced') else '待同步'}")
                 print(f"最近检查：{iso_time(endpoint.get('last_checked'))}")
                 print(f"最近变更：{iso_time(endpoint.get('changed_at'))}")

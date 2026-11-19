@@ -100,11 +100,12 @@ update_installed_core sing-box
 [[ ! -s $LOG ]] # never install an unused core
 
 update_lun_script(){ printf 'script\n' >> "$LOG"; return "$script_rc"; }
+cluster_update_from_installed_script(){ printf 'federation\n' >> "$LOG"; return "$cluster_rc"; }
 update_installed_core(){ printf '%s\n' "$1" >> "$LOG"; [[ $1 != "$fail_engine" ]]; }
-script_rc=0 fail_engine=none
+script_rc=0 cluster_rc=0 fail_engine=none
 : > "$LOG"
 update_local_lun_bundle
-[[ $(cat "$LOG") == $'script\nxray\nsing-box' ]]
+[[ $(cat "$LOG") == $'script\nfederation\nxray\nsing-box' ]]
 script_rc=1
 : > "$LOG"
 if update_local_lun_bundle; then exit 1; fi
@@ -112,8 +113,12 @@ if update_local_lun_bundle; then exit 1; fi
 script_rc=0 fail_engine=xray
 : > "$LOG"
 if update_local_lun_bundle; then exit 1; fi
-[[ $(cat "$LOG") == $'script\nxray\nsing-box' ]]
-fail_engine=none
+[[ $(cat "$LOG") == $'script\nfederation\nxray\nsing-box' ]]
+fail_engine=none cluster_rc=1
+: > "$LOG"
+if update_local_lun_bundle; then exit 1; fi
+[[ $(cat "$LOG") == $'script\nfederation\nxray\nsing-box' ]]
+cluster_rc=0
 output=$(service_update_menu <<< $'4\n0')
 [[ $output == *'同时检查 Xray / Sing-box'* ]]
 [[ $output != *'5. 更新 Xray'* && $output != *'6. 更新 Sing-box'* ]]

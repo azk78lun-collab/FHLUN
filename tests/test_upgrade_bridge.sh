@@ -65,3 +65,13 @@ cmp "$tmp/stage" "$REMOTE"
 cmp "$ENTRY" "$tmp/expected"
 [[ -z $(find "$tmp" -type d -name '.lun-upgrade.*' -print) ]]
 echo 'ok - stage API is non-mutating and removes temporary files'
+
+fixture "$REMOTE" 26.11.19.2 matching-components
+printf '%s\n' 'LUN_CLUSTER_REQUIRED_VERSION=0.3.8' \
+  'if [ "${1:-}" = cluster-update-module ]; then printf "%s\n" called >> "$HOME/cluster-update"; fi' >> "$REMOTE"
+lun_bridge_main --stage "$tmp/stage"
+[[ ! -e "$HOME/cluster-update" ]]
+lun_bridge_main --target "$ENTRY"
+lun_bridge_main --target "$ENTRY"
+[[ $(cat "$HOME/cluster-update") == $'called\ncalled' ]]
+echo 'ok - install and same-script checks run the installed cluster updater; staging does not'

@@ -28,6 +28,14 @@ lun_bridge_older(){
   }'
 }
 
+lun_bridge_update_cluster(){
+  grep -q '^LUN_CLUSTER_REQUIRED_VERSION=' "$1" || return 0
+  if ! bash "$1" cluster-update-module; then
+    echo '主脚本已就绪，但已启用的联邦组件未完成更新，请查看上方原因。' >&2
+    return 1
+  fi
+}
+
 lun_bridge_main(){
 (
   local mode=install destination= entry= temporary secondary_tmp= commit blob actual version current before after
@@ -87,6 +95,7 @@ lun_bridge_main(){
     return 1
   fi
   if [ -f "$destination" ] && cmp -s "$temporary/lun.sh" "$destination"; then
+    lun_bridge_update_cluster "$destination" || return 1
     echo "已核验实际入口：$destination；当前已是最新版 $version（提交 ${commit:0:12}）。"
     return 0
   fi
@@ -108,6 +117,7 @@ lun_bridge_main(){
   fi
   echo "Lun 更新完成：${current:-未安装} → $version"
   echo "生效入口：$destination；提交：${commit:0:12}；SHA-256：$after"
+  lun_bridge_update_cluster "$destination" || return 1
   echo '代理参数、证书、用户数据库和集群身份未修改；请重新运行 lun。'
 )
 }

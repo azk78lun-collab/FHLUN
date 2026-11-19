@@ -11,7 +11,7 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.11.19.1'
+contains "$SCRIPT" '当前版本：V26.11.19.2'
 contains "$SCRIPT" '自动巡检：每天一次'
 contains "$SCRIPT" '"suspect": "疑似离线"'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
@@ -20,6 +20,100 @@ contains "$SCRIPT" 'subscription_agent_enabled(){'
 contains "$SCRIPT" 'subscription_only_enabled(){'
 contains "$SCRIPT" 'cluster_existing_internal=$(cluster_config_value internal_port'
 contains "$SCRIPT" '[ "$cluster_reuse_existing" != yes ]'
+
+(
+  for fn in lun_has_systemd cluster_service_is_active cluster_maintenance_repair; do
+    eval "$(section "$SCRIPT" "$fn")"
+  done
+  manager=yes runtime=yes
+  command(){
+    if [[ "$*" == '-v systemctl' ]]; then [[ "$manager" == yes ]]; else builtin command "$@"; fi
+  }
+  test(){
+    if [[ "$*" == '-d /run/systemd/system' ]]; then [[ "$runtime" == yes ]]; else builtin test "$@"; fi
+  }
+  systemctl(){ [[ "$*" == 'is-active --quiet lun-agent' ]]; }
+  rc-service(){ [[ "$*" == 'lun-agent status' ]]; }
+  pidof(){ return 1; } # Missing/false-negative pidof must not hide a real manager.
+  lun_has_systemd || fail 'active systemd not detected without pidof'
+  cluster_service_is_active lun-agent not-openrc
+  runtime=no
+  if lun_has_systemd; then fail 'accepted systemctl without a running systemd'; fi
+  cluster_service_is_active not-systemd lun-agent
+  manager=no runtime=yes
+  if lun_has_systemd; then fail 'accepted systemd marker without systemctl'; fi
+
+  healthy=yes action=
+  cluster_service_is_active(){ [[ "$healthy" == yes ]]; }
+  subscription_agent_ready(){ return 0; }
+  cluster_service_start(){ action+=start; }
+  restart_subscription_service(){ action+=subscription; }
+  apply_lun_firewall_rules(){ action+=firewall; }
+  cluster_cmd(){ action+="$1"; }
+  cluster_maintenance_repair
+  [[ "$action" == endpoint-reconcilefirewallstatus ]] || fail 'healthy services were unnecessarily restarted'
+  action= healthy=no
+  cluster_maintenance_repair
+  [[ "$action" == startsubscriptionendpoint-reconcilefirewallstatus ]] || fail 'stopped service was not repaired'
+)
+
+(
+  # No system service or internet involved: substitute a local module and verify
+  # the old-runtime and startup-failure paths on the actual shell updater.
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  export HOME="$tmp/home"
+  LUN_CLUSTER_REQUIRED_VERSION=$(sed -n 's/^LUN_CLUSTER_REQUIRED_VERSION=//p' "$SCRIPT")
+  [[ $(sed -n 's/^VERSION = "\([0-9.]*\)"$/\1/p' "$ROOT/modules/cluster/lun_cluster.py") == "$LUN_CLUSTER_REQUIRED_VERSION" ]]
+  for fn in cluster_module_dir cluster_agent_version cluster_agent_version_current \
+    lun_version_is_older cluster_download_agent cluster_wait_for_running_agent cluster_upgrade_local_agent; do
+    eval "$(section "$SCRIPT" "$fn")"
+  done
+  mkdir -p "$(cluster_module_dir)"
+  target="$(cluster_module_dir)/lun_cluster.py"
+  LUN_CLUSTER_AGENT_SOURCE="$tmp/candidate.py"
+  state="$tmp/restarts"
+  enabled=yes running=yes ready=yes
+  fixture(){ printf '#!/usr/bin/env python3\nVERSION = "%s"\n' "$2" > "$1"; }
+  cluster_enabled(){ [ "$enabled" = yes ]; }
+  cluster_is_federation(){ return 0; }
+  lun_python_ensure(){ return 0; }
+  cluster_runtime_command(){
+    if [ "$1" = is-active ]; then [ "$running" = yes ]; else cluster_agent_version "$target" >> "$state"; fi
+  }
+  cluster_cmd(){ [ "$1" = service-current ] && [ "$ready" = yes ]; }
+  sleep(){ :; }
+  red_line(){ printf '%s\n' "$*"; }
+  yellow_line(){ :; }
+  green_line(){ :; }
+
+  fixture "$target" 0.3.5
+  fixture "$LUN_CLUSTER_AGENT_SOURCE" 0.3.7
+  if cluster_upgrade_local_agent; then fail 'stale download accepted'; fi
+  [[ $(cluster_agent_version "$target") == 0.3.5 && ! -e "$state" ]]
+  fixture "$LUN_CLUSTER_AGENT_SOURCE" "$LUN_CLUSTER_REQUIRED_VERSION"
+  ready=no
+  if cluster_upgrade_local_agent; then fail 'reported success without running new build'; fi
+  [[ $(cluster_agent_version "$target") == 0.3.5 ]]
+  [[ $(cat "$state") == "$LUN_CLUSTER_REQUIRED_VERSION"$'\n0.3.5' ]]
+  : > "$state"
+  ready=yes
+  cluster_upgrade_local_agent
+  [[ $(cluster_agent_version "$target") == "$LUN_CLUSTER_REQUIRED_VERSION" ]]
+  [[ $(cat "$state") == "$LUN_CLUSTER_REQUIRED_VERSION" ]]
+  cluster_upgrade_local_agent
+  [[ $(cat "$state") == "$LUN_CLUSTER_REQUIRED_VERSION" ]]
+
+  fixture "$target" 0.3.5
+  : > "$state"
+  enabled=no
+  cluster_upgrade_local_agent
+  [[ $(cluster_agent_version "$target") == 0.3.5 && ! -s "$state" ]]
+  enabled=yes running=no
+  cluster_upgrade_local_agent
+  [[ $(cluster_agent_version "$target") == "$LUN_CLUSTER_REQUIRED_VERSION" && ! -s "$state" ]]
+  [[ -z $(find "$(cluster_module_dir)" -type d -name '.upgrade.*' -print) ]]
+)
 
 MENU=$(section "$SCRIPT" cluster_federation_menu)
 printf '%s\n' "$MENU" | grep -Fq '添加服务器' || fail 'federation menu missing add server entry'

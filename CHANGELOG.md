@@ -1,10 +1,15 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.19.1`。
+Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.19.2`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.19.1`.
+Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.19.2`.
 
 ## 2026 年 11 月 19 日
+
+- `V26.11.19.2` / 集群 `0.3.8`：本机更新联动已启用的联邦组件，确认新版服务实际运行，失败回滚。已登记的域名优先用于联邦连接；状态分别显示域名解析、实测及已公布公网 IP，保留六小时检查、签名广播与现有订阅域名。
+- `V26.11.19.2` / cluster `0.3.8`: Update enabled federation components alongside the script, confirm the running build, and roll back failed service updates. Resolve signed domains before using cached IPs; report DNS, verified and published IPs separately. Keep six-hour checks, signed broadcasts and existing subscription domains.
+- `V26.11.19.2`：使用 systemd 的运行标志识别服务管理器，不再依赖 `pidof`。集群“状态 / 修复”只恢复有故障的服务，不重启健康进程。
+- `V26.11.19.2`: Detect the running systemd manager without relying on `pidof`; cluster repair leaves healthy services running.
 
 - `V26.11.19.1` / 集群 `0.3.7`：手动同步回车默认选择全部；分开报告用户配置及节点快照同步结果。凭据校验不再扫描未授权共享的本机管理设备或已撤销成员的历史设备，并继续拦截有效授权中的重复凭据。服务器总览显示中文城市、州或国家。
 - `V26.11.19.1` / cluster `0.3.7`: Default manual sync to all members on Enter and distinguish user-sync failures from snapshot results. Exclude unauthorized local devices and revoked member history from credential validation while retaining active collision checks. Localize location labels in the server overview.
