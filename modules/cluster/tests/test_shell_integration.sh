@@ -11,7 +11,10 @@ section() {
 }
 
 bash -n "$SCRIPT"
-contains "$SCRIPT" '当前版本：V26.11.19.2'
+release=$(sed -nE 's/^echo "当前版本：(V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$SCRIPT")
+[[ "$release" =~ ^V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'missing or duplicate script release version'
+contains "$ROOT/README.md" "$release"
+contains "$ROOT/README.en.md" "$release"
 contains "$SCRIPT" '自动巡检：每天一次'
 contains "$SCRIPT" '"suspect": "疑似离线"'
 contains "$SCRIPT" 'cluster_cmd endpoint-reconcile'
