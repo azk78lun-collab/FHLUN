@@ -75,7 +75,7 @@ sh "$runner" clear
 eval "$(sed -n '/^multiuser_bandwidth_enable(){/,/^}/p' "$ROOT/lun.sh")"
 multiuser_install_tc(){ :; }
 multiuser_bandwidth_install_service(){ :; }
-pidof(){ return 1; }
+lun_has_systemd(){ return 1; }
 rc-update(){ :; }
 rc-service(){ return 1; }
 red_line(){ :; }

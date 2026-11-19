@@ -25,7 +25,7 @@ red_line(){ printf '%s\n' "$*" >&2; }
 green_line(){ :; }
 yellow_line(){ :; }
 lun_python_ensure(){ :; } # Runtime provisioning has its own isolated tests.
-pidof(){ [[ $1 == systemd ]]; }
+lun_has_systemd(){ return 0; }
 nginx(){
   [[ ! -f "$tmp/nginx-invalid" ]] || return 1
   if [[ $1 == -T ]]; then

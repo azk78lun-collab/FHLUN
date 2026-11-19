@@ -37,6 +37,7 @@ record() { calls+="$*"$'\n'; }
   cluster_is_federation() { [[ $calls == $'install\n' ]]; }
   cluster_legacy_present() { return 1; }
   cluster_install() { record install; }
+  cluster_agent_version_current() { return 0; }
   cluster_federation_menu() { record menu; }
   calls=
   output=$(cluster_menu <<< '0')
@@ -135,6 +136,7 @@ record() { calls+="$*"$'\n'; }
   cluster_untrusted_member_numbers() { :; }
   lun_update_target() { printf '%s\n' "$SCRIPT"; }
   cluster_module_dir() { printf '%s\n' "$ROOT/modules/cluster"; }
+  cluster_agent_version_current() { return 0; }
   cluster_install_service() { :; }
   cluster_service_restart() { record restart; return "$restart_rc"; }
   cluster_write_install_payload() { :; }

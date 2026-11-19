@@ -247,7 +247,7 @@ grep -q '最大可用编辑权限' "$SCRIPT"
 grep -q '缺少账户级 Cloudflare Tunnel 编辑权限' "$SCRIPT"
 grep -q '不提供无副作用的写权限预检' "$SCRIPT"
 ! grep -q '粘贴 Token（输入隐藏' "$SCRIPT"
-grep -q '当前版本：V26.11.19.1' "$SCRIPT"
+grep -Eq '当前版本：V[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$SCRIPT"
 grep -q '^lun_update_target(){' "$SCRIPT"
 grep -q 'download_lun_script "$update_stage" official' "$SCRIPT"
 grep -q '一键更新所有 VPS 代理脚本' "$SCRIPT"
@@ -393,7 +393,7 @@ printf '%s\n' cdn.example.com > "$HOME/lun/cert_subject"
 printf '%s\n' 12347 > "$HOME/lun/subport.log"
 printf '%s\n' test-token > "$HOME/lun/subtoken.log"
 curl() { printf '%s\n' 'vless://cdn.example.com/node' 'vless://argo.example.com/node'; }
-pidof() { [[ $1 == systemd ]]; }
+lun_has_systemd() { return 0; }
 systemctl() { return 0; }
 cert_key_matches() { return 0; }
 cert_publicly_trusted_for_domain() { return 0; }
@@ -402,7 +402,7 @@ grep -q '^SUBSCRIPTION_HTTP=verified$' "$HOME/lun/oneclick_full_report.txt"
 grep -q '^CERT_TRUST=public$' "$HOME/lun/oneclick_full_report.txt"
 grep -q '^RESULT=PASS$' "$HOME/lun/oneclick_full_report.txt"
 [[ ! -e $HOME/lun/oneclick_full_pending ]]
-unset -f curl pidof systemctl cert_key_matches cert_publicly_trusted_for_domain
+unset -f curl lun_has_systemd systemctl cert_key_matches cert_publicly_trusted_for_domain
 rm -rf "$oneclick_test_home"
 HOME=$original_home
 
