@@ -144,6 +144,8 @@ update_installed_core sing-box
   printf 'fixture\n' > "$mu/data/lun.db"
   printf '%s\n' '--staged-core-upgrade' > "$mu/lun_agent.py"
   update_installed_core(){ :; }
+  # BusyBox flock accepts nonblocking FD locks, not util-linux's -w.
+  flock(){ [[ "$*" == '-n 7' ]]; }
   cluster_enabled(){ return 1; }
   visit_monitor_enabled(){ return 1; }
   multiuser_config_value(){ printf 'old\n'; }

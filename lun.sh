@@ -113,7 +113,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.27.1"
+echo "当前版本：V26.11.27.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -9188,7 +9188,7 @@ address=$(multiuser_config_value singbox_api)
 
 sync_lun_runtime(){ (
 update_installed_core sing-box || return 1
-local mu_dir generation pending cleaned recovery
+local mu_dir generation pending cleaned recovery lock_attempt
 mu_dir=$(multiuser_module_dir)
 [ -s "$mu_dir/config.json" ] && [ -s "$mu_dir/data/lun.db" ] || return 0
 if cluster_enabled; then
@@ -9199,7 +9199,12 @@ fi
 pending="$mu_dir/.security-transaction/state.json"
 cleaned="$mu_dir/.cleaned-$LUN_MULTIUSER_GENERATION"
 exec 7>"$mu_dir/.runtime-upgrade.lock" || return 1
-flock -w 45 7 || { red_line "另一项多用户升级仍在执行，稍后重试。"; return 1; }
+# BusyBox flock (Alpine) has -n but no -w.
+for ((lock_attempt=0; lock_attempt<45; lock_attempt++)); do
+flock -n 7 && break
+sleep 1
+done
+[ "$lock_attempt" -lt 45 ] || { red_line "无法取得多用户升级锁，请稍后重试。"; return 1; }
 if ! grep -Fq -- '--staged-core-upgrade' "$mu_dir/lun_agent.py" 2>/dev/null; then
 multiuser_download_agent || return 1
 fi
