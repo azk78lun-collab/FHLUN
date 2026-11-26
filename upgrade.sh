@@ -96,6 +96,9 @@ lun_bridge_main(){
   fi
   if [ -f "$destination" ] && cmp -s "$temporary/lun.sh" "$destination"; then
     lun_bridge_update_cluster "$destination" || return 1
+    if grep -q '^LUN_SINGBOX_VERSION=' "$destination"; then
+      bash "$destination" sync-runtime || return 1
+    fi
     echo "已核验实际入口：$destination；当前已是最新版 $version（提交 ${commit:0:12}）。"
     return 0
   fi
@@ -118,7 +121,12 @@ lun_bridge_main(){
   echo "Lun 更新完成：${current:-未安装} → $version"
   echo "生效入口：$destination；提交：${commit:0:12}；SHA-256：$after"
   lun_bridge_update_cluster "$destination" || return 1
-  echo '代理参数、证书、用户数据库和集群身份未修改；请重新运行 lun。'
+  if grep -q '^LUN_SINGBOX_VERSION=' "$destination" && [ -n "$current" ]; then
+    bash "$destination" sync-runtime || return 1
+    echo '配套内核与新版多用户资料已核验；请重新运行 lun。'
+  else
+    echo '代理参数、证书、用户数据库和集群身份未修改；请重新运行 lun。'
+  fi
 )
 }
 

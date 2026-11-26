@@ -248,12 +248,12 @@ class ClusterTestCase(unittest.TestCase):
             )
         device = self._sample_federation_user_bundle(1)["users"][0]["devices"][0]
 
-        def seed(owner, nodes, token):
+        def seed(owner, nodes, token, generation=""):
             user_key = owner + ":user:7"
             device_key = user_key + ":device:" + device["uuid"]
             shared = {"owner_id": owner, "user_key": user_key}
             rows = (
-                ("user.upsert", "user:" + user_key, {**shared, "name": "fixture"}),
+                ("user.upsert", "user:" + user_key, {**shared, "name": "fixture", "data_generation": generation}),
                 ("authorization.upsert", "authorization:" + user_key, {**shared, "nodes": nodes}),
                 ("device.upsert", "device:" + device_key, {**shared, **device, "device_key": device_key}),
                 ("token.upsert", "token:" + device_key, {**shared, "device_key": device_key, "token": token}),
@@ -285,6 +285,21 @@ class ClusterTestCase(unittest.TestCase):
                     self.cluster.apply_federation_users(refresh=False)
             write_profile.assert_not_called()
             apply.assert_not_called()
+
+            module = self.cluster.root / "modules" / "multiuser"
+            module.mkdir(parents=True, exist_ok=True)
+            (module / "config.json").write_text(json.dumps({
+                "user_data_generation": lun_cluster.USER_DATA_GENERATION,
+            }), encoding="utf-8")
+            # During a rolling update the old accounts are no longer accepted, even
+            # if an old peer replays a still-valid signed event or has the same UUID.
+            result = self.cluster.apply_federation_users(refresh=False)
+            self.assertEqual((result["users"], result["profiles"]), (0, 0))
+            self.assertEqual(self.cluster.db.connection.execute(
+                "SELECT COUNT(*) FROM profiles WHERE enabled=1").fetchone()[0], 0)
+            seed(unassigned, [local], "fresh_subscription_token", lun_cluster.USER_DATA_GENERATION)
+            result = self.cluster.apply_federation_users(refresh=False)
+            self.assertEqual((result["users"], result["profiles"]), (1, 1))
 
     def test_sync_users_cli_reports_partial_failure_without_claiming_success(self) -> None:
         result = {"failures": {"b" * 32: "fixture failure"}}
@@ -978,6 +993,23 @@ class ClusterTestCase(unittest.TestCase):
             self.assertEqual(result["nodes"][str(first.node(remote_id)["server_number"])]["status"], "updated")
             self.assertNotIn(str(first.node(legacy_id)["server_number"]), result["nodes"])
             self.assertEqual(first.node(remote_id)["role"], "federation")
+            new_script = base64.b64decode(script_payload["content"]) + b"LUN_SINGBOX_VERSION=1.14.4\n"
+            runtime_payload = {"content": base64.b64encode(new_script).decode(),
+                               "sha256": lun_cluster.hashlib.sha256(new_script).hexdigest()}
+            calls.clear()
+
+            def sync_core(*args, **kwargs):
+                _, node_id, action, parameters = args
+                if action == "core.update":
+                    calls.append((node_id, action))
+                    self.assertEqual(parameters, {"core": "singbox"})
+                    return {"result": {"returncode": 0}}
+                return fake_send(*args, **kwargs)
+
+            with mock.patch.object(lun_cluster, "send_action", side_effect=sync_core):
+                result = lun_cluster.distribute_cluster_update(first, {"script": runtime_payload, "agent": agent_payload})
+            self.assertTrue(result["complete"])
+            self.assertEqual(calls[-2:], [(remote_id, "agent.install"), (remote_id, "core.update")])
         finally:
             first.close()
             second.close()

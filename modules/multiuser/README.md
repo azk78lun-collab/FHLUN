@@ -5,7 +5,7 @@
 ## 组件
 
 - `lun_agent.py`：仅依赖 Python 3 标准库，管理 SQLite 用户数据库、配额、配置注入、订阅服务和独立域名访问监控。
-- `build-singbox-enhanced.sh`：以相同 Sing-box 版本构建带 `with_v2ray_api` 的增强内核和非驻留统计查询工具。
+- `build-singbox-enhanced.sh`：构建与主脚本对应的增强内核和非驻留统计查询工具。
 - `sb_stats_helper.go`：只允许连接回环地址的 Sing-box gRPC 统计查询工具源码。
 - `tests/`：数据库、配额、核心配置和订阅渲染单元测试。
 
@@ -46,4 +46,4 @@ Xray 26.3.27 在 `loglevel: none` 时不会创建 access 日志，因此监控�
 
 ## Sing-box 增强内核
 
-普通 Sing-box 仍可承载多用户，但无法提供按用户流量统计。增强构建保持版本不变，只在原有构建标签中增加 `with_v2ray_api`，并配套 `lun-sb-stats` 查询工具。查询工具拒绝非回环 API 地址，不是公网管理接口。构建产物经测试后再作为 Release 资产提供。
+Lun 的增强内核基于官方 Sing-box 1.14.4 重新构建，保留原协议、Snell v6 与 `with_v2ray_api`，配套 `lun-sb-stats` 查询工具。统计接口仅使用回环，查询工具拒绝非回环地址。GitHub 的 **Build Lun enhanced Sing-box** 工作流生成 amd64 与 arm64 的配套包；在主分支手动开启发布，且真实统计与 Snell 验证通过后，才建立固定 Release `lun-singbox-1.14.4`。旧资产不用作此版的升级回退源。

@@ -71,6 +71,22 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 10)); active--;
   });
   assert.equal(maximum, 16);
-  console.log('6 browser deadline/cancellation/limit/protocol/concurrency scenarios passed');
+
+  for (const [outcome, text] of [['success', '应用成功'], ['failure', '应用失败']]) {
+    const box = { style: {}, scrollIntoView() {} }, button = {};
+    ctx = vm.createContext({
+      AbortSignal, setTimeout: (fn) => queueMicrotask(fn),
+      state: { controllers: new Set(), preview: { digest: 'fixture' }, selected: ['8.8.8.8'], retained: [] },
+      $: (selector) => selector === '#applyResult' ? box : button, $$: () => [button],
+      setGlobal() {}, post: async () => ({ state: 'applying' }),
+      api: async () => { assert.match(box.textContent, /正在保存/); return { state: outcome }; },
+    });
+    vm.runInContext(['showApplyState', 'watchApply', 'apply'].map(extract).join('\n'), ctx);
+    await ctx.apply();
+    assert.match(box.textContent, new RegExp(text));
+    assert.match(box.textContent, /页面?即将失效|本页即将失效/);
+    assert.equal(button.disabled, true);
+  }
+  console.log('Browser deadline, cancellation, concurrency and apply-result scenarios passed');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -1,18 +1,31 @@
-name: Build multi-user sing-box
+name: Build Lun enhanced Sing-box
 
 on:
   workflow_dispatch:
     inputs:
-      sing_box_version:
-        description: sing-box version without leading v
-        required: true
-        default: 1.13.14
+      publish:
+        description: Publish the verified, versioned core bundle
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.pin.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the version pinned by Lun
+        id: pin
+        run: |
+          version=$(sed -n 's/^LUN_SINGBOX_VERSION=//p' lun.sh)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "value=$version" >> "$GITHUB_OUTPUT"
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -26,24 +39,48 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: 1.24.7
+          go-version: '1.25.5'
           cache: false
-      - name: Fetch sing-box source
-        run: git clone --depth 1 --branch "v${{ inputs.sing_box_version }}" https://github.com/SagerNet/sing-box.git "$RUNNER_TEMP/sing-box"
       - name: Build enhanced core
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-          SING_BOX_VERSION: ${{ inputs.sing_box_version }}
-          SING_BOX_SOURCE_DIR: ${{ runner.temp }}/sing-box
-        run: bash modules/multiuser/build-singbox-enhanced.sh "$GITHUB_WORKSPACE/sing-box-multiuser-${{ matrix.arch }}" "$GITHUB_WORKSPACE/lun-sb-stats-${{ matrix.arch }}"
-      - name: Verify build tags
+          SING_BOX_VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lun-core"
+          bash modules/multiuser/build-singbox-enhanced.sh "$RUNNER_TEMP/lun-core/sing-box" "$RUNNER_TEMP/lun-core/lun-sb-stats"
+      - name: Verify Snell v6, legacy config and real statistics
         if: matrix.arch == 'amd64'
-        run: ./sing-box-multiuser-amd64 version | grep with_v2ray_api
+        run: |
+          export LUN_TEST_SNELL="$RUNNER_TEMP/lun-core/sing-box"
+          export LUN_TEST_SB_STATS="$RUNNER_TEMP/lun-core/lun-sb-stats"
+          export PYTHONPATH="$PWD/tests/offline"
+          python3 -B -m unittest discover -s tests -p 'test_snell_core.py' -v
+      - name: Package matched binaries
+        run: tar -C "$RUNNER_TEMP/lun-core" -czf "sing-box-lun-${{ matrix.arch }}.tar.gz" sing-box lun-sb-stats
       - uses: actions/upload-artifact@v4
         with:
-          name: sing-box-multiuser-${{ matrix.arch }}
-          path: |
-            sing-box-multiuser-${{ matrix.arch }}
-            lun-sb-stats-${{ matrix.arch }}
+          name: lun-singbox-${{ matrix.arch }}
+          path: sing-box-lun-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
+
+  publish:
+    if: inputs.publish && github.ref == 'refs/heads/main'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lun-singbox-*
+          merge-multiple: true
+      - name: Publish fixed release (never overwrite an existing bundle)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          gh release create "lun-singbox-$VERSION" sing-box-lun-amd64.tar.gz sing-box-lun-arm64.tar.gz \
+            --target "$GITHUB_SHA" --latest=false --title "Lun enhanced Sing-box $VERSION" \
+            --notes "Versioned Sing-box with Snell v6 and the loopback V2Ray statistics helper."

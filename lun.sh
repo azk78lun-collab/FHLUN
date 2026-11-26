@@ -4,7 +4,10 @@ lun_has_systemd(){
 command -v systemctl >/dev/null 2>&1 && test -d /run/systemd/system
 }
 
-LUN_CLUSTER_REQUIRED_VERSION=0.3.8
+LUN_CLUSTER_REQUIRED_VERSION=0.3.9
+LUN_CDNOPT_REQUIRED_VERSION=2.0.7
+LUN_SINGBOX_VERSION=1.14.4
+LUN_MULTIUSER_GENERATION=singbox-1.14.4
 _lun_locale=$(LC_ALL=C locale -a 2>/dev/null | awk 'tolower($0) ~ /^c\.utf-?8$/ {preferred=$0} tolower($0) ~ /utf-?8$/ && !fallback {fallback=$0} END {print preferred ? preferred : fallback}')
 export LC_ALL=${_lun_locale:-C}
 export LANG="$LC_ALL"
@@ -26,26 +29,27 @@ unset _lun_locale
 [ -z "${xupt+x}" ] || xup=yes
 [ -z "${xcpt+x}" ] || xcp=yes
 [ -z "${nvpt+x}" ] || nvp=yes
+[ -z "${snpt+x}" ] || snp=yes
 [ -n "${warp:-}" ] && wap=yes
 [ -n "${cdnym:-}" ] && _lun_cdn_input=yes || _lun_cdn_input=no
 LUN_MENU_REQUEST=
-[ -z "$1" ] && [ "$vwp" != yes ] && [ "$sop" != yes ] && [ "$vxp" != yes ] && [ "$ssp" != yes ] && [ "$vlp" != yes ] && [ "$vmp" != yes ] && [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$xhp" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$xup" != yes ] && [ "$xcp" != yes ] && [ "$nvp" != yes ] && LUN_MENU_REQUEST=yes
+[ -z "$1" ] && [ "$vwp" != yes ] && [ "$sop" != yes ] && [ "$vxp" != yes ] && [ "$ssp" != yes ] && [ "$vlp" != yes ] && [ "$vmp" != yes ] && [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$xhp" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$xup" != yes ] && [ "$xcp" != yes ] && [ "$nvp" != yes ] && [ "$snp" != yes ] && LUN_MENU_REQUEST=yes
 _lun_proc_running=no
 for _P in /proc/[0-9]*; do
 [ -L "$_P/exe" ] || continue
 _exe=$(readlink -f "$_P/exe" 2>/dev/null) || continue
-case "$_exe" in */lun/sing-box*|*/lun/xray*) _lun_proc_running=yes; break ;; esac
+case "$_exe" in */lun/sing-box*|*/lun/xray*|*/lun/snell/sing-box) _lun_proc_running=yes; break ;; esac
 done
 [ "$_lun_proc_running" = "no" ] && pgrep -f 'lun/(sing-box|xray)([[:space:]]|$)' >/dev/null 2>&1 && _lun_proc_running=yes
 [ "$_lun_proc_running" = "no" ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_proc_running=yes
 _lun_installed=no
-{ [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/xr.json" ] || [ -s "$HOME/lun/sb.json" ]; } && _lun_installed=yes
+{ [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/xr.json" ] || [ -s "$HOME/lun/sb.json" ] || [ -s "$HOME/lun/snell/config.json" ]; } && _lun_installed=yes
 if [ "$_lun_proc_running" = "yes" ] || [ "$_lun_installed" = "yes" ]; then
 if [ "$1" = "rep" ]; then
-[ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
+[ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || [ "$snp" = yes ] || { echo "提示：rep重置协议时，请在脚本前至少设置一个协议变量哦，再见！"; exit; }
 fi
 else
-[ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$1" = "runtime-ensure" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
+[ "$LUN_MENU_REQUEST" = yes ] || [ "$1" = "del" ] || [ "$1" = "runtime-ensure" ] || [ "$vwp" = yes ] || [ "$sop" = yes ] || [ "$vxp" = yes ] || [ "$ssp" = yes ] || [ "$vlp" = yes ] || [ "$vmp" = yes ] || [ "$hyp" = yes ] || [ "$tup" = yes ] || [ "$xhp" = yes ] || [ "$anp" = yes ] || [ "$arp" = yes ] || [ "$xup" = yes ] || [ "$xcp" = yes ] || [ "$nvp" = yes ] || [ "$snp" = yes ] || { echo "提示：未安装 Lun，请先运行 lun 菜单安装，或在脚本前至少设置一个协议变量。"; exit; }
 fi
 export uuid=${uuid:-''}
 export port_vl_re=${vlpt:-''}
@@ -62,9 +66,11 @@ export port_so=${sopt:-''}
 export port_xu=${xupt:-''}
 export port_xc=${xcpt:-''}
 export port_nv=${nvpt:-''}
+export port_snell=${snpt:-''}
 export ym_vl_re=${reym:-''}
 export cdnym=${cdnym:-''}
 export cfip=${cfip:-''}
+_lun_argo_input=${argo+x}
 export argo=${argo:-''}
 export ARGO_DOMAIN=${agn:-''}
 export ARGO_AUTH=${agk:-''}
@@ -107,7 +113,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.19.2"
+echo "当前版本：V26.11.26.2"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -525,7 +531,7 @@ printf '%s\n' "$cdn_normalized"
 save_cdn_ip_list(){
 normalized_cdn_ips=$(normalize_cdn_ip_input "$1")
 [ -n "$normalized_cdn_ips" ] || return 1
-clear_cdn_ip_list
+clear_cdn_ip_list || return 1
 idx=1
 list=
 seen=
@@ -533,10 +539,10 @@ for one in $normalized_cdn_ips; do
 case " $seen " in *" $one "*) continue ;; esac
 seen="${seen:+$seen }$one"
 list="${list:+$list }$one"
-printf "%s\n" "$one" > "$HOME/lun/cdnip$idx"
+printf "%s\n" "$one" > "$HOME/lun/cdnip$idx" || return 1
 idx=$((idx + 1))
 done
-printf "%s\n" "$list" > "$HOME/lun/cdnip"
+printf "%s\n" "$list" > "$HOME/lun/cdnip" || return 1
 cfip="$list"
 }
 
@@ -1870,14 +1876,7 @@ echo "已安装Xray正式版内核：$sbcore"
 }
 
 upsingbox(){
-out="$HOME/lun/sing-box"; tmp="${out}.tmp.$$"
-url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-$cpu"
-download_core_asset "sing-box-$cpu" "$tmp" "$url" || return 1
-chmod +x "$tmp" || { rm -f "$tmp"; return 1; }
-sbcore=$("$tmp" version 2>/dev/null | awk '/version/{print $NF}')
-[ -n "$sbcore" ] || { echo "下载的 Sing-box 文件无法执行，已保留原内核。"; rm -f "$tmp"; return 1; }
-mv -f "$tmp" "$out"
-echo "已安装Sing-box正式版内核：$sbcore"
+update_lun_singbox
 }
 
 upcloudflared(){
@@ -2977,6 +2976,35 @@ fi
 uuid=$(cat "$HOME/lun/uuid")
 echo "UUID密码：$uuid"
 }
+vless_ws_vision_enabled(){
+[ "$(cat "$HOME/lun/vless_ws_vision" 2>/dev/null)" = on ]
+}
+
+xray_supports_ws_vision(){
+local core_version
+core_version=$("$HOME/lun/xray" version 2>/dev/null | awk '/^Xray /{print $2; exit}')
+printf '%s\n' "$core_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || return 1
+! lun_version_is_older "$core_version" 26.3.27
+}
+
+prepare_vless_ws_vision(){
+local choice=${LUN_WS_VISION_CHANGE:-} state=off
+vless_ws_vision_enabled && state=on
+case "$choice" in
+on|off) state=$choice ;;
+"") ;;
+*) return 1 ;;
+esac
+if [ "$state" = on ]; then
+xray_supports_ws_vision || { red_line "VLESS WS Vision 需要 Xray 26.3.27 或更新版本。请先更新内核，或关闭 WS Vision。"; return 1; }
+[ -n "$dekey" ] && [ "$dekey" != none ] && [ -n "$enkey" ] && [ "$enkey" != none ] || {
+red_line "VLESS WS Vision 需要有效的 ENC 密钥。原节点配置不会被覆盖。"
+return 1
+}
+fi
+[ -z "$choice" ] || (umask 077; printf '%s\n' "$state" > "$HOME/lun/vless_ws_vision")
+}
+
 installxray(){
 echo
 echo "=========启用xray内核========="
@@ -3088,6 +3116,10 @@ elif [ -n "$port_vx" ]; then
 echo "$port_vx" > "$HOME/lun/port_vx"
 fi
 port_vx=$(cat "$HOME/lun/port_vx")
+if [ "$argo" = vxpt ] && cdn_origin_tls_for_port "$port_vx"; then
+red_line "XHTTP 隧道需要本机 HTTP 回源；该监听端口已启用 CDN 源站 TLS。请选择 HTTP 回源或绑定其它协议。"
+return 1
+fi
 ensure_cdn_origin_cert "$port_vx"
 echo "Vless-xhttp-enc端口：$port_vx"
 if [ -n "$cdnym" ]; then
@@ -3238,6 +3270,11 @@ xcp=xcptargo
 fi
 if [ -n "$vwp" ]; then
 vwp=vwpt
+prepare_vless_ws_vision || return 1
+local ws_vision_field=
+if vless_ws_vision_enabled; then
+ws_vision_field=', "flow": "xtls-rprx-vision"'
+fi
 if [ -z "$port_vw" ] && [ ! -e "$HOME/lun/port_vw" ]; then
 port_vw=$(random_cdn_port http 2>/dev/null) || { yellow_line "VLESS WS 没有未占用的 Cloudflare HTTP 端口，将回退普通随机端口；后续使用 CDN 时需要 Origin Rules。"; port_vw=$(random_port 2>/dev/null) || { echo "VLESS WS 无法取得可用端口，请扩容端口池或手动指定端口。"; exit 1; }; }
 echo "$port_vw" > "$HOME/lun/port_vw"
@@ -3260,7 +3297,7 @@ cat >> "$HOME/lun/xr.json" <<EOF
       "settings": {
         "clients": [
           {
-            "id": "${uuid}"
+            "id": "${uuid}"${ws_vision_field}
           }
         ],
         "decryption": "${dekey}"
@@ -3900,9 +3937,290 @@ nohup "$HOME/lun/sing-box" run -c "$HOME/lun/sb.json" >/dev/null 2>&1 &
 fi
 fi
 }
+argo_configured_protocol(){
+case "$(cat "$HOME/lun/vlvm" 2>/dev/null)" in
+Vmess) printf '%s\n' vmpt ;;
+Vless) printf '%s\n' vwpt ;;
+Vlessx) printf '%s\n' vxpt ;;
+esac
+}
+
+argo_origin_port(){
+local port_file selected_port
+case "$1" in
+vmpt) port_file=port_vm_ws ;;
+vwpt) port_file=port_vw ;;
+vxpt) port_file=port_vx ;;
+*) return 1 ;;
+esac
+selected_port=$(cat "$HOME/lun/$port_file" 2>/dev/null)
+valid_port_value "$selected_port" || return 1
+printf '%s\n' "$selected_port"
+}
+
+argo_protocol_label(){
+case "$1" in
+vmpt) printf '%s\n' 'VMess WS' ;;
+vwpt) printf '%s\n' 'VLESS WS' ;;
+vxpt) printf '%s\n' 'VLESS XHTTP' ;;
+*) printf '%s\n' '未知' ;;
+esac
+}
+
+load_saved_argo(){
+argo=$(argo_configured_protocol)
+ARGO_DOMAIN=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
+ARGO_AUTH=$(cat "$HOME/lun/sbargotoken.log" 2>/dev/null)
+export argo ARGO_DOMAIN ARGO_AUTH
+}
+
+append_argo_xhttp_links(){
+local entry address suffix link
+for entry in $argo_entries; do
+address=$(uri_host "${entry%%|*}")
+suffix=${entry#*|}
+link="vless://$uuid@$address:443?encryption=$enkey&flow=xtls-rprx-vision&type=xhttp&host=$argodomain&path=/$uuid-vx&mode=packet-up&security=tls&sni=$argodomain&fp=chrome#$(routed_node_name "vless-xhttp-argo-tls-443-ar$suffix")"
+printf '%s\n' "$link" >> "$HOME/lun/jhsub.txt" || return 1
+printf '%s\n' "$link"
+done
+}
+
+snell_ensure_core(){
+update_lun_singbox snell
+}
+
+snell_public_port(){
+local sn_port=$1 sn_pair
+if ! is_nat_mode; then printf '%s\n' "$sn_port"; return 0; fi
+for sn_pair in $ptmap; do
+[ "${sn_pair#*-}" = "$sn_port" ] || continue
+printf '%s\n' "${sn_pair%%-*}"
+return 0
+done
+pool_public_for_inner "$sn_port"
+}
+
+snell_service(){
+local op=$1 dir="$HOME/lun/snell"
+if lun_has_systemd; then
+case "$op" in
+install)
+cat > /etc/systemd/system/lun-snell.service <<EOF
+[Unit]
+Description=Lun Snell v6 (isolated Sing-box)
+After=network.target
+[Service]
+ExecStart="$dir/sing-box" run -c "$dir/config.json"
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+PrivateTmp=yes
+ProtectSystem=full
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now lun-snell ;;
+status) systemctl is-active --quiet lun-snell ;;
+start|restart|stop) systemctl "$op" lun-snell ;;
+disable) systemctl disable --now lun-snell ;;
+remove) systemctl disable --now lun-snell >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/lun-snell.service; systemctl daemon-reload ;;
+esac
+elif command -v rc-service >/dev/null 2>&1; then
+case "$op" in
+install)
+cat > /etc/init.d/lun-snell <<EOF
+#!/sbin/openrc-run
+description="Lun Snell v6"
+command="$dir/sing-box"
+command_args="run -c $dir/config.json"
+command_background=yes
+pidfile="/run/lun-snell.pid"
+depend() { need net; }
+EOF
+chmod 755 /etc/init.d/lun-snell && rc-update add lun-snell default && rc-service lun-snell start ;;
+status|start|restart|stop) rc-service lun-snell "$op" ;;
+disable|remove)
+rc-service lun-snell stop >/dev/null 2>&1 || {
+  if rc-service lun-snell status >/dev/null 2>&1; then return 1; fi
+}
+rc-update del lun-snell default >/dev/null 2>&1 || true
+[ "$op" != remove ] || rm -f /etc/init.d/lun-snell ;;
+esac
+else
+return 1
+fi
+}
+
+snell_preflight(){
+local saved
+[ "$(id -u)" = 0 ] && { lun_has_systemd || command -v rc-service >/dev/null 2>&1; } || {
+red_line "Snell v6 需要 root 和 systemd 或 OpenRC；现有协议不受影响。"; return 1;
+}
+lun_python_ensure basic || return 1
+[ -n "$port_snell" ] || port_snell=$(random_port) || {
+red_line "Snell v6 未找到空闲端口；NAT VPS 请先登记 TCP 映射。"; return 1;
+}
+valid_port_value "$port_snell" || { red_line "Snell v6 端口无效。"; return 1; }
+port_snell=$((10#$port_snell))
+snell_public_port "$port_snell" >/dev/null || {
+red_line "Snell v6 需要已登记的公网 TCP → 内网端口映射。"; return 1;
+}
+saved=$(cat "$HOME/lun/port_snell" 2>/dev/null)
+if port_in_use "$port_snell" && { [ "$saved" != "$port_snell" ] || ! snell_service status >/dev/null 2>&1; }; then
+red_line "Snell v6 端口 $port_snell 已被占用，未改动现有服务。"
+return 1
+fi
+snell_ensure_core
+}
+
+snell_write_config(){
+local port=$1 listen=$2 key=$3
+valid_port_value "$port" && printf '%s\n' "$key" | grep -Eq '^[0-9a-f]{64}$' || return 1
+cat <<EOF
+{
+  "log": {"disabled": true},
+  "dns": {"servers": [{"type": "local", "tag": "system"}]},
+  "inbounds": [{"type": "snell", "tag": "snell-in", "listen": "$listen", "listen_port": $port, "version": 6, "psk": "$key", "mode": "default"}],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"rules": [{"action": "resolve", "server": "system"}, {"ip_is_private": true, "action": "reject"}], "final": "direct"}
+}
+EOF
+}
+
+snell_install(){
+(
+umask 077
+local dir="$HOME/lun/snell" key listen=0.0.0.0 stage attempt
+[ -n "$(cat /proc/net/if_inet6 2>/dev/null)" ] && listen=::
+if [ -s "$dir/psk" ]; then
+key=$(cat "$dir/psk") || return 1
+else
+key=$(openssl rand -hex 32) || return 1
+printf '%s\n' "$key" > "$dir/psk" || return 1
+fi
+stage=$(mktemp "$dir/.config.XXXXXXXX") || return 1
+trap 'rm -f "$stage"' EXIT
+snell_write_config "$port_snell" "$listen" "$key" > "$stage" || return 1
+"$dir/sing-box" check -c "$stage" >/dev/null 2>&1 || { red_line "Snell v6 配置校验失败。"; return 1; }
+mv -f "$stage" "$dir/config.json" || return 1
+if snell_service install >/dev/null 2>&1; then
+for attempt in 1 2 3 4 5; do
+if snell_service status >/dev/null 2>&1 && python3 -c '
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.5):
+    pass
+' "$(if [ "$listen" = "::" ]; then echo ::1; else echo 127.0.0.1; fi)" "$port_snell" 2>/dev/null; then
+printf '%s\n' "$port_snell" > "$HOME/lun/port_snell" && return 0
+break
+fi
+sleep 1
+done
+fi
+snell_service disable >/dev/null 2>&1 || true
+rm -f "$dir/config.json" "$HOME/lun/port_snell"
+red_line "Snell v6 未开始监听端口 $port_snell；可检查 lun-snell 服务。"
+return 1
+)
+}
+
+snell_apply_only(){
+(
+umask 077
+local dir="$HOME/lun/snell" backup old_port changing=no
+if [ "$snp" = yes ]; then snell_preflight || return 1; fi
+old_port=$(cat "$HOME/lun/port_snell" 2>/dev/null || true)
+backup=$(mktemp "$HOME/lun/.snell-config.XXXXXXXX") || return 1
+trap '
+  if [ "$changing" = yes ]; then
+    snell_service disable >/dev/null 2>&1 || true
+    rm -f "$dir/config.json" "$HOME/lun/port_snell"
+    if [ -s "$backup" ]; then
+      cp -p "$backup" "$dir/config.json" && printf "%s\n" "$old_port" > "$HOME/lun/port_snell" && \
+      snell_service install >/dev/null 2>&1 || red_line "旧 Snell 状态恢复失败，请检查 lun-snell。"
+    fi
+    apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
+  fi
+  rm -f "$backup"
+' EXIT
+trap 'exit 130' HUP INT TERM
+if [ -s "$dir/config.json" ]; then
+cp -p "$dir/config.json" "$backup" || return 1
+snell_service disable >/dev/null 2>&1 || { red_line "未能停止 Snell v6；配置保持原样。"; return 1; }
+fi
+changing=yes
+rm -f "$dir/config.json" "$HOME/lun/port_snell" || return 1
+if { [ "$snp" != yes ] || snell_install; } && apply_lun_firewall_rules; then
+changing=no
+if [ "$snp" = yes ]; then
+green_line "Snell v6 已启用；可在“节点订阅分享 → 私下导出 Snell”获取配置。"
+else
+green_line "Snell v6 已停用。"
+fi
+return 0
+fi
+red_line "Snell v6 调整失败；未重启现有 Xray 或 Sing-box。"
+return 1
+)
+}
+
+snell_export(){
+local format=$1 public host label
+[ -s "$HOME/lun/port_snell" ] && [ -s "$HOME/lun/snell/config.json" ] || { echo "尚未启用 Snell v6。" >&2; return 1; }
+snell_service status >/dev/null 2>&1 || { echo "Snell v6 服务未运行，暂不导出。" >&2; return 1; }
+lun_python_activate
+public=$(snell_public_port "$(cat "$HOME/lun/port_snell")") || { echo "未找到 Snell 公网 TCP 映射。" >&2; return 1; }
+v4v6 >/dev/null
+host=$(normalize_host "${v4:-$v6}")
+[ -n "$host" ] || { echo "未检测到可用的公网 IP。" >&2; return 1; }
+ensure_server_identity >/dev/null || return 1
+label=$(routed_node_name snell-v6)
+python3 - "$HOME/lun/snell/config.json" "$host" "$public" "$label" "$format" <<'PY'
+import json, sys
+path, host, port, label, target = sys.argv[1:]
+with open(path) as source:
+    inbound = json.load(source)["inbounds"][0]
+psk = inbound["psk"]
+common = dict(type="snell", server=host, psk=psk, version=6, mode="default", reuse=True)
+if target == "sing-box":
+    print(json.dumps({"outbounds": [dict(common, tag=label, server_port=int(port))]}, indent=2, ensure_ascii=False))
+elif target == "mihomo":
+    print(json.dumps({"proxies": [dict(common, name=label, port=int(port), udp=True)]}, indent=2, ensure_ascii=False))
+elif target == "surge":
+    print(f"[Proxy]\n{label} = snell, {host}, {port}, psk={psk}, version=6, mode=default, reuse=true")
+else:
+    sys.exit("用法：lun snell-export [sing-box|mihomo|surge]")
+PY
+}
+
+snell_export_menu(){
+yellow_line "以下配置含本机 Snell 密钥，仅在此 SSH 终端显示。请勿公开分享。"
+printf "格式：1. Sing-box / 2. Mihomo / 3. Surge / 0. 返回："
+local format
+IFS= read -r format || return 2
+case "$format" in
+1) snell_export sing-box ;;
+2) snell_export mihomo ;;
+3) snell_export surge ;;
+0|"") return 2 ;;
+*) echo "输入错误。" ; return 1 ;;
+esac
+}
+
+legacy_protocol_selected(){
+case " $vlp $vmp $vwp $hyp $tup $xhp $vxp $anp $ssp $arp $sop $xup $xcp $nvp " in
+*" yes "*) return 0 ;; *) return 1 ;;
+esac
+}
+
 ins(){
 lun_python_ensure basic || return 1
-if [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$ssp" != yes ] && [ "$nvp" != yes ]; then
+if [ "$snp" = yes ]; then snell_preflight || return 1; fi
+if [ "$snp" = yes ] && ! legacy_protocol_selected; then
+if [ -z "$uuid" ] && [ ! -s "$HOME/lun/uuid" ]; then uuid=$("$HOME/lun/snell/sing-box" generate uuid) || return 1; fi
+[ -z "$uuid" ] || (umask 077; printf '%s\n' "$uuid" > "$HOME/lun/uuid") || return 1
+elif [ "$hyp" != yes ] && [ "$tup" != yes ] && [ "$anp" != yes ] && [ "$arp" != yes ] && [ "$ssp" != yes ] && [ "$nvp" != yes ]; then
 installxray || return 1
 xrsbvm
 xrsbso
@@ -3924,13 +4242,25 @@ xrsbso
 warpsx
 xrsbout || return 1
 fi
-if [ -n "$argo" ] && [ -n "$vmag" ]; then
+if [ "$snp" = yes ]; then snell_install || return 1; fi
+if [ -n "$argo" ]; then
+if ! argoport=$(argo_origin_port "$argo"); then
+yellow_line "隧道绑定的协议未安装，本次不启动隧道。"
+argo=
+fi
+fi
+if [ -n "$argo" ]; then
 echo
 echo "=========启用Cloudflared-argo内核========="
 if [ ! -e "$HOME/lun/cloudflared" ]; then
 upcloudflared || { echo "Cloudflared 内核下载失败，已停止 Argo 配置。"; return 1; }
 fi
-if [ "$argo" = "vmpt" ]; then argoport=$(cat "$HOME/lun/port_vm_ws" 2>/dev/null); echo "Vmess" > "$HOME/lun/vlvm"; elif [ "$argo" = "vwpt" ]; then argoport=$(cat "$HOME/lun/port_vw" 2>/dev/null); echo "Vless" > "$HOME/lun/vlvm"; fi; echo "$argoport" > "$HOME/lun/argoport.log"
+case "$argo" in
+vmpt) echo Vmess ;;
+vwpt) echo Vless ;;
+vxpt) echo Vlessx ;;
+esac > "$HOME/lun/vlvm"
+echo "$argoport" > "$HOME/lun/argoport.log"
 if [ -n "${ARGO_DOMAIN}" ] && [ -n "${ARGO_AUTH}" ]; then
 argoname='固定'
 if lun_has_systemd && [ "$(id -u 2>/dev/null)" = "0" ]; then
@@ -3994,7 +4324,7 @@ fi
 fi
 sleep 1
 echo
-if { find /proc/[0-9]*/exe -type l 2>/dev/null | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(sing-box|xray)$'; } 2>/dev/null || pgrep -f 'lun/(sing-box|xray)([[:space:]]|$)' >/dev/null 2>&1 || systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; then
+if { [ "$snp" = yes ] && snell_service status >/dev/null 2>&1; } || { find /proc/[0-9]*/exe -type l 2>/dev/null | xargs -r readlink 2>/dev/null | grep -Eq 'lun/(sing-box|xray)$'; } 2>/dev/null || pgrep -f 'lun/(sing-box|xray)([[:space:]]|$)' >/dev/null 2>&1 || systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; then
 [ -f ~/.bashrc ] || touch ~/.bashrc
 sed -i '/lun/d' ~/.bashrc
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
@@ -4033,7 +4363,7 @@ echo '@reboot sleep 10 && /bin/sh -c "nohup $HOME/lun/xray run -c $HOME/lun/xr.j
 fi
 fi
 sed -i '/lun\/cloudflared/d' /tmp/crontab.tmp
-if [ -n "$argo" ] && [ -n "$vmag" ]; then
+if [ -n "$argo" ]; then
 if [ -n "${ARGO_DOMAIN}" ] && [ -n "${ARGO_AUTH}" ]; then
 if ! lun_has_systemd && ! command -v rc-service >/dev/null 2>&1; then
 echo '@reboot sleep 10 && /bin/sh -c "nohup $HOME/lun/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $(cat $HOME/lun/sbargotoken.log 2>/dev/null) >/dev/null 2>&1 &"' >> /tmp/crontab.tmp
@@ -4117,6 +4447,9 @@ elif [ -x "$HOME/lun/xray" ]; then
 echo "Xray：内核已安装，当前协议未使用"
 else
 echo "Xray：未安装"
+fi
+if [ -s "$HOME/lun/port_snell" ]; then
+if snell_service status >/dev/null 2>&1; then echo "Snell v6：独立内核运行中"; else echo "Snell v6：已配置，当前未运行"; fi
 fi
 if cluster_enabled; then
 if { lun_has_systemd && systemctl is-active --quiet lun-cluster-agent 2>/dev/null; } \
@@ -4741,8 +5074,8 @@ cluster_remove_service(){
 cluster_service_stop
 if lun_has_systemd; then
 systemctl disable lun-cluster-agent >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/lun-cluster-agent.service
-systemctl daemon-reload >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/lun-cluster-agent.service || return 1
+systemctl daemon-reload >/dev/null 2>&1 || return 1
 elif command -v rc-service >/dev/null 2>&1; then
 rc-update del lun-cluster-agent default >/dev/null 2>&1 || true
 rm -f /etc/init.d/lun-cluster-agent
@@ -5910,14 +6243,20 @@ cluster_refresh_profiles_async
 }
 
 cluster_join_ui(){
+local cluster_join_uri cluster_join_result cluster_join_node
 ui_title "Lun 加入联邦成员"
 yellow_line "在任意可信成员选择“生成加入地址”，复制整条 lunjoin:// 地址到这里；地址只可使用一次，15 分钟后失效。"
 printf "加入地址（输入 0 返回）："
-IFS= read -r cluster_join_uri
+IFS= read -r cluster_join_uri || return 2
 [ "$cluster_join_uri" = 0 ] && return
 [ -n "$cluster_join_uri" ] || { red_line "加入地址不能为空。"; return 1; }
-cluster_join_result=$(mktemp)
-if cluster_cmd --json add-peer --uri "$cluster_join_uri" >"$cluster_join_result"; then
+cluster_join_result=$(mktemp) || { red_line "加入失败：无法创建临时结果文件。"; return 1; }
+yellow_line "正在向对端提交加入请求……"
+if ! cluster_cmd --json add-peer --uri "$cluster_join_uri" >"$cluster_join_result"; then
+rm -f "$cluster_join_result"
+red_line "加入未确认成功；请按上方错误处理后重试，或先查看成员列表确认状态。"
+return 1
+fi
 cluster_join_node=$(python3 - "$cluster_join_result" <<'PY'
 import json, sys
 try:
@@ -5926,18 +6265,21 @@ except (OSError, ValueError):
     print("")
 PY
 )
-[ -n "$cluster_join_node" ] || { rm -f "$cluster_join_result"; red_line "加入结果缺少成员身份，请重试。"; return 1; }
-cluster_install_service && cluster_service_restart || true
+rm -f "$cluster_join_result"
+[ -n "$cluster_join_node" ] || { red_line "无法确认加入结果：缺少成员身份。请查看成员列表，不要直接重复配对。"; return 1; }
+green_line "加入成功：本机已保存对端成员身份。"
+if ! cluster_service_restart; then
+yellow_line "配对已保存，但本机联邦服务未就绪；请到“状态 / 修复”处理。"
+return 1
+fi
 apply_lun_firewall_rules || true
-yellow_line "成员已接纳，正在有界并行广播信任、动态生效并发布新订阅……"
+yellow_line "正在同步其他成员的信任和订阅……"
 if cluster_cmd finalize-peer --node-id "$cluster_join_node"; then
-green_line "成员已加入联邦；全部在线成员已自动同步，无需其它操作。"
+green_line "加入收尾完成：在线成员已同步。"
 else
-yellow_line "新成员已加入，但有旧成员当前不可达；其恢复后会在订阅刷新时自动补齐。"
+yellow_line "加入成功，但部分成员尚未同步；可稍后按需同步，不必重新配对。"
 fi
 cluster_refresh_profiles_async
-fi
-rm -f "$cluster_join_result"
 }
 
 cluster_location_ui(){
@@ -5992,7 +6334,11 @@ printf "要撤销的成员节点 ID（输入 0 返回）："; IFS= read -r clust
 [ "$cluster_node_id" = 0 ] && return
 printf "回车确认撤销（输入 0 返回）："; IFS= read -r cluster_confirm
 [ "$cluster_confirm" = 0 ] && return
-cluster_cmd remove-peer --node-id "$cluster_node_id" --reason manual && cluster_refresh_profiles_async
+if ! cluster_cmd remove-peer --node-id "$cluster_node_id" --reason manual; then
+red_line "撤销未确认完成，请查看成员状态和上方错误。"
+return 1
+fi
+cluster_refresh_profiles_async
 }
 
 cluster_subscription_takeover_release(){
@@ -6012,25 +6358,31 @@ return 0
 }
 
 cluster_disable_ui(){
-chain_require_empty || return 1
+chain_require_empty || { red_line "退出未执行：请先清理上方提示的链路。"; return 1; }
 red_line "停用只移除本机联邦控制面；不会卸载代理协议、普通本机数据或网站访问监控。"
 printf "回车确认停用本机联邦（输入 0 返回）："; IFS= read -r cluster_confirm
 [ "$cluster_confirm" = 0 ] && return
 [ -z "$cluster_confirm" ] || { red_line "请直接回车确认，或输入 0 返回。"; return 1; }
 cluster_disable_keeps_multiuser=no
 multiuser_enabled && cluster_disable_keeps_multiuser=yes
-cluster_remove_service
-if ! cluster_subscription_takeover_release; then
-red_line "单用户订阅恢复失败，已保留联邦数据和回退快照；请运行状态/修复后重试。"
+yellow_line "正在停用本机联邦……"
+if ! cluster_remove_service || cluster_service_is_active lun-cluster-agent lun-cluster-agent; then
+red_line "退出失败：未能停用本机联邦服务，联邦数据仍保留。"
 return 1
 fi
-rm -f "$HOME/lun/chain_routes.json"
-rm -rf "$(cluster_module_dir)"
+if ! cluster_subscription_takeover_release; then
+red_line "退出未完成：单用户订阅恢复失败，联邦数据和回退快照仍保留；请运行状态 / 修复后重试。"
+return 1
+fi
+if ! rm -f "$HOME/lun/chain_routes.json" || ! rm -rf "$(cluster_module_dir)"; then
+red_line "退出未完成：本机联邦数据未能全部删除，请检查文件权限。"
+return 1
+fi
 apply_lun_firewall_rules quiet || true
 if [ "$cluster_disable_keeps_multiuser" = yes ]; then
-green_line "本机联邦控制面已停用；现有多用户 lun-agent 保持运行。"
+green_line "退出成功：本机联邦控制面已停用；现有多用户 lun-agent 保持运行。"
 else
-green_line "本机联邦控制面已停用；单用户订阅已恢复为原 BusyBox 服务。"
+green_line "退出成功：本机联邦控制面已停用，已处理单用户订阅回退。"
 fi
 }
 
@@ -6352,7 +6704,7 @@ for fw_spec in \
 "udp port_tu" \
 "udp port_xu" \
 "tcp port_xc" "udp port_xc" \
-"tcp port_nv" "udp port_nv"; do
+"tcp port_nv" "udp port_nv" "tcp port_snell"; do
 set -- $fw_spec
 fw_proto=$1
 fw_file=$2
@@ -7010,7 +7362,20 @@ fi
 restart_subscription_busybox
 }
 
+snell_show_sharing_status(){
+[ -s "$HOME/lun/port_snell" ] && [ -s "$HOME/lun/snell/config.json" ] || return 1
+echo "Snell v6：内网 TCP $(cat "$HOME/lun/port_snell")，配置仅从“节点订阅分享 → 私下导出 Snell”读取。"
+if [ ! -s "$HOME/lun/xr.json" ] && [ ! -s "$HOME/lun/sb.json" ]; then
+rm -f "$HOME/lun/jhsub.txt" "$HOME/lun/clmi.yaml" "$HOME/lun/sbox.json"
+return 0
+fi
+return 1
+}
+
 cip(){
+local ws_vision_query=
+snell_show_sharing_status && return 0
+if vless_ws_vision_enabled; then ws_vision_query='&flow=xtls-rprx-vision'; fi
 ipbest(){
 serip=$( (command -v curl >/dev/null 2>&1 && (curl -s4m5 -k "$v46url" 2>/dev/null || curl -s6m5 -k "$v46url" 2>/dev/null) ) || (command -v wget >/dev/null 2>&1 && (timeout 3 wget -4 -qO- --tries=2 "$v46url" 2>/dev/null || timeout 3 wget -6 -qO- --tries=2 "$v46url" 2>/dev/null) ) )
 if echo "$serip" | grep -q ':'; then
@@ -7075,7 +7440,6 @@ uuid=$(cat "$HOME/lun/uuid")
 server_ip=$(cat "$HOME/lun/server_ip.log")
 xvvmcdnym=$(cat "$HOME/lun/cdnym" 2>/dev/null)
 argoip_cfg=$(cat "$HOME/lun/argoip" 2>/dev/null)
-[ -z "$argoip_cfg" ] && argoip_cfg="162.159.192.1 162.159.192.2"
 direct_entries=$(direct_address_entries)
 if [ -z "$direct_entries" ]; then
 if direct_domain_ip_guard_active "$(effective_address_mode)"; then
@@ -7279,11 +7643,11 @@ vw_direct_extra="&security=none"
 if cdn_origin_tls_for_port "$port_vw"; then
 vw_direct_extra="&host=$xvvmcdnym&security=tls&sni=$xvvmcdnym&fp=chrome&insecure=$generic_link_insecure&allowInsecure=$generic_link_insecure"
 fi
-vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey&type=ws&path=$uuid-vw$vw_direct_extra#$(direct_node_name vless-ws)"
+vl_vw_link="vless://$uuid@$client_addr:$client_port_vw?encryption=$enkey$ws_vision_query&type=ws&path=$uuid-vw$vw_direct_extra#$(direct_node_name vless-ws)"
 append_share_link "$vl_vw_link"
 echo
 if [ -f "$HOME/lun/cdnym" ] && cdn_protocol_enabled ws; then
-append_vless_cdn_links "Vless-ws-enc-cdn" "vless-ws" "$port_vw" "encryption=$enkey&type=ws&path=$uuid-vw"
+append_vless_cdn_links "Vless-ws-enc-cdn" "vless-ws" "$port_vw" "encryption=$enkey$ws_vision_query&type=ws&path=$uuid-vw"
 fi
 fi
 if grep reality-vision "$HOME/lun/xr.json" >/dev/null 2>&1; then
@@ -7743,9 +8107,12 @@ echo "客户端密码：$uuid"
 echo
 fi
 argodomain=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
-[ -z "$argodomain" ] && argodomain=$(grep -a trycloudflare.com "$HOME/lun/argo.log" 2>/dev/null | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+[ -z "$argodomain" ] && argodomain=$(grep -aoE 'https://[-A-Za-z0-9.]+\.trycloudflare\.com' "$HOME/lun/argo.log" 2>/dev/null | tail -1 | sed 's#https://##')
 if [ -n "$argodomain" ]; then
-vlvm=$(cat $HOME/lun/vlvm 2>/dev/null)
+vlvm=$(cat "$HOME/lun/vlvm" 2>/dev/null)
+if [ -z "$argoip_cfg" ]; then
+if [ "$vlvm" = Vlessx ]; then argoip_cfg=$argodomain; else argoip_cfg="162.159.192.1 162.159.192.2"; fi
+fi
 argo_entries=
 argo_index=0
 argo_seen=
@@ -7830,13 +8197,14 @@ for argo_entry in $argo_entries; do
 argo_addr=${argo_entry%%|*}
 argo_suffix=${argo_entry#*|}
 argo_uri=$(uri_host "$argo_addr")
-tls_link="vless://$uuid@$argo_uri:443?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#$(routed_node_name "vless-ws-argo-tls-443-ar$argo_suffix")"
-http_link="vless://$uuid@$argo_uri:80?encryption=$enkey&type=ws&host=$argodomain&path=/$uuid-vw&security=none#$(routed_node_name "vless-ws-argo-http-80-ar$argo_suffix")"
+tls_link="vless://$uuid@$argo_uri:443?encryption=$enkey$ws_vision_query&type=ws&host=$argodomain&path=/$uuid-vw&security=tls&sni=$argodomain&fp=chrome&insecure=0&allowInsecure=0#$(routed_node_name "vless-ws-argo-tls-443-ar$argo_suffix")"
+http_link="vless://$uuid@$argo_uri:80?encryption=$enkey$ws_vision_query&type=ws&host=$argodomain&path=/$uuid-vw&security=none#$(routed_node_name "vless-ws-argo-http-80-ar$argo_suffix")"
 printf '%s\n%s\n' "$tls_link" "$http_link" >> "$HOME/lun/jhsub.txt"
 argo_links_display="$argo_links_display
 $tls_link
 $http_link"
 done
+if [ -z "$ws_vision_query" ]; then
 sbvmargopt(){
 for argo_entry in $argo_entries; do
 argo_addr=${argo_entry%%|*}; argo_suffix=${argo_entry#*|}
@@ -7887,16 +8255,19 @@ clvmargopt1(){
 for argo_entry in $argo_entries; do argo_suffix=${argo_entry#*|}; echo "- $(routed_node_name "vless-ws-argo-tls-443-ar$argo_suffix")"; echo "- $(routed_node_name "vless-ws-argo-http-80-ar$argo_suffix")"; done
 }
 fi
+elif [ "$vlvm" = Vlessx ] && [ -n "$enkey" ] && [ -s "$HOME/lun/port_vx" ]; then
+argo_links_display=$(append_argo_xhttp_links) || return 1
+fi
 sbtk=$(cat "$HOME/lun/sbargotoken.log" 2>/dev/null)
 if [ -n "$sbtk" ]; then
 nametn="Argo固定隧道token：$sbtk"
 fi
 argoshow=$(
-echo "Argo隧道端口正在使用$vlvm-ws主协议端口：$(cat $HOME/lun/argoport.log 2>/dev/null)
+echo "Argo 隧道协议：$(argo_protocol_label "$(argo_configured_protocol)")，监听端口：$(cat "$HOME/lun/argoport.log" 2>/dev/null)
 Argo域名：$argodomain
 $nametn
 
-已按 Argo 优选地址导出 TLS 443 与 HTTP 80 节点：$argo_links_display
+已导出的 Argo 节点：$argo_links_display
 "
 )
 fi
@@ -8206,10 +8577,13 @@ for rebuild_file in \
 "$HOME/lun"/acme_* "$HOME/lun"/cert.env "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool \
 "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
 "$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
-"$HOME/lun"/warp* "$HOME/lun"/hy2_hop_* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm; do
+"$HOME/lun"/warp* "$HOME/lun"/hy2_hop_* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm "$HOME/lun"/vless_ws_vision; do
 [ -f "$rebuild_file" ] || continue
 cp -a "$rebuild_file" "$rebuild_snapshot/lun/" || return 1
 done
+if [ -s "$HOME/lun/snell/config.json" ]; then
+cp -p "$HOME/lun/snell/config.json" "$rebuild_snapshot/snell.json" || return 1
+fi
 [ -f "$HOME/.bashrc" ] && cp -a "$HOME/.bashrc" "$rebuild_snapshot/bashrc"
 crontab -l > "$rebuild_snapshot/crontab" 2>/dev/null || :
 for rebuild_service in /etc/systemd/system/xr.service /etc/systemd/system/sb.service /etc/systemd/system/argo.service /etc/init.d/xray /etc/init.d/sing-box /etc/init.d/argo; do
@@ -8225,6 +8599,14 @@ trap - HUP INT TERM EXIT
 [ -n "$rebuild_snapshot" ] && [ -d "$rebuild_snapshot" ] || return 1
 echo
 echo "协议重建未完成，正在自动恢复上一次可用配置……"
+if [ -f "$HOME/lun/snell/config.json" ] || [ -f "$rebuild_snapshot/snell.json" ]; then
+snell_service disable >/dev/null 2>&1 || true
+rm -f "$HOME/lun/snell/config.json"
+if [ -f "$rebuild_snapshot/snell.json" ]; then
+cp -p "$rebuild_snapshot/snell.json" "$HOME/lun/snell/config.json" && snell_service install >/dev/null 2>&1 || \
+yellow_line "上一次 Snell 监听未能自动恢复，请检查 lun-snell 服务。"
+fi
+fi
 if [ -s "$HOME/lun/oneclick_full_pending" ]; then
 oneclick_cloud_rollback >/dev/null 2>&1 || true
 fi
@@ -8234,7 +8616,7 @@ rm -f "$HOME/lun"/*.json "$HOME/lun"/port_* "$HOME/lun"/sbargo* "$HOME/lun"/argo
 "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/cfip* \
 "$HOME/lun"/xvvmcdnym "$HOME/lun"/address_mode "$HOME/lun"/addym "$HOME/lun"/addout "$HOME/lun"/ipp* \
 "$HOME/lun"/warp* "$HOME/lun"/hy2_hop_* "$HOME/lun"/ym_vl_re "$HOME/lun"/name "$HOME/lun"/server_number "$HOME/lun"/server_place "$HOME/lun"/vlvm \
-"$HOME/lun"/oneclick_*
+"$HOME/lun"/vless_ws_vision "$HOME/lun"/oneclick_*
 cp -a "$rebuild_snapshot/lun/." "$HOME/lun/" 2>/dev/null || true
 hy2_hop_apply "$(cat "$HOME/lun/hy2_hop_ports" 2>/dev/null)" "$(cat "$HOME/lun/hy2_hop_target" 2>/dev/null)" || \
 yellow_line "核心配置已恢复，但 Lun 跳跃规则未能恢复，请检查。"
@@ -8272,6 +8654,10 @@ if [ -s "$HOME/lun/sb.json" ]; then
 rebuild_configs=$((rebuild_configs + 1))
 "$HOME/lun/sing-box" check -c "$HOME/lun/sb.json" >/dev/null 2>&1 || { echo "Sing-box 配置校验失败。"; return 1; }
 fi
+if [ -s "$HOME/lun/snell/config.json" ]; then
+rebuild_configs=$((rebuild_configs + 1))
+snell_service status >/dev/null 2>&1 || { echo "Snell v6 服务未就绪。"; return 1; }
+fi
 [ "$rebuild_configs" -gt 0 ] || { echo "没有生成任何协议配置。"; return 1; }
 return 0
 }
@@ -8302,6 +8688,7 @@ multiuser_service_stop
 visit_monitor_service_stop
 hy2_hop_apply "" "" || yellow_line "Lun 跳跃规则清理未完成，其他回源规则未修改。"
 if [ "$keep_entry" != "keep-entry" ]; then
+[ ! -d "$HOME/lun/snell" ] || snell_service remove >/dev/null 2>&1 || true
 cluster_remove_service
 remove_lun_firewall_rules
 if [ -s "$(multiuser_module_dir)/data/lun.db" ]; then
@@ -8365,6 +8752,8 @@ printf "确认清空配置？输入 yes 确认，其他取消："
 IFS= read -r confirm
 fi
 [ "$confirm" = "yes" ] || { echo "已取消。"; return 1; }
+[ ! -d "$HOME/lun/snell" ] || snell_service remove >/dev/null 2>&1 || true
+rm -f "$HOME/lun/snell/config.json" "$HOME/lun/snell/psk" "$HOME/lun/port_snell"
 remove_lun_firewall_rules
 stop_lun_owned_processes
 rm -f "$HOME/lun"/port_vl_re "$HOME/lun"/port_xh "$HOME/lun"/port_vx "$HOME/lun"/port_vw "$HOME/lun"/port_ss "$HOME/lun"/port_an "$HOME/lun"/port_ar "$HOME/lun"/port_vm_ws "$HOME/lun"/port_so "$HOME/lun"/port_hy2 "$HOME/lun"/port_tu "$HOME/lun"/port_xu "$HOME/lun"/port_xc "$HOME/lun"/port_nv
@@ -8372,7 +8761,7 @@ rm -f "$HOME/lun"/uuid "$HOME/lun"/domain "$HOME/lun"/cert_mode "$HOME/lun"/cert
 rm -f "$HOME/lun"/vps_mode "$HOME/lun"/port_map "$HOME/lun"/port_pool "$HOME/lun"/inner_port_pool "$HOME/lun"/outer_port_pool
 rm -f "$HOME/lun"/acme_email "$HOME/lun"/acme_dns "$HOME/lun"/cert.env
 rm -f "$HOME/lun"/sub* "$HOME/lun"/cdn* "$HOME/lun"/argo* "$HOME/lun"/warp* "$HOME/lun"/name "$HOME/lun"/ipp*
-rm -f "$HOME/lun/address_mode"
+rm -f "$HOME/lun/address_mode" "$HOME/lun/vless_ws_vision"
 rm -f "$HOME/lun"/xr.json "$HOME/lun"/sb.json "$HOME/lun"/addym "$HOME/lun"/addout
 rm -f "$HOME/lun"/cfip* "$HOME/lun"/xvvmcdnym "$HOME/lun"/ym_vl_re "$HOME/lun"/argoport.log "$HOME/lun"/argo.log "$HOME/lun"/sbargoym.log "$HOME/lun"/sbargotoken.log
 rm -f "$HOME/lun"/subport.log "$HOME/lun"/subport_public.log "$HOME/lun"/subtoken.log "$HOME/lun"/subip_mode
@@ -8404,8 +8793,8 @@ fi
 }
 
 refresh_protocol_flags(){
-unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop xup xcp nvp vmag
-unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so port_xu port_xc port_nv
+unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop xup xcp nvp snp vmag
+unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so port_xu port_xc port_nv port_snell
 [ -z "${vlpt+x}" ] || { vlp=yes; port_vl_re=$vlpt; }
 [ -z "${vmpt+x}" ] || { vmp=yes; vmag=yes; port_vm_ws=$vmpt; }
 [ -z "${vwpt+x}" ] || { vwp=yes; vmag=yes; port_vw=$vwpt; }
@@ -8420,6 +8809,7 @@ unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an por
 [ -z "${xupt+x}" ] || { xup=yes; port_xu=$xupt; }
 [ -z "${xcpt+x}" ] || { xcp=yes; port_xc=$xcpt; }
 [ -z "${nvpt+x}" ] || { nvp=yes; port_nv=$nvpt; }
+[ -z "${snpt+x}" ] || { snp=yes; port_snell=$snpt; }
 [ -n "${warp:-}" ] && wap=yes || wap=
 }
 
@@ -8520,23 +8910,137 @@ case "$1" in xray) xrestart ;; sing-box) sbrestart ;; *) return 1 ;; esac
 
 core_update_digest(){
 command -v python3 >/dev/null 2>&1 || return 0
-command -v curl >/dev/null 2>&1 || return 0
-curl -fsSL --connect-timeout 5 --max-time 15 -H 'Cache-Control: no-cache' \
-"https://api.github.com/repos/azk78lun-collab/FHLUN/releases/tags/lun" 2>/dev/null | \
+local endpoint="https://api.github.com/repos/azk78lun-collab/FHLUN/releases/tags/${2:-lun}"
+{
+if command -v curl >/dev/null 2>&1; then
+curl -fsSL --connect-timeout 5 --max-time 15 -H 'Cache-Control: no-cache' "$endpoint"
+elif command -v wget >/dev/null 2>&1; then
+timeout 15 wget -qO- -T 10 -t 1 "$endpoint"
+fi
+} 2>/dev/null | \
 python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((a.get("digest", "") for a in d.get("assets", []) if a.get("name")==sys.argv[1]), ""))' "$1" 2>/dev/null
+}
+
+update_lun_singbox(){
+(
+umask 077
+local request=${1:-} dir="$HOME/lun" stage asset digest release version old_version
+local core="$dir/sing-box" snell="$dir/snell/sing-box" helper="$(multiuser_module_dir)/lun-sb-stats"
+local stamp="$dir/.lun-singbox-version" want_snell=no sb_live=no snell_live=no changed=no
+case "$cpu" in amd64|arm64) ;; *) red_line "Lun 增强 Sing-box 仅提供 amd64 / arm64。"; return 1 ;; esac
+lun_python_ensure basic || return 1
+mkdir -p "$dir" "$(dirname "$helper")" || return 1
+exec 8>"$dir/.singbox-update.lock" || return 1
+flock -n 8 || { red_line "已有 Sing-box 内核更新正在执行。"; return 1; }
+if [ "$request" = snell ] || [ -e "$snell" ] || [ -s "$dir/snell/config.json" ]; then want_snell=yes; fi
+version=$("$core" version 2>/dev/null || true)
+old_version=$(printf '%s\n' "$version" | awk '/^sing-box version /{print $NF; exit}')
+if [ "$(cat "$stamp" 2>/dev/null)" = "$LUN_SINGBOX_VERSION" ] && [ "$old_version" = "$LUN_SINGBOX_VERSION" ] &&
+   printf '%s\n' "$version" | grep -qw with_v2ray_api && [ -x "$helper" ]; then
+if [ "$want_snell" = no ] || [ "$core" -ef "$snell" ]; then return 0; fi
+if [ ! -e "$snell" ] && [ ! -s "$dir/snell/config.json" ]; then
+mkdir -p -m 700 "$dir/snell" && ln "$core" "$snell"
+return $?
+fi
+fi
+if [ -n "$old_version" ] && lun_version_is_older "$LUN_SINGBOX_VERSION" "$old_version"; then
+red_line "当前 Sing-box $old_version 新于配套版本 $LUN_SINGBOX_VERSION，拒绝降级。"
+return 1
+fi
+release="lun-singbox-$LUN_SINGBOX_VERSION"
+asset="sing-box-lun-$cpu.tar.gz"
+digest=$(core_update_digest "$asset" "$release") || digest=
+if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+red_line "未找到可校验的增强内核发布 $release；保留原内核和用户数据。"
+return 1
+fi
+stage=$(mktemp -d "$dir/.singbox-bundle.XXXXXXXX") || return 1
+trap '
+  if [ "$changed" = yes ]; then
+    restored=yes
+    for name in core helper snell; do
+      case "$name" in core) target=$core ;; helper) target=$helper ;; snell) target=$snell ;; esac
+      if [ -e "$stage/old-$name" ]; then mv -f "$stage/old-$name" "$target" || restored=no
+      elif [ "$name" != snell ] || [ "$want_snell" = yes ]; then rm -f "$target" || restored=no
+      fi
+    done
+    [ "$sb_live" != yes ] || core_update_restart sing-box || restored=no
+    [ "$snell_live" != yes ] || snell_service restart || restored=no
+    if [ "$restored" = no ]; then
+      red_line "增强内核回滚未完整完成；保留回滚目录：$stage"
+      exit 1
+    fi
+  fi
+  rm -rf "$stage"
+' EXIT
+trap 'exit 130' HUP INT TERM
+download_core_asset "$asset" "$stage/archive" "https://github.com/azk78lun-collab/FHLUN/releases/download/$release/$asset" || return 1
+printf '%s  %s\n' "${digest#sha256:}" "$stage/archive" | sha256sum -c - >/dev/null || {
+red_line "增强 Sing-box 配套包 SHA-256 不匹配，旧文件未改动。"; return 1;
+}
+tar -xOzf "$stage/archive" sing-box > "$stage/core" &&
+tar -xOzf "$stage/archive" lun-sb-stats > "$stage/helper" &&
+chmod 700 "$stage/core" "$stage/helper" || return 1
+version=$("$stage/core" version 2>/dev/null) || return 1
+if [ "$(printf '%s\n' "$version" | awk '/^sing-box version /{print $NF; exit}')" != "$LUN_SINGBOX_VERSION" ] ||
+   ! printf '%s\n' "$version" | grep -qw with_v2ray_api ||
+   ! "$stage/helper" --help >/dev/null 2>&1; then
+red_line "增强内核版本、V2Ray API 或配套统计程序校验失败。"
+return 1
+fi
+for config in "$dir/sb.json" "$dir/snell/config.json"; do
+[ ! -s "$config" ] || "$stage/core" check -c "$config" >/dev/null 2>&1 || {
+red_line "增强 Sing-box 不兼容现有 $(basename "$config")，未替换。"; return 1;
+}
+done
+if [ "$want_snell" = yes ]; then
+mkdir -p -m 700 "$dir/snell" && ln "$stage/core" "$stage/snell" || return 1
+if snell_service status >/dev/null 2>&1; then snell_live=yes; fi
+fi
+if [ -s "$dir/sb.json" ] && core_update_running sing-box; then sb_live=yes; fi
+[ ! -e "$core" ] || cp -p "$core" "$stage/old-core" || return 1
+[ ! -e "$helper" ] || cp -p "$helper" "$stage/old-helper" || return 1
+[ ! -e "$snell" ] || cp -p "$snell" "$stage/old-snell" || return 1
+changed=yes
+mv -f "$stage/core" "$core" && mv -f "$stage/helper" "$helper" || return 1
+[ "$want_snell" = no ] || mv -f "$stage/snell" "$snell" || return 1
+[ "$sb_live" != yes ] || core_update_restart sing-box || return 1
+[ "$snell_live" != yes ] || snell_service restart || return 1
+if [ "$sb_live" = yes ] || [ "$snell_live" = yes ]; then sleep 1; fi
+[ "$sb_live" != yes ] || core_update_running sing-box || { red_line "增强内核启动失败，正在回滚。"; return 1; }
+[ "$snell_live" != yes ] || snell_service status || { red_line "Snell 启动失败，正在回滚。"; return 1; }
+if [ "$sb_live" = yes ] && grep -q '"v2ray_api"' "$dir/sb.json" && ! multiuser_upgrade_stats_ready; then
+red_line "新内核未能恢复原来的多用户流量统计，正在回滚。"
+return 1
+fi
+printf '%s\n' "$LUN_SINGBOX_VERSION" > "$stage/version" && mv -f "$stage/version" "$stamp" || return 1
+changed=no
+rm -f "$dir/sing-box.pre-multiuser" "$helper.pre-multiuser"
+green_line "Lun 增强 Sing-box $LUN_SINGBOX_VERSION 与统计助手已同步。Snell 共用同一内核文件。"
+)
 }
 
 update_installed_core(){ (
 engine=$1
-case "$engine" in xray|sing-box) ;; *) return 1 ;; esac
-out="$HOME/lun/$engine"
+case "$engine" in
+sing-box)
+if [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/sb.json" ] ||
+   [ -x "$HOME/lun/snell/sing-box" ] || [ -s "$HOME/lun/snell/config.json" ]; then
+update_lun_singbox
+return $?
+fi
+yellow_line "sing-box 未安装，跳过，不新增内核。"
+return 0
+;;
+xray) out="$HOME/lun/xray" ;;
+*) return 1 ;;
+esac
 [ -x "$out" ] || { yellow_line "$engine 未安装，跳过，不新增内核。"; return 0; }
 stage=$(mktemp "$HOME/lun/.${engine}-update.XXXXXX") || return 1
 backup=
 trap 'rm -f "$stage"; [ -z "$backup" ] || rm -f "$backup"' EXIT
 yellow_line "正在检查 Lun 配套 $engine 内核……"
 asset="$engine-$cpu"
-if [ "$engine" = sing-box ] && multiuser_enabled; then asset="sing-box-multiuser-$cpu"; fi
 digest=$(core_update_digest "$asset") || digest=
 case "$digest" in sha256:*) expected_hash=${digest#sha256:} ;; *) expected_hash= ;; esac
 if [ "${#expected_hash}" = 64 ] && [ "$(sha256sum "$out" | awk '{print $1}')" = "$expected_hash" ]; then
@@ -8553,13 +9057,8 @@ if cmp -s "$stage" "$out"; then
 green_line "$engine 已是当前发布版本，无需重启。"
 return 0
 fi
-if [ "$engine" = xray ]; then
 old_version=$("$out" version 2>/dev/null | awk '/^Xray/{print $2; exit}')
 new_version=$("$stage" version 2>/dev/null | awk '/^Xray/{print $2; exit}')
-else
-old_version=$("$out" version 2>/dev/null | awk '/version/{print $NF; exit}')
-new_version=$("$stage" version 2>/dev/null | awk '/version/{print $NF; exit}')
-fi
 [ -n "$new_version" ] || { red_line "$engine 下载文件不可执行，保留原内核。"; return 1; }
 case "${new_version#v}:${old_version#v}" in
 *[!0-9.:]*)
@@ -8574,13 +9073,8 @@ yellow_line "$engine 当前 $old_version 新于配套发布 $new_version，保�
 return 0
 fi
 config="$HOME/lun/xr.json"
-[ "$engine" = sing-box ] && config="$HOME/lun/sb.json"
 if [ -s "$config" ]; then
-if [ "$engine" = xray ]; then
 "$stage" run -test -c "$config" >/dev/null 2>&1 || { red_line "新 Xray 不兼容现有配置，未替换。"; return 1; }
-else
-"$stage" check -c "$config" >/dev/null 2>&1 || { red_line "新 Sing-box 不兼容现有配置，未替换。"; return 1; }
-fi
 fi
 was_running=no
 core_update_running "$engine" && was_running=yes
@@ -8593,7 +9087,7 @@ if core_update_restart "$engine" && sleep 1 && core_update_running "$engine"; th
 else
 mv -f "$backup" "$out" || { red_line "恢复内核失败，回滚文件保留：$backup"; backup=; return 1; }
 backup=
-if [ "$engine" = xray ]; then xrestart; else sbrestart; fi
+xrestart
 red_line "$engine 新内核启动失败，已恢复旧内核；请检查服务状态。"
 return 1
 fi
@@ -8606,9 +9100,74 @@ update_lun_script || return 1
 local bundle_rc=0
 cluster_update_from_installed_script || bundle_rc=1
 update_installed_core xray || bundle_rc=1
-update_installed_core sing-box || bundle_rc=1
+if [ "$bundle_rc" = 0 ]; then
+if [ -n "${LUN_UPDATED_ENTRY:-}" ] && [ -r "$LUN_UPDATED_ENTRY" ]; then
+bash "$LUN_UPDATED_ENTRY" sync-runtime || bundle_rc=1
+else
+sync_lun_runtime || bundle_rc=1
+fi
+fi
 [ "$bundle_rc" = 0 ] || red_line "主脚本已检查；有配套组件未更新，请查看上方原因。"
 return "$bundle_rc"
+}
+
+multiuser_upgrade_stats_ready(){
+core_update_running sing-box || return 1
+local address
+address=$(multiuser_config_value singbox_api)
+[ -n "$address" ] && "$(multiuser_module_dir)/lun-sb-stats" --server "$address" --timeout 3s >/dev/null 2>&1
+}
+
+sync_lun_runtime(){
+update_installed_core sing-box || return 1
+local mu_dir generation pending cleaned
+mu_dir=$(multiuser_module_dir)
+[ -s "$mu_dir/config.json" ] && [ -s "$mu_dir/data/lun.db" ] || return 0
+if cluster_enabled; then
+cluster_is_federation && cluster_agent_version_current || {
+red_line "请先升级联邦模块，再清理旧多用户资料；未改动数据库。"; return 1;
+}
+fi
+generation=$(multiuser_config_value user_data_generation)
+pending="$mu_dir/.security-transaction/state.json"
+cleaned="$mu_dir/.cleaned-$LUN_MULTIUSER_GENERATION"
+if [ "$generation" = "$LUN_MULTIUSER_GENERATION" ]; then
+[ ! -f "$cleaned" ] || [ -f "$pending" ] || return 0
+if [ -f "$pending" ]; then
+if ! python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s.get("core_upgrade_reset") and s.get("committed") else 1)' "$pending" ||
+   ! multiuser_cmd security-commit; then
+red_line "仍有多用户安全事务待处理，未执行新的清理。"
+return 1
+fi
+fi
+else
+if ! grep -Fq "USER_DATA_GENERATION = \"$LUN_MULTIUSER_GENERATION\"" "$mu_dir/lun_agent.py" 2>/dev/null; then
+multiuser_download_agent || return 1
+fi
+grep -Fq "USER_DATA_GENERATION = \"$LUN_MULTIUSER_GENERATION\"" "$mu_dir/lun_agent.py" || {
+red_line "未收到新版多用户程序，未删除任何旧资料。"; return 1;
+}
+yellow_line "正在切换新版多用户数据：验证通过后将一次性清理旧账号、设备、订阅 Token、流量和本机模块备份。"
+multiuser_security_transaction reset-for-core-upgrade --generation "$LUN_MULTIUSER_GENERATION" || return 1
+fi
+rm -f "$HOME"/lun-multiuser-backup-*.sqlite3 \
+      "$HOME/lun/.last_good_rebuild/lun/xr.json" "$HOME/lun/.last_good_rebuild/lun/sb.json" || return 1
+(umask 077; : > "$cleaned")
+}
+
+lun_finish_legacy_runtime_upgrade(){
+[ -t 0 ] || return 0
+local entry previous attempt
+entry=$(lun_update_target)
+previous="$entry.update-backup"
+attempt="$HOME/lun/.legacy-runtime-attempt-$LUN_SINGBOX_VERSION"
+[ -s "$previous" ] && [ ! -f "$attempt" ] || return 0
+grep -q '^LUN_SINGBOX_VERSION=' "$previous" && return 0
+(umask 077; : > "$attempt") || return 0
+yellow_line "检测到刚从旧版 Lun 更新：同步增强内核；成功后执行一次多用户资料重置。"
+if ! cluster_update_from_installed_script || ! sync_lun_runtime; then
+yellow_line "迁移未完成；可在“服务与更新”重试，或运行 lun sync-runtime。"
+fi
 }
 
 update_lun_script(){
@@ -8670,9 +9229,9 @@ lun_reopen_updated_menu(){
 local entry=${LUN_UPDATED_ENTRY:-}
 [ -n "$entry" ] && [ -r "$entry" ] || return 1
 # A fresh menu must load saved state, not treat inherited protocol picks as installation arguments.
-unset vlpt vmpt vwpt hypt tupt xhpt vxpt anpt sspt arpt sopt xupt xcpt nvpt
-unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop xup xcp nvp vmag wap
-unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so port_xu port_xc port_nv
+unset vlpt vmpt vwpt hypt tupt xhpt vxpt anpt sspt arpt sopt xupt xcpt nvpt snpt
+unset vlp vmp vwp hyp tup xhp vxp anp ssp arp sop xup xcp nvp snp vmag wap
+unset port_vl_re port_vm_ws port_vw port_hy2 port_tu port_xh port_vx port_an port_ar port_ss port_so port_xu port_xc port_nv port_snell
 unset uuid reym ym_vl_re domain certmode acme_email acme_dns name warp oap ippz
 unset cdnym cfip cdnmode cdnpt cdnproto addrmode addym addout ptmap portpool inpool outpool vpsmode
 unset argo argoip agn agk ARGO_DOMAIN ARGO_AUTH sub subid subpt subipmode ONECLICK_FORCE_CERT
@@ -8831,7 +9390,7 @@ return 1
 protocol_port_reserved(){
 p=$1
 p_public=$(client_port "$p")
-for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu" "$port_xu" "$port_xc" "$port_nv"; do
+for used in "$port_xh" "$port_vx" "$port_vw" "$port_vl_re" "$port_ss" "$port_an" "$port_ar" "$port_vm_ws" "$port_so" "$port_hy2" "$port_tu" "$port_xu" "$port_xc" "$port_nv" "${port_snell:-}"; do
 [ -n "$used" ] || continue
 [ -n "${LUN_IGNORE_PROTOCOL_PORT:-}" ] && [ "$used" = "$LUN_IGNORE_PROTOCOL_PORT" ] && continue
 used_public=$(client_port "$used")
@@ -8840,7 +9399,7 @@ used_public=$(client_port "$used")
 [ "$used" = "$p_public" ] && return 0
 [ "$used_public" = "$p_public" ] && return 0
 done
-for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu" "$HOME/lun/port_xu" "$HOME/lun/port_xc" "$HOME/lun/port_nv"; do
+for file in "$HOME/lun/port_xh" "$HOME/lun/port_vx" "$HOME/lun/port_vw" "$HOME/lun/port_vl_re" "$HOME/lun/port_ss" "$HOME/lun/port_an" "$HOME/lun/port_ar" "$HOME/lun/port_vm_ws" "$HOME/lun/port_so" "$HOME/lun/port_hy2" "$HOME/lun/port_tu" "$HOME/lun/port_xu" "$HOME/lun/port_xc" "$HOME/lun/port_nv" "$HOME/lun/port_snell"; do
 [ -s "$file" ] || continue
 used=$(cat "$file" 2>/dev/null)
 [ -n "$used" ] || continue
@@ -9101,6 +9660,10 @@ if ! port_valid "$val"; then
 echo "端口必须是 1-65535 的数字。"
 continue
 fi
+if [ "$var" = snpt ] && ! snell_public_port "$val" >/dev/null; then
+echo "Snell v6 需要已登记的公网 TCP → 内网端口映射，请先设置映射或重新输入。"
+continue
+fi
 if [ "$label" = "VLESS XHTTP TLS TCP/UDP" ] && [ "$val" = 443 ]; then
 red_line "该协议将监听本机 443；请先确认 Nginx、面板或其它服务未占用，脚本不会自动结束未知进程。"
 fi
@@ -9117,6 +9680,10 @@ echo "端口 $val 或对应公网端口 $public_val 已被当前 Lun 协议/订�
 else
 echo "端口 $val 已被当前 Lun 协议/订阅占用，请换一个。"
 fi
+continue
+fi
+if [ "$var" = snpt ] && port_in_use "$val"; then
+echo "端口 $val 已被占用，请选择另一个端口。"
 continue
 fi
 ensure_port_available "$val" || continue
@@ -9147,6 +9714,8 @@ load_installed_protocol_flags(){
 [ -s "$HOME/lun/port_xu" ] && { xupt=$(cat "$HOME/lun/port_xu"); xup=yes; port_xu=$xupt; }
 [ -s "$HOME/lun/port_xc" ] && { xcpt=$(cat "$HOME/lun/port_xc"); xcp=yes; port_xc=$xcpt; }
 [ -s "$HOME/lun/port_nv" ] && { nvpt=$(cat "$HOME/lun/port_nv"); nvp=yes; port_nv=$nvpt; }
+[ -s "$HOME/lun/port_snell" ] && { snpt=$(cat "$HOME/lun/port_snell"); snp=yes; port_snell=$snpt; }
+return 0
 }
 
 show_protocol_summary(){
@@ -9165,7 +9734,8 @@ for item in \
 "TUIC:$HOME/lun/port_tu" \
 "VLESS XHTTP TLS UDP:$HOME/lun/port_xu" \
 "VLESS XHTTP TLS TCP/UDP:$HOME/lun/port_xc" \
-"NaiveProxy H2/H3:$HOME/lun/port_nv"; do
+"NaiveProxy H2/H3:$HOME/lun/port_nv" \
+"Snell v6:$HOME/lun/port_snell"; do
 label=${item%%:*}
 file=${item#*:}
 if [ -s "$file" ]; then
@@ -10158,7 +10728,7 @@ done
 
 prompt_argo_protocol_seed(){
 while :; do
-echo "Argo/CF 隧道需要先有 VMess WS 或 VLESS WS。"
+echo "Argo/CF 隧道需要先有 VMess WS、VLESS WS 或 VLESS XHTTP。"
 if is_nat_mode; then
 echo " 1. 添加 VLESS WS（支持后续 Argo 隧道/CF优选CDN，默认内网端口 8080）"
 echo " 2. 添加 VMess WS（支持后续 Argo 隧道/CF优选CDN，默认内网端口 8080）"
@@ -10166,13 +10736,15 @@ else
 echo " 1. 添加 VLESS WS（支持后续 Argo 隧道/CF优选CDN，默认端口 8080）"
 echo " 2. 添加 VMess WS（支持后续 Argo 隧道/CF优选CDN，默认端口 8080）"
 fi
+echo " 3. 添加 VLESS XHTTP（本机默认端口 8080，隧道边缘走 HTTPS 443）"
 echo " 0. 返回"
-printf "请选择 [0-2]，回车默认 1："
+printf "请选择 [0-3]，回车默认 1："
 IFS= read -r val
 case "$val" in
 0) return 2 ;;
 ""|1) target_var=vwpt; target_label="VLESS WS"; argo=vwpt ;;
 2) target_var=vmpt; target_label="VMess WS"; argo=vmpt ;;
+3) target_var=vxpt; target_label="VLESS XHTTP"; argo=vxpt ;;
 *) echo "输入错误。"; continue ;;
 esac
 while :; do
@@ -10191,6 +10763,7 @@ eval "export $target_var=\"\$port\""
 case "$target_var" in
 vwpt) vwp=yes; vmag=yes; port_vw=$port ;;
 vmpt) vmp=yes; vmag=yes; port_vm_ws=$port ;;
+vxpt) vxp=yes; port_vx=$port ;;
 esac
 show_port_mapping_hint "$port"
 if is_nat_mode; then
@@ -10236,25 +10809,29 @@ done
 }
 
 prompt_argo(){
-vm_ws_port="${port_vm_ws:-$(cat "$HOME/lun/port_vm_ws" 2>/dev/null)}"
-vless_ws_port="${port_vw:-$(cat "$HOME/lun/port_vw" 2>/dev/null)}"
-if [ -z "$vm_ws_port" ] && [ -z "$vless_ws_port" ]; then
+local seeded_argo= xhttp_port selected_argo_port
+vm_ws_port="${port_vm_ws:-$(cat "$HOME/lun/port_vm_ws" 2>/dev/null || true)}"
+vless_ws_port="${port_vw:-$(cat "$HOME/lun/port_vw" 2>/dev/null || true)}"
+xhttp_port="${port_vx:-$(cat "$HOME/lun/port_vx" 2>/dev/null || true)}"
+if [ -z "$vm_ws_port" ] && [ -z "$vless_ws_port" ] && [ -z "$xhttp_port" ]; then
 prompt_argo_protocol_seed
 rc=$?
 [ "$rc" = 2 ] && return 2
 [ "$rc" = 0 ] || return 1
 seeded_argo="$argo"
-vm_ws_port="${port_vm_ws:-$(cat "$HOME/lun/port_vm_ws" 2>/dev/null)}"
-vless_ws_port="${port_vw:-$(cat "$HOME/lun/port_vw" 2>/dev/null)}"
+vm_ws_port="${port_vm_ws:-$(cat "$HOME/lun/port_vm_ws" 2>/dev/null || true)}"
+vless_ws_port="${port_vw:-$(cat "$HOME/lun/port_vw" 2>/dev/null || true)}"
+xhttp_port="${port_vx:-$(cat "$HOME/lun/port_vx" 2>/dev/null || true)}"
 fi
 echo "Argo 隧道："
 [ -n "$vm_ws_port" ] && echo " 1. 使用 VMess WS 端口：$vm_ws_port" || echo " 1. VMess WS 未安装"
 [ -n "$vless_ws_port" ] && echo " 2. 使用 VLESS WS 端口：$vless_ws_port" || echo " 2. VLESS WS 未安装"
+[ -n "$xhttp_port" ] && echo " 3. 使用 VLESS XHTTP 端口：$xhttp_port（仅本机 HTTP 回源）" || echo " 3. VLESS XHTTP 未安装"
 echo " 0. 返回上一步"
 if [ -n "$seeded_argo" ]; then
-printf "请选择 [0-2]，回车绑定刚添加的协议："
+printf "请选择 [0-3]，回车绑定刚添加的协议："
 else
-printf "请选择 [0-2]，回车不启用："
+printf "请选择 [0-3]，回车不启用："
 fi
 IFS= read -r val
 case "$val" in
@@ -10262,9 +10839,14 @@ case "$val" in
 "") [ -n "$seeded_argo" ] && argo="$seeded_argo" || argo= ;;
 1) [ -n "$vm_ws_port" ] && argo=vmpt || { echo "VMess WS 未安装，不能绑定 Argo。"; return 1; } ;;
 2) [ -n "$vless_ws_port" ] && argo=vwpt || { echo "VLESS WS 未安装，不能绑定 Argo。"; return 1; } ;;
-*) argo= ;;
+3) [ -n "$xhttp_port" ] && argo=vxpt || { echo "VLESS XHTTP 未安装，不能绑定 Argo。"; return 1; } ;;
+*) echo "输入错误。"; return 1 ;;
 esac
 if [ -n "$argo" ]; then
+if [ "$argo" = vxpt ] && cdn_origin_tls_for_port "$xhttp_port"; then
+red_line "XHTTP 隧道要求本机 HTTP 监听；当前端口的 CDN 源站启用了 TLS，设置未应用。"
+return 1
+fi
 while :; do
 printf "固定隧道域名 agn，回车使用临时隧道，0 返回："
 IFS= read -r agn
@@ -10287,10 +10869,12 @@ rc=$?
 case "$argo" in
 vmpt) selected_argo_port="$vm_ws_port" ;;
 vwpt) selected_argo_port="$vless_ws_port" ;;
+vxpt) selected_argo_port="$xhttp_port" ;;
 esac
 [ -z "$agn" ] || green_line "Cloudflare Tunnel 的 Public Hostname Service 请设置为：http://localhost:$selected_argo_port"
 export argo agn agk ARGO_DOMAIN ARGO_AUTH argoip
 fi
+LUN_ARGO_EDITED=yes
 }
 
 prompt_subscription(){
@@ -10466,14 +11050,16 @@ echo " 2. 设置订阅 token / 端口"
 fi
 echo " 3. 设置订阅 IPv4/IPv6 输出"
 echo " 4. 服务器身份 / 节点命名"
+[ ! -s "$HOME/lun/port_snell" ] || echo " 5. 私下导出 Snell v6（仅 SSH）"
 echo " 0. 返回"
-printf "请选择 [0-4]："
+printf "请选择："
 IFS= read -r c
 case "$c" in
 1) refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 2) prompt_subscription; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 3 ] && { ui_pause; continue; }; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 3) prompt_subscription_ip_mode; rc=$?; [ "$rc" = 2 ] && continue; refresh_subscription_share; LUN_MENU_ACTION=menu; ui_pause; continue ;;
 4) server_identity_menu ;;
+5) snell_export_menu; [ "$?" = 2 ] || ui_pause ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -11588,9 +12174,7 @@ addout=$(cat "$HOME/lun/addout" 2>/dev/null)
 addrmode=$(cat "$HOME/lun/address_mode" 2>/dev/null)
 if [ -s "$HOME/lun/subport.log" ]; then sub=y; subpt=$(cat "$HOME/lun/subport.log"); else sub=; subpt=; fi
 subid=$(cat "$HOME/lun/subtoken.log" 2>/dev/null)
-ARGO_DOMAIN=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
-ARGO_AUTH=$(cat "$HOME/lun/sbargotoken.log" 2>/dev/null)
-case "$(cat "$HOME/lun/vlvm" 2>/dev/null)" in Vless) argo=vwpt ;; Vmess) argo=vmpt ;; *) argo= ;; esac
+load_saved_argo
 export ptmap vpsmode domain cdnym cfip cdnmode cdnpt cdnproto certmode acme_email acme_dns
 export addym addout addrmode sub subpt subid ARGO_DOMAIN ARGO_AUTH argo
 }
@@ -12217,7 +12801,7 @@ cdnopt_target=$(cdnopt_agent)
 cdnopt_tmp="$cdnopt_target.tmp.$$"
 mkdir -p "$cdnopt_dir" || return 1
 rm -f "$cdnopt_tmp"
-if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = 2.0.6 ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
+if [ -s "$cdnopt_target" ] && [ "$(python3 "$cdnopt_target" --version 2>/dev/null)" = "$LUN_CDNOPT_REQUIRED_VERSION" ] && [ "${LUN_CDNOPT_REFRESH:-no}" != yes ]; then
 return 0
 fi
 if [ -n "${LUN_CDNOPT_SOURCE:-}" ] && [ -s "$LUN_CDNOPT_SOURCE" ]; then
@@ -12260,7 +12844,7 @@ red_line "下载的 CDN 优选模块语法校验失败，已拒绝运行。"
 return 1
 }
 cdnopt_version=$(python3 "$cdnopt_tmp" --version 2>/dev/null)
-[ "$cdnopt_version" = 2.0.6 ] || {
+[ "$cdnopt_version" = "$LUN_CDNOPT_REQUIRED_VERSION" ] || {
 rm -f "$cdnopt_tmp"
 red_line "下载的 CDN 优选模块版本不匹配，已拒绝运行。"
 return 1
@@ -12362,6 +12946,74 @@ rm -f "$HOME/lun/cdnopt_port"
 apply_lun_firewall_rules quiet >/dev/null 2>&1 || true
 }
 
+cdnopt_apply_selection(){
+local result=$1 backup=$2 addresses item restore_failed=no
+python3 "$(cdnopt_agent)" extract --result-file "$result" --format table || return 1
+addresses=$(python3 "$(cdnopt_agent)" extract --result-file "$result" --format ips) || return 1
+mkdir "$backup" || return 1
+for item in "$HOME/lun/cdnip" "$HOME/lun"/cdnip[0-9]*; do
+[ ! -f "$item" ] || cp -p -- "$item" "$backup/" || return 1
+done
+if ! save_cdn_ip_list "$addresses"; then
+clear_cdn_ip_list || restore_failed=yes
+for item in "$backup"/*; do
+[ ! -f "$item" ] || cp -p -- "$item" "$HOME/lun/" || restore_failed=yes
+done
+[ "$restore_failed" != yes ] || return 2
+return 1
+fi
+}
+
+cdnopt_feedback_session(){
+(
+local session result status server_pid= rc outcome=failure keep_backup=no
+local -a extra=()
+umask 077
+exec 8>"$(cdnopt_module_dir)/.session.lock" || return 1
+flock -n 8 || { red_line "已有 CDN 优选页面在运行。"; return 1; }
+session=$(mktemp -d "$(cdnopt_module_dir)/session.XXXXXX") || return 1
+result="$session/result.json"
+status="$session/status.json"
+trap '[ -z "$server_pid" ] || { kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; }; cdnopt_cleanup_session; if [ "$keep_backup" = yes ]; then rm -f -- "$result" "$status" "$status.tmp"; else rm -rf -- "$session"; fi' EXIT
+trap 'exit 2' INT TERM
+printf '%s\n' "$cdnopt_internal" > "$HOME/lun/cdnopt_port" || return 1
+apply_lun_firewall_rules quiet >/dev/null 2>&1 || yellow_line "系统防火墙未能自动放行临时 TCP $cdnopt_internal，如页面打不开请检查防火墙/安全组。"
+[ -z "${LUN_CDNOPT_CANDIDATE_FILE:-}" ] || extra=(--source-file "$LUN_CDNOPT_CANDIDATE_FILE")
+python3 "$(cdnopt_agent)" serve \
+--port "$cdnopt_internal" --public-host "$cdnopt_host" --server-ip "$cdnopt_ip" --public-port "$cdnopt_public" \
+--result-file "$result" --status-file "$status" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
+--current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512 "${extra[@]}" &
+server_pid=$!
+while [ ! -s "$result" ] && kill -0 "$server_pid" 2>/dev/null; do sleep 0.25; done
+if [ ! -s "$result" ]; then
+rc=0
+wait "$server_pid" || rc=$?
+server_pid=
+if [ "$rc" = 2 ]; then
+yellow_line "已取消优选，未修改现有节点。"
+return 2
+fi
+red_line "CDN 优选未完成，现有节点保持不变。"
+return 1
+fi
+if cdnopt_apply_selection "$result" "$session/previous"; then
+outcome=success
+green_line "已保存优选 IP；网页会显示结果，短暂保留后关闭。"
+else
+rc=$?
+if [ "$rc" = 2 ]; then
+keep_backup=yes
+red_line "旧优选池未能完全恢复，备份保留在 $session/previous。"
+fi
+red_line "VPS 未能保存优选结果，请查看上方错误。"
+fi
+printf '{"state":"%s"}\n' "$outcome" > "$status.tmp" && mv -f -- "$status.tmp" "$status" || return 1
+wait "$server_pid" || true
+server_pid=
+[ "$outcome" = success ]
+)
+}
+
 cdnopt_run(){
 ui_title "Lun 一键优选 CDN 节点"
 echo "BestCF 聚合库提供默认候选；客户端线路与本机 VPS 分别测试、分别排行。"
@@ -12381,47 +13033,13 @@ cdnopt_public=$(client_port "$cdnopt_internal")
 cdnopt_ip=$(cdnopt_public_host) || { red_line "无法识别 VPS 公网 IP，未启动测速页。"; return 1; }
 cdnopt_host=$(cdnopt_preferred_host "$cdnopt_ip")
 cdnopt_reconcile_cluster_async
-cdnopt_result_dir=$(cdnopt_module_dir)
-cdnopt_result="$cdnopt_result_dir/result.$$.json"
-rm -f "$cdnopt_result"
-printf '%s\n' "$cdnopt_internal" > "$HOME/lun/cdnopt_port"
-apply_lun_firewall_rules quiet >/dev/null 2>&1 || yellow_line "系统防火墙未能自动放行临时 TCP $cdnopt_internal，如页面打不开请检查防火墙/安全组。"
 if is_nat_mode; then
 green_line "临时页面使用 NAT 映射：公网 $cdnopt_public → 内网 $cdnopt_internal。"
 else
 yellow_line "如页面无法打开，请在云安全组临时放行 TCP $cdnopt_public；测速结束后 Lun 会删除自己的系统防火墙规则。"
 fi
-if [ -n "${LUN_CDNOPT_CANDIDATE_FILE:-}" ]; then
-python3 "$(cdnopt_agent)" serve \
---port "$cdnopt_internal" --public-host "$cdnopt_host" --server-ip "$cdnopt_ip" --public-port "$cdnopt_public" \
---result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
---current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512 \
---source-file "$LUN_CDNOPT_CANDIDATE_FILE"
-else
-python3 "$(cdnopt_agent)" serve \
---port "$cdnopt_internal" --public-host "$cdnopt_host" --server-ip "$cdnopt_ip" --public-port "$cdnopt_public" \
---result-file "$cdnopt_result" --top "$cdnopt_top" --latency-max 150 --speed-min 80 \
---current-file "$HOME/lun/cdnip" --server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)" --test-port "${cdnpt:-443}" --candidate-limit 512
-fi
-cdnopt_rc=$?
-cdnopt_cleanup_session
-case "$cdnopt_rc" in
-0) ;;
-2) yellow_line "已取消优选，未修改现有节点。"; rm -f "$cdnopt_result"; return 2 ;;
-*) red_line "CDN 优选未完成，现有节点保持不变。"; rm -f "$cdnopt_result"; return 1 ;;
-esac
-python3 "$(cdnopt_agent)" extract --result-file "$cdnopt_result" --format table || {
-red_line "测速结果校验失败，现有节点保持不变。"
-rm -f "$cdnopt_result"
-return 1
-}
-cdnopt_ips=$(python3 "$(cdnopt_agent)" extract --result-file "$cdnopt_result" --format ips | tr '\n' ' ')
-[ -n "$cdnopt_ips" ] && save_cdn_ip_list "$cdnopt_ips" || {
-red_line "结果中没有可应用的 IP，现有节点保持不变。"
-rm -f "$cdnopt_result"
-return 1
-}
-rm -f "$cdnopt_result"
+cdnopt_feedback_session || return $?
+cfip=$(cat "$HOME/lun/cdnip") || return 1
 export cfip
 green_line "已应用到 Lun CDN 优选入口：$cfip"
 if [ -s "$HOME/lun/cdnym" ]; then
@@ -12931,15 +13549,16 @@ case "$1" in
 12) echo "VLESS XHTTP TLS UDP" ;;
 13) echo "VLESS XHTTP TLS TCP/UDP" ;;
 14) echo "NaiveProxy H2/H3" ;;
+15) echo "Snell v6" ;;
 esac
 }
 
 protocol_route_capabilities(){
 case "$1" in
-3) echo "直连 / CDN优选 / 端口回源" ;;
-4|8) echo "直连 / CDN优选 / 端口回源 / CF隧道" ;;
+3|4|8) echo "直连 / CDN优选 / 端口回源 / CF隧道" ;;
 13) echo "直连 / CDN优选(TCP、UDP需公网443) / 端口回源" ;;
 10|11|12) echo "仅直连UDP/QUIC（无CDN、回源、隧道）" ;;
+15) echo "仅直连TCP（允许在 TCP 内转发 UDP；无 CDN、回源、隧道）" ;;
 *) echo "仅直连（无CDN、回源、隧道）" ;;
 esac
 }
@@ -12953,14 +13572,14 @@ cdn|origin)
 case "$id" in 3|4|8|13) printf '✓' ;; *) printf '—' ;; esac
 ;;
 tunnel)
-case "$id" in 4|8) printf '✓' ;; *) printf '—' ;; esac
+case "$id" in 3|4|8) printf '✓' ;; *) printf '—' ;; esac
 ;;
 esac
 }
 
 protocol_table_rows(){
 printf '编号|状态|协议|监听端口|公网端口|直连|CDN优选|端口回源|CF隧道\n'
-for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 label=$(protocol_label "$id")
 port=$(protocol_current_port "$id")
 if [ -n "$port" ]; then
@@ -13018,6 +13637,7 @@ case "$1" in
 12) echo xupt ;;
 13) echo xcpt ;;
 14) echo nvpt ;;
+15) echo snpt ;;
 esac
 }
 
@@ -13050,21 +13670,29 @@ case "$1" in
 12) unset xupt xup port_xu ;;
 13) unset xcpt xcp port_xc ;;
 14) unset nvpt nvp port_nv ;;
+15) unset snpt snp port_snell ;;
 esac
 }
 
 clear_all_protocol_picks(){
-for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 clear_protocol_pick "$id"
 done
 }
 
 protocol_count(){
 count=0
-for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 [ -n "$(protocol_current_port "$id")" ] && count=$((count + 1))
 done
 printf '%s\n' "$count"
+}
+
+legacy_protocol_pick_state(){
+local number
+for number in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+printf '%s|' "$(protocol_current_port "$number")"
+done
 }
 
 show_protocol_picker(){
@@ -13087,6 +13715,7 @@ esac
 case "$id" in
 10|11|12) yellow_line "$label 使用 UDP/QUIC，请确认公网端口及服务商映射已放行 UDP。" ;;
 14) yellow_line "NaiveProxy 必须使用与服务域名匹配的公开可信证书。" ;;
+15) yellow_line "Snell v6 使用独立内核，不用证书；NAT 请预留 TCP 映射。安装后从“节点订阅分享”私下导出配置。" ;;
 esac
 prompt_port "$label" "$var" "" "$(protocol_cf_port_kind "$id")"
 }
@@ -13142,7 +13771,7 @@ load_installed_protocol_flags
 while :; do
 ui_title "Lun 快速修改单个协议端口"
 found=
-for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 current=$(protocol_current_port "$id")
 [ -n "$current" ] || continue
 found=yes
@@ -13194,7 +13823,8 @@ for item in \
 "TUIC:$port_tu" \
 "VLESS XHTTP TLS UDP:$port_xu" \
 "VLESS XHTTP TLS TCP/UDP:$port_xc" \
-"NaiveProxy H2/H3:$port_nv"; do
+"NaiveProxy H2/H3:$port_nv" \
+"Snell v6:${port_snell:-}"; do
 label=${item%%:*}
 port=${item#*:}
 [ -n "$port" ] || continue
@@ -13567,6 +14197,11 @@ fi
 guided_progress
 pick_protocols
 rc=$?
+if [ "$rc" = 0 ] && [ "$snp" = yes ] && ! legacy_protocol_selected; then
+sub=
+yellow_line "仅选 Snell v6：跳过域名、证书和 HTTP 订阅，安装后通过 SSH 私下导出。"
+step=6 && continue
+fi
 [ "$rc" = 0 ] && step=3 && continue
 [ "$rc" = 2 ] && step=1 && continue
 ;;
@@ -13592,7 +14227,10 @@ step=6 && continue
 confirm_guided_install
 rc=$?
 [ "$rc" = 0 ] && break
-[ "$rc" = 2 ] && step=4 && continue
+if [ "$rc" = 2 ]; then
+if [ "$snp" = yes ] && ! legacy_protocol_selected; then step=2; else step=4; fi
+continue
+fi
 return 1
 ;;
 esac
@@ -13969,6 +14607,7 @@ done
 }
 
 install_protocol_menu(){
+local prior_legacy prior_snell
 while :; do
 ui_title "Lun 安装 / 协议管理"
 echo " 1. 引导式安装 / 新建协议"
@@ -13978,8 +14617,24 @@ echo " 0. 返回"
 printf "请选择 [0-3]："
 IFS= read -r c
 case "$c" in
-1) guided_install; rc=$?; [ "$rc" = 0 ] && { { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; } && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
-2) pick_protocols; rc=$?; [ "$rc" = 0 ] && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=menu; return ;;
+1) guided_install; rc=$?; [ "$rc" = 0 ] && { { [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/snell/config.json" ]; } && LUN_MENU_ACTION=rep || LUN_MENU_ACTION=install; return; } ;;
+2)
+prior_legacy=
+if [ -s "$HOME/lun/xr.json" ] || [ -s "$HOME/lun/sb.json" ] || [ -s "$HOME/lun/snell/config.json" ]; then
+load_installed_protocol_flags
+prior_legacy=$(legacy_protocol_pick_state)
+prior_snell=${snpt:-}
+fi
+pick_protocols; rc=$?
+if [ "$rc" = 0 ]; then
+LUN_MENU_ACTION=rep
+if [ -n "$prior_legacy" ] && [ "$prior_legacy" = "$(legacy_protocol_pick_state)" ] && [ "$prior_snell" != "${snpt:-}" ]; then
+LUN_MENU_ACTION=snell-apply
+fi
+else
+LUN_MENU_ACTION=menu
+fi
+return ;;
 3) oneclick_setup_menu; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] && return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
@@ -14033,23 +14688,44 @@ rm -f "$probe_log"
 printf '%s\n' "$remote_service"
 }
 
+probe_argo_xhttp(){
+local url=$1 timeout=$2 padding
+# Xray's default XHTTP profile expects URL-query padding in the Referer header.
+padding=$(printf '%256s' '' | tr ' ' 'X')
+curl --http1.1 -sm "$timeout" -o /dev/null -w '%{http_code} %{content_type}' \
+  -H "Referer: $url?x_padding=$padding" "$url" 2>/dev/null || true
+}
+
 diagnose_argo_tunnel(){
 ui_title "Lun CF 隧道 / Argo 回源诊断"
 argo_port=$(cat "$HOME/lun/argoport.log" 2>/dev/null)
 argo_type=$(cat "$HOME/lun/vlvm" 2>/dev/null)
 argo_domain=$(cat "$HOME/lun/sbargoym.log" 2>/dev/null)
 [ -n "$argo_port" ] || { red_line "未找到 Argo 绑定端口，请先配置隧道。"; return 1; }
-[ "$argo_type" = Vmess ] && argo_path="/$(cat "$HOME/lun/uuid")-vm" || argo_path="/$(cat "$HOME/lun/uuid")-vw"
+case "$argo_type" in
+Vmess) argo_path="/$(cat "$HOME/lun/uuid")-vm" ;;
+Vless) argo_path="/$(cat "$HOME/lun/uuid")-vw" ;;
+Vlessx) argo_path="/$(cat "$HOME/lun/uuid")-vx/diagnostic-$$" ;;
+*) red_line "未知隧道协议，请重新选择隧道绑定。"; return 1 ;;
+esac
 expected_service="http://localhost:$argo_port"
-echo "Lun 当前协议：$argo_type WS"
+echo "Lun 当前协议：$(argo_protocol_label "$(argo_configured_protocol)")"
 echo "本机应使用的 Tunnel 服务：$expected_service"
-echo "WebSocket 路径：$argo_path"
+echo "诊断路径：$argo_path"
 if command -v curl >/dev/null 2>&1; then
+if [ "$argo_type" = Vlessx ]; then
+local_code=$(probe_argo_xhttp "$expected_service$argo_path" 3)
+case "$local_code" in
+'200 text/event-stream'*) green_line "本机 HTTP 回源已到达 XHTTP 监听（不验证代理认证）。" ;;
+*) red_line "本机 XHTTP 未响应预期内容（HTTP ${local_code:-连接失败}）。" ;;
+esac
+else
 local_code=$(curl -sm 8 -o /dev/null -w '%{http_code}' "$expected_service$argo_path" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 2>/dev/null)
 if [ "$local_code" = 101 ]; then
 green_line "本机回源：正常（WebSocket 101）"
 else
 red_line "本机回源：异常（HTTP ${local_code:-连接失败}），请先检查协议服务。"
+fi
 fi
 fi
 echo "正在读取 Cloudflare 下发的 Tunnel 配置，约需数秒……"
@@ -14065,6 +14741,15 @@ else
 yellow_line "未能读取远端服务配置；请手动确认 Public Hostname 的 Service 为 $expected_service。"
 fi
 if [ -n "$argo_domain" ] && command -v curl >/dev/null 2>&1; then
+if [ "$argo_type" = Vlessx ]; then
+edge_code=$(probe_argo_xhttp "https://$argo_domain$argo_path" 8)
+case "$edge_code" in
+'200 text/event-stream'*) green_line "Cloudflare 已回源到 XHTTP（不验证代理认证）。" ;;
+502*) red_line "Cloudflare 回源 502，请检查 Public Hostname 的 Service 与本机监听。" ;;
+*) yellow_line "Cloudflare 未返回预期的 XHTTP 响应（HTTP ${edge_code:-连接失败}）。" ;;
+esac
+return 0
+fi
 edge_code=$(curl --http1.1 -skm 12 -o /dev/null -w '%{http_code}' "https://$argo_domain$argo_path" -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 2>/dev/null)
 case "$edge_code" in
 101) green_line "Cloudflare 边缘回源：正常（WebSocket 101）" ;;
@@ -14186,6 +14871,30 @@ esac
 done
 }
 
+prompt_vless_ws_vision(){
+local state=关闭 current=off choice
+[ -s "$HOME/lun/port_vw" ] || { red_line "请先安装 VLESS WS（协议 4）。"; return 1; }
+if vless_ws_vision_enabled; then state=开启; current=on; fi
+ui_title "Lun VLESS WS Vision（当前：$state）"
+echo " 1. 开启 ENC + Vision（需要 Xray 26.3.27+，原 WS 客户端需刷新/导入新链接）"
+echo " 2. 恢复原 WS ENC 模式（不使用 Vision）"
+echo " 0. 返回"
+printf "请选择 [0-2]："
+IFS= read -r choice
+case "$choice" in
+1) choice=on ;;
+2) choice=off ;;
+0|"") return 2 ;;
+*) echo "输入错误。"; return 1 ;;
+esac
+[ "$choice" != "$current" ] || { echo "设置未变化。"; return 2; }
+if [ "$choice" = on ] && ! xray_supports_ws_vision; then
+red_line "当前内核不支持此模式，请先在“服务与更新”更新 Xray。"
+return 1
+fi
+LUN_WS_VISION_CHANGE=$choice
+}
+
 advanced_menu(){
 while :; do
 ui_title "Lun 高级设置"
@@ -14196,8 +14905,9 @@ echo " 4. 节点地址输出（域名 / IPv4 / IPv6）"
 echo " 5. 修改 UUID"
 echo " 6. 卸载 Lun"
 echo " 7. 清空配置恢复出厂设置"
+echo " 8. VLESS WS Vision"
 echo " 0. 返回"
-printf "请选择 [0-7]："
+printf "请选择 [0-8]："
 IFS= read -r c
 case "$c" in
 1) prompt_service_domain; rc=$?; [ "$rc" = 2 ] && continue; load_domain_cert_config; LUN_MENU_ACTION=list; return ;;
@@ -14207,6 +14917,7 @@ case "$c" in
 5) prompt_local_identity; ui_pause; LUN_MENU_ACTION=menu; return ;;
 6) LUN_MENU_ACTION=del; return ;;
 7) factory_reset; [ $? = 0 ] && { LUN_MENU_ACTION=install; return; } ;;
+8) prompt_vless_ws_vision; rc=$?; [ "$rc" = 2 ] && continue; [ "$rc" = 0 ] || { ui_pause; continue; }; load_installed_protocol_flags; LUN_MENU_ACTION=rep; return ;;
 0|"") LUN_MENU_ACTION=menu; return ;;
 *) echo "输入错误。" ;;
 esac
@@ -14594,6 +15305,7 @@ local_identity_apply "$requested"
 
 multiuser_security_transaction(){
 local mu_security_visit=no mu_security_agent=no mu_security_autostart=no mu_security_http=yes
+local mu_security_sb_live=no
 if ! grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null; then
 multiuser_download_agent || { red_line "安全操作需要新版多用户程序，更新失败，未修改用户。"; return 1; }
 grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null || {
@@ -14604,18 +15316,27 @@ fi
 lun_service_running lun-agent && mu_security_agent=yes
 lun_service_running lun-visit-monitor && mu_security_visit=yes
 lun_service_enabled lun-agent && mu_security_autostart=yes
-[ "$1" != set-local-identity ] || subscription_agent_enabled || mu_security_http=no
+case "$1" in set-local-identity|reset-for-core-upgrade) subscription_agent_enabled || mu_security_http=no ;; esac
+if [ "$1" = reset-for-core-upgrade ] && multiuser_enabled && [ -s "$HOME/lun/sb.json" ] &&
+   core_update_running sing-box; then
+mu_security_sb_live=yes
+fi
 multiuser_service_stop
 visit_monitor_service_stop
 if multiuser_cmd --defer-security-commit "$@"; then
-if [ "$mu_security_http" = no ] || multiuser_service_start; then
+if { [ "$mu_security_http" = no ] || multiuser_service_start; } &&
+   { [ "$mu_security_sb_live" != yes ] || multiuser_upgrade_stats_ready; }; then
 if multiuser_cmd security-commit; then
 [ "$mu_security_agent" = yes ] || multiuser_service_stop
 [ "$mu_security_autostart" = yes ] || lun_service_disable_autostart lun-agent
 [ "$mu_security_visit" != yes ] || visit_monitor_service_start || yellow_line "网站监控重启失败，请进入监控自检。"
 green_line "安全操作已生效，核心与订阅保持同步。"
 if cluster_enabled && cluster_is_federation; then
+if [ "$1" = reset-for-core-upgrade ]; then
+(cluster_cmd sync-users || true) >/dev/null 2>&1 &
+else
 cluster_cmd sync-users || yellow_line "本机已生效，但至少一台成员暂未同步。"
+fi
 fi
 return 0
 fi
@@ -15132,40 +15853,9 @@ done
 
 multiuser_install_enhanced_singbox(){
 [ -x "$HOME/lun/sing-box" ] || { red_line "Sing-box 未安装。"; return 1; }
-if "$HOME/lun/sing-box" version 2>/dev/null | grep -q with_v2ray_api; then
-green_line "当前 Sing-box 已支持按用户统计流量。"
-return 0
-fi
-mu_sb_tmp="$HOME/lun/sing-box.multiuser.tmp.$$"
-mu_helper_tmp="$(multiuser_module_dir)/lun-sb-stats.tmp.$$"
-mu_sb_url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/sing-box-multiuser-$cpu"
-mu_helper_url="https://github.com/azk78lun-collab/FHLUN/releases/download/lun/lun-sb-stats-$cpu"
-download_core_asset "sing-box-multiuser-$cpu" "$mu_sb_tmp" "$mu_sb_url" || return 1
-download_core_asset "lun-sb-stats-$cpu" "$mu_helper_tmp" "$mu_helper_url" || { rm -f "$mu_sb_tmp"; return 1; }
-chmod +x "$mu_sb_tmp"
-chmod 700 "$mu_helper_tmp"
-if ! "$mu_sb_tmp" version 2>/dev/null | grep -q with_v2ray_api; then
-rm -f "$mu_sb_tmp" "$mu_helper_tmp"
-red_line "下载的 Sing-box 不支持按用户统计流量，已拒绝替换。"
-return 1
-fi
-"$mu_helper_tmp" --help >/dev/null 2>&1 || { rm -f "$mu_sb_tmp" "$mu_helper_tmp"; red_line "Sing-box 统计辅助程序校验失败。"; return 1; }
-cp -p "$HOME/lun/sing-box" "$HOME/lun/sing-box.pre-multiuser"
-[ -s "$(multiuser_module_dir)/lun-sb-stats" ] && cp -p "$(multiuser_module_dir)/lun-sb-stats" "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser"
-mv -f "$mu_sb_tmp" "$HOME/lun/sing-box"
-mv -f "$mu_helper_tmp" "$(multiuser_module_dir)/lun-sb-stats"
-if ! multiuser_apply_changes; then
-mv -f "$HOME/lun/sing-box.pre-multiuser" "$HOME/lun/sing-box"
-if [ -s "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser" ]; then
-mv -f "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser" "$(multiuser_module_dir)/lun-sb-stats"
-else
-rm -f "$(multiuser_module_dir)/lun-sb-stats"
-fi
-sbrestart
-return 1
-fi
-rm -f "$(multiuser_module_dir)/lun-sb-stats.pre-multiuser"
-green_line "Sing-box 增强内核安装完成；协议版本不变，已增加用户统计能力。"
+update_lun_singbox || return 1
+if multiuser_enabled; then multiuser_apply_changes || return 1; fi
+green_line "Sing-box 流量统计已使用与 Snell 共用的 Lun 增强内核。"
 }
 
 multiuser_visit_refresh(){
@@ -15576,8 +16266,8 @@ green_line "新手优先：1 VLESS TCP Reality；需 CDN/隧道优先：3 VLESS 
 yellow_line "“隐蔽性”只表示流量特征更接近常见 TLS/HTTP/QUIC，不代表无法识别，也不代表匿名。"
 echo " 1. VLESS TCP Reality  【首选】直连稳定，无需证书；适合大多数 VPS 和日常主节点。隐蔽：高（Reality TLS 伪装）。要求：TCP。｜$(protocol_route_capabilities 1)"
 echo " 2. VLESS XHTTP Reality【进阶】直连 XHTTP+Reality；适合想测试 HTTP 形态且客户端支持较新的场景。隐蔽：高。要求：TCP。｜$(protocol_route_capabilities 2)"
-echo " 3. VLESS XHTTP         【CDN首选】适合橙云、优选 IP 和端口回源。隐蔽：较高（HTTP Host+Path）。要求：域名、路径正确。｜$(protocol_route_capabilities 3)"
-echo " 4. VLESS WS            【兼容首选】客户端覆盖广，适合 CDN 或 CF 隧道。隐蔽：中等（WebSocket 特征较明显）。｜$(protocol_route_capabilities 4)"
+echo " 3. VLESS XHTTP         【CDN首选】可走 CDN 或 CF 隧道。XHTTP 隧道要求本机 HTTP 回源、客户端支持 ENC + Vision。｜$(protocol_route_capabilities 3)"
+echo " 4. VLESS WS            【兼容首选】可走 CDN 或 CF 隧道。默认保留原 WS ENC；高级设置可选 Vision，切换后需刷新客户端订阅。｜$(protocol_route_capabilities 4)"
 echo " 5. Shadowsocks-2022   【简单高效】TCP/UDP 直连，适合私用、游戏和小型设备。隐蔽：中等，不是 HTTP 伪装。｜$(protocol_route_capabilities 5)"
 echo " 6. AnyTLS              【移动端备选】TLS over TCP 直连，适合 Sing-box 生态。隐蔽：较高。要求：客户端支持 AnyTLS。｜$(protocol_route_capabilities 6)"
 echo " 7. Any-Reality         【Sing-box 进阶】Reality 直连，适合不用 Xray 客户端的场景。隐蔽：高。兼容性不如 VLESS Reality 广。｜$(protocol_route_capabilities 7)"
@@ -15588,6 +16278,7 @@ echo "11. TUIC                【低延迟 UDP】适合移动网络、游戏和�
 echo "12. VLESS XHTTP TLS UDP 【实验】H3-only 直连，适合测试 XHTTP/QUIC。某些手机客户端不显延迟或重置，不建议做唯一主节点。｜$(protocol_route_capabilities 12)"
 echo "13. VLESS XHTTP TLS TCP/UDP【进阶】直连兼顾 TCP/UDP，并可生成 CDN-TCP。UDP 必须献祭本机公网443端口，否则只输出 TCP 节点。隐蔽：较高。｜$(protocol_route_capabilities 13)"
 echo "14. NaiveProxy H2/H3   【公开证书场景】HTTP CONNECT 特征接近普通 Web TLS，适合有正式域名证书的直连节点。｜$(protocol_route_capabilities 14)"
+echo "15. Snell v6           【可选直连】适合支持 Snell 的客户端，不需要域名和证书；用 SSH 私下导出密钥。｜$(protocol_route_capabilities 15)"
 yellow_line "UDP/QUIC 协议需同时放行服务商 UDP、云安全组、系统防火墙；NAT 还需 UDP 映射。"
 red_line "NaiveProxy 必须使用与域名匹配的公开可信证书，不接受自签或 Cloudflare Origin CA。"
 }
@@ -15674,12 +16365,14 @@ done
 }
 
 if [ "$LUN_MENU_REQUEST" = yes ]; then
+lun_finish_legacy_runtime_upgrade
 lun_splash
 lun_menu_prepare
 lun_menu
 case "$LUN_MENU_ACTION" in
 install) set -- ;;
 rep) set -- rep ;;
+snell-apply) set -- snell-apply ;;
 list) set -- list ;;
 res) set -- res ;;
 upx) set -- upx ;;
@@ -15757,6 +16450,9 @@ exit "$cert_cli_rc"
 elif [ "$1" = "self-update" ]; then
 update_local_lun_bundle
 exit $?
+elif [ "$1" = "sync-runtime" ]; then
+sync_lun_runtime
+exit $?
 elif [ "$1" = "cluster-update-module" ]; then
 cluster_upgrade_local_agent
 exit $?
@@ -15806,12 +16502,20 @@ echo
 showmode_short
 exit
 elif [ "$1" = "rep" ]; then
+if [ -z "$argo" ] && [ -z "$_lun_argo_input" ] && [ "${LUN_ARGO_EDITED:-no}" != yes ] && [ -s "$HOME/lun/argoport.log" ]; then
+load_saved_argo
+fi
 _lun_rebuild_request=yes
 _lun_rebuild_existing=no
-{ [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ]; } && _lun_rebuild_existing=yes
+{ [ -x "$HOME/lun/xray" ] || [ -x "$HOME/lun/sing-box" ] || [ -s "$HOME/lun/snell/config.json" ]; } && _lun_rebuild_existing=yes
+if [ "$snp" = yes ]; then snell_preflight || exit 1; fi
 create_rebuild_snapshot || { echo "无法创建重建快照，已取消操作，原服务未改动。"; exit 1; }
 trap 'rollback_rebuild' EXIT
 trap 'exit 130' HUP INT TERM
+if [ -s "$HOME/lun/snell/config.json" ]; then
+snell_service disable >/dev/null 2>&1 || { red_line "未能停止 Snell 服务，已取消重建。"; exit 1; }
+rm -f "$HOME/lun/snell/config.json" "$HOME/lun/port_snell" || exit 1
+fi
 cleandel keep-entry
 ensure_lun_command || true
 rm -f "$HOME/lun/sb.json" "$HOME/lun/xr.json" "$HOME/lun/sbargoym.log" "$HOME/lun/sbargotoken.log" "$HOME/lun/argo.log" "$HOME/lun/argoport.log" "$HOME/lun/name"
@@ -15825,19 +16529,28 @@ echo
 elif [ "$1" = "list" ]; then
 refresh_subscription_outputs
 exit
+elif [ "$1" = "snell-apply" ]; then
+snell_apply_only
+exit $?
+elif [ "$1" = "snell-export" ]; then
+snell_export "${2:-sing-box}"
+exit $?
 elif [ "$1" = "upx" ]; then
 for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/x"*) kill "$(basename "$P")" 2>/dev/null ;; esac; done
 upxray && xrestart && echo "Xray内核更新完成" && sleep 2 && refresh_subscription_outputs
 exit
 elif [ "$1" = "ups" ]; then
-for P in /proc/[0-9]*; do [ -L "$P/exe" ] || continue; TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue; case "$TARGET" in *"/lun/s"*) kill "$(basename "$P")" 2>/dev/null ;; esac; done
-upsingbox && sbrestart && echo "Sing-box内核更新完成" && sleep 2 && refresh_subscription_outputs
-exit
+sync_lun_runtime
+exit $?
 elif [ "$1" = "res" ]; then
+if [ -s "$HOME/lun/snell/config.json" ]; then
+snell_service restart >/dev/null 2>&1 || yellow_line "Snell v6 服务重启失败。"
+fi
 for P in /proc/[0-9]*; do
 [ -L "$P/exe" ] || continue
 TARGET=$(readlink -f "$P/exe" 2>/dev/null) || continue
 case "$TARGET" in
+*"/lun/snell/"*) ;;
 *"/lun/s"*)
 kill "$(basename "$P")" 2>/dev/null
 sbrestart
@@ -15873,7 +16586,7 @@ _lun_proc_running2=no
 for _P in /proc/[0-9]*; do
 [ -L "$_P/exe" ] || continue
 _exe=$(readlink -f "$_P/exe" 2>/dev/null) || continue
-case "$_exe" in */lun/sing-box*|*/lun/xray*) _lun_proc_running2=yes; break ;; esac
+case "$_exe" in */lun/sing-box*|*/lun/xray*|*/lun/snell/sing-box) _lun_proc_running2=yes; break ;; esac
 done
 [ "$_lun_proc_running2" = "no" ] && pgrep -f 'lun/(sing-box|xray)([[:space:]]|$)' >/dev/null 2>&1 && _lun_proc_running2=yes
 [ "$_lun_proc_running2" = "no" ] && { systemctl is-active --quiet xr 2>/dev/null || systemctl is-active --quiet sb 2>/dev/null; } && _lun_proc_running2=yes

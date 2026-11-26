@@ -1,8 +1,14 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前；每项链接可查看对应代码差异。当前脚本版本为 `V26.11.19.2`。
+Lun 风火轮的中英文更新记录，最新日期在前。当前脚本版本为 `V26.11.26.2`。
 
-Bilingual update history for Lun, newest date first. Each commit link opens the corresponding changes. The current script version is `V26.11.19.2`.
+Bilingual update history for Lun, newest date first. The current script version is `V26.11.26.2`.
+
+## 2026 年 11 月 26 日
+
+- `V26.11.26.2`：加入 Snell v6（协议 15），与常规 Sing-box 共用增强版 1.14.4，保留 V2Ray API 和 `lun-sb-stats`。本机与集群更新同步配套内核。新版验证通过后一次性重置多用户账号、设备、令牌、流量和本机模块备份；保留普通代理与联邦身份。
+- `V26.11.26.2`: Add Snell v6 (protocol 15) to the shared enhanced Sing-box 1.14.4 runtime, including the V2Ray API and `lun-sb-stats`. Synchronize the runtime during local and cluster updates. After verification, reset historical multi-user accounts, devices, tokens, usage, and local module backups once; preserve ordinary proxy settings and federation identity.
+- 隧道可选 XHTTP 入口；WS Vision 按兼容性单独启用。CDN 优选网页等待 VPS 的真实保存结果后再显示成功或失败。/ Add an optional XHTTP tunnel entrance and opt-in WS Vision. The CDN optimizer reports success or failure only after the VPS responds with the save result.
 
 ## 2026 年 11 月 19 日
 

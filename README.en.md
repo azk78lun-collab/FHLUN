@@ -5,14 +5,14 @@
 Lun is a VPS terminal script for multi-protocol proxies, CDN optimization, multi-user access and distributed server management.
 
 Powered by Xray, sing-box and Cloudflared, with guided menus and environment-variable installation.
-Current script version: `V26.11.19.2`.
+Current script version: `V26.11.26.2`.
 
 ## Features
 
 | Feature | What it does |
 | --- | --- |
-| Protocols and subscriptions | Manage 14 protocols/combinations; export generic, Clash/Mihomo and Sing-box subscriptions where compatible. |
-| Dual-path CDN testing | Rank client-to-CDN and VPS-to-CDN results separately; configure Cloudflare CDN, origin-port rules and WS tunnels. |
+| Protocols and subscriptions | Manage 15 protocols/combinations, with compatible subscription formats and private SSH export for Snell v6. |
+| Dual-path CDN testing | Rank client-to-CDN and VPS-to-CDN results separately; configure Cloudflare CDN, origin-port rules and WS / XHTTP tunnels. |
 | NAT and certificates | Manage port pools, NAT mappings and system firewall rules; issue/import certificates and check renewal automatically. |
 | Users and bandwidth | Manage users, devices, monthly quotas, expiry and protocol access, with server-wide fair bandwidth sharing. |
 | Distributed cluster | Connect peer VPS members, aggregate subscriptions, distribute script updates and sync CDN pools; configure two-hop proxy chains. |

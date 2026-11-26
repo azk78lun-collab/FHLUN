@@ -1093,6 +1093,54 @@ rules:
         self.assertEqual(states, {"xray": {"manager": "systemd", "active": True},
                                   "singbox": {"manager": "systemd", "active": False}})
 
+    def test_core_upgrade_reset_rolls_back_then_removes_old_accounts_and_backups_once(self):
+        device = self.add_user()
+        previous_token = self.agent.load_config()["legacy_token"]
+        backup = self.agent.backup_database()
+        old_profile = self.agent.generated / device["token"]
+        old_profile.mkdir(parents=True, exist_ok=True)
+        (old_profile / "jhsub.txt").write_text("old subscription")
+        self.agent.defer_security_commit = True
+        self.agent.reset_for_core_upgrade(lun_agent.USER_DATA_GENERATION)
+        self.assertIsNone(self.agent.db.connection.execute(
+            "SELECT id FROM devices WHERE token=?", (device["token"],)).fetchone())
+        self.assertTrue(backup.exists())
+        self.assertNotEqual(self.agent.load_config()["legacy_token"], previous_token)
+        self.agent.security_rollback()
+        self.assertEqual(self.agent.load_config()["legacy_token"], previous_token)
+        self.assertTrue(old_profile.exists())
+        self.assertIsNotNone(self.agent.db.connection.execute(
+            "SELECT id FROM devices WHERE token=?", (device["token"],)).fetchone())
+        self.agent.reset_for_core_upgrade(lun_agent.USER_DATA_GENERATION)
+        self.agent.security_commit()
+        self.assertFalse(backup.exists())
+        self.assertFalse(old_profile.exists())
+        self.assertEqual(self.agent._read_text("uuid"), "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(self.agent.db.connection.execute("SELECT name FROM users").fetchone()[0], "legacy-admin")
+        self.assertEqual(self.agent.db.connection.execute("SELECT COUNT(*) FROM usage_totals").fetchone()[0], 0)
+        fresh = self.add_user("new-account")
+        self.assertGreater(fresh["id"], device["id"])
+        self.agent.reset_for_core_upgrade(lun_agent.USER_DATA_GENERATION)
+        self.assertIsNotNone(self.agent.db.connection.execute(
+            "SELECT id FROM devices WHERE token=?", (fresh["token"],)).fetchone())
+
+    def test_core_upgrade_reset_preserves_ordinary_subscription_only_identity(self):
+        config = self.agent.load_config()
+        config.update(enabled=False, subscription_only=True)
+        self.agent.save_config(config)
+        self.agent.reset_for_core_upgrade(lun_agent.USER_DATA_GENERATION)
+        self.assertEqual(self.agent.load_config()["legacy_token"], config["legacy_token"])
+        self.assertEqual(self.agent.load_config()["user_data_generation"], lun_agent.USER_DATA_GENERATION)
+
+    def test_core_upgrade_reset_does_not_start_previously_inactive_core(self):
+        with mock.patch.object(self.agent, "_security_service_states", return_value={
+            "xray": {"manager": "systemd", "active": True},
+            "singbox": {"manager": "systemd", "active": False}}), \
+             mock.patch.object(self.agent, "_reconcile_locked", return_value={"xray": True, "singbox": True}), \
+             mock.patch.object(self.agent, "restart_cores") as restart:
+            self.agent.reset_for_core_upgrade(lun_agent.USER_DATA_GENERATION)
+        restart.assert_called_once_with({"xray": True, "singbox": False})
+
     def test_security_stage_survives_subscription_failure_and_can_commit_after_start(self):
         device = self.add_user()
         preinstall = self.agent.backups / "preinstall-xr.json"

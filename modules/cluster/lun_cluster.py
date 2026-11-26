@@ -44,7 +44,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.8"
+VERSION = "0.3.9"
+USER_DATA_GENERATION = "singbox-1.14.4"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
@@ -3040,6 +3041,7 @@ class Cluster:
             raise ClusterError("local multi-user export is invalid")
         current_entities: set[str] = set()
         events: list[dict[str, Any]] = []
+        generation = self._user_data_generation()
         for raw in users:
             if not isinstance(raw, dict):
                 raise ClusterError("local multi-user export contains a non-object user")
@@ -3055,6 +3057,8 @@ class Cluster:
                 "reset_day": int(raw.get("reset_day", 1)), "expires_at": raw.get("expires_at"),
                 "max_devices": int(raw.get("max_devices", 1)),
             }
+            if generation:
+                user_payload["data_generation"] = generation
             self._validate_federation_user_event("user.upsert", user_entity, user_payload)
             current_entities.add(user_entity)
             created = self._create_event_if_changed("user.upsert", user_entity, user_payload)
@@ -3184,6 +3188,7 @@ class Cluster:
             if isinstance(payload, dict):
                 entities[str(row["entity_key"])] = (str(row["type"]), payload, bool(row["deleted"]))
         local_id = str(self.load_config().get("node_id", ""))
+        generation = self._user_data_generation()
         trusted_ids = {str(row["id"]) for row in self.trusted_federation_nodes(include_self=True)}
         bundle_users: list[dict[str, Any]] = []
         profiles: list[tuple[str, str, str]] = []
@@ -3198,6 +3203,8 @@ class Cluster:
         seen_credentials: set[str] = set()
         for entity_key, (event_type, user, deleted) in sorted(entities.items()):
             if not entity_key.startswith("user:") or event_type != "user.upsert" or deleted:
+                continue
+            if generation and user.get("data_generation") != generation:
                 continue
             if str(user.get("owner_id", "")) not in trusted_ids or user.get("manual_disabled", False):
                 continue
@@ -3271,6 +3278,16 @@ class Cluster:
                       f"users={len(bundle_users)} profiles={len(active_profile_ids)}")
         return {"users": len(bundle_users), "profiles": len(active_profile_ids),
                 "refreshed": refreshed, "import": imported}
+
+    def _user_data_generation(self) -> str:
+        path = self.root / "modules" / "multiuser" / "config.json"
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(config, dict) and config.get("user_data_generation") == USER_DATA_GENERATION:
+                return USER_DATA_GENERATION
+        except (OSError, ValueError):
+            pass
+        return ""
 
     def create_event(self, event_type: str, entity_key: str, payload: dict[str, Any], *, created_at: int | None = None) -> dict[str, Any]:
         self._validate_event_payload(event_type, entity_key, payload)
@@ -7453,6 +7470,15 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
                 expected_sha = str(agent_payload["sha256"]) if 'cluster_source_sha256' in agent_source else ""
                 status = wait_for_member_update(cluster, node_id, ready_version, expected_sha)
                 cluster.upsert_node(status, role="federation")
+            if re.search(rb"^LUN_SINGBOX_VERSION=[0-9.]+$", script_content, re.M):
+                # Use the legacy action so an older peer can invoke the updated
+                # script entry immediately after installing the new bundle.
+                core_result = _action_result_payload(
+                    send_action(cluster, node_id, "core.update", {"core": "singbox"}, timeout=360,
+                                coordinate_failures=False)
+                )
+                if core_result.get("returncode") != 0:
+                    raise ClusterError("该节点没有确认增强内核及多用户迁移完成")
             results[number] = {
                 "status": "updated", "version": lun_version,
                 "script_sha256": script_result.get("sha256", ""),
@@ -7484,6 +7510,10 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
         script_path = Path(os.environ.get("LUN_SCRIPT", "/usr/bin/lun"))
         install_script_payload(cluster, script_path, script_payload)
         install_agent_payload(agent_payload)
+        if re.search(rb"^LUN_SINGBOX_VERSION=[0-9.]+$", script_content, re.M):
+            local_runtime = cluster._run(["bash", str(script_path), "sync-runtime"], timeout=360, check=False)
+            if local_runtime.returncode:
+                raise ClusterError((local_runtime.stderr or local_runtime.stdout or "本机运行时迁移未完成")[-2000:])
         local_result = {"status": "updated", "version": lun_version}
     with contextlib.suppress(Exception):
         cluster.upsert_node(cluster.local_status(), role="federation" if cluster.is_federation() else "master")

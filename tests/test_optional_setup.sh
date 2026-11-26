@@ -178,3 +178,81 @@ echo 'ok - optional setup dispatch is isolated and preserves each requested acti
 grep -Fq 'prepare_runtime_cert || { echo "XHTTP TLS 证书准备失败。"; return 1; }' "$SCRIPT"
 grep -Fq 'prepare_runtime_cert || { echo "Sing-box 证书准备失败。"; return 1; }' "$SCRIPT"
 echo 'ok - core installers stop on certificate preparation failure'
+
+(
+  for fn in lun_version_is_older vless_ws_vision_enabled xray_supports_ws_vision \
+      prepare_vless_ws_vision prompt_vless_ws_vision installxray; do load_function "$fn"; done
+  mkdir -p "$HOME/lun/xrk"
+  printf 'test-encryption\n' > "$HOME/lun/xrk/enkey"
+  printf 'test-decryption\n' > "$HOME/lun/xrk/dekey"
+  cat > "$HOME/lun/xray" <<'EOF'
+#!/bin/sh
+printf 'Xray %s\n' "$XRAY_FIXTURE_VERSION"
+EOF
+  chmod +x "$HOME/lun/xray"
+  export XRAY_FIXTURE_VERSION=26.3.27
+  insuuid(){ uuid=00000000-0000-4000-8000-000000000001; }
+  ensure_cdn_origin_cert(){ :; }
+  xray_stream_security_block(){ printf '        "security": "none",\n'; }
+  xhp= vlp= vxp= xup= xcp= vwp=yes port_vw=8080 cdnym= ym_vl_re=
+  (installxray) >/dev/null
+  ! grep -Fq 'xtls-rprx-vision' "$HOME/lun/xr.json"
+  [[ ! -e "$HOME/lun/vless_ws_vision" ]]
+  XRAY_FIXTURE_VERSION=26.3.26
+  ! prompt_vless_ws_vision <<< '1' >/dev/null 2>&1
+  [[ ! -e "$HOME/lun/vless_ws_vision" ]]
+  XRAY_FIXTURE_VERSION=26.3.27
+  prompt_vless_ws_vision <<< '1' >/dev/null
+  [[ ! -e "$HOME/lun/vless_ws_vision" ]]
+  (installxray) >/dev/null
+  grep -Fq '"id": "00000000-0000-4000-8000-000000000001", "flow": "xtls-rprx-vision"' "$HOME/lun/xr.json"
+  grep -Fq '"decryption": "test-decryption"' "$HOME/lun/xr.json"
+  vless_ws_vision_enabled
+  prompt_vless_ws_vision <<< '2' >/dev/null
+  (installxray) >/dev/null
+  ! grep -Fq 'xtls-rprx-vision' "$HOME/lun/xr.json"
+)
+echo 'ok - WS Vision is opt-in, gated by Xray version, and reversible'
+
+(
+  for fn in argo_configured_protocol argo_origin_port load_saved_argo \
+      append_argo_xhttp_links prompt_argo_protocol_seed prompt_argo protocol_capability_mark \
+      valid_port_value normalize_host host_is_ipv6 uri_host; do load_function "$fn"; done
+  is_nat_mode(){ return 0; }
+  ensure_port_available(){ [[ $1 == 8080 ]]; }
+  inner_port_from_public(){ [[ $1 == 28080 ]] && echo 8080 || true; }
+  port_valid(){ valid_port_value "$1"; }
+  show_port_mapping_hint(){ :; }
+  cdn_origin_tls_for_port(){ [[ ${tls:-no} == yes ]]; }
+  valid_addym(){ [[ $1 == tunnel.example.test ]]; }
+  sanitize_argo_token(){ printf '%s\n' "$1"; }
+  prompt_argo_ip(){ return 0; }
+  port_vm_ws= port_vw= port_vx= argo=
+  rm -f "$HOME/lun/port_vw"
+  prompt_argo <<< $'3\n28080\n\n\n\n' >/dev/null
+  [[ $argo == vxpt && $vxpt == 8080 && $vxp == yes && $LUN_ARGO_EDITED == yes ]]
+
+  printf '8080\n' > "$HOME/lun/port_vx"
+  printf 'Vlessx\n' > "$HOME/lun/vlvm"
+  printf 'tunnel.example.test\n' > "$HOME/lun/sbargoym.log"
+  printf 'mock-token\n' > "$HOME/lun/sbargotoken.log"
+  load_saved_argo
+  [[ $argo == vxpt && $ARGO_DOMAIN == tunnel.example.test && $ARGO_AUTH == mock-token ]]
+  [[ $(argo_origin_port "$argo") == 8080 && $(protocol_capability_mark 3 tunnel) == ✓ ]]
+  tls=yes
+  ! prompt_argo <<< '3' >/dev/null 2>&1
+  tls=no
+  prompt_argo <<< $'3\ntunnel.example.test\nmock-token\n' >/dev/null
+  [[ $argo == vxpt && $ARGO_DOMAIN == tunnel.example.test && $ARGO_AUTH == mock-token ]]
+  routed_node_name(){ printf '[测试]%s-01\n' "$1"; }
+  uuid=00000000-0000-4000-8000-000000000001 enkey=test-encryption argodomain=$ARGO_DOMAIN
+  argo_entries='tunnel.example.test|01 2001:db8::1|02'
+  append_argo_xhttp_links > "$tmp/argo-display"
+  cmp "$HOME/lun/jhsub.txt" "$tmp/argo-display"
+  [[ $(wc -l < "$tmp/argo-display") == 2 ]]
+  grep -Fq '@tunnel.example.test:443?encryption=test-encryption&flow=xtls-rprx-vision&type=xhttp' "$tmp/argo-display"
+  grep -Fq '@[2001:db8::1]:443?' "$tmp/argo-display"
+  grep -Fq "host=$argodomain&path=/$uuid-vx&mode=packet-up&security=tls&sni=$argodomain" "$tmp/argo-display"
+  grep -Fq '#[测试]vless-xhttp-argo-tls-443-ar02-01' "$tmp/argo-display"
+)
+echo 'ok - XHTTP tunnel stays on the internal HTTP port and exports TLS 443 with the right Host, path and flow'

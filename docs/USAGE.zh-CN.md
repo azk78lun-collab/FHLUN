@@ -2,7 +2,7 @@
 
 [返回中文首页](../README.md) · [English overview](../README.en.md) · [更新日志](../CHANGELOG.md)
 
-适用于 `V26.11.10.1`。本文集中说明菜单、参数和常见配置；多用户、集群及 CDN 优选另有模块文档。
+适用于 `V26.11.26.2`。本文集中说明菜单、参数和常见配置；多用户、集群及 CDN 优选另有模块文档。
 
 文中的地址和映射仅用于说明，请替换成自己的配置。
 
@@ -52,13 +52,13 @@ lun
 
 “分布式服务器集群”精简为：1. 服务器管理、2. 添加服务器、3. 刷新并查看聚合订阅、4. 同步成员状态、5. 更新与维护、6. 集群设置、7. 链式代理（手动配置）。单台配置、批量操作、地区和移除归入服务器管理；“同步 CDN 优选池”位于“5. 更新与维护 → 2”，与一键更新、状态修复及备份恢复放在同一模块。
 
-引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。协议选择和增删改界面共用带边框的对齐表格，分别显示选择状态、监听/公网端口以及直连、CDN 优选、端口回源、CF 隧道能力，支持项使用绿色 `✓`；表格由脚本按终端显示宽度排版，不依赖系统 `column` 命令。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 14 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、一键优选 CDN 节点、Cloudflare Origin Rules（手动登记或 API 自动部署）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
+引导式安装会按轻量流程询问 VPS 类型、端口池、协议/端口、服务域名、证书模式、节点订阅分享并最终确认。协议选择和增删改界面共用带边框的对齐表格，分别显示选择状态、监听/公网端口以及直连、CDN 优选、端口回源、CF 隧道能力，支持项使用绿色 `✓`；表格由脚本按终端显示宽度排版，不依赖系统 `column` 命令。中间步骤只显示单行进度，完整配置只在最终确认时显示一次；NAT 映射显示组数，不反复展开整张映射表。普通 VPS 只显示“端口/端口池”；只有选择 NAT VPS 后才显示“内网端口/公网端口/映射”。详细的 NAT、Cloudflare、证书和 15 项协议特点统一放在“使用说明 / 协议特点”。“入口网络管理”提供 VPS 类型/端口池、单协议快速改端口、CDN/CF 优选、一键优选 CDN 节点、Cloudflare Origin Rules（手动登记或 API 自动部署）、CF 隧道/Argo 和 CDN 诊断；普通 VPS 与 NAT VPS 均可使用 Origin Rules，只有操作系统/NAT 公网端口映射仍为 NAT 专用。每一步输入 `0` 返回上一级，非法域名或端口会停留在当前输入层。
 
 “安装 / 协议管理 → 3. 按需配置”先选择需要的功能，不再默认执行整套 Cloudflare 配置：
 
 - **仅域名与公开证书**：设置自己的服务域名，复用匹配的有效公开证书；否则优先使用已保存 DNS API 凭据，未配置时使用 HTTP-01。不会启用 CDN、创建隧道或改动协议端口。申请失败或取消时恢复原服务域名及现有证书。
 - **仅 CDN Host / 优选入口**：复用已有兼容协议，设置 Host、优选地址及边缘端口，不申请公开证书、不创建隧道；需要端口改写时明确提示再配置回源。
-- **仅 CF 隧道 / Argo**：复用独立隧道设置流程；缺少 WS 协议时提示添加，不强制设置普通 CDN。
+- **仅 CF 隧道 / Argo**：复用独立隧道设置流程；没有可绑定的 WS 或 XHTTP 协议时可直接添加，不强制设置普通 CDN。
 - **仅端口回源**：使用手动登记或 API 自动部署流程；API 部署会按原有规则设置 DNS 代理及必要区域选项，不额外创建隧道或申请公开证书。
 - **全部自动配置**：保留原套餐流程，会重新选择协议组合。需要 2～4 个端口、Cloudflare 用户 API Token 和优选入口，自动配置 DNS-01 证书、橙云、精确 Origin Rules 与独立 Tunnel；任一验证失败自动回滚。4 个端口包含 XHTTP TLS、WS 隧道、Reality 和订阅，3 个端口省略 Reality，2 个端口让 WS 共享 CDN 与隧道入口。
 
@@ -76,7 +76,19 @@ VPS 只用来托管临时页面、下载候选数据和校验回传结果。`VPS
 
 安装、重建、单协议改端口和订阅改端口时，脚本会按实际监听协议自动同步系统防火墙，只放行当前需要的 TCP/UDP 端口。支持启用中的 UFW、Firewalld，以及具有 DROP/REJECT 入站策略的 iptables/iptables-nft；端口改变时会删除由风火轮创建的旧规则，完整卸载时一并清理。脚本不会关闭防火墙，也不会修改用户已有规则。原生自定义 nftables 无法可靠定位规则链时会提示手动处理。云服务商安全组、NAT 服务商公网端口映射仍属于外部控制面，必须由用户放行或建立映射。
 
-Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。若没有 VMess WS 或 VLESS WS，菜单会引导直接添加一个可绑定协议，普通 VPS 默认端口为 `8080`，NAT VPS 默认内网端口为 `8080`。Argo 优选入口使用独立变量 `argoip`，不会复用普通 CDN 的 `cfip`；每个入口都会导出 TLS 443 和 HTTP 80 节点。该菜单的“诊断隧道回源”会同时检查本机 WebSocket 和 Cloudflare 下发的 Public Hostname Service，若控制台仍指向旧端口，会直接显示应改成的 `http://localhost:端口`。
+Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设置。可绑定 VMess WS、VLESS WS 或 VLESS XHTTP（协议 3，不是 Reality 或 XHTTP TLS）；没有可绑定协议时可直接添加，默认本机端口为 `8080`。固定隧道的 Public Hostname Service 设为 `http://localhost:端口`；XHTTP 不支持绑定已启用源站 TLS 的监听。隧道回源不需要 NAT 公网端口映射。
+
+Argo 优选入口使用独立变量 `argoip`，不复用普通 CDN 的 `cfip`。WS 保留原有 TLS 443 和 HTTP 80 变体；XHTTP 默认使用隧道域名，优选地址可选，仅输出 HTTPS 443 的 `packet-up` 节点。“诊断隧道回源”按所选协议检查本机监听和 Cloudflare 边缘响应；它不代替客户端代理端到端测试。
+
+“高级设置” → “VLESS WS Vision”可将协议 4 从原 WS ENC 模式切换为 ENC + Vision。默认关闭；开启需 Xray 26.3.27 或更新版本，并需刷新客户端订阅，原 WS 链接不再适用。关闭后恢复原模式，不改 UUID、ENC 密钥、端口或路径。XHTTP 隧道和 WS Vision 节点通过通用订阅导出，推荐使用新版 Xray 客户端（例如 v2rayN 选 Xray 内核）；不向未经验证的 Clash、Sing-box 配置写入这些组合。
+
+### Snell v6（协议 15）
+
+- 在「安装 / 协议管理 → 增删改协议」选 `15`；不默认启用。完成统一内核迁移后，只改 Snell 不会重启已有 Xray/Sing-box。引导式安装只选 Snell 时会跳过证书和普通订阅设置。
+- 面向 Linux amd64/arm64（systemd 或 OpenRC）。`lun-snell` 保持独立服务和配置，与原 Sing-box 服务共用一份 Lun 增强内核；以 [SagerNet Sing-box 1.14.4](https://github.com/SagerNet/sing-box/releases/tag/v1.14.4) 为基础加入 `with_v2ray_api`，配套使用本项目的 `lun-sb-stats`。
+- 只占一个 TCP 入口。UDP 由 Snell 在 TCP 中承载，不开放 UDP 监听；不走 CDN、Origin Rules、普通 CF 隧道或 WARP。NAT VPS 需要提前分配并登记公网 TCP 映射。
+- 在「节点订阅分享 → 私下导出 Snell v6」选择客户端，也可执行 `lun snell-export mihomo`、`lun snell-export sing-box` 或 `lun snell-export surge`。输出为配置片段，默认用当前公网 IP，可自行换成 DNS-only 域名。使用支持 v6 的客户端，例如 Mihomo 1.19.34+ 或 Sing-box 1.14+；不承诺普通 v2rayN 订阅直接识别该格式。
+- 本机自动生成独立 PSK，修改端口不换密钥。配置仅供本机管理，不进入 HTTP 分享、聚合订阅、网站记录或多用户额度；不要公开复制导出内容。
 
 ## 快捷操作
 
@@ -84,7 +96,9 @@ Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设
 
 “服务与更新 → 更新 Lun 脚本”会显示检查进度、当前/远端版本和明确结果；内置更新优先通过 GitHub Contents API 获取主分支原始脚本，`raw.githubusercontent.com` 作为回退，并附加防缓存参数。下载文件与实际 `lun` 入口分别管理，按内容比较；即使版本号相同但内容有改动，也会更新，不把临时文件与自身比较。下载后先校验脚本语法再原子替换并核对 SHA-256，保留上次入口备份；远端版本低于本机时拒绝降级。菜单内更新完成后按回车，会重新载入已安装的脚本及菜单，无需断开 SSH，也不会因继承协议环境变量而误触发安装。即使某个内核检查失败，已经成功安装的新脚本仍可重新载入。
 
-“服务与更新”将原有独立的 Xray / Sing-box 更新合入第 4 项“更新本机 Lun 脚本”；`lun self-update` 同样先更新脚本，再检查已安装内核。检查来源为 FHLUN `lun` Release 的配套资产，不等于自动采用上游最新版本；增强多用户 Sing-box 使用增强资产。发布 SHA-256 与本机相同就不下载、不重启；新内核先验证现有配置，低版本不自动降级，无法可靠比较的预发布/定制版本保留并提示，启动失败恢复旧内核，原先停止的服务保持停止。不新增本机未安装的内核。旧 `upx` / `ups` 命令及集群独立内核动作保留兼容。
+“服务与更新 → 更新本机 Lun 脚本”和 `lun self-update` 会同步已安装的内核；集群更新也须确认目标 VPS 完成运行时迁移才报告成功。Xray 沿用原资产，Sing-box 从固定版本 `lun-singbox-1.14.4` 取得内核和统计助手并校验 SHA-256。缺少发布资产、校验不通过、核心配置不兼容或启动失败时，保留旧运行时，不清理用户资料。原先停用的代理服务不自动启用。由更旧脚本更新到本版时，重要数据操作只在运行时同步成功后执行，可用 `lun sync-runtime` 重试。
+
+**本版一次性多用户重置**：保留联邦身份、普通节点凭据、端口、证书及服务设置。本机旧多用户账号、设备、订阅 Token、用量、配额和模块历史备份将清理，原多用户开启时只生成新的本机管理身份和 Token；不会复用旧设备订阅。同一迁移版本之后的再次更新不重置新账号。联邦只采用同一新版迁移代际的用户，防止未升级成员补回旧账号。联邦签名历史和独立导出的加密联邦备份不改写；旧令牌不再作为有效订阅使用。只承载普通订阅的本机身份不轮换。
 
 在线更新以当前 `lun` 命令实际指向的文件为准；普通用户调用系统 `/usr/bin/lun` 时，会在免密 `sudo` 可用的情况下原子更新该入口，并同步已有的 `~/bin/lun` 副本，避免“更新了另一份文件、再次运行仍是旧版”。本机更新固定使用 FHLUN 官方 `main`，不会被遗留的 `lunurl` 环境变量带回旧地址；也可运行 `lun self-update` 做非交互更新。
 
@@ -104,7 +118,7 @@ Argo 隧道可在“入口网络管理” → “CF 隧道 / Argo”里单独设
 
 启用多用户后，“节点订阅分享”的刷新入口会直接读取数据库中的本机设备 token 和多用户订阅端口，不再用旧 BusyBox 进程命令行判断状态，也不会继续读取可能过期的 `subtoken.log`。主界面只提示“token 按设备独立管理”；本机设备链接可直接刷新查看，其他设备的查看与轮换统一在“多用户管理”中完成。单用户 token/端口设置入口在多用户模式下会显示说明并拒绝覆盖设备级订阅。
 
-Xray 使用本机 API 统计用户流量，配额或到期触发时优先动态移除 VLESS/VMess 用户；Xray Socks 和 Sing-box 结构变化会执行校验后的短暂重载。Sing-box 按用户流量统计需要同版本、增加 `with_v2ray_api` 标签的增强内核，可在模块维护菜单中安装。默认安全规则阻断私网、链路本地、云元数据和 TCP 25，TCP 465/587 保持允许；第一版只观察 BT，不自动处罚。
+Xray 使用本机 API 统计用户流量，配额或到期触发时优先动态移除 VLESS/VMess 用户；Xray Socks 和 Sing-box 结构变化会执行校验后的短暂重载。Sing-box 通过 Lun 增强内核的 V2Ray API 和配套 `lun-sb-stats` 统计每位用户流量；通过「服务与更新」统一同步两者。默认安全规则阻断私网、链路本地、云元数据和 TCP 25，TCP 465/587 保持允许；第一版只观察 BT，不自动处罚。
 
 “动态公平带宽”对服务器到客户端的全部下载出口统一整形。用户填写全机总下载上限（Mbit/s），系统优先使用 CAKE 公平队列，不支持 CAKE 时回退 HTB 总量整形和 FQ-CoDel 公平排队。连接少时可借用剩余带宽，繁忙时自动公平共享。仅修改或删除带 Lun 所有权记录和专属句柄的队列；发现其它程序的自定义队列时拒绝覆盖。应用失败恢复旧队列及配置，换网卡成功后清理旧网卡上的 Lun 队列。旧版未标记的队列无法证明归属时保留，需人工核对后处理。
 
@@ -156,7 +170,7 @@ CDN 优选池同步仅处理本机 `cfip/cdnip` 地址。合并模式为来源�
 | --- | --- | --- | --- | --- |
 | VLESS TCP Reality Vision | `vlpt` | 否 | 否 | 否 |
 | VLESS XHTTP Reality ENC | `xhpt` | 否 | 否 | 否 |
-| VLESS XHTTP ENC | `vxpt` | 是 | 是 | 否 |
+| VLESS XHTTP ENC | `vxpt` | 是 | 是 | 是（本机 HTTP） |
 | VLESS WS ENC | `vwpt` | 是 | 是 | 是 |
 | Shadowsocks-2022 | `sspt` | 否 | 否 | 否 |
 | AnyTLS | `anpt` | 否 | 否 | 否 |
@@ -168,8 +182,9 @@ CDN 优选池同步仅处理本机 `cfip/cdnip` 地址。合并模式为来源�
 | VLESS XHTTP TLS UDP（H3-only） | `xupt` | 否 | 否 | 否 |
 | VLESS XHTTP TLS TCP/UDP | `xcpt` | 是（TCP；实验 UDP 443） | 是 | 否 |
 | NaiveProxy H2/H3 | `nvpt` | 否 | 否 | 否 |
+| Snell v6 | `snpt` | 否 | 否 | 否 |
 
-这里的“CF 隧道 / Argo”指当前 Lun 已实现的普通 Public Hostname 节点，只绑定 VLESS WS 或 VMess WS。Cloudflare Tunnel 理论上还能发布其它 HTTP/TCP 服务，但那些模式不属于本项目现有节点输出。Origin Rules 只作用于 Cloudflare HTTP(S) 请求，因此 Reality、任意 TCP/UDP、QUIC/H3-only 和 Naive CONNECT 不能因为改写了端口就自动变成可用 CDN 协议。
+这里的“CF 隧道 / Argo”指通过普通 Public Hostname 发布 VLESS XHTTP、VLESS WS 或 VMess WS，不包括 Cloudflare 的专用 TCP 客户端模式。Origin Rules 只作用于 Cloudflare HTTP(S) 请求，因此 Reality、任意 TCP/UDP、QUIC/H3-only 和 Naive CONNECT 不能因为改写了端口就自动变成可用 CDN 协议。
 
 示例：
 
@@ -220,7 +235,7 @@ Reality、Argo 和 CDN 仍然独立：
 | --- | --- |
 | `reym` | Reality / Any-Reality 的 SNI 伪装域名 |
 | `cdnym` | CDN 回源 Host 域名（已解析到 VPS 的域名，CF 通过它回源到你的服务器） |
-| `argo` | 填写 `vmpt` 或 `vwpt` 启用 Argo |
+| `argo` | 填写 `vmpt`、`vwpt` 或 `vxpt` 启用 Argo |
 | `agn` | Argo 固定隧道域名 |
 | `agk` | Argo 固定隧道 token |
 | `cfip` | CDN 优选 IP 或域名（客户端连接的 CF 入口地址），可填多个；留空时尝试从已橙云的 `cdnym` 自动解析 CF 边缘 IP |

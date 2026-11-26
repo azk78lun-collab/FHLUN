@@ -32,7 +32,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-VERSION = "2.0.6"
+VERSION = "2.0.7"
+APPLY_TIMEOUT = 90
+RESULT_GRACE = 18
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATES = 4096
@@ -537,7 +539,7 @@ PAGE = r'''<!doctype html>
 <section class="panel"><div class="panel-head"><h2>客户端榜</h2><span class="muted">用户当前网络 → Cloudflare</span></div><div class="panel-body"><div class="tools"><input id="clientSearch" placeholder="筛选 IP / 来源 / COLO"><select id="clientFamily"><option value="">全部地址</option><option>IPv4</option><option>IPv6</option></select><select id="clientSort"><option value="speed">带宽优先</option><option value="latency">延迟优先</option></select><button data-action="all" data-list="client">全选</button><button data-action="invert" data-list="client">反选</button><button data-action="csv" data-list="client">CSV</button></div></div><div class="tablebox"><table><thead><tr><th>选</th><th>IP</th><th>类型</th><th>来源</th><th>端口</th><th>COLO</th><th>延迟</th><th>失败率</th><th>带宽</th><th>状态</th><th>操作</th></tr></thead><tbody id="clientRows"><tr><td colspan="11" class="empty">尚未测试</td></tr></tbody></table></div></section>
 <section class="panel"><div class="panel-head"><h2>VPS 榜</h2><span class="muted">Lun 服务器 → Cloudflare</span></div><div class="panel-body"><div class="tools"><input id="vpsSearch" placeholder="筛选 IP / 来源 / COLO"><select id="vpsFamily"><option value="">全部地址</option><option>IPv4</option><option>IPv6</option></select><select id="vpsSort"><option value="speed">带宽优先</option><option value="latency">延迟优先</option></select><button data-action="all" data-list="vps">全选</button><button data-action="invert" data-list="vps">反选</button><button data-action="csv" data-list="vps">CSV</button></div></div><div class="tablebox"><table><thead><tr><th>选</th><th>IP</th><th>类型</th><th>来源</th><th>端口</th><th>COLO</th><th>延迟</th><th>失败率</th><th>带宽</th><th>状态</th><th>操作</th></tr></thead><tbody id="vpsRows"><tr><td colspan="11" class="empty">尚未测试</td></tr></tbody></table></div></section>
 </div>
-<section class="panel"><div class="panel-head"><h2>应用到 Lun</h2><div class="row"><button id="copy">复制最终 IP</button><button id="reset">清空选择</button><button class="orange" id="preview">预览替换</button></div></div><div class="panel-body"><div>最终列表共 <strong class="ok" id="selectedCount">0</strong> 个地址；切换 IP 库或重新测试不会丢失已勾选项，只有“清空选择”会全部取消。</div><div id="selectedIps" class="selected-ips"><span class="muted">尚未选择</span></div><div id="previewBox" class="preview"><div class="diff" style="margin-top:10px"><div><strong class="ok">新增</strong><div id="diffAdd"></div></div><div><strong>保留</strong><div id="diffKeep"></div></div><div><strong class="bad">删除</strong><div id="diffRemove"></div></div></div><div class="notice">确认后将替换现有优选池并返回 SSH 重建订阅。</div><button class="primary" id="apply">确认替换并应用</button><div id="applyResult" class="notice success" style="display:none"></div></div></div></section>
+<section class="panel"><div class="panel-head"><h2>应用到 Lun</h2><div class="row"><button id="copy">复制最终 IP</button><button id="reset">清空选择</button><button class="orange" id="preview">预览替换</button></div></div><div class="panel-body"><div>最终列表共 <strong class="ok" id="selectedCount">0</strong> 个地址；切换 IP 库或重新测试不会丢失已勾选项，只有“清空选择”会全部取消。</div><div id="selectedIps" class="selected-ips"><span class="muted">尚未选择</span></div><div id="previewBox" class="preview"><div class="diff" style="margin-top:10px"><div><strong class="ok">新增</strong><div id="diffAdd"></div></div><div><strong>保留</strong><div id="diffKeep"></div></div><div><strong class="bad">删除</strong><div id="diffRemove"></div></div></div><div class="notice">确认后由 VPS 保存优选池；请等待网页显示最终结果。</div><button class="primary" id="apply">确认替换并应用</button></div><div id="applyResult" role="status" class="notice" style="display:none"></div></div></section>
 <footer class="foot">候选数据默认来自 <a href="https://github.com/DustinWin/BestCF" target="_blank" rel="noopener">DustinWin/BestCF</a>，VPS 测速使用 <a href="https://github.com/cloudflare/speedtest" target="_blank" rel="noopener">Cloudflare Speedtest</a> 端点；客户端探测兼容 BestCF/HiDNS 方案。测试结果只代表当时线路质量。</footer>
 </main><script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
@@ -546,8 +548,8 @@ const helpers=['bestcf.cmliussss.hidns.vip','ns.psb.kdns.fr'];
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const route=s=>location.pathname.replace(/\/$/,'')+'/'+s;
 const num=(id,min,max)=>{const n=Number($(id).value);if(!Number.isFinite(n)||n<min||n>max)throw Error(`${id} 参数超出范围`);return n};
-async function api(path,opt={}){const r=await fetch(route(path),{cache:'no-store',...opt});let d={};try{d=await r.json()}catch(e){}if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);return d}
-function post(path,data={}){return api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
+async function api(path,opt={}){const r=await fetch(route(path),{cache:'no-store',...opt});let d={};try{d=await r.json()}catch(e){}if(!r.ok){const error=Error(d.error||`HTTP ${r.status}`);error.httpStatus=r.status;throw error}return d}
+function post(path,data={},opt={}){return api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),...opt})}
 async function abortable(url,ms,opt={},consume=null){
   const c=new AbortController(),timer=setTimeout(()=>c.abort(),ms);state.controllers.add(c);
   try{
@@ -622,15 +624,55 @@ function renderList(kind){const rows=visibleRows(kind),body=$(`#${kind}Rows`);if
 async function retryOne(kind,ip,button){const s=settings(),candidate=state.candidates.find(x=>x.ip===ip);if(!candidate)return;button.disabled=true;button.textContent='测试中';try{let result;if(kind==='client'){if(!state.helper)await chooseHelper(s).catch(()=>{});const latency=await clientLatency(candidate,s);result=latency.direct_only?latency:await clientSpeed(latency,s).catch(()=>({...latency,status:'HTTPS延迟通过·带宽未测'}));state.client=[...state.client.filter(x=>x.ip!==ip),result].sort((a,b)=>(b.speed_mbps||0)-(a.speed_mbps||0)||a.latency_ms-b.latency_ms);await post('client-results',{client_ip:state.clientIp,measurements:state.client})}else{const d=await post('vps-test/retry',{ip,port:candidatePort(candidate),timeout_ms:s.timeoutMs,download_bytes:s.downloadBytes,speed_timeout:s.speedTimeout});result=d.result;state.vps=[...state.vps.filter(x=>x.ip!==ip),result].sort((a,b)=>b.speed_mbps-a.speed_mbps||a.latency_ms-b.latency_ms)}setGlobal(`${kind==='client'?'客户端':'VPS'}单项重测完成：${ip}`,'ok');state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none'}catch(e){setGlobal(`单项重测失败：${e.message}`,'bad')}renderAll()}
 function finalIps(){return new Set([...state.selected,...state.retained])}
 function renderSelected(){const root=$('#selectedIps'),ips=[...finalIps()];root.innerHTML=ips.length?ips.map(ip=>`<div class="diff-item"><code>${esc(ip)}</code><button class="remove-selected" data-ip="${esc(ip)}">取消</button></div>`).join(''):'<span class="muted">尚未选择</span>';root.querySelectorAll('.remove-selected').forEach(b=>b.onclick=()=>{state.selected.delete(b.dataset.ip);state.retained.delete(b.dataset.ip);state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()})}
-function renderAll(){renderList('client');renderList('vps');$('#selectedCount').textContent=finalIps().size;renderSelected()}
+function renderAll(){if(state.applyLocked)return;renderList('client');renderList('vps');$('#selectedCount').textContent=finalIps().size;renderSelected()}
 function listAction(kind,action){const rows=visibleRows(kind).filter(x=>x.latency_ms>0&&x.status!=='失败');if(action==='all')rows.forEach(x=>state.selected.add(x.ip));if(action==='invert')rows.forEach(x=>state.selected.has(x.ip)?state.selected.delete(x.ip):state.selected.add(x.ip));if(action==='csv'){const head='IP,类型,来源,端口,COLO,延迟ms,失败率%,带宽Mbps\n';const body=rows.map(x=>[x.ip,x.ip_type,`"${String(x.source).replaceAll('"','""')}"`,x.port,x.colo,x.latency_ms,x.loss_pct,x.speed_mbps||'未测'].join(',')).join('\n');download(`${kind}-results.csv`,head+body)}state.preview=null;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()}
 function download(name,text){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/csv;charset=utf-8'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 async function refreshPreview(){if(!finalIps().size){state.preview=null;$('#previewBox').classList.remove('show');renderAll();return}await preview()}
 function showDiff(id,items,kind=''){const root=$(id);root.innerHTML=items.length?items.map(x=>{let action='';if(kind==='remove')action=`<button class="keep-ip" data-ip="${esc(x)}">保留</button>`;else if(kind==='keep')action=`<button class="remove-ip" data-ip="${esc(x)}">删除</button>`;return `<div class="diff-item"><code>${esc(x)}</code>${action}</div>`}).join(''):'<span class="muted">无</span>';root.querySelectorAll('.keep-ip').forEach(b=>b.onclick=async()=>{state.retained.add(b.dataset.ip);await refreshPreview()});root.querySelectorAll('.remove-ip').forEach(b=>b.onclick=async()=>{state.selected.delete(b.dataset.ip);state.retained.delete(b.dataset.ip);await refreshPreview()})}
 async function preview(){try{const d=await post('preview',{selected:[...state.selected],retained:[...state.retained]});state.preview=d;showDiff('#diffAdd',d.added);showDiff('#diffKeep',d.kept,'keep');showDiff('#diffRemove',d.removed,'remove');$('#previewBox').classList.add('show');renderAll()}catch(e){setGlobal(e.message,'bad')}}
-async function apply(){if(!state.preview)return;$('#apply').disabled=true;try{const d=await post('apply',{selected:[...state.selected],retained:[...state.retained],digest:state.preview.digest});const box=$('#applyResult');box.style.display='block';box.textContent=`✓ 已确认替换 ${d.selected.length} 个 IP。服务器正在重建订阅，请返回 SSH 查看最终结果。`;$('#apply').textContent='已提交应用';$('#preview').disabled=true;$('#reset').disabled=true;setGlobal(`已应用 ${d.selected.length} 个 IP；网页提交成功。`,'ok');box.scrollIntoView({behavior:'smooth',block:'nearest'})}catch(e){setGlobal(e.message,'bad');$('#apply').disabled=false}}
-async function init(){try{const d=await api('config');state.cfg=d;state.candidates=d.candidates;state.clientIp=d.client_ip||null;$('#version').textContent=`模块 ${d.version} · 15分钟临时会话`;$('#clientNet').textContent=d.client_ip||'未知';$('#clientIp').textContent=d.client_ip?`${d.client_ip} / 页面连接`:'等待客户端测试';$('#vpsIdentity').textContent=`${d.vps.ip} / ${d.vps.region}`;$('#source').innerHTML=d.sources.map(x=>`<option value="${esc(x.key)}" ${x.key===d.source.key?'selected':''}>${esc(x.name)}</option>`).join('');$('#limit').value=d.defaults.candidate_limit;$('#clientConcurrency').value=d.defaults.client_concurrency;$('#vpsConcurrency').value=d.defaults.vps_concurrency;$('#top').value=d.top_count;$('#latencyMax').value=d.latency_max;$('#speedMin').value=d.speed_min;$('#port').querySelector('option[value="-1"]').textContent=`自动 / 当前 Lun 端口（${d.test_port}）`;$('#sourceMeta').textContent=sourceText(d.source);$('#sourceState').textContent=d.source.cached?'使用最近缓存':'实时数据';$('#sourceState').className=d.source.cached?'warn':'ok';$('#candidateSummary').textContent=`${d.candidates.length} 个候选`;$('#networkNotice').style.display='block';$('#networkNotice').textContent=`页面连接 IP：${d.client_ip||'未知'}。客户端测速由当前浏览器发出；开启系统代理时会测试代理出口，关闭后重新打开页面可测试本机直连出口。`;renderAll();updateTraffic();setGlobal('候选库已就绪，可调整参数后开始双向测试。','ok')}catch(e){setGlobal(`会话载入失败：${e.message}`,'bad')}}
-$('#refresh').onclick=()=>refresh();$('#manualToggle').onclick=()=>{$('#manualBox').style.display=$('#manualBox').style.display==='none'?'block':'none'};$('#manualLoad').onclick=()=>refresh($('#manual').value);$('#start').onclick=start;$('#stop').onclick=stop;$('#cancel').onclick=async()=>{await stop();try{await post('cancel',{})}catch(e){}setGlobal('已取消，可关闭页面。','warn')};$('#preview').onclick=preview;$('#apply').onclick=apply;$('#copy').onclick=()=>navigator.clipboard.writeText([...finalIps()].join('\n')).then(()=>setGlobal('已复制最终 IP。','ok')).catch(()=>setGlobal('浏览器拒绝剪贴板，请使用 CSV。','warn'));$('#reset').onclick=()=>{state.selected.clear();state.retained.clear();state.preview=null;state.defaulted=false;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()};
+function showApplyState(kind){
+  const messages={
+    applying:['VPS 正在保存优选 IP，请保持此页面打开。','warn'],
+    success:['应用成功：VPS 已保存优选 IP。本页即将失效，请关闭；重新测速请回到 SSH 打开新页面。','ok'],
+    failure:['应用失败：VPS 未能保存优选结果。本页即将失效，请关闭并回到 SSH 查看错误。','bad'],
+    unknown:['未收到 VPS 的最终结果。本页不会再接受修改，请回到 SSH 核对是否已保存。','warn'],
+    exported:['已导出选择，未直接修改 Lun。本页已结束，可以关闭。','warn'],
+    cancelled:['已取消，Lun 未应用此次选择。本页即将失效，请关闭。','warn']
+  };
+  state.applyLocked=true;state.cancelled=true;
+  state.controllers.forEach(c=>c.abort());
+  $$('button,input,select,textarea').forEach(el=>el.disabled=true);
+  const [message,tone]=messages[kind]||messages.unknown;
+  const box=$('#applyResult');box.style.display='block';box.className='notice '+tone;box.textContent=message;
+  setGlobal(message,tone);
+}
+async function watchApply(start){
+  let result=start;
+  const deadline=Date.now()+95000;
+  while(result.state==='applying'&&Date.now()<deadline){
+    await new Promise(resolve=>setTimeout(resolve,650));
+    try{result=await api('apply-status',{signal:AbortSignal.timeout(3500)})}catch(e){}
+  }
+  showApplyState(result.state==='applying'?'unknown':result.state);
+}
+async function apply(){
+  if(!state.preview||state.applyLocked)return;
+  $('#apply').disabled=true;
+  setGlobal('正在提交给 VPS…','warn');
+  let result;
+  try{
+    result=await post('apply',{selected:[...state.selected],retained:[...state.retained],digest:state.preview.digest},{signal:AbortSignal.timeout(6000)});
+  }catch(e){
+    if(e.httpStatus===400){setGlobal(`提交失败：${e.message}`,'bad');$('#apply').disabled=false;return}
+    try{result=await api('apply-status',{signal:AbortSignal.timeout(3500)})}catch(_){result={state:'unknown'}}
+    if(result.state==='idle'){setGlobal('VPS 尚未确认收到请求，可重试提交。','warn');$('#apply').disabled=false;return}
+  }
+  showApplyState(result.state);
+  $('#applyResult').scrollIntoView({behavior:'smooth',block:'nearest'});
+  await watchApply(result);
+}
+async function init(){try{const application=await api('apply-status');if(application.state!=='idle'){showApplyState(application.state);await watchApply(application);return}const d=await api('config');state.cfg=d;state.candidates=d.candidates;state.clientIp=d.client_ip||null;$('#version').textContent=`模块 ${d.version} · 15分钟临时会话`;$('#clientNet').textContent=d.client_ip||'未知';$('#clientIp').textContent=d.client_ip?`${d.client_ip} / 页面连接`:'等待客户端测试';$('#vpsIdentity').textContent=`${d.vps.ip} / ${d.vps.region}`;$('#source').innerHTML=d.sources.map(x=>`<option value="${esc(x.key)}" ${x.key===d.source.key?'selected':''}>${esc(x.name)}</option>`).join('');$('#limit').value=d.defaults.candidate_limit;$('#clientConcurrency').value=d.defaults.client_concurrency;$('#vpsConcurrency').value=d.defaults.vps_concurrency;$('#top').value=d.top_count;$('#latencyMax').value=d.latency_max;$('#speedMin').value=d.speed_min;$('#port').querySelector('option[value="-1"]').textContent=`自动 / 当前 Lun 端口（${d.test_port}）`;$('#sourceMeta').textContent=sourceText(d.source);$('#sourceState').textContent=d.source.cached?'使用最近缓存':'实时数据';$('#sourceState').className=d.source.cached?'warn':'ok';$('#candidateSummary').textContent=`${d.candidates.length} 个候选`;$('#networkNotice').style.display='block';$('#networkNotice').textContent=`页面连接 IP：${d.client_ip||'未知'}。客户端测速由当前浏览器发出；开启系统代理时会测试代理出口，关闭后重新打开页面可测试本机直连出口。`;renderAll();updateTraffic();setGlobal('候选库已就绪，可调整参数后开始双向测试。','ok')}catch(e){setGlobal(`会话载入失败：${e.message}`,'bad')}}
+$('#refresh').onclick=()=>refresh();$('#manualToggle').onclick=()=>{$('#manualBox').style.display=$('#manualBox').style.display==='none'?'block':'none'};$('#manualLoad').onclick=()=>refresh($('#manual').value);$('#start').onclick=start;$('#stop').onclick=stop;$('#cancel').onclick=async()=>{try{await post('cancel',{});showApplyState('cancelled')}catch(e){setGlobal(`未能确认取消：${e.message}`,'bad')}};$('#preview').onclick=preview;$('#apply').onclick=apply;$('#copy').onclick=()=>navigator.clipboard.writeText([...finalIps()].join('\n')).then(()=>setGlobal('已复制最终 IP。','ok')).catch(()=>setGlobal('浏览器拒绝剪贴板，请使用 CSV。','warn'));$('#reset').onclick=()=>{state.selected.clear();state.retained.clear();state.preview=null;state.defaulted=false;$('#previewBox').classList.remove('show');$('#applyResult').style.display='none';renderAll()};
 $$('[data-action]').forEach(b=>b.onclick=()=>listAction(b.dataset.list,b.dataset.action));['clientSearch','clientFamily','clientSort','vpsSearch','vpsFamily','vpsSort'].forEach(id=>$(`#${id}`).oninput=()=>renderList(id.startsWith('client')?'client':'vps'));['speedLimit','downloadMb'].forEach(id=>$(`#${id}`).oninput=updateTraffic);init();
 </script></body></html>'''
 
@@ -638,6 +680,33 @@ $$('[data-action]').forEach(b=>b.onclick=()=>listAction(b.dataset.list,b.dataset
 class OptimizerServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    status_file = None
+    apply_state = "idle"
+    expired = False
+
+    def expire(self):
+        with self.lock:
+            if self.applied:
+                return
+            self.expired = True
+        self.shutdown()
+
+    def await_apply_result(self):
+        deadline = time.monotonic() + APPLY_TIMEOUT
+        state = "unknown"
+        while time.monotonic() < deadline:
+            try:
+                reported = json.loads(Path(self.status_file).read_text(encoding="utf-8")).get("state")
+                if reported in ("success", "failure"):
+                    state = reported
+                    break
+            except (OSError, ValueError, AttributeError):
+                pass
+            time.sleep(0.2)
+        with self.lock:
+            self.apply_state = state
+        time.sleep(RESULT_GRACE)
+        self.shutdown()
 
 
 class OptimizerHandler(BaseHTTPRequestHandler):
@@ -727,6 +796,11 @@ class OptimizerHandler(BaseHTTPRequestHandler):
             job = self.server.vps_job
             self._send_json(200, job.snapshot() if job else {"state": "idle", "results": [], "rows": []})
             return
+        if route == "apply-status":
+            with self.server.lock:
+                state = self.server.apply_state
+            self._send_json(200, {"state": state})
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -735,11 +809,18 @@ class OptimizerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         if route == "cancel":
-            if self.server.vps_job:
-                self.server.vps_job.cancel_event.set()
-            self.server.cancelled = True
+            with self.server.lock:
+                if self.server.applied:
+                    self._send_json(409, {"error": "VPS 正在处理或已完成，不能再取消。"})
+                    return
+                if self.server.vps_job:
+                    self.server.vps_job.cancel_event.set()
+                self.server.cancelled = True
             self._send_json(200, {"ok": True})
             self._finish_later()
+            return
+        if self.server.applied or self.server.cancelled or self.server.expired:
+            self._send_json(409, {"error": "会话不再接受修改，请查看处理结果。"})
             return
         try:
             request = self._read_json()
@@ -758,7 +839,11 @@ class OptimizerHandler(BaseHTTPRequestHandler):
             elif route == "preview":
                 self._preview(request)
             elif route == "apply":
-                self._apply(request)
+                with self.server.lock:
+                    if self.server.applied or self.server.cancelled or self.server.expired:
+                        self._send_json(409, {"error": "会话不再接受修改，请查看处理结果。"})
+                    else:
+                        self._apply(request)
             else:
                 self._send_json(404, {"error": "not found"})
         except (OSError, ValueError, urllib.error.URLError) as error:
@@ -938,8 +1023,18 @@ class OptimizerHandler(BaseHTTPRequestHandler):
         }
         _atomic_json(self.server.result_file, result)
         self.server.applied = True
-        self._send_json(200, {"ok": True, "selected": rows})
-        self._finish_later()
+        if self.server.vps_job:
+            self.server.vps_job.cancel_event.set()
+        if self.server.status_file:
+            self.server.apply_state = "applying"
+            threading.Thread(target=self.server.await_apply_result, daemon=True).start()
+            self._send_json(202, {"ok": True, "selected": rows, "state": "applying"})
+        else:
+            self.server.apply_state = "exported"
+            try:
+                self._send_json(200, {"ok": True, "selected": rows, "state": "exported"})
+            finally:
+                self._finish_later()
 
 
 def _display_host(host):
@@ -970,6 +1065,7 @@ def serve(args):
     server.candidate_limit = args.candidate_limit
     server.cache_dir = args.cache_dir
     server.result_file = args.result_file
+    server.status_file = args.status_file
     server.seed = args.seed
     server.cancelled = False
     server.applied = False
@@ -990,8 +1086,8 @@ def serve(args):
     print("\n请用需要优化的电脑/手机网络打开：")
     print(url)
     print(f"\n会话 {args.timeout // 60} 分钟后自动关闭；客户端榜与 VPS 榜分别输出。")
-    print("网页确认替换预览并点击应用后，SSH 会自动继续。", flush=True)
-    timer = threading.Timer(args.timeout, server.shutdown)
+    print("网页确认替换后，请等待 VPS 返回实际处理结果。", flush=True)
+    timer = threading.Timer(args.timeout, server.expire)
     timer.daemon = True
     timer.start()
     try:
@@ -1042,6 +1138,7 @@ def build_parser():
     run.add_argument("--server-ip", default="")
     run.add_argument("--public-port", type=int, default=0)
     run.add_argument("--result-file", required=True)
+    run.add_argument("--status-file", help="由 Lun 写入实际应用结果；完成后短暂保留网页回执")
     run.add_argument("--current-file")
     run.add_argument("--server-place", default="")
     run.add_argument("--cache-dir")

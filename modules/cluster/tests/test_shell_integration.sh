@@ -177,7 +177,47 @@ printf '%s\n' "$REFRESH_OUTPUTS" | grep -Fq 'cluster_push_event' || fail 'subscr
 JOIN=$(section "$SCRIPT" cluster_join_ui)
 printf '%s\n' "$JOIN" | grep -Fq 'cluster_cmd --json add-peer' || fail 'one-paste join does not capture the new member identity'
 printf '%s\n' "$JOIN" | grep -Fq 'finalize-peer --node-id' || fail 'one-paste join does not finalize federation propagation'
-printf '%s\n' "$JOIN" | grep -Fq '无需其它操作' || fail 'one-paste join completion is unclear'
+(
+  eval "$JOIN"
+  eval "$(section "$SCRIPT" cluster_disable_ui)"
+  ui_title(){ :; }
+  yellow_line(){ printf '%s\n' "$*"; }; red_line(){ yellow_line "$@"; }; green_line(){ yellow_line "$@"; }
+  cluster_service_restart(){ [[ "$scenario" != service-failure ]]; }
+  apply_lun_firewall_rules(){ :; }; cluster_refresh_profiles_async(){ :; }
+  cluster_cmd(){
+    if [[ "$1" == --json ]]; then
+      [[ "$scenario" != join-failure ]] || return 1
+      printf '%s\n' '{"node_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+    else
+      [[ "$scenario" != sync-failure ]]
+    fi
+  }
+  scenario=join-failure
+  if output=$(cluster_join_ui <<< fixture); then fail 'failed join reported success'; fi
+  [[ $output == *'加入未确认成功'* ]]
+  scenario=sync-failure
+  output=$(cluster_join_ui <<< fixture)
+  [[ $output == *'加入成功，但部分成员尚未同步'* ]]
+  scenario=success
+  output=$(cluster_join_ui <<< fixture)
+  [[ $output == *'加入收尾完成'* ]]
+  tmp=$(mktemp -d)
+  trap 'rm -rf -- "$tmp"' EXIT
+  HOME=$tmp
+  mkdir -p "$HOME/lun/cluster"
+  cluster_module_dir(){ printf '%s\n' "$HOME/lun/cluster"; }
+  chain_require_empty(){ :; }
+  multiuser_enabled(){ return 1; }
+  cluster_remove_service(){ [[ "$scenario" != exit-failure ]]; }
+  cluster_service_is_active(){ return 1; }
+  cluster_subscription_takeover_release(){ :; }
+  scenario=exit-failure
+  if output=$(cluster_disable_ui <<< ''); then fail 'failed exit reported success'; fi
+  [[ $output == *'退出失败'* && -d "$HOME/lun/cluster" ]]
+  scenario=success
+  output=$(cluster_disable_ui <<< '')
+  [[ $output == *'退出成功'* && ! -d "$HOME/lun/cluster" ]]
+)
 
 CDN=$(section "$SCRIPT" cluster_cdn_payload)
 printf '%s\n' "$CDN" | grep -Fq '"mode"' || fail 'CDN payload missing mode'

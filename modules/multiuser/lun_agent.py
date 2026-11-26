@@ -38,7 +38,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
+USER_DATA_GENERATION = "singbox-1.14.4"
 IDENTITY_FILES = ("uuid", "jhsub.txt", "clmi.yaml", "sbox.json")
 PROTOCOLS = (
     "vl", "xh", "vx", "vw", "ss", "an", "ar", "vm", "so", "hy", "tu", "xu", "xc", "nv"
@@ -1175,8 +1176,10 @@ class Agent:
     ) -> dict[str, Any]:
         legacy_uuid = args.legacy_uuid or self._read_text("uuid") or str(__import__("uuid").uuid4())
         legacy_token = args.legacy_token or self._read_text("subtoken.log") or legacy_uuid
+        previous = self.load_config() if self.config_path.is_file() else {}
         return {
             "version": VERSION,
+            "user_data_generation": previous.get("user_data_generation", ""),
             "enabled": enabled,
             "subscription_only": subscription_only,
             "bind": args.bind,
@@ -1597,6 +1600,59 @@ class Agent:
             if backup != current:
                 backup.unlink(missing_ok=True)
 
+    def reset_for_core_upgrade(self, generation: str) -> None:
+        """Recreate just the local service identity, invalidating every old user subscription."""
+        if generation != USER_DATA_GENERATION:
+            raise AgentError("未知的多用户数据迁移版本")
+        with FileLock(self.lock_path):
+            config = self.load_config()
+            if config.get("user_data_generation") == generation:
+                return
+            keep_local = bool(config.get("subscription_only")) and not config.get("enabled")
+            tokens = {str(row[0]) for row in self.db.connection.execute(
+                "SELECT token FROM devices WHERE ?=0 OR legacy=0", (int(keep_local),))}
+            if not keep_local and config.get("legacy_token"):
+                tokens.add(str(config["legacy_token"]))
+            # Federated profile caches may still exist while peers are being upgraded.
+            # Retain only non-reversible digests of the old credentials.
+            cluster_db = self.root / "modules" / "cluster" / "data" / "cluster.db"
+            if cluster_db.is_file():
+                with contextlib.closing(sqlite3.connect(f"file:{cluster_db}?mode=ro", uri=True, timeout=5)) as connection:
+                    row = connection.execute("SELECT value FROM settings WHERE key='federation.user_profile_ids'").fetchone()
+                    for profile_id in json.loads(row[0]) if row else []:
+                        profile = connection.execute("SELECT token FROM profiles WHERE id=?", (profile_id,)).fetchone()
+                        if profile:
+                            tokens.add(str(profile[0]))
+            self.db.connection.execute("PRAGMA secure_delete=ON")
+            with self.security_transaction(tokens, apply_cores=bool(config.get("enabled")), locked=True):
+                pending = self.security_pending / "state.json"
+                snapshot_state = json.loads(pending.read_text(encoding="utf-8"))
+                snapshot_state["core_upgrade_reset"] = True
+                atomic_write(pending, json.dumps(snapshot_state))
+                with self.db.connection:
+                    # Keep the AUTOINCREMENT sequence so federation tombstones for
+                    # retired IDs never also revoke newly created local accounts.
+                    self.db.connection.execute(
+                        "DELETE FROM users WHERE ?=0 OR id NOT IN (SELECT user_id FROM devices WHERE legacy=1)",
+                        (int(keep_local),))
+                    self.db.connection.execute("DELETE FROM usage_totals")
+                    self.db.connection.execute("DELETE FROM runtime_state")
+                    self.db.connection.execute("DELETE FROM audit_log")
+                    self.db.connection.execute("DELETE FROM settings WHERE key NOT LIKE 'visit_%'")
+                    self.db.set_setting("retired_core_subscription_tokens", json.dumps(sorted(
+                        hashlib.sha256(token.encode()).hexdigest() for token in tokens if token)))
+                    if not keep_local:
+                        config["legacy_token"] = secrets.token_urlsafe(24)
+                    config["ss_server_password"] = base64.b64encode(secrets.token_bytes(16)).decode()
+                    config["user_data_generation"] = generation
+                    config["version"] = VERSION
+                    self._ensure_legacy_identity(config["legacy_uuid"], config["legacy_token"])
+                    self.save_config(config)
+                    self.db.audit("module.core-upgrade-reset", "module", generation)
+                self.sync_legacy_subscription_state()
+                if not config.get("enabled"):
+                    self.render_all_subscriptions()
+
     @contextlib.contextmanager
     def security_transaction(self, tokens: Iterable[str], *, apply_cores: bool = True, locked: bool = False):
         """Keep rollback material until both cores and subscription startup succeed."""
@@ -1694,6 +1750,9 @@ class Agent:
         state = json.loads((self.security_pending / "state.json").read_text(encoding="utf-8"))
         state["committed"] = True
         atomic_write(self.security_pending / "state.json", json.dumps(state))
+        if state.get("core_upgrade_reset"):
+            self.db.connection.execute("VACUUM")
+            self.db.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._replace_security_backups()
         # Installation/visit rollback files can also contain the revoked credentials.
         # A future installation creates fresh preinstall files before changing anything.
@@ -1704,6 +1763,13 @@ class Agent:
             target = self.generated / token
             if re.fullmatch(r"[A-Za-z0-9_-]+", token) and target.exists():
                 shutil.rmtree(target)
+            if state.get("core_upgrade_reset") and re.fullmatch(r"[A-Za-z0-9_-]+", token):
+                for directory in (self.root.parent / "weblun", self.root / "modules" / "cluster" / "generated"):
+                    old_profile = directory / token
+                    if old_profile.is_symlink() or old_profile.is_file():
+                        old_profile.unlink()
+                    elif old_profile.is_dir():
+                        shutil.rmtree(old_profile)
         for backup in self.generated.glob("previous-*.json"):
             backup.unlink(missing_ok=True)
         shutil.rmtree(self.security_pending)
@@ -2323,12 +2389,16 @@ class Agent:
 
     def apply(self, *, locked: bool = False) -> dict[str, bool]:
         changed = self._reconcile_locked(validate=True) if locked else self.reconcile(validate=True)
+        restart = changed
         if locked and self.security_pending.exists():
             state = json.loads((self.security_pending / "state.json").read_text(encoding="utf-8"))
-            state["restart_cores"] = changed
+            if state.get("core_upgrade_reset"):
+                restart = {core: touched and state["services"].get(core, {}).get("active", True)
+                           for core, touched in changed.items()}
+            state["restart_cores"] = restart
             atomic_write(self.security_pending / "state.json", json.dumps(state))
         try:
-            self.restart_cores(changed)
+            self.restart_cores(restart)
         except AgentError as exc:
             restored: dict[str, bool] = {"xray": False, "singbox": False}
             for core, filename in (("xray", "xr.json"), ("singbox", "sb.json")):
@@ -2336,7 +2406,7 @@ class Agent:
                 target = self.root / filename
                 if changed.get(core) and previous.exists():
                     shutil.copy2(previous, target)
-                    restored[core] = True
+                    restored[core] = restart.get(core, False)
             rollback_error = ""
             try:
                 self.restart_cores(restored)
@@ -2614,6 +2684,9 @@ class Agent:
         database = self.root / "modules" / "cluster" / "data" / "cluster.db"
         target = self.root / "modules" / "cluster" / "generated" / token / filename
         if not database.exists() or not target.exists() or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+            return None
+        retired = json.loads(self.db.setting("retired_core_subscription_tokens", "[]"))
+        if hashlib.sha256(token.encode()).hexdigest() in retired:
             return None
         connection: sqlite3.Connection | None = None
         try:
@@ -3652,6 +3725,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("apply")
     sub.add_parser("maintenance")
     sub.add_parser("backup")
+    upgrade_reset = sub.add_parser("reset-for-core-upgrade")
+    upgrade_reset.add_argument("--generation", required=True)
     sub.add_parser("security-commit")
     sub.add_parser("security-rollback")
     restore = sub.add_parser("restore-database")
@@ -3802,6 +3877,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False))
         elif args.command == "backup":
             result = str(agent.backup_database())
+        elif args.command == "reset-for-core-upgrade":
+            agent.reset_for_core_upgrade(args.generation)
+            print("已重新初始化多用户资料；等待订阅服务验证后清理旧备份。")
             print(f"备份完成：{result}")
         elif args.command == "restore-database":
             agent.restore_database(args.path)

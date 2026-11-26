@@ -52,6 +52,27 @@ multiuser_security_transaction set-local-identity --uuid example
 [[ " ${events[*]} " == *'set-local-identity --uuid example security-commit'* ]]
 [[ " ${events[*]} " != *' start '* ]]
 
+# Never commit a reset if Sing-box was active but failed to restore its statistics API.
+(
+eval "$(sed -n '/^multiuser_upgrade_stats_ready(){/,/^}/p' "$ROOT/lun.sh")"
+HOME=$(mktemp -d)
+trap 'rm -rf -- "$HOME"' EXIT
+mkdir "$HOME/lun"
+printf '{}\n' > "$HOME/lun/sb.json"
+subscription_agent_enabled(){ return 0; }
+multiuser_enabled(){ return 0; }
+live=yes
+core_update_running(){ [[ $live == yes ]]; }
+multiuser_config_value(){ return 1; }
+multiuser_cmd(){
+  events+=("$*")
+  if [[ $* == *'reset-for-core-upgrade'* ]]; then live=no; fi
+}
+events=()
+if multiuser_security_transaction reset-for-core-upgrade --generation fixture; then exit 1; fi
+[[ " ${events[*]} " == *'security-rollback'* && " ${events[*]} " != *' security-commit '* ]]
+)
+
 (
 for helper in local_identity_apply prompt_local_identity; do
   eval "$(sed -n "/^${helper}(){/,/^}/p" "$ROOT/lun.sh")"

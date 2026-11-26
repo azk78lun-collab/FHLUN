@@ -5,12 +5,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 SCRIPT="$ROOT/lun.sh"
 
 bash -n "$SCRIPT"
-[[ $(python3 -B "$ROOT/modules/cdnopt/lun_cdn_optimizer.py" --version) == 2.0.6 ]]
+required=$(sed -n 's/^LUN_CDNOPT_REQUIRED_VERSION=//p' "$SCRIPT")
+[[ -n "$required" && $(python3 -B "$ROOT/modules/cdnopt/lun_cdn_optimizer.py" --version) == "$required" ]]
 grep -q '3. 一键优选 CDN 节点（按需下载，浏览器实测）' "$SCRIPT"
 grep -q 'cdnopt_download_agent ||' "$SCRIPT"
 grep -q 'firewall_append_file tcp "$fw_root/cdnopt_port"' "$SCRIPT"
 grep -q '^prompt_cdn_ips(){' "$SCRIPT"
-grep -q 'save_cdn_ip_list "$cdnopt_ips"' "$SCRIPT"
+grep -q 'save_cdn_ip_list "$addresses"' "$SCRIPT"
+grep -q -- '--status-file "$status"' "$SCRIPT"
 grep -q -- '--current-file "$HOME/lun/cdnip"' "$SCRIPT"
 grep -q -- '--test-port "${cdnpt:-443}"' "$SCRIPT"
 grep -q -- '--server-place "$(cat "$HOME/lun/server_place" 2>/dev/null)"' "$SCRIPT"
@@ -90,5 +92,53 @@ cdnopt_prompt_count <<< "0" >/dev/null
 rc=$?
 set -e
 [[ $rc == 2 ]]
+
+(
+  for fn in cdnopt_feedback_session cdnopt_apply_selection cdnopt_cleanup_session; do
+    eval "$(sed -n "/^$fn(){/,/^}/p" "$SCRIPT")"
+  done
+  HOME=$(mktemp -d)
+  trap 'rm -rf -- "$HOME"' EXIT
+  mkdir -p "$HOME/lun/test-cdnopt"
+  cdnopt_module_dir(){ printf '%s\n' "$HOME/lun/test-cdnopt"; }
+  cdnopt_agent(){ printf '%s\n' fixture; }
+  clear_cdn_ip_list(){ rm -f "$HOME/lun/cdnip" "$HOME/lun"/cdnip[0-9]*; }
+  save_cdn_ip_list(){ printf '%s\n' "$1" > "$HOME/lun/cdnip"; [[ "$fixture_result" == success ]]; }
+  apply_lun_firewall_rules(){ :; }
+  green_line(){ :; }; red_line(){ :; }; yellow_line(){ :; }
+  if [[ ${OSTYPE:-} == msys* ]]; then flock(){ :; }; fi
+  cdnopt_internal=1234 cdnopt_public=1234 cdnopt_ip=8.8.8.8 cdnopt_host=8.8.8.8 cdnopt_top=1
+  python3(){
+    local selection receipt tries
+    if [[ "$2" == extract ]]; then
+      [[ "${*: -1}" != ips ]] || printf '8.8.8.8\n'
+      return 0
+    fi
+    while (( $# > 1 )); do
+      case "$1" in --result-file) selection=$2 ;; --status-file) receipt=$2 ;; esac
+      shift
+    done
+    [[ "$fixture_result" != cancelled ]] || return 2
+    printf '{}\n' > "$selection"
+    for tries in {1..40}; do
+      if [[ -s "$receipt" ]]; then cat "$receipt" > "$HOME/feedback.json"; return 0; fi
+      sleep .1
+    done
+    return 1
+  }
+  printf '1.1.1.1\n' > "$HOME/lun/cdnip"
+  fixture_result=failure
+  if cdnopt_feedback_session; then exit 1; fi
+  grep -Fq '"state":"failure"' "$HOME/feedback.json"
+  [[ $(cat "$HOME/lun/cdnip") == 1.1.1.1 ]]
+  fixture_result=success
+  cdnopt_feedback_session
+  grep -Fq '"state":"success"' "$HOME/feedback.json"
+  [[ $(cat "$HOME/lun/cdnip") == 8.8.8.8 ]]
+  fixture_result=cancelled
+  rc=0; cdnopt_feedback_session || rc=$?
+  [[ $rc == 2 && ! -e "$HOME/lun/cdnopt_port" ]]
+  [[ -z $(find "$(cdnopt_module_dir)" -name 'session.*' -print) ]]
+)
 
 echo "cdn optimizer shell integration tests passed"

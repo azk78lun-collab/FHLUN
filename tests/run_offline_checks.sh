@@ -5,7 +5,7 @@ cd "$ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT/tests/offline${PYTHONPATH:+:$PYTHONPATH}"
 unset LUN_TEST_SKIP_SYMLINK
-unset LUN_TEST_XRAY LUN_TEST_CHAIN_LIVE
+unset LUN_TEST_XRAY LUN_TEST_CHAIN_LIVE LUN_TEST_SNELL LUN_TEST_MIHOMO LUN_TEST_SB_STATS
 # Tests with temporary cluster roots must never invoke the host's installed Lun.
 export LUN_SCRIPT="$ROOT/tests/offline/disabled-system-lun"
 
@@ -18,7 +18,7 @@ for suite in modules/multiuser/tests modules/cluster/tests modules/cdnopt/tests 
   printf 'Running Python suite: %s\n' "$suite"
   python3 -B -m unittest discover -s "$suite" -p 'test_*.py' -v
 done
-for test in tests/test_startup_interpreter.sh tests/test_upgrade_bridge.sh tests/test_runtime_helpers.sh tests/test_acme_lifecycle.sh tests/test_optional_setup.sh tests/test_chain_ui.sh tests/test_core_bundle_update.sh tests/test_script_update.sh tests/test_menu_navigation.sh tests/test_banner.sh \
+for test in tests/test_startup_interpreter.sh tests/test_upgrade_bridge.sh tests/test_runtime_helpers.sh tests/test_acme_lifecycle.sh tests/test_optional_setup.sh tests/test_chain_ui.sh tests/test_core_bundle_update.sh tests/test_script_update.sh tests/test_menu_navigation.sh tests/test_banner.sh tests/test_snell.sh \
     modules/cluster/tests/test_shell_integration.sh modules/cdnopt/tests/test_shell_integration.sh \
     modules/multiuser/tests/test_firewall_helpers.sh modules/multiuser/tests/test_nat_hopping.sh \
     modules/multiuser/tests/test_security_transaction.sh modules/multiuser/tests/test_bandwidth_ownership.sh \

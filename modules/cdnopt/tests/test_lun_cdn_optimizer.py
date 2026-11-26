@@ -85,7 +85,7 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(MOD._validate_measurements([{**row, "speed_mbps": 10}], candidates, "client"), [])
 
     def test_version_and_page_expose_two_independent_boards(self):
-        self.assertEqual(MOD.VERSION, "2.0.6")
+        self.assertRegex(MOD.VERSION, r"^\d+\.\d+\.\d+$")
         for marker in ('id="clientRows"', 'id="vpsRows"', 'id="preview"', 'id="manual"', '一键双向优选'):
             self.assertIn(marker, MOD.PAGE)
         self.assertIn("不做隐藏加权", MOD.PAGE)
@@ -235,6 +235,50 @@ broken
             result = json.loads(target.read_text(encoding="utf-8"))
             self.assertEqual(result["selected"][0]["ip"], "8.8.8.8")
             self.assertEqual(result["client_test_ip"], "8.8.4.4")
+
+    def test_http_acknowledges_actual_vps_success_or_failure_before_closing(self):
+        for outcome in ("success", "failure"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                server = self._server(Path(tmp) / "result.json")
+                server.status_file = Path(tmp) / "status.json"
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .025}, daemon=True)
+                thread.start()
+                origin = f"http://127.0.0.1:{server.server_address[1]}"
+                base = f"{origin}/test-token"
+
+                def state():
+                    with urllib.request.urlopen(f"{base}/apply-status", timeout=2) as response:
+                        return json.load(response)["state"]
+
+                try:
+                    with mock.patch.object(MOD, "RESULT_GRACE", .45):
+                        self.assertEqual(state(), "idle")
+                        self._post(base, "client-results", {"client_ip": "8.8.4.4", "measurements": [
+                            {"ip": "8.8.8.8", "latency_ms": 30, "speed_mbps": 100, "loss_pct": 0}]})
+                        preview = self._post(base, "preview", {"selected": ["8.8.8.8"]})
+                        selection = {"selected": ["8.8.8.8"], "digest": preview["digest"]}
+                        self.assertEqual(self._post(base, "apply", selection)["state"], "applying")
+                        self.assertEqual(state(), "applying")
+                        for route in ("apply", "cancel"):
+                            with self.assertRaises(urllib.error.HTTPError) as response:
+                                self._post(base, route, selection)
+                            self.assertEqual(response.exception.code, 409)
+                            response.exception.close()
+                        with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+                            urllib.request.urlopen(f"{origin}/wrong-token/apply-status", timeout=2)
+                        self.assertEqual(unauthorized.exception.code, 404)
+                        unauthorized.exception.close()
+                        MOD._atomic_json(server.status_file, {"state": outcome})
+                        deadline = time.monotonic() + 2
+                        while state() == "applying" and time.monotonic() < deadline:
+                            time.sleep(.025)
+                        self.assertEqual(state(), outcome)
+                        thread.join(timeout=2)
+                        self.assertFalse(thread.is_alive(), "feedback listener did not expire")
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=2)
+                    server.server_close()
 
     def test_preview_can_retain_current_ip_and_reject_foreign_retention(self):
         with tempfile.TemporaryDirectory() as tmp:
