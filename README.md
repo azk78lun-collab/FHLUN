@@ -22,6 +22,12 @@ Lun 风火轮：集多协议代理、CDN 优选、多用户与分布式服务器
 链式代理目前仅支持 VLESS TCP Reality 两跳与 TCP 业务；
 CDN、隧道和订阅兼容范围见[协议能力表](docs/USAGE.zh-CN.md#协议与域名变量)。
 
+### 协议面板预览
+
+![Lun 协议面板：15 种协议的选择状态及直连、CDN 优选、回源和 CF 隧道支持情况](docs/images/lun-protocol-panel.png)
+
+图中端口为示例；实际端口以你的 VPS 配置为准。
+
 ## 快速开始
 
 通过 SSH 登录 VPS 后，在 Bash 中执行：

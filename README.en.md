@@ -22,6 +22,12 @@ Multi-user access, clustering and monitoring are optional; the CDN testing page 
 Proxy chains currently support two-hop VLESS TCP Reality for TCP traffic only.
 See the [protocol capability table](docs/USAGE.zh-CN.md#协议与域名变量) for CDN, tunnel and subscription compatibility.
 
+### Protocol menu preview
+
+![Lun protocol menu showing 15 choices, selection status, and support for direct connections, CDN, origin port routing, and Cloudflare Tunnel](docs/images/lun-protocol-panel.png)
+
+Ports shown are examples; your VPS configuration determines the actual ports.
+
 ## Quick start
 
 Connect to your VPS over SSH and run in Bash:
