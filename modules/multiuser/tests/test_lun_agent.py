@@ -1132,6 +1132,26 @@ rules:
         self.assertEqual(self.agent.load_config()["legacy_token"], config["legacy_token"])
         self.assertEqual(self.agent.load_config()["user_data_generation"], lun_agent.USER_DATA_GENERATION)
 
+    def test_core_upgrade_port_relocation_is_staged_and_rolls_back(self):
+        previous = self.agent.load_config()
+        self.agent.defer_security_commit = True
+        with self.assertRaisesRegex(lun_agent.AgentError, "没有待验证"):
+            self.agent.set_subscription_port(2443, 42443, staged_core_upgrade=True)
+        with self.agent.security_transaction([], apply_cores=False):
+            pass
+        with self.assertRaisesRegex(lun_agent.AgentError, "未完成的安全操作"):
+            self.agent.set_subscription_port(2443, 42443, staged_core_upgrade=True)
+        self.agent.security_rollback()
+
+        self.agent.reset_for_core_upgrade(lun_agent.USER_DATA_GENERATION)
+        with self.assertRaisesRegex(lun_agent.AgentError, "未完成的安全操作"):
+            self.agent.set_subscription_port(2443, 42443)
+        self.agent.set_subscription_port(2443, 42443, staged_core_upgrade=True)
+        self.assertEqual(self.agent.load_config()["port"], 2443)
+        self.agent.security_rollback()
+        for field in ("port", "public_port", "legacy_token"):
+            self.assertEqual(self.agent.load_config()[field], previous[field])
+
     def test_core_upgrade_reset_does_not_start_previously_inactive_core(self):
         with mock.patch.object(self.agent, "_security_service_states", return_value={
             "xray": {"manager": "systemd", "active": True},

@@ -61,6 +61,7 @@ mkdir "$HOME/lun"
 printf '{}\n' > "$HOME/lun/sb.json"
 subscription_agent_enabled(){ return 0; }
 multiuser_enabled(){ return 0; }
+multiuser_upgrade_subscription_ready(){ events+=(ready); }
 live=yes
 core_update_running(){ [[ $live == yes ]]; }
 multiuser_config_value(){ return 1; }
@@ -70,7 +71,19 @@ multiuser_cmd(){
 }
 events=()
 if multiuser_security_transaction reset-for-core-upgrade --generation fixture; then exit 1; fi
-[[ " ${events[*]} " == *'security-rollback'* && " ${events[*]} " != *' security-commit '* ]]
+[[ " ${events[*]} " == *'ready stop security-rollback'* && " ${events[*]} " != *' security-commit '* ]]
+)
+
+# A service-manager “started” result is not enough to discard the old database.
+(
+lun_service_running(){ return 0; }
+subscription_agent_enabled(){ return 0; }
+multiuser_enabled(){ return 1; }
+multiuser_upgrade_subscription_ready(){ events+=(probe); return 1; }
+events=()
+if multiuser_security_transaction reset-for-core-upgrade --generation fixture; then exit 1; fi
+[[ " ${events[*]} " == *'start probe stop security-rollback start'* ]]
+[[ " ${events[*]} " != *' security-commit '* ]]
 )
 
 (

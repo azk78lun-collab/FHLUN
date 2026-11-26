@@ -407,6 +407,7 @@ rm -rf "$oneclick_test_home"
 HOME=$original_home
 
 eval "$(extract_shell_function multiuser_prepare_service_port)"
+eval "$(extract_shell_function multiuser_subscription_tcp_port_in_use)"
 service_test_home=$(mktemp -d)
 HOME=$service_test_home
 mkdir -p "$HOME/lun"
@@ -423,11 +424,13 @@ apply_lun_firewall_rules() { :; }
 
 owned_busybox_stopped=no
 stop_subscription_service() { owned_busybox_stopped=yes; }
-port_in_use() { [[ $owned_busybox_stopped != yes ]]; }
+port_owner_lines() { if [[ $owned_busybox_stopped != yes ]]; then printf 'tcp LISTEN\n'; fi; }
+multiuser_prepare_service_port
+port_owner_lines() { printf 'udp UNCONN\n'; }
 multiuser_prepare_service_port
 
 stop_subscription_service() { :; }
-port_in_use() { return 0; }
+port_owner_lines() { printf 'tcp LISTEN\n'; }
 select_subscription_port() { printf '12344\n'; }
 client_port() { printf '51286\n'; }
 is_nat_mode() { return 0; }
@@ -435,6 +438,8 @@ captured_port_update=
 multiuser_cmd() { captured_port_update="$*"; }
 multiuser_prepare_service_port
 [[ $captured_port_update == "set-subscription-port --port 12344 --public-port 51286" ]]
+multiuser_prepare_service_port staged-core-upgrade
+[[ $captured_port_update == "set-subscription-port --port 12344 --public-port 51286 --staged-core-upgrade" ]]
 
 select_subscription_port() { return 1; }
 ! multiuser_prepare_service_port

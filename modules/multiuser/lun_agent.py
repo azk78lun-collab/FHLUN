@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 USER_DATA_GENERATION = "singbox-1.14.4"
 IDENTITY_FILES = ("uuid", "jhsub.txt", "clmi.yaml", "sbox.json")
 PROTOCOLS = (
@@ -532,20 +532,23 @@ class Agent:
     def save_config(self, config: dict[str, Any]) -> None:
         atomic_write(self.config_path, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
 
-    def set_subscription_port(self, port: int, public_port: int) -> dict[str, int]:
+    def set_subscription_port(self, port: int, public_port: int, *, staged_core_upgrade: bool = False) -> dict[str, int]:
         if not 1 <= port <= 65535 or not 1 <= public_port <= 65535:
             raise AgentError("订阅端口必须在 1-65535 范围内")
-        config = self.load_config()
-        config["port"] = port
-        config["public_port"] = public_port
-        self.save_config(config)
-        with self.db.connection:
-            self.db.audit(
-                "subscription.port",
-                "module",
-                f"internal={port},public={public_port}",
-            )
-        self.sync_legacy_subscription_state()
+        with FileLock(self.lock_path):
+            if self.security_pending.exists():
+                state = json.loads((self.security_pending / "state.json").read_text(encoding="utf-8"))
+                if not (staged_core_upgrade and state.get("core_upgrade_reset") and not state.get("committed")):
+                    raise AgentError("未完成的安全操作不允许另行更改订阅端口")
+            elif staged_core_upgrade:
+                raise AgentError("没有待验证的内核迁移")
+            config = self.load_config()
+            config["port"] = port
+            config["public_port"] = public_port
+            self.save_config(config)
+            with self.db.connection:
+                self.db.audit("subscription.port", "module", f"internal={port},public={public_port}")
+            self.sync_legacy_subscription_state()
         return {"port": port, "public_port": public_port}
 
     def local_subscription_device(self) -> sqlite3.Row:
@@ -3738,6 +3741,7 @@ def build_parser() -> argparse.ArgumentParser:
     subscription_port = sub.add_parser("set-subscription-port")
     subscription_port.add_argument("--port", type=int, required=True)
     subscription_port.add_argument("--public-port", type=int, required=True)
+    subscription_port.add_argument("--staged-core-upgrade", action="store_true")
     sub.add_parser("sync-subscription-state")
     cluster_export = sub.add_parser("cluster-export")
     cluster_export.add_argument("--user-ids", default="")
@@ -3786,7 +3790,8 @@ def main(argv: list[str] | None = None) -> int:
     agent = Agent(Path(args.root))
     agent.defer_security_commit = args.defer_security_commit
     try:
-        if agent.security_pending.exists() and args.command not in {
+        staged_port = args.command == "set-subscription-port" and args.staged_core_upgrade
+        if agent.security_pending.exists() and not staged_port and args.command not in {
             "security-commit", "security-rollback", "serve", "status", "list-users", "usage", "doctor",
             "show-user", "show-subscription", "show-local-subscription", "sync-subscription-state",
         }:
@@ -3919,7 +3924,7 @@ def main(argv: list[str] | None = None) -> int:
             result = {"enabled": config["enabled"]}
             print("模块已启用。" if config["enabled"] else "模块已停用。")
         elif args.command == "set-subscription-port":
-            result = agent.set_subscription_port(args.port, args.public_port)
+            result = agent.set_subscription_port(args.port, args.public_port, staged_core_upgrade=staged_port)
             print(
                 f"多用户订阅端口已更新：内网 {result['port']} / 公网 {result['public_port']}。"
             )

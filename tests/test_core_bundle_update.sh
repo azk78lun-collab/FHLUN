@@ -135,6 +135,36 @@ update_installed_core sing-box
 [[ "$HOME/lun/sing-box" -ef "$HOME/lun/snell/sing-box" ]]
 [[ $(cat "$LOG") == "download sing-box-lun-$cpu.tar.gz" ]] # recover missing binaries without starting stopped services
 
+(
+  # A retry may recover only its own interrupted migration, never another security operation.
+  mu=$(multiuser_module_dir)
+  pending_dir="$mu/.security-transaction"
+  mkdir -p "$mu/data" "$pending_dir"
+  printf 'fixture\n' > "$mu/config.json"
+  printf 'fixture\n' > "$mu/data/lun.db"
+  printf '%s\n' '--staged-core-upgrade' > "$mu/lun_agent.py"
+  update_installed_core(){ :; }
+  cluster_enabled(){ return 1; }
+  visit_monitor_enabled(){ return 1; }
+  multiuser_config_value(){ printf 'old\n'; }
+  multiuser_service_stop(){ printf 'stop\n' >> "$LOG"; }
+  multiuser_service_start(){ printf 'start\n' >> "$LOG"; }
+  multiuser_cmd(){
+    [[ $1 == security-rollback ]]
+    printf 'rollback\n' >> "$LOG"
+    rm -f "$pending_dir/state.json"
+    rmdir "$pending_dir"
+  }
+  multiuser_security_transaction(){ printf 'new migration\n' >> "$LOG"; }
+  : > "$LOG"
+  printf '{}\n' > "$pending_dir/state.json"
+  ! sync_lun_runtime
+  [[ -f $pending_dir/state.json && ! -s $LOG ]]
+  printf '{"core_upgrade_reset":true}\n' > "$pending_dir/state.json"
+  sync_lun_runtime
+  [[ $(cat "$LOG") == $'stop\nrollback\nstart\nnew migration' ]]
+)
+
 update_lun_script(){ printf 'script\n' >> "$LOG"; return "$script_rc"; }
 cluster_update_from_installed_script(){ printf 'federation\n' >> "$LOG"; return "$cluster_rc"; }
 update_installed_core(){ printf '%s\n' "$1" >> "$LOG"; [[ $1 != "$fail_engine" ]]; }

@@ -1,8 +1,13 @@
 # Lun 更新日志 Changelog
 
-Lun 风火轮的中英文更新记录，最新日期在前。当前脚本版本为 `V26.11.26.2`。
+Lun 风火轮的中英文更新记录，最新日期在前。当前脚本版本为 `V26.11.27.1`。
 
-Bilingual update history for Lun, newest date first. The current script version is `V26.11.26.2`.
+Bilingual update history for Lun, newest date first. The current script version is `V26.11.27.1`.
+
+## 2026 年 11 月 27 日
+
+- `V26.11.27.1`：手动更新和集群下发等待新版联邦服务实际就绪；不把计划内重启记成节点离线。处理订阅旧进程残留、升级中断和端口冲突；验证订阅真正可用后才提交一次性多用户迁移。已完成迁移的机器不会重置第二次。
+- `V26.11.27.1`: Wait for the new federation process during local and fleet updates without counting planned restarts as outages. Recover stale subscription processes, interrupted upgrades and port conflicts; commit the one-time multi-user migration only after a real subscription check. Completed migrations do not run twice.
 
 ## 2026 年 11 月 26 日
 

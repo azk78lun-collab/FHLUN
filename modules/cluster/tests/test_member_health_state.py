@@ -191,20 +191,22 @@ class MemberHealthTests(unittest.TestCase):
         self.assertFalse(target.with_name(target.name + ".cluster-backup").exists())
 
     def test_update_waits_for_loaded_module_and_restart_listener(self):
+        slow_start = [m.FederationTransportError("restarting")] * 12
         with mock.patch.object(m, "probe_federation_member", side_effect=[
-                {"cluster_version": "0.3.0"}, m.FederationTransportError("restarting"),
+                {"cluster_version": "0.3.0"}, *slow_start,
                 {"cluster_version": "0.3.1"}]) as probe, mock.patch.object(m.time, "sleep") as sleep:
             result = m.wait_for_member_update(self.c, self.peer, "0.3.1")
         self.assertEqual(result["cluster_version"], "0.3.1")
-        self.assertEqual(probe.call_count, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(probe.call_count, 14)
+        self.assertEqual(sleep.call_count, 13)
 
     def test_update_restart_wait_is_bounded_and_identity_errors_are_not_retried(self):
         with mock.patch.object(m, "probe_federation_member", side_effect=m.FederationTransportError("down")) as probe, \
                 mock.patch.object(m.time, "sleep"):
-            with self.assertRaises(m.FederationTransportError):
+            with self.assertRaisesRegex(m.ClusterError, "重启等待期内未恢复") as raised:
                 m.wait_for_member_update(self.c, self.peer, "0.3.1")
-        self.assertEqual(probe.call_count, 6)
+        self.assertNotIsInstance(raised.exception, m.FederationTransportError)
+        self.assertEqual(probe.call_count, 40)
         with mock.patch.object(m, "probe_federation_member", side_effect=m.ClusterError("identity mismatch")) as probe:
             with self.assertRaisesRegex(m.ClusterError, "identity mismatch"):
                 m.wait_for_member_update(self.c, self.peer, "0.3.1")

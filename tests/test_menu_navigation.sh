@@ -139,6 +139,7 @@ record() { calls+="$*"$'\n'; }
   cluster_agent_version_current() { return 0; }
   cluster_install_service() { :; }
   cluster_service_restart() { record restart; return "$restart_rc"; }
+  cluster_wait_for_running_agent() { record wait; return "$wait_rc"; }
   cluster_write_install_payload() { :; }
   cluster_push_event() { :; }
   mktemp() { command mktemp; }
@@ -149,10 +150,11 @@ record() { calls+="$*"$'\n'; }
       *) printf 'unexpected cluster command: %s\n' "$*" >&2; return 1 ;;
     esac
   }
-  update_lun_script() { official_calls=$((official_calls + 1)); return 1; }
+  update_local_lun_bundle() { official_calls=$((official_calls + 1)); return 1; }
   official_calls=0
   service_current_rc=0
   restart_rc=0
+  wait_rc=0
   calls=
   # 本机来源不依赖 GitHub；当前服务就绪时不得重启。
   cluster_update_all_ui <<< $'\n\n' >/dev/null
@@ -162,7 +164,15 @@ record() { calls+="$*"$'\n'; }
   service_current_rc=1
   calls=
   cluster_update_all_ui <<< $'\n\n' >/dev/null
-  [[ $official_calls -eq 0 && $calls == $'service-current\nrestart\nupdate-all --script-payload '* ]]
+  [[ $official_calls -eq 0 && $calls == $'service-current\nrestart\nwait\nupdate-all --script-payload '* ]]
+  wait_rc=1
+  calls=
+  if cluster_update_all_ui <<< $'\n\n' >/dev/null; then
+    echo 'unready service unexpectedly started an update' >&2
+    exit 1
+  fi
+  [[ $calls == $'service-current\nrestart\nwait\n' ]]
+  wait_rc=0
   restart_rc=1
   calls=
   if cluster_update_all_ui <<< $'\n\n' >/dev/null; then

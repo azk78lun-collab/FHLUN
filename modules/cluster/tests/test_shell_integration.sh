@@ -85,6 +85,8 @@ contains "$SCRIPT" '[ "$cluster_reuse_existing" != yes ]'
     if [ "$1" = is-active ]; then [ "$running" = yes ]; else cluster_agent_version "$target" >> "$state"; fi
   }
   cluster_cmd(){ [ "$1" = service-current ] && [ "$ready" = yes ]; }
+  cluster_service_start(){ printf '%s\n' started >> "$state"; }
+  cluster_service_stop(){ printf '%s\n' stopped >> "$state"; }
   sleep(){ :; }
   red_line(){ printf '%s\n' "$*"; }
   yellow_line(){ :; }
@@ -114,7 +116,10 @@ contains "$SCRIPT" '[ "$cluster_reuse_existing" != yes ]'
   [[ $(cluster_agent_version "$target") == 0.3.5 && ! -s "$state" ]]
   enabled=yes running=no
   cluster_upgrade_local_agent
-  [[ $(cluster_agent_version "$target") == "$LUN_CLUSTER_REQUIRED_VERSION" && ! -s "$state" ]]
+  [[ $(cluster_agent_version "$target") == "$LUN_CLUSTER_REQUIRED_VERSION" && $(cat "$state") == started ]]
+  : > "$state"
+  cluster_upgrade_local_agent
+  [[ $(cat "$state") == started ]] # current file is not equivalent to a running service
   [[ -z $(find "$(cluster_module_dir)" -type d -name '.upgrade.*' -print) ]]
 )
 

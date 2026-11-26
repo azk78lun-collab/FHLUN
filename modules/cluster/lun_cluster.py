@@ -44,11 +44,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-VERSION = "0.3.9"
+VERSION = "0.3.10"
 USER_DATA_GENERATION = "singbox-1.14.4"
 CLUSTER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 API_VERSION = 3
 RESTART_EXIT_CODE = 75
+UPDATE_RESTART_GRACE = 75
 JOIN_TTL = 15 * 60
 BOOTSTRAP_TIMEOUT = 30
 JOIN_REQUEST_TIMEOUT = 120
@@ -7398,7 +7399,8 @@ def wait_for_member_update(cluster: Cluster, node_id: str, expected_version: str
                            expected_sha256: str = "") -> dict[str, Any]:
     """An acknowledged install still needs its new TLS listener to come back."""
     last_error: Exception | None = None
-    for attempt in range(6):
+    deadline = time.monotonic() + UPDATE_RESTART_GRACE
+    for _ in range(40):
         try:
             status = probe_federation_member(cluster, cluster.node(node_id))
             if status.get("cluster_version") == expected_version and (
@@ -7407,10 +7409,13 @@ def wait_for_member_update(cluster: Cluster, node_id: str, expected_version: str
             last_error = ClusterError("联邦服务仍在切换版本")
         except FederationTransportError as exc:
             last_error = exc
-        if attempt < 5:
-            time.sleep(attempt + 1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(2, remaining))
     if isinstance(last_error, FederationTransportError):
-        raise FederationTransportError("文件已更新，但联邦服务重启尚未恢复：" + str(last_error)) from last_error
+        # A failed probe during a planned restart is not evidence of node death.
+        raise ClusterError("文件已更新，但联邦服务在重启等待期内未恢复：" + str(last_error)) from last_error
     raise ClusterError("文件已更新，但未确认新版联邦服务就绪")
 
 
@@ -7468,6 +7473,11 @@ def distribute_cluster_update(cluster: Cluster, payload: dict[str, Any], source_
             )
             if cluster.is_federation() and ready_version:
                 expected_sha = str(agent_payload["sha256"]) if 'cluster_source_sha256' in agent_source else ""
+                if agent_result.get("unchanged") and (status.get("cluster_version") != ready_version or (
+                        expected_sha and status.get("cluster_source_sha256") != expected_sha)):
+                    send_action(cluster, node_id, "service.control",
+                                {"component": "cluster", "operation": "restart"}, timeout=20,
+                                coordinate_failures=False)
                 status = wait_for_member_update(cluster, node_id, ready_version, expected_sha)
                 cluster.upsert_node(status, role="federation")
             if re.search(rb"^LUN_SINGBOX_VERSION=[0-9.]+$", script_content, re.M):

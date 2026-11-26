@@ -4,7 +4,7 @@ lun_has_systemd(){
 command -v systemctl >/dev/null 2>&1 && test -d /run/systemd/system
 }
 
-LUN_CLUSTER_REQUIRED_VERSION=0.3.9
+LUN_CLUSTER_REQUIRED_VERSION=0.3.10
 LUN_CDNOPT_REQUIRED_VERSION=2.0.7
 LUN_SINGBOX_VERSION=1.14.4
 LUN_MULTIUSER_GENERATION=singbox-1.14.4
@@ -113,7 +113,7 @@ echo "Lun 项目地址：https://github.com/azk78lun-collab/FHLUN"
 echo ""
 echo ""
 echo "风火轮一键无交互脚本"
-echo "当前版本：V26.11.26.2"
+echo "当前版本：V26.11.27.1"
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 fi
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -4531,12 +4531,70 @@ systemctl stop lun-agent >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
 rc-service lun-agent stop >/dev/null 2>&1 || true
 fi
-for P in /proc/[0-9]*; do
-[ -r "$P/cmdline" ] || continue
-PID=$(basename "$P")
-CMD=$(tr '\0' ' ' < "$P/cmdline" 2>/dev/null)
-case "$CMD" in *"/lun/modules/multiuser/lun_agent.py"*" serve"*) kill "$PID" 2>/dev/null || true ;; esac
+local proc pid attempt remaining
+local -a old_pids=()
+for proc in /proc/[0-9]*; do
+pid=${proc##*/}
+if multiuser_owned_listener_pid "$pid"; then
+old_pids+=("$pid")
+kill -TERM "$pid" 2>/dev/null || true
+fi
 done
+for attempt in 1 2 3 4 5; do
+remaining=no
+for pid in "${old_pids[@]}"; do multiuser_owned_listener_pid "$pid" && remaining=yes; done
+[ "$remaining" = yes ] || return 0
+sleep 1
+done
+# Older agents can stall in a TLS handshake. Never kill a process by port alone.
+for pid in "${old_pids[@]}"; do
+if multiuser_owned_listener_pid "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+done
+if ! lun_has_systemd && command -v rc-service >/dev/null 2>&1; then
+rc-service lun-agent stop >/dev/null 2>&1 || true
+fi
+}
+
+multiuser_owned_listener_pid(){
+local pid=$1 executable arg script
+[ -r "/proc/$pid/cmdline" ] || return 1
+executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+case "${executable##*/}" in python|python3|python3.*) ;; *) return 1 ;; esac
+{
+IFS= read -r -d '' arg && IFS= read -r -d '' script || return 1
+[ "$script" = "$HOME/lun/modules/multiuser/lun_agent.py" ] || return 1
+while IFS= read -r -d '' arg; do [ "$arg" != serve ] || return 0; done
+} 2>/dev/null < "/proc/$pid/cmdline"
+return 1
+}
+
+multiuser_subscription_tcp_port_in_use(){
+port_owner_lines "$1" | awk '$1 ~ /^tcp[46]?$/ { found=1 } END { exit !found }'
+}
+
+multiuser_upgrade_subscription_ready(){
+python3 - "$(multiuser_module_dir)/config.json" <<'PY'
+import http.client, json, ssl, sys, time
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+host = config.get("bind", "::")
+host = {"::": "::1", "0.0.0.0": "127.0.0.1"}.get(host, host)
+port = int(config["port"])
+path = "/" + config["legacy_token"] + "/jhsub.txt"
+for _ in range(8):
+    client = (http.client.HTTPSConnection(host, port, timeout=1, context=ssl._create_unverified_context())
+              if config.get("scheme") == "https" else http.client.HTTPConnection(host, port, timeout=1))
+    try:
+        client.request("HEAD", path)
+        if client.getresponse().status == 200:
+            sys.exit(0)
+    except (OSError, http.client.HTTPException):
+        pass
+    finally:
+        client.close()
+    time.sleep(.5)
+sys.exit(1)
+PY
 }
 
 multiuser_clear_legacy_subscription_autostart(){
@@ -4550,6 +4608,7 @@ rm -f /etc/local.d/alpinesublun.start
 }
 
 multiuser_prepare_service_port(){
+local -a port_args=()
 subscription_agent_enabled || return 0
 stop_subscription_service
 multiuser_clear_legacy_subscription_autostart
@@ -4559,7 +4618,7 @@ valid_port_value "$mu_service_port" || {
 red_line "多用户订阅端口配置无效。"
 return 1
 }
-if ! port_in_use "$mu_service_port"; then
+if ! multiuser_subscription_tcp_port_in_use "$mu_service_port"; then
 return 0
 fi
 yellow_line "多用户订阅端口 $mu_service_port 被非风火轮进程占用，正在自动选择可用端口。"
@@ -4573,7 +4632,8 @@ if is_nat_mode && [ "$mu_service_public" = "$mu_service_new" ]; then
 red_line "新内网端口 $mu_service_new 没有 NAT 公网映射，已拒绝写入。"
 return 1
 fi
-multiuser_cmd set-subscription-port --port "$mu_service_new" --public-port "$mu_service_public" >/dev/null || return 1
+[ "${1:-}" != staged-core-upgrade ] || port_args+=(--staged-core-upgrade)
+multiuser_cmd set-subscription-port --port "$mu_service_new" --public-port "$mu_service_public" "${port_args[@]}" >/dev/null || return 1
 printf '%s\n' "$mu_service_new" > "$HOME/lun/subport.log"
 green_line "多用户订阅端口已迁移：内网 $mu_service_new / 公网 $mu_service_public。"
 apply_lun_firewall_rules quiet || true
@@ -4583,7 +4643,7 @@ multiuser_service_start(){
 subscription_agent_enabled || return 0
 lun_python_ensure modules || return 1
 multiuser_service_stop
-multiuser_prepare_service_port || return 1
+multiuser_prepare_service_port "$@" || return 1
 multiuser_install_service || return 1
 if lun_has_systemd; then
 systemctl enable --now lun-agent >/dev/null 2>&1 || return 1
@@ -5156,10 +5216,10 @@ fi
 }
 
 cluster_wait_for_running_agent(){
-local attempt
-for attempt in 1 2 3 4 5 6 7 8; do
+local attempt start=$SECONDS
+for ((attempt=0; attempt<40 && SECONDS-start<75; attempt++)); do
 cluster_cmd service-current >/dev/null 2>&1 && return 0
-sleep 1
+sleep 2
 done
 return 1
 }
@@ -5170,8 +5230,12 @@ cluster_enabled && cluster_is_federation || return 0
 local target stage active=no previous
 target="$(cluster_module_dir)/lun_cluster.py"
 if cluster_agent_version_current "$target"; then
-if ! cluster_runtime_command is-active || cluster_cmd service-current >/dev/null 2>&1; then return 0; fi
+if cluster_runtime_command is-active; then
+if cluster_cmd service-current >/dev/null 2>&1; then return 0; fi
 cluster_runtime_command restart && cluster_wait_for_running_agent && return 0
+else
+cluster_service_start && cluster_wait_for_running_agent && return 0
+fi
 red_line "联邦文件已更新，但服务未加载该版本；请查看集群日志。"
 return 1
 fi
@@ -5183,11 +5247,13 @@ cluster_download_agent "$stage/new.py" || { red_line "联邦组件未更新，�
 cp -p "$target" "$stage/previous.py" || return 1
 cluster_runtime_command is-active && active=yes
 mv -f "$stage/new.py" "$target" || return 1
-if [ "$active" = yes ] && { ! cluster_runtime_command restart || ! cluster_wait_for_running_agent; }; then
+if ! { if [ "$active" = yes ]; then cluster_runtime_command restart; else cluster_service_start; fi; } ||
+   ! cluster_wait_for_running_agent; then
+if [ "$active" != yes ]; then cluster_service_stop; fi
 if ! mv -f "$stage/previous.py" "$target"; then
 trap - EXIT
 red_line "联邦组件回滚失败，原文件保留在 $stage/previous.py。"
-elif cluster_runtime_command restart; then
+elif [ "$active" != yes ] || cluster_runtime_command restart; then
 red_line "新版联邦服务未就绪，已恢复原组件。"
 else
 red_line "已恢复旧联邦文件，但服务未重启，请查看集群日志。"
@@ -5991,8 +6057,8 @@ cluster_update_exclude="${cluster_update_exclude:+$cluster_update_exclude,}$clus
 fi
 
 if [ "$cluster_update_origin" = official ]; then
-if ! update_lun_script || ! cluster_update_from_installed_script; then
-red_line "本机主脚本或联邦组件未完整更新，已停止集群推送。"
+if ! update_local_lun_bundle; then
+red_line "本机脚本、联邦或运行时组件未完整更新，已停止集群推送。"
 return 1
 fi
 fi
@@ -6023,7 +6089,9 @@ return 1
 fi
 cluster_install_service || return 1
 if ! cluster_cmd service-current >/dev/null 2>&1; then
-cluster_service_restart || { red_line "本机分布式集群服务重启失败。"; return 1; }
+cluster_service_restart && cluster_wait_for_running_agent || {
+red_line "本机分布式集群服务重启后未就绪，已停止下发。"; return 1;
+}
 fi
 
 cluster_script_payload=$(mktemp "$HOME/lun/.cluster-script.XXXXXX") || return 1
@@ -9118,9 +9186,9 @@ address=$(multiuser_config_value singbox_api)
 [ -n "$address" ] && "$(multiuser_module_dir)/lun-sb-stats" --server "$address" --timeout 3s >/dev/null 2>&1
 }
 
-sync_lun_runtime(){
+sync_lun_runtime(){ (
 update_installed_core sing-box || return 1
-local mu_dir generation pending cleaned
+local mu_dir generation pending cleaned recovery
 mu_dir=$(multiuser_module_dir)
 [ -s "$mu_dir/config.json" ] && [ -s "$mu_dir/data/lun.db" ] || return 0
 if cluster_enabled; then
@@ -9128,32 +9196,48 @@ cluster_is_federation && cluster_agent_version_current || {
 red_line "请先升级联邦模块，再清理旧多用户资料；未改动数据库。"; return 1;
 }
 fi
-generation=$(multiuser_config_value user_data_generation)
 pending="$mu_dir/.security-transaction/state.json"
 cleaned="$mu_dir/.cleaned-$LUN_MULTIUSER_GENERATION"
-if [ "$generation" = "$LUN_MULTIUSER_GENERATION" ]; then
-[ ! -f "$cleaned" ] || [ -f "$pending" ] || return 0
-if [ -f "$pending" ]; then
-if ! python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s.get("core_upgrade_reset") and s.get("committed") else 1)' "$pending" ||
-   ! multiuser_cmd security-commit; then
-red_line "仍有多用户安全事务待处理，未执行新的清理。"
-return 1
-fi
-fi
-else
-if ! grep -Fq "USER_DATA_GENERATION = \"$LUN_MULTIUSER_GENERATION\"" "$mu_dir/lun_agent.py" 2>/dev/null; then
+exec 7>"$mu_dir/.runtime-upgrade.lock" || return 1
+flock -w 45 7 || { red_line "另一项多用户升级仍在执行，稍后重试。"; return 1; }
+if ! grep -Fq -- '--staged-core-upgrade' "$mu_dir/lun_agent.py" 2>/dev/null; then
 multiuser_download_agent || return 1
 fi
-grep -Fq "USER_DATA_GENERATION = \"$LUN_MULTIUSER_GENERATION\"" "$mu_dir/lun_agent.py" || {
+grep -Fq -- '--staged-core-upgrade' "$mu_dir/lun_agent.py" || {
 red_line "未收到新版多用户程序，未删除任何旧资料。"; return 1;
 }
+generation=$(multiuser_config_value user_data_generation)
+if [ -d "$mu_dir/.security-transaction" ]; then
+recovery=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(("commit" if s.get("committed") else "rollback") if s.get("core_upgrade_reset") else "")' "$pending") || return 1
+case "$recovery" in
+commit)
+[ "$generation" = "$LUN_MULTIUSER_GENERATION" ] && multiuser_cmd security-commit || return 1
+;;
+rollback)
+yellow_line "恢复上次未完成的多用户升级，保留原资料后再重试。"
+multiuser_service_stop
+multiuser_cmd security-rollback && multiuser_service_start || return 1
+if visit_monitor_enabled; then visit_monitor_service_start || yellow_line "网站监控未恢复，请进入自检。"; fi
+generation=$(multiuser_config_value user_data_generation)
+;;
+*) red_line "存在其他未完成的安全操作，未覆盖或清理旧资料。"; return 1 ;;
+esac
+elif [ "$generation" = "$LUN_MULTIUSER_GENERATION" ] && [ -f "$cleaned" ]; then
+if subscription_agent_enabled && lun_service_running lun-agent && ! multiuser_upgrade_subscription_ready; then
+multiuser_service_start && multiuser_upgrade_subscription_ready || {
+red_line "订阅服务未通过实际请求验证；未重复重置多用户资料。"; return 1;
+}
+fi
+return 0
+fi
+if [ "$generation" != "$LUN_MULTIUSER_GENERATION" ]; then
 yellow_line "正在切换新版多用户数据：验证通过后将一次性清理旧账号、设备、订阅 Token、流量和本机模块备份。"
 multiuser_security_transaction reset-for-core-upgrade --generation "$LUN_MULTIUSER_GENERATION" || return 1
 fi
 rm -f "$HOME"/lun-multiuser-backup-*.sqlite3 \
       "$HOME/lun/.last_good_rebuild/lun/xr.json" "$HOME/lun/.last_good_rebuild/lun/sb.json" || return 1
 (umask 077; : > "$cleaned")
-}
+) }
 
 lun_finish_legacy_runtime_upgrade(){
 [ -t 0 ] || return 0
@@ -15305,7 +15389,10 @@ local_identity_apply "$requested"
 
 multiuser_security_transaction(){
 local mu_security_visit=no mu_security_agent=no mu_security_autostart=no mu_security_http=yes
-local mu_security_sb_live=no
+local mu_security_sb_live=no mu_security_staged=no
+local -a mu_security_start_args=()
+local mu_security_pending="$(multiuser_module_dir)/.security-transaction"
+[ ! -d "$mu_security_pending" ] || { red_line "存在未完成的安全操作，未触碰现有服务。"; return 1; }
 if ! grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null; then
 multiuser_download_agent || { red_line "安全操作需要新版多用户程序，更新失败，未修改用户。"; return 1; }
 grep -q '^    def security_commit(' "$(multiuser_module_dir)/lun_agent.py" 2>/dev/null || {
@@ -15317,6 +15404,7 @@ lun_service_running lun-agent && mu_security_agent=yes
 lun_service_running lun-visit-monitor && mu_security_visit=yes
 lun_service_enabled lun-agent && mu_security_autostart=yes
 case "$1" in set-local-identity|reset-for-core-upgrade) subscription_agent_enabled || mu_security_http=no ;; esac
+if [ "$1" = reset-for-core-upgrade ]; then mu_security_start_args+=(staged-core-upgrade); fi
 if [ "$1" = reset-for-core-upgrade ] && multiuser_enabled && [ -s "$HOME/lun/sb.json" ] &&
    core_update_running sing-box; then
 mu_security_sb_live=yes
@@ -15324,7 +15412,9 @@ fi
 multiuser_service_stop
 visit_monitor_service_stop
 if multiuser_cmd --defer-security-commit "$@"; then
-if { [ "$mu_security_http" = no ] || multiuser_service_start; } &&
+mu_security_staged=yes
+if { [ "$mu_security_http" = no ] || { multiuser_service_start "${mu_security_start_args[@]}" &&
+     { [ "$1" != reset-for-core-upgrade ] || multiuser_upgrade_subscription_ready; }; }; } &&
    { [ "$mu_security_sb_live" != yes ] || multiuser_upgrade_stats_ready; }; then
 if multiuser_cmd security-commit; then
 [ "$mu_security_agent" = yes ] || multiuser_service_stop
@@ -15333,7 +15423,7 @@ if multiuser_cmd security-commit; then
 green_line "安全操作已生效，核心与订阅保持同步。"
 if cluster_enabled && cluster_is_federation; then
 if [ "$1" = reset-for-core-upgrade ]; then
-(cluster_cmd sync-users || true) >/dev/null 2>&1 &
+(exec 7>&-; cluster_cmd sync-users || true) >/dev/null 2>&1 &
 else
 cluster_cmd sync-users || yellow_line "本机已生效，但至少一台成员暂未同步。"
 fi
@@ -15346,7 +15436,8 @@ return 1
 fi
 fi
 multiuser_service_stop
-if multiuser_cmd security-rollback && { [ "$mu_security_agent" != yes ] || multiuser_service_start; }; then
+if { { [ "$mu_security_staged" = no ] && [ ! -d "$mu_security_pending" ]; } || multiuser_cmd security-rollback; } &&
+   { [ "$mu_security_agent" != yes ] || multiuser_service_start; }; then
 [ "$mu_security_autostart" = yes ] || lun_service_disable_autostart lun-agent
 green_line "本次安全操作已完整回滚，原凭据和订阅保持不变。"
 else
